@@ -1,7 +1,7 @@
-"""OpenHachimi 的命令行对话入口。"""
+"""OpenHachimi 命令入口。"""
 
-from openhachimi_agent.cli import run_cli
+from openhachimi_agent.__main__ import main
 
 
 if __name__ == "__main__":
-    run_cli()
+    main()

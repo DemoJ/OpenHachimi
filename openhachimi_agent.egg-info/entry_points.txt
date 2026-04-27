@@ -1,0 +1,3 @@
+[console_scripts]
+Hachimi = openhachimi_agent.__main__:main
+hachimi = openhachimi_agent.__main__:main

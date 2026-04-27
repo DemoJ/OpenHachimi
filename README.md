@@ -81,13 +81,73 @@ OPENHACHIMI_ROLE=default
 OPENAI_BASE_URL=https://your-openai-compatible-server.example/v1
 ```
 
-## 运行方式
+## 一键部署
 
-激活虚拟环境后，直接运行：
+项目提供统一的一键部署入口，会自动根据当前环境完成虚拟环境创建、依赖安装、命令入口安装和后台守护部署。
 
 ```bash
-python main.py
+python deploy.py
 ```
+
+部署脚本默认会：
+
+- 创建或复用 `.venv`
+- 执行 `pip install -e .[deploy]`
+- 如果缺少 `.env`，从 `.env.example` 复制一份
+- 调用 `hachimi deploy` 部署后台守护服务
+
+如果只想安装命令，不启动后台守护：
+
+```bash
+python deploy.py --skip-daemon
+```
+
+如果要修改监听地址：
+
+```bash
+python deploy.py --host 127.0.0.1 --port 8765
+```
+
+## 运行方式
+
+安装后会提供 `hachimi` 和 `Hachimi` 两个命令入口。
+
+一键部署并启动后台守护服务：
+
+```bash
+hachimi deploy
+```
+
+进入 CLI 对话：
+
+```bash
+hachimi
+```
+
+`deploy` 在 Linux + systemd 环境下会创建并启动 `systemd --user` 服务；其他环境会在项目目录生成本地后台启动脚本。
+
+如果要手动启动后台服务：
+
+```bash
+hachimi serve
+```
+
+再打开另一个终端进入 CLI：
+
+```bash
+hachimi cli
+```
+
+`serve` 默认监听 `127.0.0.1:8765`，CLI 默认连接 `http://127.0.0.1:8765`。
+
+如果要修改地址：
+
+```bash
+hachimi deploy --host 127.0.0.1 --port 8765
+OPENHACHIMI_SERVER_URL=http://127.0.0.1:8765 hachimi
+```
+
+单独运行 `python main.py` 仍等同于 `python main.py cli`。
 
 ## 命令说明
 
@@ -109,6 +169,8 @@ python main.py
 
 ## 持久化记忆
 
+- 后台服务负责维护当前角色、当前会话和模型调用状态
+- CLI 只是连接本机 `localhost` 服务的客户端，可以随时退出再进入
 - 会话历史按“角色 + 对话”单独保存到 [`.memory`](./.memory/) 目录下
 - 每个角色可以拥有多段历史对话，互不覆盖
 - 程序启动时会自动恢复默认角色最近一次对话
@@ -141,6 +203,24 @@ python main.py
 使用 `run_command` 时，Agent 还会按共享系统提示优先判断当前平台，再选择对应命令语法。
 
 它还额外做了基础安全限制，会拒绝明显危险的删除或强制清理命令。
+
+## 后台守护
+
+`hachimi deploy` 会优先使用当前用户的 systemd 服务，不需要手写 service 文件。部署后可用这些命令管理：
+
+```bash
+systemctl --user status openhachimi
+systemctl --user restart openhachimi
+journalctl --user -u openhachimi -f
+```
+
+如果服务器要求用户退出后仍保持 user service 运行，可以开启 linger：
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+在没有 systemd 的环境中，`hachimi deploy` 会生成 `openhachimi-serve.sh` 或 `openhachimi-serve.bat`，运行该脚本即可启动后台服务。
 
 ## 跨平台说明
 

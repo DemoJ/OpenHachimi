@@ -1,32 +1,53 @@
 """命令行交互逻辑。"""
 
-from pydantic_ai.messages import ModelMessage
-
-from openhachimi_agent.agent import build_agent
-from openhachimi_agent.config import AppConfig, load_config
-from openhachimi_agent.memory import load_message_history, save_message_history, start_new_session
-from openhachimi_agent.roles import list_role_names
+import json
+import os
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 EXIT_COMMANDS = {"/exit", "/quit", "退出", "q"}
 NEW_SESSION_COMMANDS = {"/new", "新对话"}
 HELP_COMMANDS = {"/help", "帮助"}
 ROLE_LIST_COMMANDS = {"/roles", "/list-roles"}
+DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
 
 
-def print_welcome(config: AppConfig, role_name: str) -> None:
-    """打印命令行欢迎信息。"""
+def get_server_url() -> str:
+    return os.getenv("OPENHACHIMI_SERVER_URL", DEFAULT_SERVER_URL).rstrip("/")
+
+
+def request_json(server_url: str, method: str, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = Request(
+        f"{server_url}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(request) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def error_detail(exc: HTTPError) -> str:
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+    except json.JSONDecodeError:
+        return str(exc)
+    return str(payload.get("detail", exc))
+
+
+def print_welcome(state: dict[str, object], server_url: str) -> None:
     print("OpenHachimi CLI Agent")
-    print(f"当前模型：{config.model_name}")
-    print(f"当前 Base URL：{config.openai_base_url or '官方默认地址'}")
-    print(f"当前角色：{role_name}")
+    print(f"服务地址：{server_url}")
+    print(f"当前角色：{state['role']}")
+    print(f"当前会话：{state['session_id']}")
     print("输入内容后回车即可对话。")
     print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/new 新建对话，/exit 退出程序。")
     print()
 
 
 def print_help() -> None:
-    """打印命令帮助。"""
     print("命令说明：")
     print("  /help   查看帮助信息")
     print("  /roles  查看可用角色列表")
@@ -36,67 +57,47 @@ def print_help() -> None:
     print()
 
 
-def print_roles(config: AppConfig, current_role: str) -> None:
-    """打印角色列表，并标记当前使用中的角色。"""
-    role_names = list_role_names(config.roles_dir)
-    if not role_names:
-        print("当前没有可用的角色配置，请先在 roles 目录下创建 .md 文件。")
-        print()
-        return
+def print_roles(server_url: str) -> None:
+    payload = request_json(server_url, "GET", "/roles")
 
     print("可用角色：")
-    for role_name in role_names:
-        marker = "（当前）" if role_name == current_role else ""
+    for role_name in payload["roles"]:
+        marker = "（当前）" if role_name == payload["current_role"] else ""
         print(f"  - {role_name}{marker}")
     print()
 
 
-def ensure_api_key(config: AppConfig) -> None:
-    """确认运行前已经配置 API Key。"""
-    if not config.openai_api_key:
-        raise SystemExit("请先在环境变量或 .env 文件中设置 OPENAI_API_KEY。")
-
-
-def handle_role_switch(
-    config: AppConfig,
-    user_input: str,
-    current_role: str,
-) -> tuple[str, str, list[ModelMessage], bool] | None:
-    """处理角色切换命令。"""
+def switch_role(server_url: str, user_input: str) -> None:
     if user_input == "/role":
         print("请在 /role 后面填写角色名称，例如：/role default")
         print()
-        return current_role, "", [], False
+        return
 
-    if not user_input.startswith("/role "):
-        return None
-
-    next_role = user_input[6:].strip()
-    if not next_role:
+    role_name = user_input[6:].strip()
+    if not role_name:
         print("请在 /role 后面填写角色名称，例如：/role default")
         print()
-        return current_role, "", [], False
+        return
 
-    build_agent(config, next_role)
-    session_id = start_new_session(config.memory_dir, next_role)
-    print(f"已切换到角色：{next_role}，并新建对话。")
-    print()
-    return next_role, session_id, [], True
-
-
-def run_cli(config: AppConfig | None = None) -> None:
-    """启动一个带上下文记忆的命令行对话循环。"""
-    config = config or load_config()
-    ensure_api_key(config)
-
-    current_role = config.default_role_name
-    agent = build_agent(config, current_role)
-    current_session_id, history = load_message_history(config.memory_dir, current_role)
-
-    print_welcome(config, current_role)
-    if history:
-        print(f"已恢复角色 {current_role} 的历史会话。")
+    try:
+        payload = request_json(server_url, "POST", "/role", {"role": role_name})
+    except HTTPError as exc:
+        print(f"助手 > 切换角色失败：{error_detail(exc)}")
         print()
+        return
+
+    print(payload["message"])
+    print()
+
+
+def run_cli() -> None:
+    server_url = get_server_url()
+    try:
+        state = request_json(server_url, "GET", "/state")
+    except URLError as exc:
+        raise SystemExit(f"无法连接 OpenHachimi 后台服务：{server_url}，请先运行 python main.py serve") from exc
+
+    print_welcome(state, server_url)
 
     while True:
         try:
@@ -113,9 +114,8 @@ def run_cli(config: AppConfig | None = None) -> None:
             return
 
         if user_input in NEW_SESSION_COMMANDS:
-            current_session_id = start_new_session(config.memory_dir, current_role)
-            history = []
-            print("已保存上一段对话，并新建对话。")
+            payload = request_json(server_url, "POST", "/new")
+            print(payload["message"])
             continue
 
         if user_input in HELP_COMMANDS:
@@ -123,32 +123,18 @@ def run_cli(config: AppConfig | None = None) -> None:
             continue
 
         if user_input in ROLE_LIST_COMMANDS:
-            print_roles(config, current_role)
+            print_roles(server_url)
+            continue
+
+        if user_input == "/role" or user_input.startswith("/role "):
+            switch_role(server_url, user_input)
             continue
 
         try:
-            role_switch_result = handle_role_switch(config, user_input, current_role)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"助手 > 切换角色失败：{exc}")
-            print()
+            payload = request_json(server_url, "POST", "/chat", {"message": user_input})
+        except HTTPError as exc:
+            print(f"助手 > 调用模型时出错：{error_detail(exc)}")
             continue
 
-        if role_switch_result is not None:
-            next_role, next_session_id, next_history, switched = role_switch_result
-            if switched:
-                current_role = next_role
-                current_session_id = next_session_id
-                agent = build_agent(config, current_role)
-                history = next_history
-            continue
-
-        try:
-            result = agent.run_sync(user_input, message_history=history, deps=config)
-        except Exception as exc:
-            print(f"助手 > 调用模型时出错：{exc}")
-            continue
-
-        history = list(result.all_messages())
-        save_message_history(config.memory_dir, current_role, current_session_id, result.all_messages_json())
-        print(f"助手 > {result.output}")
+        print(f"助手 > {payload['output']}")
         print()
