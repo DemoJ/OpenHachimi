@@ -1,6 +1,7 @@
 .venv/
 .tmp/
 .tmp-ensurepip/
+.memory/
 .env
 __pycache__/
 *.pyc

@@ -1,0 +1,504 @@
+"""基于 PydanticAI FunctionToolset 的工作区工具。"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+import platform
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+from pydantic_ai import FunctionToolset, RunContext
+
+from openhachimi_agent.config import AppConfig
+
+
+MAX_LIST_ENTRIES = 200
+MAX_READ_LINES = 200
+MAX_SEARCH_RESULTS = 200
+MAX_COMMAND_OUTPUT_CHARS = 12000
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 60
+SKIP_DIR_NAMES = {
+    ".git",
+    ".memory",
+    ".tmp",
+    ".tmp-ensurepip",
+    ".venv",
+    "__pycache__",
+    "openhachimi_agent.egg-info",
+}
+DANGEROUS_COMMAND_PATTERNS = [
+    r"\brm\b",
+    r"\bunlink\b",
+    r"\bremove-item\b",
+    r"\bdel\b",
+    r"\berase\b",
+    r"\brmdir\b",
+    r"\brd\b",
+    r"\bgit\s+reset\s+--hard\b",
+    r"\bgit\s+clean\b",
+    r"\bformat\b",
+    r"\bshutdown\b",
+    r"\brestart-computer\b",
+    r"\bstop-process\b",
+]
+
+
+def resolve_workspace_path(workspace_root: Path, path: str) -> Path:
+    """将用户提供的路径解析到工作区内，并阻止越界访问。"""
+    raw_path = Path(path)
+    resolved = raw_path.resolve() if raw_path.is_absolute() else (workspace_root / raw_path).resolve()
+
+    try:
+        resolved.relative_to(workspace_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"路径超出当前工作区，不允许访问：{path}") from exc
+
+    return resolved
+
+
+def normalize_relative_path(workspace_root: Path, path: Path) -> str:
+    """将绝对路径转换为工作区相对路径。"""
+    return path.relative_to(workspace_root).as_posix()
+
+
+def relative_path_from(cwd: Path, target: Path) -> str:
+    """计算一个路径相对指定目录的相对表示。"""
+    return Path(os.path.relpath(target, cwd)).as_posix()
+
+
+def should_skip_path(path: Path) -> bool:
+    """判断路径是否应从搜索结果中跳过。"""
+    return any(part in SKIP_DIR_NAMES for part in path.parts)
+
+
+def iter_workspace_items(root: Path, recursive: bool) -> list[Path]:
+    """按需遍历目录内容，并跳过不关注的目录。"""
+    if not recursive:
+        return sorted(item for item in root.iterdir() if item.name not in SKIP_DIR_NAMES)
+
+    items: list[Path] = []
+    for item in root.rglob("*"):
+        if should_skip_path(item.relative_to(root)):
+            continue
+        items.append(item)
+    return sorted(items)
+
+
+def read_text_file(workspace_root: Path, path: str) -> tuple[Path, str]:
+    """读取工作区内文本文件。"""
+    target_file = resolve_workspace_path(workspace_root, path)
+    if not target_file.exists():
+        raise FileNotFoundError(f"文件不存在：{path}")
+    if not target_file.is_file():
+        raise IsADirectoryError(f"目标不是文件：{path}")
+
+    return target_file, target_file.read_text(encoding="utf-8", errors="replace")
+
+
+def trim_output(text: str, max_chars: int = MAX_COMMAND_OUTPUT_CHARS) -> tuple[str, bool]:
+    """限制工具输出大小，避免模型上下文被大量终端文本淹没。"""
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def assert_safe_command(command: str) -> None:
+    """阻止明显危险的命令，保留测试、构建、查询类命令。"""
+    normalized = command.lower()
+    for pattern in DANGEROUS_COMMAND_PATTERNS:
+        if re.search(pattern, normalized):
+            raise ValueError(f"命令包含高风险操作，已拒绝执行：{command}")
+
+
+def run_subprocess(
+    command: list[str],
+    cwd: Path,
+    timeout_seconds: int,
+) -> dict[str, object]:
+    """在指定目录执行子进程并返回结构化结果。"""
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            shell=False,
+        )
+        stdout, stdout_truncated = trim_output(completed.stdout)
+        stderr, stderr_truncated = trim_output(completed.stderr)
+        exit_code: int | None = completed.returncode
+        timed_out = False
+    except subprocess.TimeoutExpired as exc:
+        stdout, stdout_truncated = trim_output(exc.stdout or "")
+        stderr, stderr_truncated = trim_output(exc.stderr or "")
+        exit_code = None
+        timed_out = True
+
+    return {
+        "cwd": cwd.as_posix(),
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "timed_out": timed_out,
+    }
+
+
+def get_command_shell() -> tuple[list[str], str]:
+    """根据当前操作系统选择执行命令的 shell。"""
+    system_name = platform.system().lower()
+    if system_name == "windows":
+        if shutil.which("pwsh"):
+            return ["pwsh", "-NoProfile", "-Command"], "pwsh"
+        return ["powershell", "-NoProfile", "-Command"], "powershell"
+
+    shell_path = os.environ.get("SHELL") or "/bin/sh"
+    return [shell_path, "-lc"], Path(shell_path).name
+
+
+def list_files(
+    ctx: RunContext[AppConfig],
+    path: str = ".",
+    recursive: bool = False,
+    max_entries: int = MAX_LIST_ENTRIES,
+) -> dict[str, object]:
+    """列出工作区内某个目录下的文件和子目录。"""
+    target_dir = resolve_workspace_path(ctx.deps.base_dir, path)
+    if not target_dir.exists():
+        raise FileNotFoundError(f"目录不存在：{path}")
+    if not target_dir.is_dir():
+        raise NotADirectoryError(f"目标不是目录：{path}")
+
+    max_entries = max(1, min(max_entries, MAX_LIST_ENTRIES))
+    entries: list[dict[str, object]] = []
+
+    for item in iter_workspace_items(target_dir, recursive):
+        entries.append(
+            {
+                "path": normalize_relative_path(ctx.deps.base_dir, item),
+                "type": "directory" if item.is_dir() else "file",
+                "size": item.stat().st_size if item.is_file() else None,
+            }
+        )
+        if len(entries) >= max_entries:
+            break
+
+    return {
+        "directory": normalize_relative_path(ctx.deps.base_dir, target_dir)
+        if target_dir != ctx.deps.base_dir
+        else ".",
+        "recursive": recursive,
+        "entries": entries,
+        "truncated": len(entries) >= max_entries,
+    }
+
+
+def find_files(
+    ctx: RunContext[AppConfig],
+    pattern: str,
+    path: str = ".",
+    max_entries: int = MAX_SEARCH_RESULTS,
+) -> dict[str, object]:
+    """按 glob 模式在工作区中查找文件和目录。"""
+    target_dir = resolve_workspace_path(ctx.deps.base_dir, path)
+    if not target_dir.exists():
+        raise FileNotFoundError(f"目录不存在：{path}")
+    if not target_dir.is_dir():
+        raise NotADirectoryError(f"目标不是目录：{path}")
+
+    max_entries = max(1, min(max_entries, MAX_SEARCH_RESULTS))
+    matches: list[dict[str, object]] = []
+    for item in iter_workspace_items(target_dir, recursive=True):
+        relative_path = normalize_relative_path(ctx.deps.base_dir, item)
+        if fnmatch.fnmatch(item.name, pattern) or fnmatch.fnmatch(relative_path, pattern):
+            matches.append(
+                {
+                    "path": relative_path,
+                    "type": "directory" if item.is_dir() else "file",
+                }
+            )
+        if len(matches) >= max_entries:
+            break
+
+    return {
+        "pattern": pattern,
+        "directory": normalize_relative_path(ctx.deps.base_dir, target_dir)
+        if target_dir != ctx.deps.base_dir
+        else ".",
+        "matches": matches,
+        "truncated": len(matches) >= max_entries,
+    }
+
+
+def search_text(
+    ctx: RunContext[AppConfig],
+    query: str,
+    path: str = ".",
+    file_pattern: str = "*",
+    case_sensitive: bool = False,
+    max_results: int = MAX_SEARCH_RESULTS,
+) -> dict[str, object]:
+    """在工作区文本文件中搜索指定字符串。"""
+    if not query:
+        raise ValueError("query 不能为空")
+
+    target_dir = resolve_workspace_path(ctx.deps.base_dir, path)
+    if not target_dir.exists():
+        raise FileNotFoundError(f"目录不存在：{path}")
+    if not target_dir.is_dir():
+        raise NotADirectoryError(f"目标不是目录：{path}")
+
+    max_results = max(1, min(max_results, MAX_SEARCH_RESULTS))
+    normalized_query = query if case_sensitive else query.lower()
+    matches: list[dict[str, object]] = []
+
+    for item in iter_workspace_items(target_dir, recursive=True):
+        if item.is_dir():
+            continue
+
+        relative_path = normalize_relative_path(ctx.deps.base_dir, item)
+        if not (fnmatch.fnmatch(item.name, file_pattern) or fnmatch.fnmatch(relative_path, file_pattern)):
+            continue
+
+        text = item.read_text(encoding="utf-8", errors="replace")
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            haystack = line if case_sensitive else line.lower()
+            if normalized_query in haystack:
+                matches.append(
+                    {
+                        "path": relative_path,
+                        "line": line_number,
+                        "text": line,
+                    }
+                )
+                if len(matches) >= max_results:
+                    break
+        if len(matches) >= max_results:
+            break
+
+    return {
+        "query": query,
+        "directory": normalize_relative_path(ctx.deps.base_dir, target_dir)
+        if target_dir != ctx.deps.base_dir
+        else ".",
+        "file_pattern": file_pattern,
+        "matches": matches,
+        "truncated": len(matches) >= max_results,
+    }
+
+
+def read_file(
+    ctx: RunContext[AppConfig],
+    path: str,
+    start_line: int = 1,
+    end_line: int | None = None,
+) -> dict[str, object]:
+    """读取工作区内文件的全部内容或指定行范围。"""
+    target_file, text = read_text_file(ctx.deps.base_dir, path)
+    if start_line < 1:
+        raise ValueError("start_line 必须大于等于 1")
+
+    lines = text.splitlines()
+    total_lines = len(lines)
+
+    if end_line is None:
+        end_line = min(total_lines, start_line + MAX_READ_LINES - 1)
+    if end_line < start_line:
+        raise ValueError("end_line 不能小于 start_line")
+
+    selected = lines[start_line - 1 : end_line]
+    numbered_content = "\n".join(
+        f"{index}: {line}" for index, line in enumerate(selected, start=start_line)
+    )
+
+    return {
+        "path": normalize_relative_path(ctx.deps.base_dir, target_file),
+        "start_line": start_line,
+        "end_line": start_line + len(selected) - 1 if selected else start_line - 1,
+        "total_lines": total_lines,
+        "content": numbered_content,
+    }
+
+
+def write_file(
+    ctx: RunContext[AppConfig],
+    path: str,
+    content: str,
+    overwrite: bool = True,
+) -> dict[str, object]:
+    """在工作区内写入文件内容，可用于新建或覆盖文件。"""
+    target_file = resolve_workspace_path(ctx.deps.base_dir, path)
+    existed_before = target_file.exists()
+    if target_file.exists() and target_file.is_dir():
+        raise IsADirectoryError(f"目标是目录，不能直接写入：{path}")
+    if target_file.exists() and not overwrite:
+        raise FileExistsError(f"文件已存在，且 overwrite=False：{path}")
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text(content, encoding="utf-8")
+
+    return {
+        "path": normalize_relative_path(ctx.deps.base_dir, target_file),
+        "bytes_written": len(content.encode("utf-8")),
+        "overwritten": existed_before,
+    }
+
+
+def make_directory(
+    ctx: RunContext[AppConfig],
+    path: str,
+    parents: bool = True,
+    exist_ok: bool = True,
+) -> dict[str, object]:
+    """在工作区内创建目录。"""
+    target_dir = resolve_workspace_path(ctx.deps.base_dir, path)
+    existed_before = target_dir.exists()
+    if existed_before and not target_dir.is_dir():
+        raise NotADirectoryError(f"目标已存在且不是目录：{path}")
+
+    target_dir.mkdir(parents=parents, exist_ok=exist_ok)
+
+    return {
+        "path": normalize_relative_path(ctx.deps.base_dir, target_dir),
+        "created": not existed_before,
+    }
+
+
+def replace_in_file(
+    ctx: RunContext[AppConfig],
+    path: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
+) -> dict[str, object]:
+    """在工作区文件中替换指定文本片段。"""
+    if not old_text:
+        raise ValueError("old_text 不能为空")
+
+    target_file, original_text = read_text_file(ctx.deps.base_dir, path)
+    match_count = original_text.count(old_text)
+    if match_count == 0:
+        raise ValueError("未找到需要替换的文本片段")
+    if match_count > 1 and not replace_all:
+        raise ValueError("匹配到多个位置，请将 replace_all 设为 true 后重试")
+
+    updated_text = (
+        original_text.replace(old_text, new_text)
+        if replace_all
+        else original_text.replace(old_text, new_text, 1)
+    )
+    target_file.write_text(updated_text, encoding="utf-8")
+
+    return {
+        "path": normalize_relative_path(ctx.deps.base_dir, target_file),
+        "replacements": match_count if replace_all else 1,
+    }
+
+
+def run_command(
+    ctx: RunContext[AppConfig],
+    command: str,
+    cwd: str = ".",
+    timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """在工作区内执行非交互式系统命令。
+
+    Windows 下默认使用 PowerShell 或 pwsh。
+    Linux/macOS 下默认使用当前 SHELL，找不到时回退到 /bin/sh。
+    """
+    if not command.strip():
+        raise ValueError("command 不能为空")
+
+    assert_safe_command(command)
+    target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
+    if not target_cwd.exists():
+        raise FileNotFoundError(f"工作目录不存在：{cwd}")
+    if not target_cwd.is_dir():
+        raise NotADirectoryError(f"工作目录不是目录：{cwd}")
+
+    timeout_seconds = max(1, min(timeout_seconds, DEFAULT_COMMAND_TIMEOUT_SECONDS))
+    shell_command, shell_name = get_command_shell()
+    result = run_subprocess(
+        [*shell_command, command],
+        cwd=target_cwd,
+        timeout_seconds=timeout_seconds,
+    )
+    result["cwd"] = normalize_relative_path(ctx.deps.base_dir, target_cwd) if target_cwd != ctx.deps.base_dir else "."
+    result["shell"] = shell_name
+    result["command_text"] = command
+    return result
+
+
+def git_status(ctx: RunContext[AppConfig], cwd: str = ".") -> dict[str, object]:
+    """查看当前工作区的 Git 状态。"""
+    target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
+    if not target_cwd.is_dir():
+        raise NotADirectoryError(f"工作目录不是目录：{cwd}")
+
+    result = run_subprocess(
+        ["git", "status", "--short", "--branch"],
+        cwd=target_cwd,
+        timeout_seconds=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    )
+    result["cwd"] = normalize_relative_path(ctx.deps.base_dir, target_cwd) if target_cwd != ctx.deps.base_dir else "."
+    status_lines = [line for line in str(result["stdout"]).splitlines() if line.strip()]
+    result["clean"] = bool(status_lines) and all(line.startswith("## ") for line in status_lines)
+    return result
+
+
+def git_diff(
+    ctx: RunContext[AppConfig],
+    path: str | None = None,
+    staged: bool = False,
+    ref: str | None = None,
+    cwd: str = ".",
+) -> dict[str, object]:
+    """查看 Git diff，可查看未暂存、已暂存或相对某个引用的差异。"""
+    target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
+    if not target_cwd.is_dir():
+        raise NotADirectoryError(f"工作目录不是目录：{cwd}")
+
+    command = ["git", "diff"]
+    if ref:
+        command.append(ref)
+    elif staged:
+        command.append("--cached")
+
+    if path:
+        target_path = resolve_workspace_path(ctx.deps.base_dir, path)
+        command.extend(["--", relative_path_from(target_cwd, target_path)])
+
+    result = run_subprocess(
+        command,
+        cwd=target_cwd,
+        timeout_seconds=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    )
+    result["cwd"] = normalize_relative_path(ctx.deps.base_dir, target_cwd) if target_cwd != ctx.deps.base_dir else "."
+    result["staged"] = staged
+    result["ref"] = ref
+    result["path"] = path
+    return result
+
+
+WORKSPACE_TOOLSET = FunctionToolset(
+    tools=[
+        list_files,
+        find_files,
+        search_text,
+        read_file,
+        write_file,
+        make_directory,
+        replace_in_file,
+        run_command,
+        git_status,
+        git_diff,
+    ]
+)

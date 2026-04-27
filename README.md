@@ -7,11 +7,59 @@
 
 建议使用 Python 3.10 及以上版本。
 
+1. 创建虚拟环境
+
+Windows PowerShell:
+
 ```powershell
-C:\Users\diyun-pc\.pyenv\pyenv-win\versions\3.13.2\python.exe -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -U pip
-.\.venv\Scripts\python.exe -m pip install -e .
+python -m venv .venv
+```
+
+Linux / macOS:
+
+```bash
+python3 -m venv .venv
+```
+
+2. 激活虚拟环境
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Windows CMD:
+
+```bat
+.\.venv\Scripts\activate.bat
+```
+
+Linux / macOS:
+
+```bash
+source .venv/bin/activate
+```
+
+3. 安装依赖
+
+```bash
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+4. 复制环境变量文件
+
+Windows PowerShell:
+
+```powershell
 Copy-Item .env.example .env
+```
+
+Linux / macOS:
+
+```bash
+cp .env.example .env
 ```
 
 然后在 `.env` 中填写你的 API Key。
@@ -35,25 +83,67 @@ OPENAI_BASE_URL=https://your-openai-compatible-server.example/v1
 
 ## 运行方式
 
-```powershell
-.\.venv\Scripts\python.exe .\main.py
-```
+激活虚拟环境后，直接运行：
 
-启动后你可以直接在终端里连续对话，程序会自动保留当前会话上下文。
+```bash
+python main.py
+```
 
 ## 命令说明
 
 - `/help`：查看帮助信息
 - `/roles`：查看当前可用角色
-- `/role default`：切换到指定角色，并清空当前会话上下文
-- `/clear`：清空当前会话上下文
+- `/role default`：切换到指定角色，并为该角色新建一段空白对话
+- `/new`：保存当前对话，并为当前角色新建一段空白对话
 - `/exit`：退出程序
 
 ## 角色配置
 
-角色配置统一放在 [roles](C:/Users/diyun-pc/Desktop/code/OpenHachimi/roles) 目录中，每个角色对应一个 Markdown 文件。
+角色配置统一放在 [roles](./roles/) 目录中，每个角色对应一个 Markdown 文件。
 
-- [default.md](C:/Users/diyun-pc/Desktop/code/OpenHachimi/roles/default.md:1)：默认中文助手
-- [code_assistant.md](C:/Users/diyun-pc/Desktop/code/OpenHachimi/roles/code_assistant.md:1)：偏工程实现的代码助手
+- [default.md](./roles/default.md)：默认中文助手
+- [code_assistant.md](./roles/code_assistant.md)：偏工程实现的代码助手
 
-你可以直接新增更多 `.md` 文件，例如 `product_manager.md`、`translator.md`、`reviewer.md`。文件内容会被直接作为该角色的系统指令加载。
+你可以直接新增更多 `.md` 文件，例如 `product_manager.md`、`translator.md`、`reviewer.md`。这些文件只需要描述角色的人设、目标和输出风格。
+
+
+## 持久化记忆
+
+- 会话历史按“角色 + 对话”单独保存到 [`.memory`](./.memory/) 目录下
+- 每个角色可以拥有多段历史对话，互不覆盖
+- 程序启动时会自动恢复默认角色最近一次对话
+- 使用 `/role <名称>` 切换角色时，会保存原对话，并为目标角色新建一段空白对话
+- 使用 `/new` 会保存当前对话，并为当前角色新建一段空白对话
+- 旧版 `.memory/<角色>.json` 历史文件仍会被兼容读取
+
+这部分持久化能力基于 `pydantic-ai` 的消息历史接口实现：运行时传入 `message_history`，保存时使用 `all_messages_json()`，恢复时使用 `ModelMessagesTypeAdapter.validate_json(...)`
+
+## 工具调用
+
+当前项目使用 `pydantic-ai` 自带的 `FunctionToolset` 为 Agent 注册了几项基础工具：
+
+- `list_files`：列出工作区目录内容
+- `find_files`：按文件名或 glob 模式查找文件/目录
+- `search_text`：在文本文件中搜索字符串
+- `read_file`：读取文件内容，支持指定行范围
+- `write_file`：新建或覆盖写入文件
+- `make_directory`：创建目录
+- `replace_in_file`：替换文件中的文本片段
+- `run_command`：在工作区内执行非交互式系统命令
+- `git_status`：查看当前 Git 状态
+- `git_diff`：查看 Git diff
+
+这些工具全部限制在当前工作区内，不能访问工作区外的路径。
+其中 `run_command` 会按当前系统自动选择 shell：
+- Windows 下使用 `pwsh` 或 `powershell`
+- Linux/macOS 下使用当前 `SHELL` 或回退到 `/bin/sh`
+
+使用 `run_command` 时，Agent 还会按共享系统提示优先判断当前平台，再选择对应命令语法。
+
+它还额外做了基础安全限制，会拒绝明显危险的删除或强制清理命令。
+
+## 跨平台说明
+
+- 项目本身按跨平台方式组织，Windows、Linux、macOS 都可以运行。
+- Python 环境、虚拟环境路径和 shell 命令会因系统不同而不同，因此 README 对这些步骤分别给了示例。
+- Agent 的 `run_command` 工具会根据当前系统自动选择合适的 shell，但具体执行的命令内容仍然需要符合目标平台语法。
