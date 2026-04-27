@@ -1,0 +1,8 @@
+README.md
+main.py
+pyproject.toml
+openhachimi_agent.egg-info/PKG-INFO
+openhachimi_agent.egg-info/SOURCES.txt
+openhachimi_agent.egg-info/dependency_links.txt
+openhachimi_agent.egg-info/requires.txt
+openhachimi_agent.egg-info/top_level.txt

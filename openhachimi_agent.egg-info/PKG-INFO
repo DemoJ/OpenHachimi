@@ -1,0 +1,50 @@
+Metadata-Version: 2.4
+Name: openhachimi-agent
+Version: 0.1.0
+Summary: A custom agent project built on top of PydanticAI.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic-ai-slim[openai]>=1.0.10
+Requires-Dist: python-dotenv>=1.1.0
+
+# OpenHachimi Agent
+
+This project is your own agent application built on top of
+[PydanticAI](https://github.com/pydantic/pydantic-ai).
+
+## Why this setup
+
+- You do **not** need to fork `pydantic/pydantic-ai` to build your own agent.
+- The upstream project uses the MIT License, so you can build your own app on top
+  of it as long as you keep the original license notice when you copy upstream
+  source code into your own project.
+- The cleanest approach is to keep your app in its own repository and install
+  PydanticAI as a dependency.
+
+## Local setup
+
+Use Python 3.10+.
+
+```powershell
+C:\Users\diyun-pc\.pyenv\pyenv-win\versions\3.13.2\python.exe -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -U pip
+.\.venv\Scripts\python.exe -m pip install -e .
+Copy-Item .env.example .env
+```
+
+Then set your API key in `.env`.
+
+## Run
+
+```powershell
+.\.venv\Scripts\python.exe .\main.py
+```
+
+## Recommended workflow
+
+1. Keep this project as **your own repo/app**.
+2. Use `pydantic-ai-slim[openai]` unless you need many providers.
+3. If you want to study upstream internals, clone `pydantic/pydantic-ai`
+   separately as a reference repo, but do not develop your app inside it.
+4. Only copy upstream code into your repo when you truly need to customize
+   framework internals. If you do, preserve the MIT license notice.
