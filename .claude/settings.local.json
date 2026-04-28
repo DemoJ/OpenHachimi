@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python *)",
-      "Bash(hachimi *)",
-      "Bash(C:/Users/diyun-pc/.pyenv/pyenv-win/versions/3.13.2/Scripts/hachimi.EXE *)"
-    ]
-  }
-}

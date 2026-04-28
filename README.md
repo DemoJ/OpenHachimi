@@ -92,7 +92,7 @@ python deploy.py
 部署脚本默认会：
 
 - 创建或复用 `.venv`
-- 执行 `pip install -e .[deploy]`
+- 执行 `pip install -e .`
 - 如果缺少 `.env`，从 `.env.example` 复制一份
 - 调用 `hachimi deploy` 部署后台守护服务
 

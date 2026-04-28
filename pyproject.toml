@@ -11,9 +11,6 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
 ]
 
-[project.optional-dependencies]
-deploy = []
-
 [project.scripts]
 hachimi = "openhachimi_agent.__main__:main"
 Hachimi = "openhachimi_agent.__main__:main"

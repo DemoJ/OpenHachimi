@@ -5,5 +5,7 @@
 .env
 __pycache__/
 *.pyc
+*.egg-info/
+.claude/settings.local.json
 openhachimi-serve.bat
 openhachimi-serve.sh

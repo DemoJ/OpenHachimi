@@ -50,7 +50,7 @@ def ensure_venv() -> None:
 def install_project() -> None:
     python_path = str(venv_python())
     run([python_path, "-m", "pip", "install", "-U", "pip"])
-    run([python_path, "-m", "pip", "install", "-e", ".[deploy]"])
+    run([python_path, "-m", "pip", "install", "-e", "."])
 
 
 def write_env_if_missing() -> None:
