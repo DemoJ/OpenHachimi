@@ -5,6 +5,9 @@ import os
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from openhachimi_agent.config import load_config
+from openhachimi_agent.service import AgentService
+
 
 EXIT_COMMANDS = {"/exit", "/quit", "退出", "q"}
 NEW_SESSION_COMMANDS = {"/new", "新对话"}
@@ -45,6 +48,73 @@ def print_welcome(state: dict[str, object], server_url: str) -> None:
     print("输入内容后回车即可对话。")
     print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/new 新建对话，/exit 退出程序。")
     print()
+
+
+def state_payload(state: object) -> dict[str, object]:
+    return {
+        "role": state.role,
+        "session_id": state.session_id,
+        "has_history": state.has_history,
+    }
+
+
+def run_embedded_cli() -> None:
+    service = AgentService(load_config())
+    server_url = "embedded"
+    print_welcome(state_payload(service.state()), server_url)
+
+    while True:
+        try:
+            user_input = input("你 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已退出对话。")
+            return
+
+        if not user_input:
+            continue
+
+        if user_input in EXIT_COMMANDS:
+            print("已退出对话。")
+            return
+
+        if user_input in NEW_SESSION_COMMANDS:
+            print(service.new_session().message)
+            continue
+
+        if user_input in HELP_COMMANDS:
+            print_help()
+            continue
+
+        if user_input in ROLE_LIST_COMMANDS:
+            roles = service.list_roles()
+            print("可用角色：")
+            for role_name in roles.roles:
+                marker = "（当前）" if role_name == roles.current_role else ""
+                print(f"  - {role_name}{marker}")
+            print()
+            continue
+
+        if user_input == "/role" or user_input.startswith("/role "):
+            role_name = user_input[6:].strip()
+            if not role_name:
+                print("请在 /role 后面填写角色名称，例如：/role default")
+                print()
+                continue
+            try:
+                print(service.switch_role(role_name).message)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"助手 > 切换角色失败：{exc}")
+            print()
+            continue
+
+        try:
+            response = service.send_message(user_input)
+        except Exception as exc:
+            print(f"助手 > 调用模型时出错：{exc}")
+            continue
+
+        print(f"助手 > {response.output}")
+        print()
 
 
 def print_help() -> None:

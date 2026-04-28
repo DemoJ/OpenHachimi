@@ -4,7 +4,7 @@ import argparse
 
 import uvicorn
 
-from openhachimi_agent.cli import run_cli
+from openhachimi_agent.cli import run_cli, run_embedded_cli
 from openhachimi_agent.config import load_config
 from openhachimi_agent.daemon import DEFAULT_HOST, DEFAULT_PORT, deploy_daemon
 
@@ -34,7 +34,7 @@ def main() -> None:
         uvicorn.run("openhachimi_agent.server:app", host=args.host, port=args.port)
         return
 
-    run_cli()
+    run_embedded_cli()
 
 
 if __name__ == "__main__":

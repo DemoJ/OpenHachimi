@@ -12,6 +12,9 @@ from openhachimi_agent.tools import WORKSPACE_TOOLSET
 
 def build_agent(config: AppConfig, role_name: str) -> Agent:
     """根据指定角色创建 Agent。"""
+    if not config.openai_api_key:
+        raise ValueError("未配置 OPENAI_API_KEY，请先在 .env 中填写 API Key。")
+
     system_prompt = load_system_prompt(config.prompts_dir)
     role_content = load_role_content(config.roles_dir, role_name)
     provider = OpenAIProvider(

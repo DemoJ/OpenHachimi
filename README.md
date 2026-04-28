@@ -67,7 +67,7 @@ cp .env.example .env
 `.env` 示例：
 
 ```env
-OPENAI_API_KEY=请在这里填写你的_OpenAI_API_Key
+OPENAI_API_KEY=sk-xxxxxxxx
 OPENAI_MODEL=gpt-5.2
 OPENAI_BASE_URL=
 OPENHACHIMI_ROLE=default
@@ -140,6 +140,12 @@ hachimi cli
 
 `serve` 默认监听 `127.0.0.1:8765`，CLI 默认连接 `http://127.0.0.1:8765`。
 
+开发时也可以直接运行单进程 CLI，不需要先启动后台服务：
+
+```bash
+python main.py
+```
+
 如果要修改地址：
 
 ```bash
@@ -147,7 +153,7 @@ hachimi deploy --host 127.0.0.1 --port 8765
 OPENHACHIMI_SERVER_URL=http://127.0.0.1:8765 hachimi
 ```
 
-单独运行 `python main.py` 仍等同于 `python main.py cli`。
+单独运行 `python main.py` 会启动开发用的单进程 CLI；运行 `python main.py cli` 会连接已启动的后台服务。
 
 ## 命令说明
 
