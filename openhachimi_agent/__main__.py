@@ -8,6 +8,7 @@ import uvicorn
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
+from openhachimi_agent.core.version import PACKAGE_NAME, get_version
 from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, deploy_daemon
 from openhachimi_agent.interface.cli import run_cli, run_embedded_cli
 
@@ -17,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="openhachimi")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"{PACKAGE_NAME} {get_version()}",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("cli", help="连接本地后台服务并进入 CLI 对话")
@@ -29,7 +36,15 @@ def main() -> None:
     serve_parser.add_argument("--host", default=DEFAULT_HOST)
     serve_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
 
+    subparsers.add_parser("update", help="检查并更新到最新版本")
+
     args = parser.parse_args()
+
+    if args.command == "update":
+        from openhachimi_agent.core.updater import run_update
+
+        run_update()
+        return
 
     if args.command == "deploy":
         config = load_config()

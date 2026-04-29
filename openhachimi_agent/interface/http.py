@@ -21,8 +21,10 @@ logger.info("server module initialized")
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    from openhachimi_agent.core.version import get_version
+
     logger.debug("health check")
-    return {"status": "ok"}
+    return {"status": "ok", "version": get_version()}
 
 
 @app.get("/state")

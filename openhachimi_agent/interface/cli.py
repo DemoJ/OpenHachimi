@@ -68,7 +68,9 @@ def error_detail(exc: HTTPError) -> str:
 
 
 def print_welcome(state: dict[str, object], server_url: str) -> None:
-    print("OpenHachimi CLI Agent")
+    from openhachimi_agent.core.version import get_version
+
+    print(f"OpenHachimi CLI Agent  v{get_version()}")
     print(f"服务地址：{server_url}")
     print(f"当前模型：{state['model']}")
     if state.get("base_url"):

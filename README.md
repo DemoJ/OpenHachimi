@@ -131,6 +131,18 @@ python deploy.py --host 127.0.0.1 --port 8765
 hachimi deploy
 ```
 
+查看当前版本：
+
+```bash
+hachimi --version
+```
+
+检查并更新到最新版本：
+
+```bash
+hachimi update
+```
+
 进入 CLI 对话：
 
 ```bash
@@ -174,6 +186,8 @@ OPENHACHIMI_SERVER_URL=http://127.0.0.1:8765 hachimi
 
 ## 命令说明
 
+- `hachimi --version`：查看当前版本号
+- `hachimi update`：检查远程版本并自动更新
 - `/help`：查看帮助信息
 - `/roles`：查看当前可用角色
 - `/role default`：切换到指定角色，并为该角色新建一段空白对话
