@@ -1,12 +1,18 @@
 """OpenHachimi 命令入口。"""
 
 import argparse
+import asyncio
+import logging
 
 import uvicorn
 
-from openhachimi_agent.cli import run_cli, run_embedded_cli
-from openhachimi_agent.config import load_config
-from openhachimi_agent.daemon import DEFAULT_HOST, DEFAULT_PORT, deploy_daemon
+from openhachimi_agent.app_logging import configure_logging
+from openhachimi_agent.core.config import load_config
+from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, deploy_daemon
+from openhachimi_agent.interface.cli import run_cli, run_embedded_cli
+
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -26,15 +32,20 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "deploy":
+        config = load_config()
+        configure_logging(config)
+        logger.info("deploy command host=%s port=%s", args.host, args.port)
         deploy_daemon(args.host, args.port)
         return
 
     if args.command == "serve":
-        load_config()
-        uvicorn.run("openhachimi_agent.server:app", host=args.host, port=args.port)
+        config = load_config()
+        configure_logging(config)
+        logger.info("serve command host=%s port=%s", args.host, args.port)
+        uvicorn.run("openhachimi_agent.interface.http:app", host=args.host, port=args.port)
         return
 
-    run_embedded_cli()
+    asyncio.run(run_embedded_cli())
 
 
 if __name__ == "__main__":

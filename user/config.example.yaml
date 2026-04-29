@@ -1,0 +1,16 @@
+app:
+  default_role: default
+
+llm:
+  api_key: sk-xxxxxxxx
+  model: gpt-5.2
+  base_url: https://your-openai-compatible-server.example/v1
+
+paths:
+  roles_dir: user/roles
+  memory_dir: .memory
+
+logging:
+  level: INFO
+  dir: .logs
+  console: false

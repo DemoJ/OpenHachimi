@@ -1,12 +1,18 @@
 """命令行交互逻辑。"""
 
+import codecs
 import json
+import logging
 import os
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from openhachimi_agent.config import load_config
-from openhachimi_agent.service import AgentService
+from openhachimi_agent.app_logging import configure_logging
+from openhachimi_agent.core.config import load_config
+from openhachimi_agent.service.agent_service import AgentService
+
+
+logger = logging.getLogger(__name__)
 
 
 EXIT_COMMANDS = {"/exit", "/quit", "退出", "q"}
@@ -21,6 +27,7 @@ def get_server_url() -> str:
 
 
 def request_json(server_url: str, method: str, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+    logger.debug("http request method=%s path=%s server_url=%s", method, path, server_url)
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(
         f"{server_url}{path}",
@@ -30,6 +37,26 @@ def request_json(server_url: str, method: str, path: str, payload: dict[str, obj
     )
     with urlopen(request) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def request_stream(server_url: str, path: str, payload: dict[str, object]):
+    logger.debug("http stream request path=%s server_url=%s", path, server_url)
+    data = json.dumps(payload).encode("utf-8")
+    request = Request(
+        f"{server_url}{path}",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    with urlopen(request) as response:
+        while chunk := response.read(1):
+            text = decoder.decode(chunk)
+            if text:
+                yield text
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            yield tail
 
 
 def error_detail(exc: HTTPError) -> str:
@@ -43,6 +70,9 @@ def error_detail(exc: HTTPError) -> str:
 def print_welcome(state: dict[str, object], server_url: str) -> None:
     print("OpenHachimi CLI Agent")
     print(f"服务地址：{server_url}")
+    print(f"当前模型：{state['model']}")
+    if state.get("base_url"):
+        print(f"模型服务：{state['base_url']}")
     print(f"当前角色：{state['role']}")
     print(f"当前会话：{state['session_id']}")
     print("输入内容后回车即可对话。")
@@ -55,11 +85,16 @@ def state_payload(state: object) -> dict[str, object]:
         "role": state.role,
         "session_id": state.session_id,
         "has_history": state.has_history,
+        "model": state.model,
+        "base_url": state.base_url,
     }
 
 
-def run_embedded_cli() -> None:
-    service = AgentService(load_config())
+async def run_embedded_cli() -> None:
+    config = load_config()
+    configure_logging(config)
+    logger.info("starting embedded cli")
+    service = AgentService(config)
     server_url = "embedded"
     print_welcome(state_payload(service.state()), server_url)
 
@@ -108,13 +143,14 @@ def run_embedded_cli() -> None:
             continue
 
         try:
-            response = service.send_message(user_input)
+            print("助手 > ", end="", flush=True)
+            async for chunk in service.stream_message(user_input):
+                print(chunk, end="", flush=True)
         except Exception as exc:
-            print(f"助手 > 调用模型时出错：{exc}")
+            print(f"\n助手 > 调用模型时出错：{exc}")
             continue
 
-        print(f"助手 > {response.output}")
-        print()
+        print("\n")
 
 
 def print_help() -> None:
@@ -161,7 +197,13 @@ def switch_role(server_url: str, user_input: str) -> None:
 
 
 def run_cli() -> None:
+    try:
+        configure_logging(load_config())
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+        logger.exception("failed to configure logging from local config")
     server_url = get_server_url()
+    logger.info("starting cli client server_url=%s", server_url)
     try:
         state = request_json(server_url, "GET", "/state")
     except URLError as exc:
@@ -201,10 +243,14 @@ def run_cli() -> None:
             continue
 
         try:
-            payload = request_json(server_url, "POST", "/chat", {"message": user_input})
+            print("助手 > ", end="", flush=True)
+            for chunk in request_stream(server_url, "/chat/stream", {"message": user_input}):
+                print(chunk, end="", flush=True)
         except HTTPError as exc:
-            print(f"助手 > 调用模型时出错：{error_detail(exc)}")
+            print(f"\n助手 > 调用模型时出错：{error_detail(exc)}")
+            continue
+        except URLError as exc:
+            print(f"\n助手 > 调用模型时出错：{exc}")
             continue
 
-        print(f"助手 > {payload['output']}")
-        print()
+        print("\n")

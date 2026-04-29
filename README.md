@@ -48,37 +48,50 @@ python -m pip install -U pip
 python -m pip install -e .
 ```
 
-4. 复制环境变量文件
+4. 复制配置文件
 
 Windows PowerShell:
 
 ```powershell
-Copy-Item .env.example .env
+Copy-Item user/config.example.yaml user/config.yaml
 ```
 
 Linux / macOS:
 
 ```bash
-cp .env.example .env
+cp user/config.example.yaml user/config.yaml
 ```
 
-然后在 `.env` 中填写你的 API Key。
+然后在 `user/config.yaml` 中填写你的 API Key。
 
-`.env` 示例：
+`user/config.yaml` 示例：
 
-```env
-OPENAI_API_KEY=sk-xxxxxxxx
-OPENAI_MODEL=gpt-5.2
-OPENAI_BASE_URL=
-OPENHACHIMI_ROLE=default
+```yaml
+app:
+  default_role: default
+
+llm:
+  api_key: sk-xxxxxxxx
+  model: gpt-5.2
+  base_url: https://your-openai-compatible-server.example/v1
+
+paths:
+  roles_dir: user/roles
+  memory_dir: .memory
+
+logging:
+  level: INFO
+  dir: .logs
+  console: false
 ```
 
-如果你要接自定义网关、代理服务，或者兼容 OpenAI 接口的模型服务，可以设置 `OPENAI_BASE_URL`。
+如果你要接自定义网关、代理服务，或者兼容 OpenAI 接口的模型服务，可以设置 `llm.base_url`。
 
 示例：
 
-```env
-OPENAI_BASE_URL=https://your-openai-compatible-server.example/v1
+```yaml
+llm:
+  base_url: https://your-openai-compatible-server.example/v1
 ```
 
 ## 一键部署
@@ -93,7 +106,7 @@ python deploy.py
 
 - 创建或复用 `.venv`
 - 执行 `pip install -e .`
-- 如果缺少 `.env`，从 `.env.example` 复制一份
+- 如果缺少 `user/config.yaml`，从 `user/config.example.yaml` 复制一份
 - 调用 `hachimi deploy` 部署后台守护服务
 
 如果只想安装命令，不启动后台守护：
@@ -123,6 +136,10 @@ hachimi deploy
 ```bash
 hachimi
 ```
+
+CLI 中模型回复会边生成边输出，不需要等待完整响应结束。
+
+日志默认写入 `.logs/openhachimi.log`。如果需要在终端同时查看日志，可以把 `user/config.yaml` 中的 `logging.console` 改成 `true`。
 
 `deploy` 在 Linux + systemd 环境下会创建并启动 `systemd --user` 服务；其他环境会在项目目录生成本地后台启动脚本。
 
@@ -165,12 +182,14 @@ OPENHACHIMI_SERVER_URL=http://127.0.0.1:8765 hachimi
 
 ## 角色配置
 
-角色配置统一放在 [roles](./roles/) 目录中，每个角色对应一个 Markdown 文件。
+角色配置统一放在 [user/roles](./user/roles/) 目录中，每个角色对应一个 Markdown 文件。
 
-- [default.md](./roles/default.md)：默认中文助手
-- [code_assistant.md](./roles/code_assistant.md)：偏工程实现的代码助手
+- [default.md](./user/roles/default.md)：默认中文助手
+- [code_assistant.md](./user/roles/code_assistant.md)：偏工程实现的代码助手
 
 你可以直接新增更多 `.md` 文件，例如 `product_manager.md`、`translator.md`、`reviewer.md`。这些文件只需要描述角色的人设、目标和输出风格。
+
+系统提示词随当前版本内置在程序包中，不放在 `user/` 目录中。
 
 
 ## 持久化记忆
@@ -206,7 +225,7 @@ OPENHACHIMI_SERVER_URL=http://127.0.0.1:8765 hachimi
 - Windows 下使用 `pwsh` 或 `powershell`
 - Linux/macOS 下使用当前 `SHELL` 或回退到 `/bin/sh`
 
-使用 `run_command` 时，Agent 还会按共享系统提示优先判断当前平台，再选择对应命令语法。
+使用 `run_command` 时，Agent 还会按内置系统提示优先判断当前平台，再选择对应命令语法。
 
 它还额外做了基础安全限制，会拒绝明显危险的删除或强制清理命令。
 

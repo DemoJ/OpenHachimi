@@ -4,9 +4,9 @@
 tmp_tool_dir/
 .memory/
 .env
+user/config.yaml
+.logs/
 __pycache__/
 *.pyc
 *.egg-info/
-.claude/settings.local.json
-openhachimi-serve.bat
-openhachimi-serve.sh
+.claude

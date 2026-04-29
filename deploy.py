@@ -53,13 +53,14 @@ def install_project() -> None:
     run([python_path, "-m", "pip", "install", "-e", "."])
 
 
-def write_env_if_missing() -> None:
-    env_path = PROJECT_ROOT / ".env"
-    example_path = PROJECT_ROOT / ".env.example"
-    if env_path.exists() or not example_path.exists():
+def write_config_if_missing() -> None:
+    config_path = PROJECT_ROOT / "user" / "config.yaml"
+    example_path = PROJECT_ROOT / "user" / "config.example.yaml"
+    if config_path.exists() or not example_path.exists():
         return
-    shutil.copyfile(example_path, env_path)
-    print(f"已创建 {env_path}，请确认其中的 OPENAI_API_KEY 等配置。")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(example_path, config_path)
+    print(f"已创建 {config_path}，请确认其中的 llm.api_key 等配置。")
 
 
 def deploy_daemon(host: str, port: int) -> None:
@@ -75,7 +76,7 @@ def main() -> None:
 
     ensure_venv()
     install_project()
-    write_env_if_missing()
+    write_config_if_missing()
 
     if not args.skip_daemon:
         deploy_daemon(args.host, args.port)

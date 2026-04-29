@@ -1,11 +1,15 @@
 """消息历史持久化。"""
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelMessage
+
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_role_name(role_name: str) -> str:
@@ -62,13 +66,23 @@ def load_message_history(
         history_path = get_memory_path(memory_dir, role_name, resolved_session_id)
 
     if not history_path.exists():
+        logger.info("message history not found role=%s session_id=%s path=%s", role_name, resolved_session_id, history_path)
         return resolved_session_id, []
 
     raw_json = history_path.read_bytes()
     if not raw_json.strip():
+        logger.info("message history empty role=%s session_id=%s path=%s", role_name, resolved_session_id, history_path)
         return resolved_session_id, []
 
-    return resolved_session_id, list(ModelMessagesTypeAdapter.validate_json(raw_json))
+    messages = list(ModelMessagesTypeAdapter.validate_json(raw_json))
+    logger.info(
+        "message history loaded role=%s session_id=%s messages=%d path=%s",
+        role_name,
+        resolved_session_id,
+        len(messages),
+        history_path,
+    )
+    return resolved_session_id, messages
 
 
 def save_message_history(memory_dir: Path, role_name: str, session_id: str, history_json: bytes) -> None:
@@ -77,11 +91,17 @@ def save_message_history(memory_dir: Path, role_name: str, session_id: str, hist
     role_memory_dir.mkdir(parents=True, exist_ok=True)
     get_memory_path(memory_dir, role_name, session_id).write_bytes(history_json)
     save_latest_session_id(memory_dir, role_name, session_id)
+    logger.debug(
+        "message history saved role=%s session_id=%s bytes=%d",
+        role_name,
+        session_id,
+        len(history_json),
+    )
 
 
 def start_new_session(memory_dir: Path, role_name: str) -> str:
     """为指定角色创建新会话，并把它设为当前会话。"""
     session_id = create_session_id()
     save_latest_session_id(memory_dir, role_name, session_id)
+    logger.info("new memory session created role=%s session_id=%s", role_name, session_id)
     return session_id
-

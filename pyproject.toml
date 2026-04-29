@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
     "pydantic-ai-slim[openai]>=1.0.10",
-    "python-dotenv>=1.1.0",
+    "PyYAML>=6.0.0",
     "uvicorn[standard]>=0.32.0",
 ]
 
@@ -17,6 +17,9 @@ Hachimi = "openhachimi_agent.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["openhachimi_agent*"]
+
+[tool.setuptools.package-data]
+openhachimi_agent = ["system_prompts/*.md"]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

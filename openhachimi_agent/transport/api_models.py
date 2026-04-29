@@ -7,6 +7,8 @@ class AgentState(BaseModel):
     role: str
     session_id: str
     has_history: bool
+    model: str
+    base_url: str | None = None
 
 
 class ChatRequest(BaseModel):

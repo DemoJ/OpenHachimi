@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import subprocess
+import logging
 from pathlib import Path
 
 MAX_LIST_ENTRIES = 200
@@ -38,6 +39,8 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\brestart-computer\b",
     r"\bstop-process\b",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_workspace_path(workspace_root: Path, path: str) -> Path:
@@ -133,6 +136,7 @@ def run_subprocess(
         stderr, stderr_truncated = trim_output(exc.stderr or "")
         exit_code = None
         timed_out = True
+        logger.warning("subprocess timed out cwd=%s timeout_seconds=%d command=%s", cwd, timeout_seconds, command)
 
     return {
         "cwd": cwd.as_posix(),
@@ -151,8 +155,11 @@ def get_command_shell() -> tuple[list[str], str]:
     system_name = platform.system().lower()
     if system_name == "windows":
         if shutil.which("pwsh"):
+            logger.debug("selected command shell=pwsh")
             return ["pwsh", "-NoProfile", "-Command"], "pwsh"
+        logger.debug("selected command shell=powershell")
         return ["powershell", "-NoProfile", "-Command"], "powershell"
 
     shell_path = os.environ.get("SHELL") or "/bin/sh"
+    logger.debug("selected command shell=%s", Path(shell_path).name)
     return [shell_path, "-lc"], Path(shell_path).name

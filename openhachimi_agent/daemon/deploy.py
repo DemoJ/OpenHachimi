@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from openhachimi_agent.config import load_config
+from openhachimi_agent.core.config import load_config
 
 
 SERVICE_NAME = "openhachimi"
@@ -37,8 +37,6 @@ def deploy_systemd_user_service(host: str, port: int) -> None:
     service_dir = Path.home() / ".config" / "systemd" / "user"
     service_dir.mkdir(parents=True, exist_ok=True)
     service_path = service_dir / f"{SERVICE_NAME}.service"
-    env_file = config.base_dir / ".env"
-    environment_file_line = f"EnvironmentFile={env_file}\n" if env_file.exists() else ""
 
     service_path.write_text(
         "[Unit]\n"
@@ -47,7 +45,6 @@ def deploy_systemd_user_service(host: str, port: int) -> None:
         "[Service]\n"
         "Type=simple\n"
         f"WorkingDirectory={config.base_dir}\n"
-        f"{environment_file_line}"
         f"ExecStart={_python_executable()} -m openhachimi_agent serve --host {host} --port {port}\n"
         "Restart=on-failure\n"
         "RestartSec=3\n\n"
