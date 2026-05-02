@@ -140,16 +140,16 @@ async def run_embedded_cli() -> None:
             try:
                 print(service.switch_role(role_name).message)
             except (FileNotFoundError, ValueError) as exc:
-                print(f"助手 > 切换角色失败：{exc}")
+                print(f"哈基米 > 切换角色失败：{exc}")
             print()
             continue
 
         try:
-            print("助手 > ", end="", flush=True)
+            print("哈基米 > ", end="", flush=True)
             async for chunk in service.stream_message(user_input):
                 print(chunk, end="", flush=True)
         except Exception as exc:
-            print(f"\n助手 > 调用模型时出错：{exc}")
+            print(f"\n哈基米 > 调用模型时出错：{exc}")
             continue
 
         print("\n")
@@ -190,7 +190,7 @@ def switch_role(server_url: str, user_input: str) -> None:
     try:
         payload = request_json(server_url, "POST", "/role", {"role": role_name})
     except HTTPError as exc:
-        print(f"助手 > 切换角色失败：{error_detail(exc)}")
+        print(f"哈基米 > 切换角色失败：{error_detail(exc)}")
         print()
         return
 
@@ -245,14 +245,14 @@ def run_cli() -> None:
             continue
 
         try:
-            print("助手 > ", end="", flush=True)
+            print("哈基米 > ", end="", flush=True)
             for chunk in request_stream(server_url, "/chat/stream", {"message": user_input}):
                 print(chunk, end="", flush=True)
         except HTTPError as exc:
-            print(f"\n助手 > 调用模型时出错：{error_detail(exc)}")
+            print(f"\n哈基米 > 调用模型时出错：{error_detail(exc)}")
             continue
         except URLError as exc:
-            print(f"\n助手 > 调用模型时出错：{exc}")
+            print(f"\n哈基米 > 调用模型时出错：{exc}")
             continue
 
         print("\n")

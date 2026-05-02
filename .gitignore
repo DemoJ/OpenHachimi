@@ -10,3 +10,8 @@ __pycache__/
 *.pyc
 *.egg-info/
 .claude
+
+# Ignore all user skills
+user/skills/*
+# Keep test/dummy skills tracked
+!user/skills/dummy/

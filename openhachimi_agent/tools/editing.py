@@ -89,3 +89,47 @@ def replace_in_file(
         "path": normalize_relative_path(ctx.deps.base_dir, target_file),
         "replacements": match_count if replace_all else 1,
     }
+
+
+def delete_path(
+    ctx: RunContext[AppConfig],
+    path: str,
+) -> dict[str, object]:
+    """在工作区内安全地删除文件或文件夹（自动递归删除）。"""
+    import shutil
+    import os
+    import stat
+    
+    def remove_readonly(func, file_path, excinfo):
+        """移除只读属性并重试删除（解决 Windows 下删除 .git 目录报错的问题）。"""
+        try:
+            os.chmod(file_path, stat.S_IWRITE)
+            func(file_path)
+        except Exception:
+            pass
+
+    logger.info("tool delete_path path=%s", path)
+    target_path = resolve_workspace_path(ctx.deps.base_dir, path)
+    
+    if not target_path.exists():
+        return {"message": f"路径不存在，跳过删除：{path}", "deleted": False}
+        
+    try:
+        if target_path.is_file() or target_path.is_symlink():
+            try:
+                target_path.unlink()
+            except PermissionError:
+                os.chmod(target_path, stat.S_IWRITE)
+                target_path.unlink()
+            deleted_type = "file"
+        elif target_path.is_dir():
+            shutil.rmtree(target_path, onerror=remove_readonly)
+            deleted_type = "directory"
+            
+        return {
+            "path": normalize_relative_path(ctx.deps.base_dir, target_path),
+            "deleted": True,
+            "type": deleted_type,
+        }
+    except Exception as e:
+        raise RuntimeError(f"删除失败：{e}")
