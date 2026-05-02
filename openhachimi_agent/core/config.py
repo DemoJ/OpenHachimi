@@ -27,6 +27,7 @@ class AppConfig:
     log_dir: Path
     log_level: str
     log_console: bool
+    skills_dirs: list[Path]
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -109,4 +110,7 @@ def load_config() -> AppConfig:
         ),
         log_level=_config_string(logging_config, "level", "INFO").upper(),
         log_console=_config_bool(logging_config, "console", False),
+        skills_dirs=[
+            user_dir / "skills",
+        ],
     )
