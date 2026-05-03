@@ -2,10 +2,12 @@
 
 import asyncio
 import logging
+import random
 from typing import Any
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import Error as PlaywrightError
+from playwright_stealth import Stealth
 
 from openhachimi_agent.core.config import AppConfig
 
@@ -41,28 +43,70 @@ class BrowserManager:
             if not self._playwright:
                 self._playwright = await async_playwright().start()
 
-            if not self._browser:
+            if not self._context:
                 headless = self.config.browser_headless
                 channel = self.config.browser_channel
+                user_data_dir = self.config.base_dir / ".browser_data"
+
                 try:
-                    kwargs = {"headless": headless}
+                    # 使用极其普通的现代浏览器 User-Agent
+                    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    kwargs = {
+                        "headless": headless,
+                        "viewport": {"width": 1280, "height": 800},
+                        "device_scale_factor": 1,
+                        "user_agent": ua,
+                        "args": ["--disable-blink-features=AutomationControlled"]
+                    }
                     if channel:
                         kwargs["channel"] = channel
-                    self._browser = await self._playwright.chromium.launch(**kwargs)
+                    
+                    if not headless:
+                        # 非无头模式下使用持久化上下文，保留登录信息
+                        self._context = await self._playwright.chromium.launch_persistent_context(
+                            user_data_dir=user_data_dir,
+                            **kwargs
+                        )
+                    else:
+                        if not self._browser:
+                            browser_kwargs = {"headless": headless}
+                            if channel:
+                                browser_kwargs["channel"] = channel
+                            self._browser = await self._playwright.chromium.launch(**browser_kwargs)
+                            
+                        self._context = await self._browser.new_context(
+                            viewport={"width": 1280, "height": 800},
+                            device_scale_factor=1,
+                            user_agent=ua
+                        )
+                        
+                    # 应用 playwright-stealth 插件，隐藏 WebDriver 痕迹，模拟真实浏览器
+                    await Stealth().apply_stealth_async(self._context)
+
                 except PlaywrightError as e:
                     if "Executable doesn't exist" in str(e):
                         raise RuntimeError("未找到浏览器内核，请先执行 `.venv/Scripts/playwright.exe install chromium` 安装，或在 config.yaml 中配置 browser_channel 使用本地浏览器。") from e
                     raise
 
-            if not self._context:
-                self._context = await self._browser.new_context(
-                    viewport={"width": 1280, "height": 800},
-                    device_scale_factor=1,
-                )
-
-            self._page = await self._context.new_page()
+            pages = self._context.pages
+            if pages:
+                self._page = pages[-1]
+            else:
+                self._page = await self._context.new_page()
             logger.info("Playwright 浏览器已启动并打开新页面。")
             return self._page
+
+    async def _update_active_page(self):
+        """如果打开了新标签页，自动切换到最新的标签页"""
+        if self._context and self._context.pages:
+            newest_page = self._context.pages[-1]
+            if self._page != newest_page:
+                logger.info("检测到新标签页，自动切换当前页面。")
+                self._page = newest_page
+                try:
+                    await self._page.bring_to_front()
+                except Exception:
+                    pass
 
     async def navigate(self, url: str) -> str:
         """导航到指定网页。"""
@@ -70,6 +114,8 @@ class BrowserManager:
             url = "https://" + url
             
         page = await self._ensure_browser()
+        await self._update_active_page()
+        page = self._page
         logger.info("Browser navigating to: %s", url)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -80,6 +126,8 @@ class BrowserManager:
 
     async def get_state(self) -> str:
         """获取当前页面的简化可访问性树（包含元素 ID），供大模型阅读。"""
+        await self._update_active_page()
+        
         if not self._page or self._page.is_closed():
             return "当前没有打开的页面，请先使用 browser_navigate 导航到网页。"
 
@@ -176,10 +224,15 @@ class BrowserManager:
         logger.info("Browser clicking element_id=%d selector=%s", element_id, selector)
         
         try:
-            # 尝试点击，如果被遮挡，可以使用 force=True
-            await self._page.locator(selector).first.click(timeout=5000)
+            # 模拟人类：在点击前稍微停顿
+            await asyncio.sleep(random.uniform(0.2, 0.6))
+            # 尝试点击，如果被遮挡，可以使用 force=True。增加随机按压延迟模拟人类
+            await self._page.locator(selector).first.click(timeout=5000, delay=random.randint(10, 50))
             # 等待可能发生的页面跳转或加载
             try:
+                # 等待一会儿让新标签页有机会打开
+                await asyncio.sleep(0.5)
+                await self._update_active_page()
                 await self._page.wait_for_load_state("networkidle", timeout=3000)
             except Exception:
                 pass
@@ -189,6 +242,8 @@ class BrowserManager:
 
     async def type_text(self, element_id: int, text: str) -> str:
         """在指定 ID 的输入框中输入文本。"""
+        await self._update_active_page()
+        
         if not self._page or self._page.is_closed():
             return "当前没有打开的页面。"
             
@@ -200,7 +255,13 @@ class BrowserManager:
         
         try:
             locator = self._page.locator(selector).first
-            await locator.fill(text, timeout=5000)
+            # 模拟人类交互：先点击聚焦框，稍微等待
+            await locator.click(timeout=5000)
+            await asyncio.sleep(random.uniform(0.1, 0.4))
+            # 清空已有内容
+            await locator.fill("")
+            # 逐字输入文本，带有随机延迟
+            await locator.press_sequentially(text, delay=random.randint(50, 150), timeout=10000)
             return f"成功在元素 [{element_id}] 输入文本。"
         except Exception as e:
             return f"输入文本失败：{e}"
