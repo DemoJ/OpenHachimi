@@ -28,6 +28,8 @@ class AppConfig:
     log_level: str
     log_console: bool
     skills_dirs: list[Path]
+    browser_headless: bool
+    browser_channel: str | None
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -113,4 +115,6 @@ def load_config() -> AppConfig:
         skills_dirs=[
             user_dir / "skills",
         ],
+        browser_headless=_config_bool(app_config, "browser_headless", True),
+        browser_channel=_config_string(app_config, "browser_channel") or None,
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic_ai import FunctionToolset
 
+from openhachimi_agent.tools.browser import browser_click, browser_get_state, browser_navigate, browser_type
 from openhachimi_agent.tools.command import command_status, run_command, send_command_input
 from openhachimi_agent.tools.editing import delete_path, make_directory, replace_in_file, write_file
 from openhachimi_agent.tools.filesystem import find_files, list_files, read_file, search_text
@@ -28,5 +29,9 @@ WORKSPACE_TOOLSET = FunctionToolset(
         git_diff,
         list_skills,
         get_skill_instructions,
+        browser_navigate,
+        browser_get_state,
+        browser_click,
+        browser_type,
     ]
 )
