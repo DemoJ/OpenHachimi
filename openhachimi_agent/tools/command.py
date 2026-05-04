@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import logging
+import asyncio
 
 from pydantic_ai import RunContext
 
@@ -20,7 +21,7 @@ from openhachimi_agent.tools.utils import (
 logger = logging.getLogger(__name__)
 
 
-def run_command(
+async def run_command(
     ctx: RunContext[AppConfig],
     command: str,
     cwd: str = ".",
@@ -60,7 +61,7 @@ def run_command(
     end_time = time.time() + wait_seconds
     
     while time.time() < end_time and proc.is_running():
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
         
     output, truncated = proc.get_output()
     is_running = proc.is_running()
@@ -98,7 +99,7 @@ def command_status(ctx: RunContext[AppConfig], command_id: str) -> dict[str, obj
 
 from typing import Literal
 
-def send_command_input(
+async def send_command_input(
     ctx: RunContext[AppConfig], 
     command_id: str, 
     text: str = "",
@@ -138,7 +139,7 @@ def send_command_input(
         return {"error": f"发送输入失败：{e}"}
         
     # 发送后等待一小段时间以便捕获新的响应
-    time.sleep(2.0)
+    await asyncio.sleep(2.0)
     
     output, truncated = proc.get_output()
     return {

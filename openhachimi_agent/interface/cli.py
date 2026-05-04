@@ -46,17 +46,21 @@ def request_stream(server_url: str, path: str, payload: dict[str, object]):
         f"{server_url}{path}",
         data=data,
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
-    decoder = codecs.getincrementaldecoder("utf-8")()
     with urlopen(request) as response:
-        while chunk := response.read(1):
-            text = decoder.decode(chunk)
-            if text:
-                yield text
-        tail = decoder.decode(b"", final=True)
-        if tail:
-            yield tail
+        for line in response:
+            line_str = line.decode("utf-8").strip()
+            if line_str.startswith("data: "):
+                data_str = line_str[6:]
+                try:
+                    data_json = json.loads(data_str)
+                    if "error" in data_json:
+                        raise URLError(data_json["error"])
+                    if "text" in data_json:
+                        yield data_json["text"]
+                except json.JSONDecodeError:
+                    pass
 
 
 def error_detail(exc: HTTPError) -> str:
@@ -67,7 +71,7 @@ def error_detail(exc: HTTPError) -> str:
     return str(payload.get("detail", exc))
 
 
-def print_welcome(state: dict[str, object], server_url: str) -> None:
+def print_welcome(state: dict[str, object], server_url: str, current_role: str, current_session_id: str) -> None:
     from openhachimi_agent.core.version import get_version
 
     print(f"OpenHachimi CLI Agent  v{get_version()}")
@@ -75,8 +79,8 @@ def print_welcome(state: dict[str, object], server_url: str) -> None:
     print(f"当前模型：{state['model']}")
     if state.get("base_url"):
         print(f"模型服务：{state['base_url']}")
-    print(f"当前角色：{state['role']}")
-    print(f"当前会话：{state['session_id']}")
+    print(f"当前角色：{current_role}")
+    print(f"当前会话：{current_session_id}")
     print("输入内容后回车即可对话。")
     print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/new 新建对话，/exit 退出程序。")
     print()
@@ -84,9 +88,6 @@ def print_welcome(state: dict[str, object], server_url: str) -> None:
 
 def state_payload(state: object) -> dict[str, object]:
     return {
-        "role": state.role,
-        "session_id": state.session_id,
-        "has_history": state.has_history,
         "model": state.model,
         "base_url": state.base_url,
     }
@@ -98,7 +99,9 @@ async def run_embedded_cli() -> None:
     logger.info("starting embedded cli")
     service = AgentService(config)
     server_url = "embedded"
-    print_welcome(state_payload(service.state()), server_url)
+    current_role = config.default_role_name
+    current_session_id = service.new_session(current_role).session_id
+    print_welcome(state_payload(service.state()), server_url, current_role, current_session_id)
 
     while True:
         try:
@@ -115,7 +118,9 @@ async def run_embedded_cli() -> None:
             return
 
         if user_input in NEW_SESSION_COMMANDS:
-            print(service.new_session().message)
+            response = service.new_session(current_role)
+            current_session_id = response.session_id
+            print(response.message)
             continue
 
         if user_input in HELP_COMMANDS:
@@ -126,7 +131,7 @@ async def run_embedded_cli() -> None:
             roles = service.list_roles()
             print("可用角色：")
             for role_name in roles.roles:
-                marker = "（当前）" if role_name == roles.current_role else ""
+                marker = "（当前）" if role_name == current_role else ""
                 print(f"  - {role_name}{marker}")
             print()
             continue
@@ -138,7 +143,10 @@ async def run_embedded_cli() -> None:
                 print()
                 continue
             try:
-                print(service.switch_role(role_name).message)
+                response = service.switch_role(role_name)
+                current_role = response.role
+                current_session_id = response.session_id
+                print(response.message)
             except (FileNotFoundError, ValueError) as exc:
                 print(f"哈基米 > 切换角色失败：{exc}")
             print()
@@ -146,7 +154,7 @@ async def run_embedded_cli() -> None:
 
         try:
             print("哈基米 > ", end="", flush=True)
-            async for chunk in service.stream_message(user_input):
+            async for chunk in service.stream_message(user_input, current_role, current_session_id):
                 print(chunk, end="", flush=True)
         except Exception as exc:
             print(f"\n哈基米 > 调用模型时出错：{exc}")
@@ -165,37 +173,38 @@ def print_help() -> None:
     print()
 
 
-def print_roles(server_url: str) -> None:
+def print_roles(server_url: str, current_role: str) -> None:
     payload = request_json(server_url, "GET", "/roles")
 
     print("可用角色：")
     for role_name in payload["roles"]:
-        marker = "（当前）" if role_name == payload["current_role"] else ""
+        marker = "（当前）" if role_name == current_role else ""
         print(f"  - {role_name}{marker}")
     print()
 
 
-def switch_role(server_url: str, user_input: str) -> None:
+def switch_role(server_url: str, user_input: str) -> tuple[str, str] | None:
     if user_input == "/role":
         print("请在 /role 后面填写角色名称，例如：/role default")
         print()
-        return
+        return None
 
     role_name = user_input[6:].strip()
     if not role_name:
         print("请在 /role 后面填写角色名称，例如：/role default")
         print()
-        return
+        return None
 
     try:
         payload = request_json(server_url, "POST", "/role", {"role": role_name})
     except HTTPError as exc:
         print(f"哈基米 > 切换角色失败：{error_detail(exc)}")
         print()
-        return
+        return None
 
     print(payload["message"])
     print()
+    return payload["role"], payload["session_id"]
 
 
 def run_cli() -> None:
@@ -208,10 +217,15 @@ def run_cli() -> None:
     logger.info("starting cli client server_url=%s", server_url)
     try:
         state = request_json(server_url, "GET", "/state")
+        roles_info = request_json(server_url, "GET", "/roles")
+        current_role = roles_info["current_role"]
+        from urllib.parse import urlencode
+        new_resp = request_json(server_url, "POST", f"/new?{urlencode({'role': current_role})}")
+        current_session_id = new_resp["session_id"]
     except URLError as exc:
         raise SystemExit(f"无法连接 OpenHachimi 后台服务：{server_url}，请先运行 python main.py serve") from exc
 
-    print_welcome(state, server_url)
+    print_welcome(state, server_url, current_role, current_session_id)
 
     while True:
         try:
@@ -228,7 +242,9 @@ def run_cli() -> None:
             return
 
         if user_input in NEW_SESSION_COMMANDS:
-            payload = request_json(server_url, "POST", "/new")
+            from urllib.parse import urlencode
+            payload = request_json(server_url, "POST", f"/new?{urlencode({'role': current_role})}")
+            current_session_id = payload["session_id"]
             print(payload["message"])
             continue
 
@@ -237,16 +253,23 @@ def run_cli() -> None:
             continue
 
         if user_input in ROLE_LIST_COMMANDS:
-            print_roles(server_url)
+            print_roles(server_url, current_role)
             continue
 
         if user_input == "/role" or user_input.startswith("/role "):
-            switch_role(server_url, user_input)
+            result = switch_role(server_url, user_input)
+            if result:
+                current_role, current_session_id = result
             continue
 
         try:
             print("哈基米 > ", end="", flush=True)
-            for chunk in request_stream(server_url, "/chat/stream", {"message": user_input}):
+            req_payload = {
+                "message": user_input,
+                "role": current_role,
+                "session_id": current_session_id
+            }
+            for chunk in request_stream(server_url, "/chat/stream", req_payload):
                 print(chunk, end="", flush=True)
         except HTTPError as exc:
             print(f"\n哈基米 > 调用模型时出错：{error_detail(exc)}")

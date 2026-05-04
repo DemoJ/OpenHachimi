@@ -4,6 +4,7 @@ import logging
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+import json
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
@@ -41,7 +42,7 @@ def roles():
 def chat(request: ChatRequest):
     logger.info("http chat request message_chars=%d stream=false", len(request.message))
     try:
-        return service.send_message(request.message)
+        return service.send_message(request.message, request.role, request.session_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -49,19 +50,29 @@ def chat(request: ChatRequest):
 @app.post("/chat/stream")
 def chat_stream(request: ChatRequest):
     logger.info("http chat request message_chars=%d stream=true", len(request.message))
+
+    async def sse_generator():
+        try:
+            async for chunk in service.stream_message(request.message, request.role, request.session_id):
+                yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.exception("stream error")
+            yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+
     try:
         return StreamingResponse(
-            service.stream_message(request.message),
-            media_type="text/plain; charset=utf-8",
+            sse_generator(),
+            media_type="text/event-stream",
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/new")
-def new_session():
-    logger.info("http new session request")
-    return service.new_session()
+def new_session(role: str | None = None):
+    logger.info("http new session request role=%s", role)
+    return service.new_session(role)
 
 
 @app.post("/role")

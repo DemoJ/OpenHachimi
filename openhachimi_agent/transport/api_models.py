@@ -4,15 +4,14 @@ from pydantic import BaseModel, Field
 
 
 class AgentState(BaseModel):
-    role: str
-    session_id: str
-    has_history: bool
     model: str
     base_url: str | None = None
 
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
+    role: str | None = None
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
