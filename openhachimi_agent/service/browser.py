@@ -225,7 +225,13 @@ class BrowserManager:
             return f"导航失败：{e}"
 
     async def get_state(self) -> str:
-        """获取当前页面的简化可访问性树（包含元素 ID），供大模型阅读。"""
+        """获取当前页面的完整可访问性树（包含元素 ID），供大模型阅读。
+
+        【重要设计原则】
+        - 返回整个已渲染页面的所有元素，不受当前滚动位置限制。
+        - 视口内外的元素均会输出，用位置标记（[视口内]/[↑上方]/[↓下方]）区分。
+        - browser_scroll 应仅用于触发懒加载（无限滚动），而非"查看"已有内容。
+        """
         await self._update_active_page()
         
         if not self._page or self._page.is_closed():
@@ -236,48 +242,50 @@ class BrowserManager:
         # 重置映射表
         self._element_mapping = {}
         
-        # 获取 ariaSnapshot
-        # 由于 page.accessibility.snapshot() 被弃用且复杂，我们使用 Playwright 的 locator 获取常见的交互元素
         try:
-            # 对于现代单页应用(SPA)如推特，networkidle几乎总是因为后台心跳或长轮询而超时
-            # 所以我们用固定的短暂等待替代，或者等待 domcontentloaded
             await asyncio.sleep(0.5)
         except Exception:
             pass
             
+        # 单次返回全页元素的上限，防止超大页面撑爆模型上下文
+        MAX_ELEMENTS = 500
+
         try:
-            # 我们通过执行一段 JS 来获取页面上的交互元素并分配临时 ID
-            # 这种方法比分析复杂的 ariaSnapshot 更直接稳定
             script = """
-            () => {
+            (maxElements) => {
                 let idCounter = 1;
                 const elements = [];
-                const interactiveNodes = []; // 仅记录交互节点，用于过滤子文本
+                const interactiveNodes = [];
                 
-                // 遍历所有节点，以防漏掉隐藏在深处或没有标准语义的魔改节点
                 const nodes = document.querySelectorAll('*');
                 const winHeight = window.innerHeight;
-                const winWidth = window.innerWidth;
+                const winWidth  = window.innerWidth;
                 
                 for (const node of nodes) {
-                    // 1. 过滤特殊与无用标签
-                    const tagName = node.tagName.toLowerCase();
-                    if (['script', 'style', 'noscript', 'meta', 'link', 'head'].includes(tagName)) continue;
+                    if (elements.length >= maxElements) break;
                     
-                    // 2. 视口与尺寸严格过滤
+                    // 1. 过滤无意义标签
+                    const tagName = node.tagName.toLowerCase();
+                    if (['script','style','noscript','meta','link','head'].includes(tagName)) continue;
+                    
+                    // 2. 尺寸过滤：零尺寸 = 未渲染，直接跳过
                     const rect = node.getBoundingClientRect();
                     if (rect.width === 0 || rect.height === 0) continue;
-                    // 剔除屏幕外元素，强制大模型只能看到视口内的内容
-                    if (rect.bottom < 0 || rect.top > winHeight || rect.right < 0 || rect.left > winWidth) continue;
                     
-                    // 剔除完全透明或被隐藏的元素
+                    // 3. CSS 可见性过滤
                     const style = window.getComputedStyle(node);
                     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
                     
-                    // 3. 通用交互性检测 (包含标准属性与鼠标手势探测)
-                    const isEditable = tagName === 'input' || tagName === 'textarea' || 
-                                       node.isContentEditable || 
-                                       node.getAttribute('role') === 'textbox' || 
+                    // 4. 计算元素相对视口的位置（用于输出标记，不用于过滤）
+                    let position;
+                    if (rect.bottom < 0)       position = 'above';    // 视口上方
+                    else if (rect.top > winHeight) position = 'below'; // 视口下方
+                    else                           position = 'viewport'; // 当前可见
+                    
+                    // 5. 交互性检测
+                    const isEditable = tagName === 'input' || tagName === 'textarea' ||
+                                       node.isContentEditable ||
+                                       node.getAttribute('role') === 'textbox' ||
                                        node.getAttribute('role') === 'combobox';
                                        
                     let isInteractive = isEditable || tagName === 'a' || tagName === 'button' || tagName === 'select' ||
@@ -285,36 +293,26 @@ class BrowserManager:
                                         node.getAttribute('role') === 'menuitem' || node.getAttribute('role') === 'option' ||
                                         (node.hasAttribute('tabindex') && node.getAttribute('tabindex') !== '-1') ||
                                         style.cursor === 'pointer' || style.cursor === 'text';
-                                        
-                    // 4. 物理遮挡剔除 (Occlusion Culling)
-                    if (isInteractive) {
+                    
+                    // 6. 物理遮挡剔除（仅对视口内元素有意义，视口外无浮层覆盖问题）
+                    if (isInteractive && position === 'viewport') {
                         const centerX = rect.left + rect.width / 2;
-                        const centerY = rect.top + rect.height / 2;
+                        const centerY = rect.top  + rect.height / 2;
                         if (centerX >= 0 && centerX <= winWidth && centerY >= 0 && centerY <= winHeight) {
                             const topEl = document.elementFromPoint(centerX, centerY);
-                            // 如果顶级元素不是自己，也不是包含关系
                             if (topEl && topEl !== node && !node.contains(topEl) && !topEl.contains(node)) {
-                                // 寻找最近公共祖先 (防误杀：如富文本编辑器的 placeholder 兄弟节点覆盖了 input)
-                                let p1 = node;
-                                let common = null;
-                                let depth = 0;
-                                while(p1 && depth < 5) {
-                                    if (p1.contains(topEl)) {
-                                        common = p1;
-                                        break;
-                                    }
+                                let p1 = node, common = null, depth = 0;
+                                while (p1 && depth < 5) {
+                                    if (p1.contains(topEl)) { common = p1; break; }
                                     p1 = p1.parentElement;
                                     depth++;
                                 }
-                                // 如果 5 层之内找不到公共祖先，说明是被毫不相干的浮层遮挡了
-                                if (!common) {
-                                    isInteractive = false; // 降级为非交互节点
-                                }
+                                if (!common) isInteractive = false;
                             }
                         }
                     }
                     
-                    // 5. 文本智能提取
+                    // 7. 文本提取
                     let text = '';
                     if (isInteractive) {
                         if (isEditable) {
@@ -325,7 +323,7 @@ class BrowserManager:
                             text = node.getAttribute('aria-label') || node.getAttribute('alt') || node.innerText || node.value || node.getAttribute('data-testid') || '';
                         }
                     } else {
-                        // 非交互元素仅提取它直属的文本节点，杜绝因为 innerText 导致的父子文本“俄罗斯套娃”重复
+                        // 非交互节点只取直属文本，避免父子俄罗斯套娃
                         let directText = '';
                         for (let child of node.childNodes) {
                             if (child.nodeType === 3) directText += child.textContent;
@@ -334,20 +332,17 @@ class BrowserManager:
                         if (directText) {
                             text = node.getAttribute('aria-label') || node.getAttribute('alt') || directText;
                         } else {
-                            continue; // 彻底没有任何自身信息的无用节点
+                            continue;
                         }
                     }
                     
                     text = text.replace(/\\n/g, ' ').replace(/\\s+/g, ' ').trim();
-                    if (text.length > 100) text = text.substring(0, 100) + '...';
-                    
+                    if (text.length > 120) text = text.substring(0, 120) + '...';
                     if (!text && !isInteractive) continue;
                     
-                    // 6. 祖先去重：如果当前纯文本节点的某个交互父级已经被提取过了，就不再作为独立节点输出，以防干扰模型
+                    // 8. 祖先去重
                     if (!isInteractive) {
-                        if (interactiveNodes.some(parent => parent.contains(node))) {
-                            continue;
-                        }
+                        if (interactiveNodes.some(parent => parent.contains(node))) continue;
                     }
                     
                     const role = node.getAttribute('role') || tagName;
@@ -357,45 +352,83 @@ class BrowserManager:
                         role: role,
                         text: text,
                         type: node.type || undefined,
-                        isInteractive: isInteractive
+                        isInteractive: isInteractive,
+                        position: position,
                     };
                     
                     node.setAttribute('data-agent-id', elData.id);
                     elements.push(elData);
-                    
-                    if (isInteractive) {
-                        interactiveNodes.push(node);
-                    }
+                    if (isInteractive) interactiveNodes.push(node);
                 }
                 
                 return {
                     url: document.location.href,
                     title: document.title,
-                    elements: elements
+                    elements: elements,
+                    truncated: elements.length >= maxElements,
+                    scrollY: Math.round(window.scrollY),
+                    scrollHeight: Math.round(document.body.scrollHeight),
+                    clientHeight: Math.round(window.innerHeight),
                 };
             }
             """
             
-            result = await self._page.evaluate(script)
+            result = await self._page.evaluate(script, MAX_ELEMENTS)
+            
+            scroll_y  = result.get('scrollY', 0)
+            scroll_h  = result.get('scrollHeight', 0)
+            client_h  = result.get('clientHeight', 0)
+            truncated = result.get('truncated', False)
             
             output = [f"URL: {result['url']}"]
             output.append(f"Title: {result['title']}")
-            output.append("-" * 40)
-            output.append("Interactive Elements (带有 [*] 标记的为可交互元素):")
             
-            for el in result["elements"]:
-                # 保存映射表用于后续操作：通过 data-agent-id 定位
+            # 统计各区域元素数
+            all_els = result["elements"]
+            cnt_above    = sum(1 for e in all_els if e.get('position') == 'above')
+            cnt_viewport = sum(1 for e in all_els if e.get('position') == 'viewport')
+            cnt_below    = sum(1 for e in all_els if e.get('position') == 'below')
+            output.append(
+                f"[页面概况] 共 {len(all_els)} 个元素"
+                + (f"（已达上限 {MAX_ELEMENTS}，页面可能有更多）" if truncated else "")
+                + f"：视口上方 {cnt_above} 个 | 视口内 {cnt_viewport} 个 | 视口下方 {cnt_below} 个"
+            )
+            
+            # 滚动提示：区分"已有内容"与"待懒加载内容"
+            # 判断依据：如果页面总高度远超已知元素覆盖的区域，说明可能有懒加载内容
+            loaded_bottom = scroll_y + scroll_h  # 粗略估计
+            potential_lazy = scroll_h > client_h * 2 and cnt_below == 0 and not truncated
+            if potential_lazy:
+                output.append(
+                    f"[滚动提示] 页面总高度 {scroll_h}px，当前视口 {client_h}px。"
+                    "若需要加载更多内容（如无限滚动列表），可使用 browser_scroll('down') 触发懒加载后重新 browser_get_state。"
+                )
+            elif cnt_below > 0 or cnt_above > 0:
+                output.append(
+                    "[滚动提示] 以上已包含整个页面的全部已渲染元素（含视口外），无需滚动即可阅读全部内容。"
+                    "仅当需要触发懒加载（如无限滚动）时才使用 browser_scroll。"
+                )
+            else:
+                output.append("[滚动提示] 当前页面所有内容均已包含在上方列表中。")
+            
+            output.append("-" * 40)
+            output.append("页面元素列表（[*] = 可交互，[↑] = 视口上方，[↓] = 视口下方）：")
+            
+            for el in all_els:
                 self._element_mapping[el['id']] = f"[data-agent-id='{el['id']}']"
                 
-                type_str = f" [type: {el['type']}]" if el.get('type') else ""
-                interactive_mark = " [*]" if el.get('isInteractive') else ""
-                output.append(f"[{el['id']}]{interactive_mark} {el['role'].upper()}{type_str}: {el['text']}")
+                type_str     = f" [type:{el['type']}]" if el.get('type') else ""
+                interact_mark = " [*]" if el.get('isInteractive') else ""
+                pos = el.get('position', 'viewport')
+                pos_mark = "" if pos == 'viewport' else (" [↑]" if pos == 'above' else " [↓]")
+                output.append(f"[{el['id']}]{interact_mark}{pos_mark} {el['role'].upper()}{type_str}: {el['text']}")
                 
             return "\n".join(output)
             
         except Exception as e:
             logger.error("Failed to get state: %s", e)
             return f"获取页面状态失败：{e}"
+
 
     async def click(self, element_id: int) -> str:
         """点击指定 ID 的元素。"""
@@ -468,6 +501,43 @@ class BrowserManager:
             return f"成功在元素 [{element_id}] 输入文本。"
         except Exception as e:
             return f"输入文本失败：{e}"
+
+    async def scroll(self, direction: str, amount: int = 600) -> str:
+        """滚动页面。
+        
+        direction: 滚动方向，支持 'up'（向上）、'down'（向下）、'top'（跳到页首）、'bottom'（跳到页尾）
+        amount: 滚动像素数（仅 up/down 有效，默认 600，约一屏高度）
+        """
+        await self._update_active_page()
+        
+        if not self._page or self._page.is_closed():
+            return "当前没有打开的页面。"
+        
+        direction = direction.strip().lower()
+        if direction not in ("up", "down", "top", "bottom"):
+            return f"不支持的滚动方向：{direction}，请使用 up / down / top / bottom。"
+        
+        try:
+            if direction == "top":
+                await self._page.evaluate("window.scrollTo(0, 0)")
+                result_msg = "已滚动到页面顶部。"
+            elif direction == "bottom":
+                await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                result_msg = "已滚动到页面底部。"
+            elif direction == "down":
+                await self._page.evaluate(f"window.scrollBy(0, {amount})")
+                result_msg = f"已向下滚动 {amount}px。"
+            else:  # up
+                await self._page.evaluate(f"window.scrollBy(0, -{amount})")
+                result_msg = f"已向上滚动 {amount}px。"
+            
+            # 等待动态内容加载（如懒加载图片、无限滚动列表）
+            await asyncio.sleep(0.8)
+            logger.info("Browser scroll direction=%s amount=%d", direction, amount)
+            return result_msg + " 请调用 browser_get_state 查看滚动后的页面内容。"
+        except Exception as e:
+            logger.error("Scroll failed: %s", e)
+            return f"滚动失败：{e}"
 
     async def close(self) -> None:
         """关闭浏览器实例。"""

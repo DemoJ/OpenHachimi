@@ -51,3 +51,11 @@ def configure_logging(config: AppConfig) -> None:
         config.log_dir / LOG_FILE_NAME,
         config.log_console,
     )
+
+    # 屏蔽第三方库的 INFO 级别日志，避免 Telegram Polling 的 getUpdates 等请求污染日志
+    # httpx 每 10s 一次的轮询请求只在 WARNING 以上才输出
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # telegram 底层传输层日志同样静默
+    logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
+

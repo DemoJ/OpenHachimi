@@ -30,6 +30,7 @@ class AppConfig:
     skills_dirs: list[Path]
     browser_headless: bool
     browser_channel: str | None
+    telegram_bot_token: str | None
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -117,4 +118,5 @@ def load_config() -> AppConfig:
         ],
         browser_headless=_config_bool(app_config, "browser_headless", True),
         browser_channel=_config_string(app_config, "browser_channel") or None,
+        telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
     )

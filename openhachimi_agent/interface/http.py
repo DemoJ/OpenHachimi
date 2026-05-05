@@ -1,13 +1,19 @@
-"""localhost HTTP daemon。"""
+"""localhost HTTP daemon。
 
+通过 FastAPI lifespan 机制，在服务启动时自动启动 Telegram Bot（若已配置 token），
+服务关闭时优雅停止 Bot。所有渠道共享同一 asyncio 事件循环。
+"""
+
+import json
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-import json
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
+from openhachimi_agent.interface.telegram import telegram_lifespan
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.transport.api_models import ChatRequest, RoleSwitchRequest
 
@@ -16,8 +22,23 @@ config = load_config()
 configure_logging(config)
 logger = logging.getLogger(__name__)
 service = AgentService(config)
-app = FastAPI(title="OpenHachimi Agent")
 logger.info("server module initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI 应用生命周期管理器。
+
+    负责在服务启动/停止时，统一管理所有渠道（当前为 Telegram Bot）的生命周期。
+    各渠道以异步上下文管理器的形式嵌套，共享同一 asyncio 事件循环，无需额外线程。
+    """
+    async with telegram_lifespan(config):
+        logger.info("all channels started")
+        yield
+        logger.info("all channels stopping")
+
+
+app = FastAPI(title="OpenHachimi Agent", lifespan=lifespan)
 
 
 @app.get("/health")

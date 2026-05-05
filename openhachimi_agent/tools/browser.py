@@ -56,3 +56,22 @@ async def browser_type(ctx: RunContext[AppConfig], element_id: int, text: str) -
     """
     bm = _get_browser_manager(ctx.deps)
     return await bm.type_text(element_id, text)
+
+
+async def browser_scroll(ctx: RunContext[AppConfig], direction: str, amount: int = 600) -> str:
+    """滚动当前浏览器页面。
+    
+    当 browser_get_state 输出中显示“下方还有 Npx 内容”时，必须调用此工具滚动查看更多内容。
+    
+    参数：
+    - direction: 滚动方向。可选：
+        'down'   — 向下滚动（最常用，向下查看更多内容）
+        'up'     — 向上滚动
+        'bottom' — 直接跳到页面最底部
+        'top'    — 直接跳回页面顶部
+    - amount: 滚动像素数（仅 up/down 有效，默认 600 约一屏）
+    
+    滚动完成后必须调用 browser_get_state 查看新视口中的内容。
+    """
+    bm = _get_browser_manager(ctx.deps)
+    return await bm.scroll(direction, amount)
