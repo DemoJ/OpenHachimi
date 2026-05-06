@@ -11,7 +11,7 @@
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/deploy.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/install.sh | bash
 ```
 
 ### Windows（PowerShell）
@@ -27,7 +27,7 @@ python deploy.py
 hachimi       # 进入 CLI 对话（需先将 .venv/bin 加入 PATH，见部署完成提示）
 ```
 
-> **常用部署选项**
+> **常用部署选项**（在项目目录内运行）
 >
 > ```bash
 > # 指定监听地址和端口

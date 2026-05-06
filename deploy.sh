@@ -81,11 +81,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo ""
-echo -e "${BOLD}=== OpenHachimi 一键部署 ===${RESET}"
+echo -e "${BOLD}=== OpenHachimi 部署 ===${RESET}"
 echo ""
 
 # ── 步骤 1：检查 Python 版本 ──────────────────────────────────────────────────
-info "步骤 1/5：检查 Python 环境..."
+info "步骤 1/4：检查 Python 环境..."
 
 PYTHON=""
 for cmd in python3 python; do
@@ -106,34 +106,18 @@ if [[ -z "$PYTHON" ]]; then
     error "未找到 Python 3.10 或更高版本。\n请先安装：\n  Ubuntu/Debian：sudo apt install python3\n  CentOS/RHEL：  sudo dnf install python3\n  Arch：         sudo pacman -S python"
 fi
 
-# ── 步骤 2：确保项目目录存在（自举 clone）────────────────────────────────────
-info "步骤 2/5：准备项目目录..."
-
-# 判断脚本是否已经在项目目录内（存在 pyproject.toml 即认定为项目根）
+# ── 确定项目根目录（deploy.sh 必须在项目根目录内运行）────────────────────────
+# 脚本自身就在项目根，或者由 install.sh exec 过来（已 cd 好）
 if [[ -f "pyproject.toml" ]]; then
     PROJECT_ROOT="$(pwd)"
-    success "已在项目目录中：$PROJECT_ROOT"
-else
-    # 不在项目目录，执行自举 clone
-    if ! command -v git &>/dev/null; then
-        error "未找到 git，请先安装 git 再重试。"
-    fi
-
-    CLONE_DIR="$(realpath "$CLONE_DIR")"
-    if [[ -d "$CLONE_DIR/.git" ]]; then
-        info "目录已存在，拉取最新代码：$CLONE_DIR"
-        git -C "$CLONE_DIR" pull --ff-only
-    else
-        info "克隆项目到：$CLONE_DIR"
-        git clone "$REPO_URL" "$CLONE_DIR"
-    fi
-
-    PROJECT_ROOT="$CLONE_DIR"
-    success "项目已就绪：$PROJECT_ROOT"
-
-    # 切换到项目目录，后续操作均在此目录
+elif [[ -f "$(dirname "${BASH_SOURCE[0]}")/pyproject.toml" ]]; then
+    PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     cd "$PROJECT_ROOT"
+else
+    error "找不到 pyproject.toml，请在项目根目录内运行此脚本，或使用 install.sh 安装。"
 fi
+
+success "项目目录：$PROJECT_ROOT"
 
 VENV_DIR="$PROJECT_ROOT/.venv"
 CONFIG_EXAMPLE="$PROJECT_ROOT/user/config.example.yaml"
@@ -184,7 +168,7 @@ create_venv() {
 }
 
 # ── 步骤 3：准备虚拟环境 ────────────────────────────────────────────────────
-info "步骤 3/5：准备虚拟环境..."
+info "步骤 2/4：准备虚拟环境..."
 
 if venv_is_healthy; then
     success "虚拟环境健全，复用：$VENV_DIR"
@@ -207,7 +191,7 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 VENV_HACHIMI="$VENV_DIR/bin/hachimi"
 
 # ── 步骤 4：安装依赖 ─────────────────────────────────────────────────────────
-info "步骤 4/5：安装项目依赖（pip install -e .）..."
+info "步骤 3/4：安装项目依赖（pip install -e .）..."
 
 if ! "$VENV_PYTHON" -m pip install -U pip --quiet 2>/tmp/_oh_pip_err; then
     cat /tmp/_oh_pip_err >&2
@@ -238,9 +222,9 @@ fi
 
 # ── 步骤 5：部署后台守护服务 ─────────────────────────────────────────────────
 if [[ "$SKIP_DAEMON" == true ]]; then
-    info "步骤 5/5：已跳过后台守护部署（--skip-daemon）。"
+    info "步骤 4/4：已跳过后台守护部署（--skip-daemon）。"
 else
-    info "步骤 5/5：部署后台守护服务（host=$HOST port=$PORT）..."
+    info "步骤 4/4：部署后台守护服务（host=$HOST port=$PORT）..."
     "$VENV_HACHIMI" deploy --host "$HOST" --port "$PORT"
 fi
 
