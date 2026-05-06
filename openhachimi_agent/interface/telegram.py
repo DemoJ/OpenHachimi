@@ -313,7 +313,14 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
     if proxy_url:
         logger.info("telegram bot using proxy: %s", proxy_url)
         request = HTTPXRequest(proxy=proxy_url)
-        app = Application.builder().token(token).request(request).build()
+        get_updates_request = HTTPXRequest(proxy=proxy_url, read_timeout=30.0)
+        app = (
+            Application.builder()
+            .token(token)
+            .request(request)
+            .get_updates_request(get_updates_request)
+            .build()
+        )
     else:
         # 使用默认配置构建 Application（含内置 Updater），由 asyncio 事件循环统一调度
         app = Application.builder().token(token).build()
