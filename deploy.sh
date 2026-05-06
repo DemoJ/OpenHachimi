@@ -57,7 +57,7 @@ ${BOLD}OpenHachimi 一键部署脚本${RESET}
 
 示例：
   # 一键下载并部署（无需提前 clone 项目）
-  bash <(curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/deploy.sh)
+  curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/deploy.sh | bash
 
   # 指定监听地址和端口
   bash deploy.sh --host 0.0.0.0 --port 9000
@@ -139,41 +139,71 @@ VENV_DIR="$PROJECT_ROOT/.venv"
 CONFIG_EXAMPLE="$PROJECT_ROOT/user/config.example.yaml"
 CONFIG_FILE="$PROJECT_ROOT/user/config.yaml"
 
-# ── 步骤 3：创建或复用虚拟环境 ──────────────────────────────────────────────
+# ── 辅助函数：检测 venv 是否健全（python + pip 均可用）────────────────────────
+venv_is_healthy() {
+    [[ -f "$VENV_DIR/bin/python" ]] && "$VENV_DIR/bin/python" -m pip --version &>/dev/null
+}
+
+# ── 辅助函数：尝试安装 python3-venv（仅 apt-get 环境）──────────────────────
+install_venv_pkg() {
+    local minor
+    minor="$("$PYTHON" -c 'import sys; print(sys.version_info.minor)')"
+    local pkg="python3.${minor}-venv"
+    warn "检测到缺少虚拟环境支持包，尝试自动安装 $pkg ..."
+    if command -v apt-get &>/dev/null; then
+        if sudo apt-get install -y "$pkg" >/dev/null 2>&1; then
+            success "已安装 $pkg。"
+            return 0
+        fi
+        # 部分系统只有 python3-venv 而没有 python3.X-venv
+        warn "$pkg 安装失败，尝试 python3-venv ..."
+        if sudo apt-get install -y python3-venv >/dev/null 2>&1; then
+            success "已安装 python3-venv。"
+            return 0
+        fi
+        error "自动安装失败，请手动执行：\n  sudo apt-get install -y $pkg\n然后重新运行此脚本。"
+    else
+        error "创建虚拟环境失败。请先安装 python3-venv（或系统等效包）后重试。"
+    fi
+}
+
+# ── 辅助函数：创建 venv，失败时自动修复并重试 ─────────────────────────────
+create_venv() {
+    rm -rf "$VENV_DIR"   # 清除可能存在的残破目录
+    if "$PYTHON" -m venv "$VENV_DIR" 2>/tmp/_oh_venv_err; then
+        return 0
+    fi
+    if grep -qi "ensurepip\|venv" /tmp/_oh_venv_err 2>/dev/null; then
+        install_venv_pkg
+        info "重新创建虚拟环境..."
+        if ! "$PYTHON" -m venv "$VENV_DIR" 2>/tmp/_oh_venv_err; then
+            cat /tmp/_oh_venv_err >&2
+            error "安装依赖包后仍无法创建虚拟环境，请查看上方错误信息。"
+        fi
+    else
+        cat /tmp/_oh_venv_err >&2
+        error "创建虚拟环境失败，请查看上方错误信息。"
+    fi
+}
+
+# ── 步骤 3：准备虚拟环境 ────────────────────────────────────────────────────
 info "步骤 3/5：准备虚拟环境..."
 
-if [[ -f "$VENV_DIR/bin/python" ]]; then
-    success "虚拟环境已存在，复用：$VENV_DIR"
+if venv_is_healthy; then
+    success "虚拟环境健全，复用：$VENV_DIR"
+elif [[ -d "$VENV_DIR" ]]; then
+    warn "检测到残破的虚拟环境（pip 不可用），清除并重建..."
+    create_venv
+    success "虚拟环境重建完成。"
 else
     info "创建虚拟环境：$VENV_DIR"
-
-    # 尝试创建，如果失败则检测是否为 Debian/Ubuntu 缺少 python3-venv 的问题
-    if ! "$PYTHON" -m venv "$VENV_DIR" 2>/tmp/_oh_venv_err; then
-        if grep -qi "ensurepip\|venv" /tmp/_oh_venv_err 2>/dev/null; then
-            # 获取 Python 次版本号，用于安装对应的 python3.X-venv
-            MINOR="$("$PYTHON" -c 'import sys; print(sys.version_info.minor)')"
-            VENV_PKG="python3.${MINOR}-venv"
-            warn "检测到缺少 $VENV_PKG，尝试自动安装..."
-
-            if command -v apt-get &>/dev/null; then
-                if sudo apt-get install -y "$VENV_PKG" >/dev/null 2>&1; then
-                    success "已安装 $VENV_PKG，重新创建虚拟环境..."
-                    "$PYTHON" -m venv "$VENV_DIR"
-                else
-                    error "自动安装 $VENV_PKG 失败，请手动执行：\n  sudo apt-get install -y $VENV_PKG\n然后重新运行此脚本。"
-                fi
-            else
-                # 打印原始错误，并给出通用提示
-                cat /tmp/_oh_venv_err >&2
-                error "创建虚拟环境失败。请先安装 python3-venv（或等效包）后重试。"
-            fi
-        else
-            cat /tmp/_oh_venv_err >&2
-            error "创建虚拟环境失败，请查看上方错误信息。"
-        fi
-    fi
-
+    create_venv
     success "虚拟环境创建完成。"
+fi
+
+# 最终校验
+if ! venv_is_healthy; then
+    error "虚拟环境创建后 pip 仍不可用，请检查你的 Python 安装。"
 fi
 
 VENV_PYTHON="$VENV_DIR/bin/python"
@@ -182,8 +212,15 @@ VENV_HACHIMI="$VENV_DIR/bin/hachimi"
 # ── 步骤 4：安装依赖 ─────────────────────────────────────────────────────────
 info "步骤 4/5：安装项目依赖（pip install -e .）..."
 
-"$VENV_PYTHON" -m pip install -U pip --quiet
-"$VENV_PYTHON" -m pip install -e "$PROJECT_ROOT" --quiet
+if ! "$VENV_PYTHON" -m pip install -U pip --quiet 2>/tmp/_oh_pip_err; then
+    cat /tmp/_oh_pip_err >&2
+    error "pip 升级失败，请检查网络连接或代理设置后重试。"
+fi
+
+if ! "$VENV_PYTHON" -m pip install -e "$PROJECT_ROOT" --quiet 2>/tmp/_oh_pip_err; then
+    cat /tmp/_oh_pip_err >&2
+    error "依赖安装失败，请查看上方错误信息。\n常见原因：\n  - 网络不通或需要设置代理\n  - 缺少系统编译依赖（尝试：sudo apt-get install -y build-essential）"
+fi
 
 success "依赖安装完成。"
 
