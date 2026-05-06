@@ -22,6 +22,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.service.agent_service import AgentService
@@ -307,8 +308,15 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
 
     bot = TelegramBot(config)
 
-    # 使用默认配置构建 Application（含内置 Updater），由 asyncio 事件循环统一调度
-    app = Application.builder().token(token).build()
+    # 根据配置决定是否使用代理
+    proxy_url = config.telegram_proxy_url
+    if proxy_url:
+        logger.info("telegram bot using proxy: %s", proxy_url)
+        request = HTTPXRequest(proxy=proxy_url)
+        app = Application.builder().token(token).request(request).build()
+    else:
+        # 使用默认配置构建 Application（含内置 Updater），由 asyncio 事件循环统一调度
+        app = Application.builder().token(token).build()
 
     # 注册命令处理器
     app.add_handler(CommandHandler("start", bot.cmd_start))
