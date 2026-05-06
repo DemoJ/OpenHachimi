@@ -327,30 +327,41 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
     # 普通文本消息处理器（非命令）
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
 
-    # 启动 Bot
-    await app.initialize()
-    await app.start()
+    # 启动 Bot（连接失败时不阻断 HTTP 服务，仅记录错误）
+    try:
+        await app.initialize()
+        await app.start()
 
-    # 向 Telegram 服务器注册命令菜单（用户输入 / 时显示的命令列表）
-    # 注意：此调用会持久化到 Telegram 服务器，重启服务无需重复设置，但保持同步是最佳实践
-    from telegram import BotCommand
-    await app.bot.set_my_commands([
-        BotCommand("new",   "💾 保存当前对话，新建一段对话"),
-        BotCommand("roles", "🎭 查看可用角色列表"),
-        BotCommand("role",  "🔄 切换角色（如：/role default）"),
-        BotCommand("help",  "📖 查看帮助"),
-    ])
-    logger.info("telegram bot commands menu registered")
+        # 向 Telegram 服务器注册命令菜单（用户输入 / 时显示的命令列表）
+        # 注意：此调用会持久化到 Telegram 服务器，重启服务无需重复设置，但保持同步是最佳实践
+        from telegram import BotCommand
+        await app.bot.set_my_commands([
+            BotCommand("new",   "💾 保存当前对话，新建一段对话"),
+            BotCommand("roles", "🎭 查看可用角色列表"),
+            BotCommand("role",  "🔄 切换角色（如：/role default）"),
+            BotCommand("help",  "📖 查看帮助"),
+        ])
+        logger.info("telegram bot commands menu registered")
 
-    # 在同一 asyncio 事件循环中启动 Polling，不阻塞
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    logger.info("telegram bot polling started")
+        # 在同一 asyncio 事件循环中启动 Polling，不阻塞
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("telegram bot polling started")
+    except Exception:
+        logger.exception(
+            "telegram bot 启动失败（可能是代理不通或 token 无效），"
+            "HTTP 服务将继续运行，Telegram 功能不可用"
+        )
+        yield  # HTTP 服务照常运行
+        return
 
     yield  # FastAPI 服务运行期间 Bot 持续工作
 
     # 优雅关闭
     logger.info("telegram bot shutting down")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
+    try:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+    except Exception:
+        logger.exception("telegram bot 关闭时出错，忽略")
     logger.info("telegram bot stopped")
