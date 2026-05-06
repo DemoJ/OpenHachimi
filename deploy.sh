@@ -3,7 +3,7 @@
 # OpenHachimi 一键部署脚本（支持自举）
 #
 # 用法一：直接下载运行（自动 clone 项目）
-#   bash <(curl -fsSL https://raw.githubusercontent.com/你的仓库/main/deploy.sh)
+#   curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/deploy.sh | bash
 #
 # 用法二：在项目目录中运行
 #   bash deploy.sh [选项]
@@ -146,7 +146,33 @@ if [[ -f "$VENV_DIR/bin/python" ]]; then
     success "虚拟环境已存在，复用：$VENV_DIR"
 else
     info "创建虚拟环境：$VENV_DIR"
-    "$PYTHON" -m venv "$VENV_DIR"
+
+    # 尝试创建，如果失败则检测是否为 Debian/Ubuntu 缺少 python3-venv 的问题
+    if ! "$PYTHON" -m venv "$VENV_DIR" 2>/tmp/_oh_venv_err; then
+        if grep -qi "ensurepip\|venv" /tmp/_oh_venv_err 2>/dev/null; then
+            # 获取 Python 次版本号，用于安装对应的 python3.X-venv
+            MINOR="$("$PYTHON" -c 'import sys; print(sys.version_info.minor)')"
+            VENV_PKG="python3.${MINOR}-venv"
+            warn "检测到缺少 $VENV_PKG，尝试自动安装..."
+
+            if command -v apt-get &>/dev/null; then
+                if sudo apt-get install -y "$VENV_PKG" >/dev/null 2>&1; then
+                    success "已安装 $VENV_PKG，重新创建虚拟环境..."
+                    "$PYTHON" -m venv "$VENV_DIR"
+                else
+                    error "自动安装 $VENV_PKG 失败，请手动执行：\n  sudo apt-get install -y $VENV_PKG\n然后重新运行此脚本。"
+                fi
+            else
+                # 打印原始错误，并给出通用提示
+                cat /tmp/_oh_venv_err >&2
+                error "创建虚拟环境失败。请先安装 python3-venv（或等效包）后重试。"
+            fi
+        else
+            cat /tmp/_oh_venv_err >&2
+            error "创建虚拟环境失败，请查看上方错误信息。"
+        fi
+    fi
+
     success "虚拟环境创建完成。"
 fi
 

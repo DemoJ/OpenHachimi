@@ -101,9 +101,45 @@ def ensure_venv(project_root: Path) -> None:
     if python_path.exists():
         print(f"[OK] 虚拟环境已存在，复用：{python_path.parent.parent}")
         return
+
     print(f"[INFO] 创建虚拟环境：{project_root / '.venv'}")
-    run([find_python(), "-m", "venv", str(project_root / ".venv")])
-    print("[OK] 虚拟环境创建完成。")
+    venv_cmd = [find_python(), "-m", "venv", str(project_root / ".venv")]
+
+    result = subprocess.run(venv_cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("[OK] 虚拟环境创建完成。")
+        return
+
+    # 创建失败，检测是否为 Debian/Ubuntu 缺少 python3-venv 的问题
+    combined = (result.stdout + result.stderr).lower()
+    if "ensurepip" in combined or "venv" in combined:
+        minor = sys.version_info.minor
+        venv_pkg = f"python3.{minor}-venv"
+        print(f"[WARN] 检测到缺少 {venv_pkg}，尝试自动安装...")
+
+        apt = shutil.which("apt-get")
+        if apt:
+            ret = subprocess.run(["sudo", apt, "install", "-y", venv_pkg])
+            if ret.returncode == 0:
+                print(f"[OK] 已安装 {venv_pkg}，重新创建虚拟环境...")
+                run(venv_cmd)
+                print("[OK] 虚拟环境创建完成。")
+                return
+            else:
+                raise SystemExit(
+                    f"自动安装 {venv_pkg} 失败，请手动执行：\n"
+                    f"  sudo apt-get install -y {venv_pkg}\n"
+                    "然后重新运行此脚本。"
+                )
+        else:
+            print(result.stderr, file=sys.stderr)
+            raise SystemExit(
+                "创建虚拟环境失败。请先安装 python3-venv（或等效包）后重试。"
+            )
+
+    print(result.stderr, file=sys.stderr)
+    raise SystemExit("创建虚拟环境失败，请查看上方错误信息。")
+
 
 
 def install_project(project_root: Path) -> None:

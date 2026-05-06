@@ -11,7 +11,7 @@
 ### Linux / macOS
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/deploy.sh)
+curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/deploy.sh | bash
 ```
 
 ### Windows（PowerShell）
