@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# OpenHachimi Linux 一键部署脚本
-# 用法：bash deploy.sh [选项]
+# OpenHachimi 一键部署脚本（支持自举）
+#
+# 用法一：直接下载运行（自动 clone 项目）
+#   bash <(curl -fsSL https://raw.githubusercontent.com/你的仓库/main/deploy.sh)
+#
+# 用法二：在项目目录中运行
+#   bash deploy.sh [选项]
+#
+# 选项：
 #   -H, --host HOST       监听地址（默认 127.0.0.1）
 #   -p, --port PORT       监听端口（默认 8765）
 #   --skip-daemon         只安装依赖，不部署后台守护服务
+#   --repo URL            自定义 Git 仓库地址
+#   --dir DIR             指定克隆目标目录（默认 ./OpenHachimi）
 #   -h, --help            显示帮助
 # =============================================================================
 
@@ -27,17 +36,13 @@ error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 HOST="127.0.0.1"
 PORT=8765
 SKIP_DAEMON=false
-
-# ── 脚本自身所在目录（项目根目录）──────────────────────────────────────────────
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$PROJECT_ROOT/.venv"
-CONFIG_EXAMPLE="$PROJECT_ROOT/user/config.example.yaml"
-CONFIG_FILE="$PROJECT_ROOT/user/config.yaml"
+REPO_URL="https://github.com/DemoJ/OpenHachimi.git"
+CLONE_DIR="./OpenHachimi"
 
 # ── 解析命令行参数 ────────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
-${BOLD}OpenHachimi Linux 一键部署脚本${RESET}
+${BOLD}OpenHachimi 一键部署脚本${RESET}
 
 用法：
   bash deploy.sh [选项]
@@ -46,11 +51,13 @@ ${BOLD}OpenHachimi Linux 一键部署脚本${RESET}
   -H, --host HOST       后台服务监听地址（默认：127.0.0.1）
   -p, --port PORT       后台服务监听端口（默认：8765）
   --skip-daemon         只安装依赖，不部署后台守护服务
+  --repo URL            自定义 Git 仓库地址
+  --dir DIR             指定克隆目标目录（默认：./OpenHachimi）
   -h, --help            显示此帮助并退出
 
 示例：
-  # 使用默认设置一键部署
-  bash deploy.sh
+  # 一键下载并部署（无需提前 clone 项目）
+  bash <(curl -fsSL https://raw.githubusercontent.com/DemoJ/OpenHachimi/main/deploy.sh)
 
   # 指定监听地址和端口
   bash deploy.sh --host 0.0.0.0 --port 9000
@@ -66,22 +73,23 @@ while [[ $# -gt 0 ]]; do
         -H|--host)      HOST="$2"; shift 2 ;;
         -p|--port)      PORT="$2"; shift 2 ;;
         --skip-daemon)  SKIP_DAEMON=true; shift ;;
+        --repo)         REPO_URL="$2"; shift 2 ;;
+        --dir)          CLONE_DIR="$2"; shift 2 ;;
         -h|--help)      usage ;;
         *)              error "未知参数：$1，使用 -h 查看帮助。" ;;
     esac
 done
 
-# ── 步骤 1：检查 Python 版本 ──────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}=== OpenHachimi 一键部署 ===${RESET}"
 echo ""
 
+# ── 步骤 1：检查 Python 版本 ──────────────────────────────────────────────────
 info "步骤 1/5：检查 Python 环境..."
 
 PYTHON=""
 for cmd in python3 python; do
     if command -v "$cmd" &>/dev/null; then
-        VER="$($cmd -c 'import sys; print(sys.version_info[:2])')"
         MAJOR="$($cmd -c 'import sys; print(sys.version_info.major)')"
         MINOR="$($cmd -c 'import sys; print(sys.version_info.minor)')"
         if [[ "$MAJOR" -ge 3 && "$MINOR" -ge 10 ]]; then
@@ -95,11 +103,44 @@ for cmd in python3 python; do
 done
 
 if [[ -z "$PYTHON" ]]; then
-    error "未找到 Python 3.10 或更高版本。\n请先安装 Python（推荐使用系统包管理器或 pyenv）：\n  Ubuntu/Debian：sudo apt install python3\n  CentOS/RHEL：  sudo dnf install python3\n  Arch：         sudo pacman -S python"
+    error "未找到 Python 3.10 或更高版本。\n请先安装：\n  Ubuntu/Debian：sudo apt install python3\n  CentOS/RHEL：  sudo dnf install python3\n  Arch：         sudo pacman -S python"
 fi
 
-# ── 步骤 2：创建或复用虚拟环境 ──────────────────────────────────────────────
-info "步骤 2/5：准备虚拟环境..."
+# ── 步骤 2：确保项目目录存在（自举 clone）────────────────────────────────────
+info "步骤 2/5：准备项目目录..."
+
+# 判断脚本是否已经在项目目录内（存在 pyproject.toml 即认定为项目根）
+if [[ -f "pyproject.toml" ]]; then
+    PROJECT_ROOT="$(pwd)"
+    success "已在项目目录中：$PROJECT_ROOT"
+else
+    # 不在项目目录，执行自举 clone
+    if ! command -v git &>/dev/null; then
+        error "未找到 git，请先安装 git 再重试。"
+    fi
+
+    CLONE_DIR="$(realpath "$CLONE_DIR")"
+    if [[ -d "$CLONE_DIR/.git" ]]; then
+        info "目录已存在，拉取最新代码：$CLONE_DIR"
+        git -C "$CLONE_DIR" pull --ff-only
+    else
+        info "克隆项目到：$CLONE_DIR"
+        git clone "$REPO_URL" "$CLONE_DIR"
+    fi
+
+    PROJECT_ROOT="$CLONE_DIR"
+    success "项目已就绪：$PROJECT_ROOT"
+
+    # 切换到项目目录，后续操作均在此目录
+    cd "$PROJECT_ROOT"
+fi
+
+VENV_DIR="$PROJECT_ROOT/.venv"
+CONFIG_EXAMPLE="$PROJECT_ROOT/user/config.example.yaml"
+CONFIG_FILE="$PROJECT_ROOT/user/config.yaml"
+
+# ── 步骤 3：创建或复用虚拟环境 ──────────────────────────────────────────────
+info "步骤 3/5：准备虚拟环境..."
 
 if [[ -f "$VENV_DIR/bin/python" ]]; then
     success "虚拟环境已存在，复用：$VENV_DIR"
@@ -110,20 +151,17 @@ else
 fi
 
 VENV_PYTHON="$VENV_DIR/bin/python"
-VENV_PIP="$VENV_DIR/bin/pip"
 VENV_HACHIMI="$VENV_DIR/bin/hachimi"
 
-# ── 步骤 3：安装依赖 ─────────────────────────────────────────────────────────
-info "步骤 3/5：安装项目依赖（pip install -e .）..."
+# ── 步骤 4：安装依赖 ─────────────────────────────────────────────────────────
+info "步骤 4/5：安装项目依赖（pip install -e .）..."
 
 "$VENV_PYTHON" -m pip install -U pip --quiet
 "$VENV_PYTHON" -m pip install -e "$PROJECT_ROOT" --quiet
 
 success "依赖安装完成。"
 
-# ── 步骤 4：初始化配置文件 ───────────────────────────────────────────────────
-info "步骤 4/5：检查配置文件..."
-
+# ── 初始化配置文件（步骤 4.5，嵌入步骤 4 和 5 之间）────────────────────────
 if [[ -f "$CONFIG_FILE" ]]; then
     success "配置文件已存在：$CONFIG_FILE"
 else
@@ -152,6 +190,7 @@ echo -e "${GREEN}${BOLD}========================================${RESET}"
 echo -e "${GREEN}${BOLD}  部署完成！${RESET}"
 echo -e "${GREEN}${BOLD}========================================${RESET}"
 echo ""
+echo -e "  项目目录：${BOLD}$PROJECT_ROOT${RESET}"
 echo -e "  可执行文件：${BOLD}$VENV_HACHIMI${RESET}"
 echo ""
 echo -e "  ${BOLD}常用命令：${RESET}"
@@ -164,5 +203,5 @@ echo -e "    ${BOLD}echo 'export PATH=\"$VENV_DIR/bin:\$PATH\"' >> ~/.bashrc && 
 echo ""
 if [[ -f "$CONFIG_FILE" ]]; then
     grep -q "sk-xxxxxxxx" "$CONFIG_FILE" 2>/dev/null && \
-        echo -e "  ${YELLOW}${BOLD}[提醒] 检测到配置文件中仍使用示例 API Key，请记得修改 $CONFIG_FILE${RESET}"
+        echo -e "  ${YELLOW}${BOLD}[提醒] 配置文件中仍使用示例 API Key，请记得修改：$CONFIG_FILE${RESET}"
 fi
