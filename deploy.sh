@@ -259,6 +259,18 @@ if [[ "$HACHIMI_CMD" != "hachimi" ]]; then
     echo -e "  ${YELLOW}提示：将 hachimi 加入全局 PATH 以使用简短命令：${RESET}"
     echo -e "    ${BOLD}echo 'export PATH=\"$VENV_DIR/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${RESET}"
     echo ""
+    echo -e "  加入 PATH 后，可直接使用以下短命令："
+    echo -e "    ${BOLD}hachimi${RESET}            进入 CLI 对话"
+    echo -e "    ${BOLD}hachimi status${RESET}      查看后台服务状态"
+    echo -e "    ${BOLD}hachimi start${RESET}       启动后台服务"
+    echo -e "    ${BOLD}hachimi stop${RESET}        停止后台服务"
+    echo -e "    ${BOLD}hachimi restart${RESET}     重启后台服务"
+    echo -e "    ${BOLD}hachimi log${RESET}         实时查看服务日志（Ctrl-C 退出）"
+    echo -e "    ${BOLD}hachimi config${RESET}      编辑配置文件"
+    echo -e "    ${BOLD}hachimi install${RESET}     安装 Playwright 浏览器驱动"
+    echo -e "    ${BOLD}hachimi update${RESET}      更新到最新版本"
+    echo -e "    ${BOLD}hachimi uninstall${RESET}   卸载后台守护服务"
+    echo ""
 fi
 if [[ -f "$CONFIG_FILE" ]]; then
     grep -q "sk-xxxxxxxx" "$CONFIG_FILE" 2>/dev/null && \

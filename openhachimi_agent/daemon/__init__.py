@@ -7,6 +7,7 @@ from openhachimi_agent.daemon.deploy import (
     deploy_daemon,
     deploy_local_script,
     deploy_systemd_user_service,
+    undeploy_daemon,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "deploy_daemon",
     "deploy_local_script",
     "deploy_systemd_user_service",
+    "undeploy_daemon",
 ]

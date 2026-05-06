@@ -29,7 +29,7 @@ import uvicorn
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.core.version import PACKAGE_NAME, get_version
-from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME, deploy_daemon
+from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME, deploy_daemon, undeploy_daemon
 from openhachimi_agent.interface.cli import run_embedded_cli
 
 
@@ -162,6 +162,41 @@ def cmd_install(_args: argparse.Namespace) -> None:
         sys.exit(result.returncode)
 
 
+def cmd_uninstall(args: argparse.Namespace) -> None:
+    """卸载后台守护服务，可选清理虚拟环境或整个项目。"""
+    _warn("即将执行卸载操作，此操作不可撤销！")
+
+    # 构造提示信息
+    actions = ["停止并注销后台守护服务"]
+    if args.purge:
+        actions.append("删除虚拟环境（.venv）")
+    if args.remove_all:
+        actions += ["删除虚拟环境（.venv）", "删除整个项目目录"]
+        args.purge = True  # remove_all 隐含 purge
+
+    print("将执行以下操作：")
+    for act in dict.fromkeys(actions):  # 去重保序
+        print(f"  - {act}")
+    print()
+
+    if not args.yes:
+        try:
+            answer = input("确认继续？输入 yes 继续，其他任意键取消：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            _info("已取消。")
+            return
+        if answer != "yes":
+            _info("已取消。")
+            return
+
+    undeploy_daemon(
+        remove_venv=args.purge or args.remove_all,
+        remove_project=args.remove_all,
+    )
+    _ok("卸载完成。")
+
+
 def cmd_deploy(args: argparse.Namespace) -> None:
     """部署并注册后台守护服务。"""
     config = load_config()
@@ -204,7 +239,7 @@ def main() -> None:
   hachimi log            实时查看服务日志
   hachimi config         编辑配置文件
   hachimi install        安装 Playwright 浏览器驱动
-""",
+  hachimi uninstall      卸载后台守护服务""",
     )
     parser.add_argument(
         "-V",
@@ -232,6 +267,14 @@ def main() -> None:
     sub.add_parser("install", help="安装 Playwright 浏览器驱动（chromium）")
     sub.add_parser("update",  help="检查并更新到最新版本")
 
+    uninstall_p = sub.add_parser("uninstall", help="卸载后台守护服务")
+    uninstall_p.add_argument("-y", "--yes", action="store_true",
+                             help="跳过交互确认，直接执行")
+    uninstall_p.add_argument("--purge", action="store_true",
+                             help="同时删除虚拟环境（.venv）")
+    uninstall_p.add_argument("--remove-all", action="store_true",
+                             help="同时删除虚拟环境和整个项目目录（危险！）")
+
     # ── 部署与运行 ────────────────────────────────────────────────────────────
     deploy_p = sub.add_parser("deploy", help="部署并注册后台守护服务")
     deploy_p.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址（默认 {DEFAULT_HOST}）")
@@ -247,17 +290,18 @@ def main() -> None:
 
     # 命令分发表
     _dispatch = {
-        "status":  cmd_status,
-        "start":   cmd_start,
-        "stop":    cmd_stop,
-        "restart": cmd_restart,
-        "log":     cmd_log,
-        "config":  cmd_config,
-        "install": cmd_install,
-        "update":  cmd_update,
-        "deploy":  cmd_deploy,
-        "serve":   cmd_serve,
-        "cli":     cmd_cli,
+        "status":    cmd_status,
+        "start":     cmd_start,
+        "stop":      cmd_stop,
+        "restart":   cmd_restart,
+        "log":       cmd_log,
+        "config":    cmd_config,
+        "install":   cmd_install,
+        "update":    cmd_update,
+        "uninstall": cmd_uninstall,
+        "deploy":    cmd_deploy,
+        "serve":     cmd_serve,
+        "cli":       cmd_cli,
     }
 
     if args.command in _dispatch:
