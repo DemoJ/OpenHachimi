@@ -170,19 +170,16 @@ install_venv_pkg() {
 # ── 辅助函数：创建 venv，失败时自动修复并重试 ─────────────────────────────
 create_venv() {
     rm -rf "$VENV_DIR"   # 清除可能存在的残破目录
-    if "$PYTHON" -m venv "$VENV_DIR" 2>/tmp/_oh_venv_err; then
-        return 0
-    fi
-    if grep -qi "ensurepip\|venv" /tmp/_oh_venv_err 2>/dev/null; then
+
+    # 提前检测 ensurepip 是否可用（Ubuntu/Debian 默认不包含，会导致 venv 创建失败）
+    # 比捕获错误文本更可靠，避免 stdout/stderr 重定向问题
+    if ! "$PYTHON" -c "import ensurepip" 2>/dev/null; then
         install_venv_pkg
-        info "重新创建虚拟环境..."
-        if ! "$PYTHON" -m venv "$VENV_DIR" 2>/tmp/_oh_venv_err; then
-            cat /tmp/_oh_venv_err >&2
-            error "安装依赖包后仍无法创建虚拟环境，请查看上方错误信息。"
-        fi
-    else
-        cat /tmp/_oh_venv_err >&2
-        error "创建虚拟环境失败，请查看上方错误信息。"
+    fi
+
+    # 创建 venv
+    if ! "$PYTHON" -m venv "$VENV_DIR" 2>&1; then
+        error "创建虚拟环境失败，请检查你的 Python 安装。"
     fi
 }
 
