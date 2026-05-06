@@ -1,66 +1,270 @@
-"""OpenHachimi 命令入口。"""
+"""OpenHachimi 命令入口。
+
+子命令速查：
+  hachimi              进入 CLI 对话（默认行为）
+  hachimi status       查看后台服务状态
+  hachimi start        启动后台服务
+  hachimi stop         停止后台服务
+  hachimi restart      重启后台服务
+  hachimi log          实时查看服务日志
+  hachimi config       编辑配置文件
+  hachimi deploy       部署并注册后台守护服务
+  hachimi serve        直接在前台运行 HTTP 服务（调试用）
+  hachimi update       更新到最新版本
+  hachimi install      安装 Playwright 浏览器驱动
+"""
 
 import argparse
 import asyncio
 import logging
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import uvicorn
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.core.version import PACKAGE_NAME, get_version
-from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, deploy_daemon
-from openhachimi_agent.interface.cli import run_cli, run_embedded_cli
+from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME, deploy_daemon
+from openhachimi_agent.interface.cli import run_embedded_cli
 
 
 logger = logging.getLogger(__name__)
 
+# ── 颜色输出（终端支持时启用）─────────────────────────────────────────────────
+_USE_COLOR = sys.stdout.isatty() and platform.system().lower() != "windows"
+
+def _c(code: str, text: str) -> str:
+    """用 ANSI 色码包裹文字，不支持颜色时原样返回。"""
+    if not _USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+def _ok(msg: str)   -> None: print(_c("32", f"[OK]    {msg}"))
+def _info(msg: str) -> None: print(_c("34", f"[INFO]  {msg}"))
+def _warn(msg: str) -> None: print(_c("33", f"[WARN]  {msg}"))
+def _err(msg: str)  -> None: print(_c("31", f"[ERROR] {msg}"), file=sys.stderr)
+
+
+# ── systemd 工具函数 ───────────────────────────────────────────────────────────
+
+def _has_systemd() -> bool:
+    """检查当前系统是否支持 systemctl --user。"""
+    return (
+        platform.system().lower() == "linux"
+        and shutil.which("systemctl") is not None
+    )
+
+
+def _systemctl(*args: str, check: bool = False) -> int:
+    """运行 systemctl --user <args>，返回退出码。"""
+    cmd = ["systemctl", "--user", *args]
+    result = subprocess.run(cmd, check=False)
+    if check and result.returncode != 0:
+        _err(f"systemctl 命令失败（退出码 {result.returncode}）：{' '.join(cmd)}")
+        sys.exit(result.returncode)
+    return result.returncode
+
+
+def _require_systemd() -> None:
+    """若不支持 systemd，打印提示并退出。"""
+    if not _has_systemd():
+        _err("当前系统不支持 systemd，无法使用此命令。")
+        _info("请手动运行后台脚本，或使用 `hachimi serve` 在前台启动服务。")
+        sys.exit(1)
+
+
+# ── 子命令实现 ────────────────────────────────────────────────────────────────
+
+def cmd_status(_args: argparse.Namespace) -> None:
+    """查看后台服务状态。"""
+    _require_systemd()
+    _systemctl("status", SERVICE_NAME)
+
+
+def cmd_start(_args: argparse.Namespace) -> None:
+    """启动后台服务。"""
+    _require_systemd()
+    _info(f"正在启动 {SERVICE_NAME} 服务...")
+    _systemctl("start", SERVICE_NAME, check=True)
+    _ok("服务已启动。使用 `hachimi status` 确认运行状态。")
+
+
+def cmd_stop(_args: argparse.Namespace) -> None:
+    """停止后台服务。"""
+    _require_systemd()
+    _info(f"正在停止 {SERVICE_NAME} 服务...")
+    _systemctl("stop", SERVICE_NAME, check=True)
+    _ok("服务已停止。")
+
+
+def cmd_restart(_args: argparse.Namespace) -> None:
+    """重启后台服务。"""
+    _require_systemd()
+    _info(f"正在重启 {SERVICE_NAME} 服务...")
+    _systemctl("restart", SERVICE_NAME, check=True)
+    _ok("服务已重启。使用 `hachimi status` 确认运行状态。")
+
+
+def cmd_log(args: argparse.Namespace) -> None:
+    """实时查看服务日志（默认跟随，Ctrl-C 退出）。"""
+    _require_systemd()
+    cmd = ["journalctl", "--user", "-u", SERVICE_NAME]
+    if not args.no_follow:
+        cmd.append("-f")
+    if args.lines:
+        cmd += ["-n", str(args.lines)]
+    os.execvp(cmd[0], cmd)   # 替换当前进程，让 journalctl 直接接管终端
+
+
+def cmd_config(_args: argparse.Namespace) -> None:
+    """用编辑器打开配置文件。"""
+    config = load_config()
+    config_path = config.config_path
+    if not config_path.exists():
+        _err(f"配置文件不存在：{config_path}")
+        _info("请先运行 `hachimi deploy` 完成初始部署。")
+        sys.exit(1)
+
+    # 按优先级选择编辑器
+    editor = (
+        os.environ.get("EDITOR")
+        or os.environ.get("VISUAL")
+        or shutil.which("nano")
+        or shutil.which("vim")
+        or shutil.which("vi")
+    )
+    if not editor:
+        _err("未找到可用的文本编辑器，请设置 $EDITOR 环境变量。")
+        _info(f"配置文件路径：{config_path}")
+        sys.exit(1)
+
+    _info(f"使用 {editor} 打开配置文件：{config_path}")
+    os.execvp(editor, [editor, str(config_path)])
+
+
+def cmd_install(_args: argparse.Namespace) -> None:
+    """安装 Playwright 浏览器驱动（chromium）。"""
+    _info("正在安装 Playwright 浏览器驱动（chromium）...")
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=False,
+    )
+    if result.returncode == 0:
+        _ok("Playwright 浏览器驱动安装完成。")
+    else:
+        _err("安装失败，请检查网络连接或手动运行：")
+        _info("  playwright install chromium")
+        sys.exit(result.returncode)
+
+
+def cmd_deploy(args: argparse.Namespace) -> None:
+    """部署并注册后台守护服务。"""
+    config = load_config()
+    configure_logging(config)
+    logger.info("deploy command host=%s port=%s", args.host, args.port)
+    deploy_daemon(args.host, args.port)
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    """在前台直接运行 HTTP 服务（调试用）。"""
+    config = load_config()
+    configure_logging(config)
+    logger.info("serve command host=%s port=%s", args.host, args.port)
+    uvicorn.run("openhachimi_agent.interface.http:app", host=args.host, port=args.port)
+
+
+def cmd_update(_args: argparse.Namespace) -> None:
+    """检查并更新到最新版本。"""
+    from openhachimi_agent.core.updater import run_update
+    run_update()
+
+
+def cmd_cli(_args: argparse.Namespace) -> None:
+    """进入 CLI 对话模式。"""
+    asyncio.run(run_embedded_cli())
+
+
+# ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="openhachimi")
+    parser = argparse.ArgumentParser(
+        prog="hachimi",
+        description="OpenHachimi 管理工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+常用命令：
+  hachimi                进入 CLI 对话（默认）
+  hachimi status         查看后台服务状态
+  hachimi restart        重启后台服务
+  hachimi log            实时查看服务日志
+  hachimi config         编辑配置文件
+  hachimi install        安装 Playwright 浏览器驱动
+""",
+    )
     parser.add_argument(
         "-V",
         "--version",
         action="version",
         version=f"{PACKAGE_NAME} {get_version()}",
     )
-    subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("cli", help="连接本地后台服务并进入 CLI 对话")
+    sub = parser.add_subparsers(dest="command", metavar="<子命令>")
 
-    deploy_parser = subparsers.add_parser("deploy", help="部署并启动本地后台守护服务")
-    deploy_parser.add_argument("--host", default=DEFAULT_HOST)
-    deploy_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    # ── 服务管理 ──────────────────────────────────────────────────────────────
+    sub.add_parser("status",  help="查看后台服务状态")
+    sub.add_parser("start",   help="启动后台服务")
+    sub.add_parser("stop",    help="停止后台服务")
+    sub.add_parser("restart", help="重启后台服务")
 
-    serve_parser = subparsers.add_parser("serve", help="启动 localhost HTTP 后台服务")
-    serve_parser.add_argument("--host", default=DEFAULT_HOST)
-    serve_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    log_p = sub.add_parser("log", help="实时查看服务日志（Ctrl-C 退出）")
+    log_p.add_argument("-n", "--lines", type=int, default=None, metavar="N",
+                       help="显示最近 N 行日志")
+    log_p.add_argument("--no-follow", action="store_true",
+                       help="不跟随日志，输出后直接退出")
 
-    subparsers.add_parser("update", help="检查并更新到最新版本")
+    # ── 配置与工具 ────────────────────────────────────────────────────────────
+    sub.add_parser("config",  help="用编辑器打开配置文件")
+    sub.add_parser("install", help="安装 Playwright 浏览器驱动（chromium）")
+    sub.add_parser("update",  help="检查并更新到最新版本")
+
+    # ── 部署与运行 ────────────────────────────────────────────────────────────
+    deploy_p = sub.add_parser("deploy", help="部署并注册后台守护服务")
+    deploy_p.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址（默认 {DEFAULT_HOST}）")
+    deploy_p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
+
+    serve_p = sub.add_parser("serve", help="在前台运行 HTTP 服务（调试用）")
+    serve_p.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址（默认 {DEFAULT_HOST}）")
+    serve_p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
+
+    sub.add_parser("cli", help="进入 CLI 对话（与默认行为相同）")
 
     args = parser.parse_args()
 
-    if args.command == "update":
-        from openhachimi_agent.core.updater import run_update
+    # 命令分发表
+    _dispatch = {
+        "status":  cmd_status,
+        "start":   cmd_start,
+        "stop":    cmd_stop,
+        "restart": cmd_restart,
+        "log":     cmd_log,
+        "config":  cmd_config,
+        "install": cmd_install,
+        "update":  cmd_update,
+        "deploy":  cmd_deploy,
+        "serve":   cmd_serve,
+        "cli":     cmd_cli,
+    }
 
-        run_update()
-        return
-
-    if args.command == "deploy":
-        config = load_config()
-        configure_logging(config)
-        logger.info("deploy command host=%s port=%s", args.host, args.port)
-        deploy_daemon(args.host, args.port)
-        return
-
-    if args.command == "serve":
-        config = load_config()
-        configure_logging(config)
-        logger.info("serve command host=%s port=%s", args.host, args.port)
-        uvicorn.run("openhachimi_agent.interface.http:app", host=args.host, port=args.port)
-        return
-
-    asyncio.run(run_embedded_cli())
+    if args.command in _dispatch:
+        _dispatch[args.command](args)
+    else:
+        # 无子命令 → 默认进入 CLI 对话
+        asyncio.run(run_embedded_cli())
 
 
 if __name__ == "__main__":

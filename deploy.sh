@@ -229,6 +229,13 @@ else
 fi
 
 # ── 完成提示 ─────────────────────────────────────────────────────────────────
+
+# 检查 hachimi 是否已在 PATH 中
+HACHIMI_CMD="$VENV_HACHIMI"
+if command -v hachimi &>/dev/null; then
+    HACHIMI_CMD="hachimi"
+fi
+
 echo ""
 echo -e "${GREEN}${BOLD}========================================${RESET}"
 echo -e "${GREEN}${BOLD}  部署完成！${RESET}"
@@ -238,14 +245,25 @@ echo -e "  项目目录：${BOLD}$PROJECT_ROOT${RESET}"
 echo -e "  可执行文件：${BOLD}$VENV_HACHIMI${RESET}"
 echo ""
 echo -e "  ${BOLD}常用命令：${RESET}"
-echo -e "    进入 CLI 对话：  ${BOLD}$VENV_HACHIMI${RESET}"
-echo -e "    查看服务状态：  ${BOLD}systemctl --user status openhachimi${RESET}"
-echo -e "    实时查看日志：  ${BOLD}journalctl --user -u openhachimi -f${RESET}"
+echo -e "    ${BOLD}$HACHIMI_CMD${RESET}            进入 CLI 对话"
+echo -e "    ${BOLD}$HACHIMI_CMD status${RESET}      查看后台服务状态"
+echo -e "    ${BOLD}$HACHIMI_CMD start${RESET}       启动后台服务"
+echo -e "    ${BOLD}$HACHIMI_CMD stop${RESET}        停止后台服务"
+echo -e "    ${BOLD}$HACHIMI_CMD restart${RESET}     重启后台服务"
+echo -e "    ${BOLD}$HACHIMI_CMD log${RESET}         实时查看服务日志（Ctrl-C 退出）"
+echo -e "    ${BOLD}$HACHIMI_CMD config${RESET}      编辑配置文件"
+echo -e "    ${BOLD}$HACHIMI_CMD install${RESET}     安装 Playwright 浏览器驱动"
+echo -e "    ${BOLD}$HACHIMI_CMD update${RESET}      更新到最新版本"
 echo ""
-echo -e "  如需将 hachimi 加入全局 PATH，可运行："
-echo -e "    ${BOLD}echo 'export PATH=\"$VENV_DIR/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${RESET}"
-echo ""
+if [[ "$HACHIMI_CMD" != "hachimi" ]]; then
+    echo -e "  ${YELLOW}提示：将 hachimi 加入全局 PATH 以使用简短命令：${RESET}"
+    echo -e "    ${BOLD}echo 'export PATH=\"$VENV_DIR/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${RESET}"
+    echo ""
+fi
 if [[ -f "$CONFIG_FILE" ]]; then
     grep -q "sk-xxxxxxxx" "$CONFIG_FILE" 2>/dev/null && \
-        echo -e "  ${YELLOW}${BOLD}[提醒] 配置文件中仍使用示例 API Key，请记得修改：$CONFIG_FILE${RESET}"
+        echo -e "  ${YELLOW}${BOLD}[提醒] 配置文件中仍使用示例 API Key，请记得修改：${RESET}"
+    grep -q "sk-xxxxxxxx" "$CONFIG_FILE" 2>/dev/null && \
+        echo -e "    ${BOLD}$HACHIMI_CMD config${RESET}"
+    echo ""
 fi
