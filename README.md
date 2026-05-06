@@ -96,7 +96,48 @@ llm:
 
 ## 一键部署
 
-项目提供统一的一键部署入口，会自动根据当前环境完成虚拟环境创建、依赖安装、命令入口安装和后台守护部署。
+### Linux 一键部署（推荐）
+
+在 Linux 环境下，直接运行项目根目录的 Shell 脚本即可完成全部部署流程：
+
+```bash
+bash deploy.sh
+```
+
+脚本会依次自动完成：
+
+1. **检查 Python 版本**（需要 3.10+，否则给出安装提示）
+2. **创建或复用 `.venv` 虚拟环境**
+3. **安装项目依赖**（`pip install -e .`）
+4. **初始化配置文件**：如果 `user/config.yaml` 不存在，从模板复制一份并提示填写 API Key
+5. **部署后台守护服务**：在支持 systemd 的环境下注册 `systemd --user` 服务
+
+**常用选项：**
+
+```bash
+# 指定监听地址和端口
+bash deploy.sh --host 0.0.0.0 --port 9000
+
+# 只安装依赖，不启动后台守护服务
+bash deploy.sh --skip-daemon
+
+# 查看所有可用选项
+bash deploy.sh --help
+```
+
+部署完成后，将虚拟环境加入 PATH（可选，一次性操作）：
+
+```bash
+echo 'export PATH="$PWD/.venv/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+之后就可以直接使用 `hachimi` 命令。
+
+---
+
+### 跨平台 Python 部署脚本
+
+项目同时提供跨平台的 Python 部署入口，适用于 Windows / Linux / macOS：
 
 ```bash
 python deploy.py
