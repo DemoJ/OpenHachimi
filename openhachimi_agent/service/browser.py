@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 import os
+import socket
 import sys
 import shutil
 import subprocess
@@ -30,17 +31,204 @@ class BrowserManager:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._chrome_process = None
+        self._chrome_stderr_file = None
         self._lock = asyncio.Lock()
         
         # 存储当前页面的可交互元素映射表：id -> locator
         # 这样 LLM 只需要返回一个数字 ID 就能点击
         self._element_mapping: dict[int, str] = {}
 
+    def _find_free_port(self) -> int:
+        """让系统分配一个当前可用的本地端口，避免固定 9222 端口冲突。"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _read_process_environ(self, pid: str) -> dict[str, str]:
+        environ_path = f"/proc/{pid}/environ"
+        try:
+            with open(environ_path, "rb") as file:
+                raw = file.read()
+        except OSError:
+            return {}
+
+        env: dict[str, str] = {}
+        for item in raw.split(b"\0"):
+            if not item or b"=" not in item:
+                continue
+            key, value = item.split(b"=", 1)
+            try:
+                env[key.decode("utf-8")] = value.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        return env
+
+    def _discover_linux_desktop_env(self) -> dict[str, str]:
+        """从同用户的图形会话进程中补齐 systemd 后台服务缺失的桌面环境变量。"""
+        if sys.platform != "linux":
+            return {}
+
+        wanted = {
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_RUNTIME_DIR",
+            "XDG_SESSION_TYPE",
+        }
+        current = {key: value for key in wanted if (value := os.environ.get(key))}
+        if current.get("DISPLAY") or current.get("WAYLAND_DISPLAY"):
+            return current
+
+        uid = os.getuid()
+        preferred_names = (
+            "gnome-session",
+            "gnome-shell",
+            "plasmashell",
+            "xfce4-session",
+            "xrdp",
+            "Xorg",
+            "Xwayland",
+            "chrome",
+            "chromium",
+        )
+        candidates: list[dict[str, str]] = []
+
+        try:
+            proc_entries = list(os.scandir("/proc"))
+        except OSError:
+            return current
+
+        for entry in proc_entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                if entry.stat(follow_symlinks=False).st_uid != uid:
+                    continue
+            except OSError:
+                continue
+
+            env = self._read_process_environ(entry.name)
+            if not (env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")):
+                continue
+
+            try:
+                with open(f"/proc/{entry.name}/comm", "r", encoding="utf-8") as file:
+                    name = file.read().strip()
+            except OSError:
+                name = ""
+
+            score = 0
+            if env.get("DISPLAY"):
+                score += 2
+            if env.get("DBUS_SESSION_BUS_ADDRESS"):
+                score += 2
+            if env.get("XAUTHORITY"):
+                score += 1
+            if any(token in name for token in preferred_names):
+                score += 3
+            env["_score"] = str(score)
+            candidates.append(env)
+
+        if not candidates:
+            inferred = self._infer_x11_env_from_socket()
+            if inferred:
+                logger.info("从 X11 socket 推断浏览器环境: DISPLAY=%s", inferred.get("DISPLAY"))
+                return inferred
+            return current
+
+        best = max(candidates, key=lambda item: int(item.get("_score", "0")))
+        desktop_env = {key: value for key in wanted if (value := best.get(key))}
+        logger.info(
+            "从现有桌面会话补齐浏览器环境: DISPLAY=%s WAYLAND_DISPLAY=%s XDG_SESSION_TYPE=%s",
+            desktop_env.get("DISPLAY"),
+            desktop_env.get("WAYLAND_DISPLAY"),
+            desktop_env.get("XDG_SESSION_TYPE"),
+        )
+        return desktop_env
+
+    def _infer_x11_env_from_socket(self) -> dict[str, str]:
+        """在拿不到会话环境时，根据 /tmp/.X11-unix/X* 兜底推断 X11 DISPLAY。"""
+        if sys.platform != "linux":
+            return {}
+
+        socket_dir = "/tmp/.X11-unix"
+        try:
+            entries = [
+                entry for entry in os.scandir(socket_dir)
+                if entry.name.startswith("X") and entry.name[1:].isdigit()
+            ]
+        except OSError:
+            return {}
+
+        if not entries:
+            return {}
+
+        try:
+            best = max(entries, key=lambda entry: entry.stat(follow_symlinks=False).st_mtime)
+        except OSError:
+            return {}
+
+        env = {
+            "DISPLAY": f":{best.name[1:]}",
+            "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus",
+        }
+        xauthority = os.path.expanduser("~/.Xauthority")
+        if os.path.exists(xauthority):
+            env["XAUTHORITY"] = xauthority
+        return env
+
+    def _browser_process_env(self, headless: bool) -> dict[str, str]:
+        env = os.environ.copy()
+        if sys.platform == "linux":
+            env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            env.update(self._discover_linux_desktop_env())
+            if not headless and not (env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")):
+                raise RuntimeError(
+                    "当前后台服务没有可用的 Linux 图形会话环境（DISPLAY/WAYLAND_DISPLAY 为空），"
+                    "无法启动可视浏览器。请在远程桌面会话内启动服务，或将 app.browser_headless 改为 true。"
+                )
+        return env
+
+    def _tail_chrome_stderr(self) -> str:
+        stderr_path = self.config.log_dir / "chrome-browser.log"
+        if not stderr_path.exists():
+            return ""
+        try:
+            with stderr_path.open("rb") as file:
+                file.seek(0, os.SEEK_END)
+                file_size = file.tell()
+                file.seek(max(file_size - 8192, 0))
+                stderr_bytes = file.read()
+        except Exception:
+            return ""
+        if not stderr_bytes:
+            return ""
+        text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        lines = text.splitlines()
+        return "\n".join(lines[-40:])
+
     def _find_chrome_executable(self) -> str:
         """寻找系统中真实的 Chrome/Edge 可执行文件路径"""
         config_path = getattr(self.config, 'browser_channel', '')
         if config_path and os.path.isabs(config_path) and os.path.exists(config_path):
             return config_path
+        config_alias = config_path.lower() if config_path else ""
+
+        channel_aliases = {
+            "chrome": ["google-chrome", "google-chrome-stable"],
+            "google-chrome": ["google-chrome", "google-chrome-stable"],
+            "chromium": ["chromium-browser", "chromium"],
+            "msedge": ["microsoft-edge", "microsoft-edge-stable"],
+            "edge": ["microsoft-edge", "microsoft-edge-stable"],
+        }
+        if config_alias in channel_aliases:
+            for command in channel_aliases[config_alias]:
+                cmd = shutil.which(command)
+                if cmd:
+                    return cmd
             
         if sys.platform == "win32":
             paths = [
@@ -61,13 +249,13 @@ class BrowserManager:
                 if os.path.exists(p):
                     return p
         else:
-            paths = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "microsoft-edge"]
+            paths = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "microsoft-edge", "microsoft-edge-stable"]
             for p in paths:
                 cmd = shutil.which(p)
                 if cmd:
                     return cmd
                     
-        raise RuntimeError("无法找到系统中安装的 Chrome 或 Edge 浏览器。请在 config.yaml 中配置 browser_channel 指定绝对路径。")
+        raise RuntimeError("无法找到系统中安装的 Chrome 或 Edge 浏览器。请在 config.yaml 中配置 browser_channel 为 chrome、msedge 或绝对路径。")
 
 
     async def _ensure_browser(self) -> Page:
@@ -102,7 +290,8 @@ class BrowserManager:
                 
                 try:
                     chrome_path = self._find_chrome_executable()
-                    port = 9222
+                    port = self._find_free_port()
+                    browser_env = self._browser_process_env(headless)
                     
                     args = [
                         chrome_path,
@@ -110,32 +299,67 @@ class BrowserManager:
                         f"--user-data-dir={user_data_dir}",
                         "--no-first-run",
                         "--no-default-browser-check",
+                        "--disable-dev-shm-usage",
+                        "--disable-background-networking",
+                        "--disable-renderer-backgrounding",
+                        "--disable-background-timer-throttling",
+                        "--password-store=basic",
+                        "--window-size=1280,900",
                     ]
+                    if sys.platform == "linux":
+                        args.extend([
+                            "--no-sandbox",
+                            "--disable-gpu",
+                            "--enable-automation",
+                        ])
                     if headless:
                         args.extend(["--headless=new"])
                         
-                    logger.info("以 CDP 接管模式启动原生浏览器: %s", chrome_path)
+                    logger.info(
+                        "以 CDP 接管模式启动原生浏览器: path=%s port=%s headless=%s display=%s wayland=%s",
+                        chrome_path,
+                        port,
+                        headless,
+                        browser_env.get("DISPLAY"),
+                        browser_env.get("WAYLAND_DISPLAY"),
+                    )
+                    chrome_stderr_path = self.config.log_dir / "chrome-browser.log"
+                    chrome_stderr_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._chrome_stderr_file = chrome_stderr_path.open("ab", buffering=0)
                     self._chrome_process = subprocess.Popen(
                         args,
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
+                        stderr=self._chrome_stderr_file,
+                        env=browser_env,
                     )
                     
                     # 等待调试端口就绪
                     max_retries = 30
                     port_ready = False
                     for _ in range(max_retries):
+                        if self._chrome_process.poll() is not None:
+                            stderr_tail = self._tail_chrome_stderr()
+                            detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
+                            raise RuntimeError(
+                                f"Chrome 进程已退出，无法建立 CDP 连接（退出码 {self._chrome_process.returncode}）。{detail}"
+                            )
                         try:
-                            response = urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1)
-                            if response.getcode() == 200:
-                                port_ready = True
-                                break
+                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as response:
+                                if response.getcode() == 200:
+                                    port_ready = True
+                                    break
                         except (urllib.error.URLError, ConnectionError):
                             pass
                         await asyncio.sleep(0.5)
                         
                     if not port_ready:
-                        raise RuntimeError(f"等待浏览器 CDP 端口 {port} 就绪超时！可能已被其他程序占用，请尝试关闭所有 Chrome 窗口。")
+                        stderr_tail = self._tail_chrome_stderr()
+                        detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
+                        raise RuntimeError(
+                            f"等待浏览器 CDP 端口 {port} 就绪超时。"
+                            "请查看 Chrome stderr 判断是否为显示环境、权限、沙箱或 profile 锁定问题。"
+                            f"{detail}"
+                        )
                         
                     # Playwright 接管
                     self._browser = await self._playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -150,6 +374,9 @@ class BrowserManager:
                     if self._chrome_process:
                         self._chrome_process.kill()
                         self._chrome_process = None
+                    if self._chrome_stderr_file:
+                        self._chrome_stderr_file.close()
+                        self._chrome_stderr_file = None
                     raise
 
             try:
@@ -580,6 +807,12 @@ class BrowserManager:
                     logger.error("关闭 Chrome 进程失败: %s", e)
                 finally:
                     self._chrome_process = None
+            if self._chrome_stderr_file:
+                try:
+                    self._chrome_stderr_file.close()
+                except Exception:
+                    pass
+                self._chrome_stderr_file = None
                     
             logger.info("Playwright 浏览器已关闭。")
 

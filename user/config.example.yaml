@@ -1,7 +1,7 @@
 app:
   default_role: default
-  browser_headless: true     # 是否无头模式运行浏览器（开发测试时建议 false，后台服务建议 true）
-  browser_channel: ""        # 本地浏览器的通道，如果安装了 Chrome，可以填 "chrome" 或 "msedge"，无需安装内核。如果留空，则使用 Playwright 默认的 Chromium
+  browser_headless: true     # 是否无头模式运行浏览器；Ubuntu 远程桌面若要显示窗口可设为 false，服务会尝试自动继承图形会话环境
+  browser_channel: ""        # 本地浏览器：可填 "chrome" / "chromium" / "msedge" 或绝对路径，如 /usr/bin/google-chrome
   telegram_bot_token: ""     # Telegram Bot Token，通过 @BotFather 申请后填入。留空则不启用 Telegram 渠道
   telegram_proxy_url: ""     # 代理地址（可选），在无法直连 Telegram 的环境下配置。支持 HTTP/SOCKS5，例如：
                              #   socks5://127.0.0.1:1080
