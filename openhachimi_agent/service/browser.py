@@ -9,6 +9,7 @@ import socket
 import sys
 import shutil
 import subprocess
+from urllib.parse import urlsplit, urlunsplit
 from typing import Any
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -37,6 +38,21 @@ class BrowserManager:
         # 这样 LLM 只需要返回一个数字 ID 就能点击
         self._element_mapping: dict[int, str] = {}
 
+    def _ensure_local_proxy_bypass(self) -> None:
+        """保留外网代理，但强制本机 CDP 连接绕过代理。"""
+        local_hosts = ["127.0.0.1", "localhost", "::1"]
+        for key in ("NO_PROXY", "no_proxy"):
+            values = [
+                item.strip()
+                for item in os.environ.get(key, "").split(",")
+                if item.strip()
+            ]
+            existing = {item.lower() for item in values}
+            for host in local_hosts:
+                if host.lower() not in existing:
+                    values.append(host)
+            os.environ[key] = ",".join(values)
+
     def _find_free_port(self) -> int:
         """让系统分配一个当前可用的本地端口，避免固定 9222 端口冲突。"""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -47,7 +63,7 @@ class BrowserManager:
         """用原生 socket 读取 CDP websocket 地址，避免 urllib/代理和 /json/version/ 兼容问题。"""
         request = (
             "GET /json/version HTTP/1.1\r\n"
-            "Host: 127.0.0.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
             "Connection: close\r\n"
             "\r\n"
         ).encode("ascii")
@@ -78,7 +94,17 @@ class BrowserManager:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
         websocket_url = payload.get("webSocketDebuggerUrl")
-        return websocket_url if isinstance(websocket_url, str) and websocket_url.startswith("ws") else None
+        if not isinstance(websocket_url, str) or not websocket_url.startswith("ws"):
+            return None
+        return self._normalize_cdp_websocket_url(websocket_url, port)
+
+    def _normalize_cdp_websocket_url(self, websocket_url: str, port: int) -> str:
+        """有些代理/Host 场景下 Chrome 返回的 ws 地址缺端口，这里补回实际 CDP 端口。"""
+        parsed = urlsplit(websocket_url)
+        if parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port is None:
+            netloc = f"{parsed.hostname}:{port}"
+            return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+        return websocket_url
 
     def _read_process_environ(self, pid: str) -> dict[str, str]:
         environ_path = f"/proc/{pid}/environ"
@@ -218,6 +244,14 @@ class BrowserManager:
 
     def _browser_process_env(self, headless: bool) -> dict[str, str]:
         env = os.environ.copy()
+        local_no_proxy = ["127.0.0.1", "localhost", "::1"]
+        for key in ("NO_PROXY", "no_proxy"):
+            values = [item.strip() for item in env.get(key, "").split(",") if item.strip()]
+            existing = {item.lower() for item in values}
+            for host in local_no_proxy:
+                if host.lower() not in existing:
+                    values.append(host)
+            env[key] = ",".join(values)
         if sys.platform == "linux":
             env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
             env.update(self._discover_linux_desktop_env())
@@ -305,6 +339,7 @@ class BrowserManager:
 
             logger.info("启动 Playwright 浏览器...")
             if not self._playwright:
+                self._ensure_local_proxy_bypass()
                 self._playwright = await async_playwright().start()
 
             # 检测现有浏览器或上下文是否被意外关闭
