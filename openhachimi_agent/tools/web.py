@@ -28,6 +28,12 @@ WEB_TIMEOUT_SECONDS = 20
 WEB_USER_AGENT = "OpenHachimi-Agent/0.1 (+https://github.com/DemoJ/OpenHachimi)"
 
 
+class WebFetchError(Exception):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class ResourceLinkParser(HTMLParser):
     def __init__(self, base_url: str) -> None:
         super().__init__()
@@ -113,9 +119,9 @@ def _request_url(url: str) -> tuple[str, str, str]:
             raw = response.read(MAX_WEB_RESPONSE_CHARS + 1)
     except HTTPError as exc:
         body = exc.read(12000).decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {body}") from exc
+        raise WebFetchError(f"HTTP {exc.code} {exc.reason}: {body}", status_code=exc.code) from exc
     except URLError as exc:
-        raise RuntimeError(f"请求失败：{exc}") from exc
+        raise WebFetchError(f"请求失败：{exc}") from exc
 
     charset = "utf-8"
     match = re.search(r"charset=([\w.-]+)", content_type, re.IGNORECASE)
@@ -142,7 +148,13 @@ def web_fetch(ctx: RunContext[AppConfig], url: str) -> str:
     del ctx
     target_url = _validate_public_url(url)
     logger.info("tool web_fetch url=%s", target_url)
-    final_url, content_type, text = _request_url(target_url)
+    try:
+        final_url, content_type, text = _request_url(target_url)
+    except WebFetchError as exc:
+        if exc.status_code in {401, 403, 429, 503}:
+            return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请改用 browser_navigate 等浏览器相关工具来访问此页面。"
+        return f"Fetch failed: {exc}"
+    
     text = _maybe_pretty_json(text)
     trimmed, truncated = trim_output(text, MAX_WEB_RESPONSE_CHARS)
     header = [
@@ -163,7 +175,12 @@ def discover_web_resources(ctx: RunContext[AppConfig], url: str) -> str:
     del ctx
     target_url = _validate_public_url(url)
     logger.info("tool discover_web_resources url=%s", target_url)
-    final_url, content_type, text = _request_url(target_url)
+    try:
+        final_url, content_type, text = _request_url(target_url)
+    except WebFetchError as exc:
+        if exc.status_code in {401, 403, 429, 503}:
+            return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请改用 browser_navigate 等浏览器相关工具来访问此页面。"
+        return f"Fetch failed: {exc}"
 
     parser = ResourceLinkParser(final_url)
     parser.feed(text[:MAX_WEB_RESPONSE_CHARS])
