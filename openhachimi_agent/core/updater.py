@@ -189,8 +189,9 @@ def _merge_ff_only(project_root: Path, ref: str) -> bool:
 
 def _print_restart_hint() -> None:
     print("  如果正在运行后台守护服务，请重启以使更新生效：")
-    print("    systemctl --user restart openhachimi   # Linux systemd")
-    print("    或重新运行 hachimi deploy")
+    print("    如果已将哈基米加入 PATH，可以直接运行：hachimi restart")
+    print("    或者对于 Linux systemd：systemctl --user restart openhachimi")
+    print("    或者重新运行：hachimi deploy")
 
 
 def run_update(*, force: bool = False) -> None:
