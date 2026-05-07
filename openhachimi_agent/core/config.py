@@ -32,6 +32,8 @@ class AppConfig:
     browser_channel: str | None
     telegram_bot_token: str | None
     telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
+    agent_timeout_seconds: int
+    stream_idle_timeout_seconds: int
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -65,6 +67,15 @@ def _config_bool(section: dict[str, Any], key: str, default: bool = False) -> bo
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _config_int(section: dict[str, Any], key: str, default: int, minimum: int = 1) -> int:
+    value = section.get(key, default)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"config.yaml 中的 {key} 必须是整数。") from exc
+    return max(minimum, parsed)
 
 
 def load_config() -> AppConfig:
@@ -121,4 +132,6 @@ def load_config() -> AppConfig:
         browser_channel=_config_string(app_config, "browser_channel") or None,
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
+        agent_timeout_seconds=_config_int(app_config, "agent_timeout_seconds", 300),
+        stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
     )

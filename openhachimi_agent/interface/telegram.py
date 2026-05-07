@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from telegram import Update, constants
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +35,17 @@ logger = logging.getLogger(__name__)
 _EDIT_INTERVAL = 1.5
 # 单条 Telegram 消息最大字符数（官方限制 4096，留余量）
 _MAX_MSG_LEN = 4000
+
+
+def _exception_text(exc: BaseException) -> str:
+    text = str(exc).strip()
+    if text:
+        return f"{exc.__class__.__name__}: {text}"
+    return exc.__class__.__name__
+
+
+def _is_message_not_modified(exc: BaseException) -> bool:
+    return "message is not modified" in str(exc).lower()
 
 
 def _split_long_text(text: str) -> list[str]:
@@ -256,8 +268,12 @@ class TelegramBot:
                     try:
                         display = _md_to_tg_html(part)
                         parse_mode = constants.ParseMode.HTML
-                    except Exception:
-                        logger.warning("markdown to html conversion failed, fallback to plain text")
+                    except Exception as exc:
+                        logger.warning(
+                            "markdown to html conversion failed, fallback to plain text: %s",
+                            _exception_text(exc),
+                            exc_info=True,
+                        )
                         display = part
                         parse_mode = None
                 else:
@@ -268,11 +284,32 @@ class TelegramBot:
                 if i < len(sent_parts):
                     try:
                         await sent_parts[i].edit_text(display, parse_mode=parse_mode)
-                    except Exception:
-                        pass  # 内容未变化时 Telegram 会报错，忽略即可
+                    except TelegramError as exc:
+                        if _is_message_not_modified(exc):
+                            continue
+                        logger.warning(
+                            "telegram edit_text failed user_id=%d part=%d final=%s: %s",
+                            user_id,
+                            i,
+                            final,
+                            _exception_text(exc),
+                            exc_info=True,
+                        )
+                        try:
+                            new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
+                            sent_parts[i] = new_msg
+                        except Exception as fallback_exc:
+                            raise RuntimeError(
+                                "Telegram 更新回复失败，且发送备用消息也失败："
+                                f"edit={_exception_text(exc)}; "
+                                f"reply={_exception_text(fallback_exc)}"
+                            ) from fallback_exc
                 else:
-                    new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
-                    sent_parts.append(new_msg)
+                    try:
+                        new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
+                        sent_parts.append(new_msg)
+                    except Exception as exc:
+                        raise RuntimeError(f"Telegram 发送分段回复失败：{_exception_text(exc)}") from exc
 
             last_edit_time = time.monotonic()
 
@@ -287,11 +324,20 @@ class TelegramBot:
 
         except Exception as exc:
             logger.exception("telegram stream error user_id=%d", user_id)
-            err_text = f"⚠️ 调用 Agent 时出错：{exc}"
+            err_text = f"⚠️ 调用 Agent 时出错：{_exception_text(exc)}"
             try:
                 await sent_parts[0].edit_text(err_text)
-            except Exception:
-                await update.message.reply_text(err_text)
+            except Exception as edit_exc:
+                logger.warning(
+                    "telegram failed to edit error message user_id=%d: %s",
+                    user_id,
+                    _exception_text(edit_exc),
+                    exc_info=True,
+                )
+                try:
+                    await update.message.reply_text(err_text)
+                except Exception:
+                    logger.exception("telegram failed to send error message user_id=%d", user_id)
 
 
 @asynccontextmanager

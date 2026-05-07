@@ -213,10 +213,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
     uvicorn.run("openhachimi_agent.interface.http:app", host=args.host, port=args.port)
 
 
-def cmd_update(_args: argparse.Namespace) -> None:
+def cmd_update(args: argparse.Namespace) -> None:
     """检查并更新到最新版本。"""
     from openhachimi_agent.core.updater import run_update
-    run_update()
+    run_update(force=args.force)
 
 
 def cmd_cli(_args: argparse.Namespace) -> None:
@@ -265,7 +265,8 @@ def main() -> None:
     # ── 配置与工具 ────────────────────────────────────────────────────────────
     sub.add_parser("config",  help="用编辑器打开配置文件")
     sub.add_parser("install", help="安装 Playwright 浏览器驱动（chromium）")
-    sub.add_parser("update",  help="检查并更新到最新版本")
+    update_p = sub.add_parser("update",  help="检查并更新到最新版本")
+    update_p.add_argument("--force", action="store_true", help="即使代码已是最新，也重新安装依赖")
 
     uninstall_p = sub.add_parser("uninstall", help="卸载后台守护服务")
     uninstall_p.add_argument("-y", "--yes", action="store_true",

@@ -1,6 +1,7 @@
 """Agent 后台服务层。"""
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -25,6 +26,13 @@ from openhachimi_agent.transport.api_models import AgentState, ChatResponse, Com
 
 logger = logging.getLogger(__name__)
 _STREAM_DONE = object()
+
+
+def _error_message(exc: BaseException) -> str:
+    text = str(exc).strip()
+    if text:
+        return f"{exc.__class__.__name__}: {text}"
+    return exc.__class__.__name__
 
 
 def _text_from_stream_event(event: object) -> str:
@@ -172,6 +180,7 @@ class AgentService:
         output_chars = 0
         chunk_count = 0
         first_chunk_ms: float | None = None
+        last_chunk_preview = ""
         stream_queue: asyncio.Queue[str | object] = asyncio.Queue()
         result_holder: dict[str, object] = {}
         logger.info(
@@ -191,11 +200,29 @@ class AgentService:
 
         async def run_agent() -> None:
             try:
-                result_holder["result"] = await agent.run(
-                    message,
-                    message_history=history,
-                    deps=self.config,
-                    event_stream_handler=handle_stream_events,
+                result_holder["result"] = await asyncio.wait_for(
+                    agent.run(
+                        message,
+                        message_history=history,
+                        deps=self.config,
+                        event_stream_handler=handle_stream_events,
+                    ),
+                    timeout=self.config.agent_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                result_holder["error"] = TimeoutError(
+                    "Agent 执行超时："
+                    f"{self.config.agent_timeout_seconds}s 内没有完成。"
+                    f"模型={self.config.model_name}，"
+                    f"base_url={self.config.openai_base_url or '默认'}，"
+                    f"role={role}，session_id={actual_session_id}。"
+                    "常见原因：模型服务无响应、工具调用卡住、浏览器/网络代理不可用。"
+                )
+                logger.exception(
+                    "chat timed out role=%s session_id=%s timeout_seconds=%d stream=true",
+                    role,
+                    actual_session_id,
+                    self.config.agent_timeout_seconds,
                 )
             except Exception as exc:
                 result_holder["error"] = exc
@@ -210,11 +237,46 @@ class AgentService:
         task = asyncio.create_task(run_agent())
 
         while True:
-            item = await stream_queue.get()
+            try:
+                item = await asyncio.wait_for(
+                    stream_queue.get(),
+                    timeout=self.config.stream_idle_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                logger.error(
+                    "chat stream idle timeout role=%s session_id=%s idle_timeout_seconds=%d chunks=%d output_chars=%d duration_ms=%.0f last_chunk=%s",
+                    role,
+                    actual_session_id,
+                    self.config.stream_idle_timeout_seconds,
+                    chunk_count,
+                    output_chars,
+                    elapsed_ms,
+                    last_chunk_preview,
+                )
+                last_chunk_detail = f"最后片段={last_chunk_preview!r}，" if last_chunk_preview else ""
+                raise TimeoutError(
+                    "流式回复超时："
+                    f"{self.config.stream_idle_timeout_seconds}s 内没有收到新的模型片段或工具状态。"
+                    f"已收到片段数={chunk_count}，已输出字符数={output_chars}，"
+                    f"{last_chunk_detail}"
+                    f"模型={self.config.model_name}，"
+                    f"base_url={self.config.openai_base_url or '默认'}，"
+                    f"role={role}，session_id={actual_session_id}。"
+                    "如果刚显示了几个字就停住，通常是后续模型请求、工具调用、浏览器或网络代理卡住。"
+                ) from exc
             if item is _STREAM_DONE:
                 break
 
             chunk = str(item)
+            compact_chunk = " ".join(chunk.split())
+            if len(compact_chunk) > 120:
+                compact_chunk = compact_chunk[:117] + "..."
+            if compact_chunk:
+                last_chunk_preview = compact_chunk
             if first_chunk_ms is None:
                 first_chunk_ms = (time.perf_counter() - start_time) * 1000
                 logger.info(
@@ -230,7 +292,7 @@ class AgentService:
 
         await task
         if error := result_holder.get("error"):
-            raise error
+            raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
 
         result = result_holder["result"]
         new_history = list(result.all_messages())  # type: ignore[attr-defined]

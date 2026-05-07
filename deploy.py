@@ -143,11 +143,11 @@ def ensure_venv(project_root: Path) -> None:
 
 
 def install_project(project_root: Path) -> None:
-    python_path = str(venv_python(project_root))
-    print("[INFO] 安装项目依赖（pip install -e .）...")
-    run([python_path, "-m", "pip", "install", "-U", "pip", "--quiet"], cwd=project_root)
-    run([python_path, "-m", "pip", "install", "-e", ".", "--quiet"], cwd=project_root)
-    print("[OK] 依赖安装完成。")
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from openhachimi_agent.core.install import install_project as shared_install_project
+
+    shared_install_project(project_root, python_executable=str(venv_python(project_root)))
 
 
 def write_config_if_missing(project_root: Path) -> None:
