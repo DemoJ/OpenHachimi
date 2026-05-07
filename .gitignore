@@ -10,6 +10,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .claude
+build/
 
 # Ignore all user skills
 user/skills/*
