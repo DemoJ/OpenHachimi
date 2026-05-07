@@ -6,6 +6,7 @@ from openhachimi_agent.tools.editing import make_directory, replace_in_file, wri
 from openhachimi_agent.tools.filesystem import find_files, list_files, read_file, search_text
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.registry import WORKSPACE_TOOLSET
+from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 
 __all__ = [
     "WORKSPACE_TOOLSET",
@@ -19,6 +20,8 @@ __all__ = [
     "run_command",
     "git_status",
     "git_diff",
+    "discover_web_resources",
+    "web_fetch",
     "browser_navigate",
     "browser_get_state",
     "browser_click",

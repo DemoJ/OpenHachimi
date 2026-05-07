@@ -10,6 +10,7 @@ from openhachimi_agent.tools.editing import delete_path, make_directory, replace
 from openhachimi_agent.tools.filesystem import find_files, list_files, read_file, search_text
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills
+from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 
 
 WORKSPACE_TOOLSET = FunctionToolset(
@@ -29,6 +30,8 @@ WORKSPACE_TOOLSET = FunctionToolset(
         git_diff,
         list_skills,
         get_skill_instructions,
+        discover_web_resources,
+        web_fetch,
         browser_navigate,
         browser_get_state,
         browser_click,

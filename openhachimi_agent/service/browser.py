@@ -21,6 +21,19 @@ from openhachimi_agent.core.config import AppConfig
 logger = logging.getLogger(__name__)
 
 
+HUMAN_VERIFICATION_REQUIRED = "HUMAN_VERIFICATION_REQUIRED"
+
+
+def _human_verification_message(url: str, reason: str) -> str:
+    return (
+        f"{HUMAN_VERIFICATION_REQUIRED}: 检测到人机验证或访问挑战，当前页面：{url}。"
+        f"触发原因：{reason}。"
+        "请暂停浏览器自动化，不要切换到其它网站规避验证。"
+        "请用户在已打开的浏览器窗口中手动完成验证，然后回复“继续”。"
+        "收到“继续”后，应先调用 browser_get_state 重新读取当前页面，再接着完成原任务。"
+    )
+
+
 class BrowserManager:
     """管理后台 Playwright 浏览器实例。"""
 
@@ -327,6 +340,53 @@ class BrowserManager:
                     
         raise RuntimeError("无法找到系统中安装的 Chrome 或 Edge 浏览器。请在 config.yaml 中配置 browser_channel 为 chrome、msedge 或绝对路径。")
 
+    async def _detect_human_verification(self) -> str | None:
+        """Detect common CAPTCHA/challenge pages and ask for human takeover."""
+        if not self._page or self._page.is_closed():
+            return None
+
+        try:
+            signal = await self._page.evaluate(
+                """
+                () => {
+                    const text = [
+                        document.title || '',
+                        document.body ? document.body.innerText : '',
+                        ...Array.from(document.querySelectorAll('iframe')).map(el => el.src || ''),
+                        ...Array.from(document.querySelectorAll('[id],[class],[name],[aria-label]')).slice(0, 300)
+                          .flatMap(el => [el.id, el.className, el.getAttribute('name'), el.getAttribute('aria-label')])
+                    ].join(' ').toLowerCase();
+
+                    const patterns = [
+                        ['cloudflare', 'cloudflare challenge'],
+                        ['verify you are human', 'verify you are human'],
+                        ['checking your browser', 'checking your browser'],
+                        ['just a moment', 'just a moment'],
+                        ['captcha', 'captcha'],
+                        ['recaptcha', 'recaptcha'],
+                        ['hcaptcha', 'hcaptcha'],
+                        ['turnstile', 'turnstile'],
+                        ['cf-challenge', 'cf-challenge'],
+                        ['人机验证', '人机验证'],
+                        ['请完成安全验证', '安全验证'],
+                        ['拖动滑块', '滑块验证'],
+                        ['验证码', '验证码']
+                    ];
+                    for (const [needle, label] of patterns) {
+                        if (text.includes(needle)) return label;
+                    }
+                    return null;
+                }
+                """
+            )
+        except Exception as exc:
+            logger.debug("human verification detection failed: %s", exc)
+            return None
+
+        if signal:
+            logger.warning("human verification detected url=%s reason=%s", self._page.url, signal)
+            return str(signal)
+        return None
 
     async def _ensure_browser(self) -> Page:
         """确保浏览器和页面已经启动。"""
@@ -508,11 +568,16 @@ class BrowserManager:
         target_url = url.rstrip("/")
         if current_url == target_url or current_url.startswith(target_url + "?") or current_url.startswith(target_url + "#"):
             logger.info("Browser already at target url: %s", current_url)
+            if reason := await self._detect_human_verification():
+                return _human_verification_message(page.url, reason)
             return f"当前已在 {page.url}，无需重复导航。请直接使用 browser_get_state 获取页面内容。"
             
         logger.info("Browser navigating to: %s", url)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(random.uniform(0.8, 1.6))
+            if reason := await self._detect_human_verification():
+                return _human_verification_message(page.url, reason)
             return f"成功导航到：{page.url}。请使用 browser_get_state 获取页面内容。"
         except Exception as e:
             logger.error("Navigation failed: %s", e)
@@ -532,6 +597,8 @@ class BrowserManager:
             return "当前没有打开的页面，请先使用 browser_navigate 导航到网页。"
 
         logger.info("获取当前页面状态（Accessibility Tree）...")
+        if reason := await self._detect_human_verification():
+            return _human_verification_message(self._page.url, reason)
         
         # 重置映射表
         self._element_mapping = {}
@@ -750,6 +817,8 @@ class BrowserManager:
                 await self._update_active_page()
             except Exception:
                 pass
+            if reason := await self._detect_human_verification():
+                return _human_verification_message(self._page.url, reason)
             return f"成功点击元素 [{element_id}]。"
         except Exception as e:
             return f"点击失败：{e}"
@@ -792,6 +861,8 @@ class BrowserManager:
                 
             # 尝试逐字输入文本，使用较小的随机延迟加快输入速度但保持人类特征
             await locator.press_sequentially(text, delay=random.randint(10, 30), timeout=10000)
+            if reason := await self._detect_human_verification():
+                return _human_verification_message(self._page.url, reason)
             return f"成功在元素 [{element_id}] 输入文本。"
         except Exception as e:
             return f"输入文本失败：{e}"
@@ -828,6 +899,8 @@ class BrowserManager:
             # 等待动态内容加载（如懒加载图片、无限滚动列表）
             await asyncio.sleep(0.8)
             logger.info("Browser scroll direction=%s amount=%d", direction, amount)
+            if reason := await self._detect_human_verification():
+                return _human_verification_message(self._page.url, reason)
             return result_msg + " 请调用 browser_get_state 查看滚动后的页面内容。"
         except Exception as e:
             logger.error("Scroll failed: %s", e)
