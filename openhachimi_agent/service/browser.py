@@ -348,7 +348,7 @@ class BrowserManager:
                                 if response.getcode() == 200:
                                     port_ready = True
                                     break
-                        except (urllib.error.URLError, ConnectionError):
+                        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
                             pass
                         await asyncio.sleep(0.5)
                         
