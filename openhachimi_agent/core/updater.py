@@ -31,7 +31,7 @@ class GitRef:
 
 def _run_git(project_root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", f"safe.directory={project_root.as_posix()}", *args],
         cwd=project_root,
         capture_output=True,
         text=True,
@@ -41,10 +41,18 @@ def _run_git(project_root: Path, *args: str, check: bool = True) -> subprocess.C
     )
 
 
-def _get_project_root() -> Path | None:
+def _find_git_root_marker(path: Path) -> Path | None:
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists() and (candidate / "pyproject.toml").exists():
+            return candidate
+    return None
+
+
+def _git_root_from(path: Path) -> Path | None:
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            ["git", "-c", f"safe.directory={path.as_posix()}", "rev-parse", "--show-toplevel"],
+            cwd=path,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -53,7 +61,24 @@ def _get_project_root() -> Path | None:
         )
         return Path(result.stdout.strip())
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
+        return _find_git_root_marker(path)
+
+
+def _installed_project_dir() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _get_project_root() -> Path | None:
+    """Locate the OpenHachimi git root from cwd or the installed package path."""
+    cwd_root = _git_root_from(Path.cwd())
+    if cwd_root is not None:
+        return cwd_root
+
+    package_root = _git_root_from(_installed_project_dir())
+    if package_root is not None:
+        return package_root
+
+    return None
 
 
 def _git_output(project_root: Path, *args: str) -> str:
@@ -176,8 +201,10 @@ def run_update(*, force: bool = False) -> None:
     project_root = _get_project_root()
     if project_root is None:
         print("[x] 未检测到 Git 仓库，无法自动更新。")
-        print("  请进入 OpenHachimi Git 仓库后重试，或手动执行 git pull 并重新安装。")
+        print(f"  已尝试当前目录和安装目录：{_installed_project_dir()}")
+        print("  如果这是非 Git 方式安装的副本，请手动执行安装脚本重新部署。")
         return
+    print(f"项目目录：{project_root}")
 
     update_ref = _resolve_update_ref(project_root)
     if update_ref is None:
