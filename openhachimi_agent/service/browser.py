@@ -1,6 +1,7 @@
 """Browser 管理服务，用于提供 Playwright 支持和可访问性树截取。"""
 
 import asyncio
+import json
 import logging
 import random
 import os
@@ -42,8 +43,8 @@ class BrowserManager:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
-    def _is_cdp_ready(self, port: int) -> bool:
-        """用原生 socket 探测 CDP，避免 urllib 受代理环境变量影响而卡住。"""
+    def _get_cdp_websocket_url(self, port: int) -> str | None:
+        """用原生 socket 读取 CDP websocket 地址，避免 urllib/代理和 /json/version/ 兼容问题。"""
         request = (
             "GET /json/version HTTP/1.1\r\n"
             "Host: 127.0.0.1\r\n"
@@ -54,10 +55,30 @@ class BrowserManager:
             with socket.create_connection(("127.0.0.1", port), timeout=1) as sock:
                 sock.settimeout(1)
                 sock.sendall(request)
-                response = sock.recv(4096)
+                chunks: list[bytes] = []
+                while True:
+                    try:
+                        chunk = sock.recv(4096)
+                    except TimeoutError:
+                        break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
         except OSError:
-            return False
-        return b" 200 " in response or response.startswith(b"HTTP/1.1 200")
+            return None
+
+        response = b"".join(chunks)
+        if not (b" 200 " in response or response.startswith(b"HTTP/1.1 200")):
+            return None
+        _, _, body = response.partition(b"\r\n\r\n")
+        if not body:
+            return None
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        websocket_url = payload.get("webSocketDebuggerUrl")
+        return websocket_url if isinstance(websocket_url, str) and websocket_url.startswith("ws") else None
 
     def _read_process_environ(self, pid: str) -> dict[str, str]:
         environ_path = f"/proc/{pid}/environ"
@@ -350,7 +371,7 @@ class BrowserManager:
                     
                     # 等待调试端口就绪
                     max_retries = 30
-                    port_ready = False
+                    cdp_endpoint = ""
                     for _ in range(max_retries):
                         if self._chrome_process.poll() is not None:
                             stderr_tail = self._tail_chrome_stderr()
@@ -358,12 +379,12 @@ class BrowserManager:
                             raise RuntimeError(
                                 f"Chrome 进程已退出，无法建立 CDP 连接（退出码 {self._chrome_process.returncode}）。{detail}"
                             )
-                        if self._is_cdp_ready(port):
-                            port_ready = True
+                        if websocket_url := self._get_cdp_websocket_url(port):
+                            cdp_endpoint = websocket_url
                             break
                         await asyncio.sleep(0.5)
                         
-                    if not port_ready:
+                    if not cdp_endpoint:
                         stderr_tail = self._tail_chrome_stderr()
                         detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
                         raise RuntimeError(
@@ -373,7 +394,7 @@ class BrowserManager:
                         )
                         
                     # Playwright 接管
-                    self._browser = await self._playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                    self._browser = await self._playwright.chromium.connect_over_cdp(cdp_endpoint)
                     
                     if self._browser.contexts:
                         self._context = self._browser.contexts[0]
