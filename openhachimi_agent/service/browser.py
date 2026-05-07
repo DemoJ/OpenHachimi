@@ -8,8 +8,6 @@ import socket
 import sys
 import shutil
 import subprocess
-import urllib.request
-import urllib.error
 from typing import Any
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -43,6 +41,23 @@ class BrowserManager:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
+
+    def _is_cdp_ready(self, port: int) -> bool:
+        """用原生 socket 探测 CDP，避免 urllib 受代理环境变量影响而卡住。"""
+        request = (
+            "GET /json/version HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1) as sock:
+                sock.settimeout(1)
+                sock.sendall(request)
+                response = sock.recv(4096)
+        except OSError:
+            return False
+        return b" 200 " in response or response.startswith(b"HTTP/1.1 200")
 
     def _read_process_environ(self, pid: str) -> dict[str, str]:
         environ_path = f"/proc/{pid}/environ"
@@ -343,13 +358,9 @@ class BrowserManager:
                             raise RuntimeError(
                                 f"Chrome 进程已退出，无法建立 CDP 连接（退出码 {self._chrome_process.returncode}）。{detail}"
                             )
-                        try:
-                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as response:
-                                if response.getcode() == 200:
-                                    port_ready = True
-                                    break
-                        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
-                            pass
+                        if self._is_cdp_ready(port):
+                            port_ready = True
+                            break
                         await asyncio.sleep(0.5)
                         
                     if not port_ready:
