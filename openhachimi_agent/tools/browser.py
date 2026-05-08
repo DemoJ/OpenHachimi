@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.tools.utils import check_prompt_read
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def _ensure_browser_prompt_read(ctx: RunContext[AppConfig]) -> None:
     if not check_prompt_read(ctx, "system_prompts/browser.md"):
-        raise PermissionError(
+        raise ModelRetry(
             "🛑 拦截：在使用浏览器工具前，必须首先调用 read_file 读取 openhachimi_agent/system_prompts/browser.md 了解操作指南与反爬规则。"
         )
 

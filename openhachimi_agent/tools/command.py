@@ -7,6 +7,7 @@ import logging
 import asyncio
 
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.tools.utils import (
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 def _ensure_commands_prompt_read(ctx: RunContext[AppConfig]) -> None:
     if not check_prompt_read(ctx, "system_prompts/commands.md"):
-        raise PermissionError(
+        raise ModelRetry(
             "🛑 拦截：在使用命令行相关工具前，必须首先调用 read_file 读取 openhachimi_agent/system_prompts/commands.md 了解平台命令差异及长命令交互处理指南。"
         )
 

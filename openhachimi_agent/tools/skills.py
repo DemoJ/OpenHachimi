@@ -5,6 +5,7 @@ Claude Skills defined in the workspace.
 """
 
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
@@ -13,7 +14,7 @@ from openhachimi_agent.tools.utils import check_prompt_read
 
 def _ensure_skills_prompt_read(ctx: RunContext[AppConfig]) -> None:
     if not check_prompt_read(ctx, "system_prompts/skills.md"):
-        raise PermissionError(
+        raise ModelRetry(
             "🛑 拦截：在操作技能(Skills)前，必须首先调用 read_file 读取 openhachimi_agent/system_prompts/skills.md 了解技能安装与管理工作流。"
         )
 
