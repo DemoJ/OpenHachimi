@@ -15,10 +15,18 @@ from openhachimi_agent.tools.utils import (
     get_command_shell,
     normalize_relative_path,
     resolve_workspace_path,
+    check_prompt_read,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_commands_prompt_read(ctx: RunContext[AppConfig]) -> None:
+    if not check_prompt_read(ctx, "system_prompts/commands.md"):
+        raise PermissionError(
+            "🛑 拦截：在使用命令行相关工具前，必须首先调用 read_file 读取 openhachimi_agent/system_prompts/commands.md 了解平台命令差异及长命令交互处理指南。"
+        )
 
 
 async def run_command(
@@ -34,6 +42,7 @@ async def run_command(
     则返回一个 command_id 和迄今为止的输出内容。
     后续可以使用 command_status 和 send_command_input 工具与之交互。
     """
+    _ensure_commands_prompt_read(ctx)
     if not command.strip():
         raise ValueError("command 不能为空")
 
@@ -80,6 +89,7 @@ async def run_command(
 
 def command_status(ctx: RunContext[AppConfig], command_id: str) -> dict[str, object]:
     """检查后台运行中的命令状态，获取最新的输出日志。"""
+    _ensure_commands_prompt_read(ctx)
     from openhachimi_agent.service.process import process_manager
     proc = process_manager.get_process(command_id)
     if not proc:
@@ -111,6 +121,7 @@ async def send_command_input(
     如果需要发送特殊按键（如回车、方向键），请使用 `special_key` 参数。
     不要在 text 中发送像 "\\n" 或 "\\r" 这样的转义字符，请直接使用 special_key="enter"。
     """
+    _ensure_commands_prompt_read(ctx)
     from openhachimi_agent.service.process import process_manager
     proc = process_manager.get_process(command_id)
     if not proc:

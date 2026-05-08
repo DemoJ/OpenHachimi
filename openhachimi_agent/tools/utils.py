@@ -163,3 +163,24 @@ def get_command_shell() -> tuple[list[str], str]:
     shell_path = os.environ.get("SHELL") or "/bin/sh"
     logger.debug("selected command shell=%s", Path(shell_path).name)
     return [shell_path, "-lc"], Path(shell_path).name
+
+def check_prompt_read(ctx: object, prompt_filename: str) -> bool:
+    """检查 Agent 是否已经读取过指定的系统提示词文件。"""
+    if not hasattr(ctx, "messages"):
+        return False
+        
+    messages = getattr(ctx, "messages", [])
+    for msg in messages:
+        parts = getattr(msg, "parts", [])
+        for part in parts:
+            if part.__class__.__name__ == "ToolReturnPart":
+                content = str(getattr(part, "content", ""))
+                # 例如返回内容中包含 path: openhachimi_agent/system_prompts/browser.md
+                if prompt_filename in content:
+                    return True
+            elif part.__class__.__name__ == "SystemPromptPart":
+                # 如果这个提示词本身就由系统主动注入(例如包含文件名的引述不代表已读，如果是全量文本注入则代表已读)
+                # 我们这里主要检查 ToolReturnPart
+                pass
+    return False
+

@@ -8,6 +8,14 @@ from pydantic_ai import RunContext
 
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.tools.utils import check_prompt_read
+
+
+def _ensure_skills_prompt_read(ctx: RunContext[AppConfig]) -> None:
+    if not check_prompt_read(ctx, "system_prompts/skills.md"):
+        raise PermissionError(
+            "🛑 拦截：在操作技能(Skills)前，必须首先调用 read_file 读取 openhachimi_agent/system_prompts/skills.md 了解技能安装与管理工作流。"
+        )
 
 
 def list_skills(ctx: RunContext[AppConfig]) -> str:
@@ -17,6 +25,7 @@ def list_skills(ctx: RunContext[AppConfig]) -> str:
         A formatted string listing the name, description, and when to use 
         for each discovered skill.
     """
+    _ensure_skills_prompt_read(ctx)
     skills = find_skills(ctx.deps.skills_dirs)
     if not skills:
         return "No skills found in the current project."
@@ -40,6 +49,7 @@ def get_skill_instructions(ctx: RunContext[AppConfig], skill_name: str) -> str:
     Returns:
         The markdown body of the skill, or an error message if not found.
     """
+    _ensure_skills_prompt_read(ctx)
     skills = find_skills(ctx.deps.skills_dirs)
     
     for skill in skills:
