@@ -242,28 +242,14 @@ def run_update(*, force: bool = False) -> None:
         _print_restart_hint()
         return
 
-    if _is_working_tree_dirty(project_root):
-        print("[x] 检测到本地有未提交的修改，为防止覆盖已中止更新。")
-        print("  请先提交或暂存你的修改：")
-        print("    git stash    # 暂存修改")
-        print("    git commit   # 或提交修改")
-        print("  然后再次运行 hachimi update。")
-        return
-
-    if _is_ancestor(project_root, "HEAD", update_ref.name):
-        if remote_version == local_version:
-            print("[INFO] 远端代码有更新，但版本号未变化；仍将按 commit 更新。")
-        print("\n正在快进到远端最新代码...")
-        if not _merge_ff_only(project_root, update_ref.name):
-            return
-    elif _is_ancestor(project_root, update_ref.name, "HEAD"):
-        print("[ok] 本地 commit 比远端更新，无需更新。")
-        return
-    else:
-        print("[x] 本地分支和远端分支已分叉，无法安全自动更新。")
-        print(f"  本地：HEAD {local_short}")
-        print(f"  远端：{update_ref.name} {remote_short}")
-        print("  请手动处理 merge/rebase 后再运行 hachimi update。")
+    print("\n[INFO] 正在将本地已追踪的代码文件强制同步为远端最新版本（本地新增的未追踪文件将被保留）...")
+    reset_result = _run_git(project_root, "reset", "--hard", update_ref.name, check=False)
+    if reset_result.returncode != 0:
+        print("[x] 强制同步失败：")
+        if reset_result.stdout.strip():
+            print(reset_result.stdout.strip())
+        if reset_result.stderr.strip():
+            print(reset_result.stderr.strip())
         return
 
     new_local_short = _short_commit(project_root, "HEAD")
