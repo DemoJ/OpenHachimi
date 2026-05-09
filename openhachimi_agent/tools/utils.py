@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import logging
 from pathlib import Path
+from pydantic_ai.exceptions import ModelRetry
 
 MAX_LIST_ENTRIES = 200
 MAX_READ_LINES = 200
@@ -43,22 +44,36 @@ DANGEROUS_COMMAND_PATTERNS = [
 logger = logging.getLogger(__name__)
 
 
-def resolve_workspace_path(workspace_root: Path, path: str) -> Path:
+def resolve_workspace_path(workspace_root: Path, path: str, allowed_roots: list[Path] | None = None) -> Path:
     """将用户提供的路径解析到工作区内，并阻止越界访问。"""
     raw_path = Path(path)
     resolved = raw_path.resolve() if raw_path.is_absolute() else (workspace_root / raw_path).resolve()
 
-    try:
-        resolved.relative_to(workspace_root.resolve())
-    except ValueError as exc:
-        raise ValueError(f"路径超出当前工作区，不允许访问：{path}") from exc
+    roots_to_check = [workspace_root.resolve()]
+    if allowed_roots:
+        roots_to_check.extend([r.resolve() for r in allowed_roots])
+
+    is_allowed = False
+    for root in roots_to_check:
+        try:
+            resolved.relative_to(root)
+            is_allowed = True
+            break
+        except ValueError:
+            continue
+
+    if not is_allowed:
+        raise ModelRetry(f"路径超出当前工作区及允许的外部目录，不允许访问：{path}")
 
     return resolved
 
 
 def normalize_relative_path(workspace_root: Path, path: Path) -> str:
     """将绝对路径转换为工作区相对路径。"""
-    return path.relative_to(workspace_root).as_posix()
+    try:
+        return path.relative_to(workspace_root).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def relative_path_from(cwd: Path, target: Path) -> str:
@@ -84,13 +99,13 @@ def iter_workspace_items(root: Path, recursive: bool) -> list[Path]:
     return sorted(items)
 
 
-def read_text_file(workspace_root: Path, path: str) -> tuple[Path, str]:
+def read_text_file(workspace_root: Path, path: str, allowed_roots: list[Path] | None = None) -> tuple[Path, str]:
     """读取工作区内文本文件。"""
-    target_file = resolve_workspace_path(workspace_root, path)
+    target_file = resolve_workspace_path(workspace_root, path, allowed_roots)
     if not target_file.exists():
-        raise FileNotFoundError(f"文件不存在：{path}")
+        raise ModelRetry(f"文件不存在：{path}")
     if not target_file.is_file():
-        raise IsADirectoryError(f"目标不是文件：{path}")
+        raise ModelRetry(f"目标不是文件：{path}")
 
     return target_file, target_file.read_text(encoding="utf-8", errors="replace")
 

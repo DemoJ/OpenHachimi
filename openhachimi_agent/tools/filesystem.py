@@ -6,6 +6,7 @@ import fnmatch
 import logging
 
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.tools.utils import (
@@ -29,12 +30,12 @@ def list_files(
     max_entries: int = MAX_LIST_ENTRIES,
 ) -> dict[str, object]:
     """列出工作区内某个目录下的文件和子目录。"""
-    target_dir = resolve_workspace_path(ctx.deps.base_dir, path)
+    target_dir = resolve_workspace_path(ctx.deps.base_dir, path, ctx.deps.skills_dirs)
     logger.debug("tool list_files path=%s recursive=%s max_entries=%d", path, recursive, max_entries)
     if not target_dir.exists():
-        raise FileNotFoundError(f"目录不存在：{path}")
+        raise ModelRetry(f"目录不存在：{path}")
     if not target_dir.is_dir():
-        raise NotADirectoryError(f"目标不是目录：{path}")
+        raise ModelRetry(f"目标不是目录：{path}")
 
     max_entries = max(1, min(max_entries, MAX_LIST_ENTRIES))
     entries: list[dict[str, object]] = []
@@ -67,12 +68,12 @@ def find_files(
     max_entries: int = MAX_SEARCH_RESULTS,
 ) -> dict[str, object]:
     """按 glob 模式在工作区中查找文件和目录。"""
-    target_dir = resolve_workspace_path(ctx.deps.base_dir, path)
+    target_dir = resolve_workspace_path(ctx.deps.base_dir, path, ctx.deps.skills_dirs)
     logger.debug("tool find_files pattern=%s path=%s max_entries=%d", pattern, path, max_entries)
     if not target_dir.exists():
-        raise FileNotFoundError(f"目录不存在：{path}")
+        raise ModelRetry(f"目录不存在：{path}")
     if not target_dir.is_dir():
-        raise NotADirectoryError(f"目标不是目录：{path}")
+        raise ModelRetry(f"目标不是目录：{path}")
 
     max_entries = max(1, min(max_entries, MAX_SEARCH_RESULTS))
     matches: list[dict[str, object]] = []
@@ -108,14 +109,14 @@ def search_text(
 ) -> dict[str, object]:
     """在工作区文本文件中搜索指定字符串。"""
     if not query:
-        raise ValueError("query 不能为空")
+        raise ModelRetry("query 不能为空")
 
-    target_dir = resolve_workspace_path(ctx.deps.base_dir, path)
+    target_dir = resolve_workspace_path(ctx.deps.base_dir, path, ctx.deps.skills_dirs)
     logger.debug("tool search_text path=%s file_pattern=%s case_sensitive=%s", path, file_pattern, case_sensitive)
     if not target_dir.exists():
-        raise FileNotFoundError(f"目录不存在：{path}")
+        raise ModelRetry(f"目录不存在：{path}")
     if not target_dir.is_dir():
-        raise NotADirectoryError(f"目标不是目录：{path}")
+        raise ModelRetry(f"目标不是目录：{path}")
 
     max_results = max(1, min(max_results, MAX_SEARCH_RESULTS))
     normalized_query = query if case_sensitive else query.lower()
@@ -166,7 +167,7 @@ def read_file(
     logger.debug("tool read_file path=%s start_line=%d end_line=%s", path, start_line, end_line)
     target_file, text = read_text_file(ctx.deps.base_dir, path)
     if start_line < 1:
-        raise ValueError("start_line 必须大于等于 1")
+        raise ModelRetry("start_line 必须大于等于 1")
 
     lines = text.splitlines()
     total_lines = len(lines)
@@ -174,7 +175,7 @@ def read_file(
     if end_line is None:
         end_line = min(total_lines, start_line + MAX_READ_LINES - 1)
     if end_line < start_line:
-        raise ValueError("end_line 不能小于 start_line")
+        raise ModelRetry("end_line 不能小于 start_line")
 
     selected = lines[start_line - 1 : end_line]
     numbered_content = "\n".join(

@@ -23,8 +23,8 @@ def list_skills(ctx: RunContext[AppConfig]) -> str:
     """Lists available Claude Skills for the current project.
     
     Returns:
-        A formatted string listing the name, description, and when to use 
-        for each discovered skill.
+        A formatted string listing the name, description, when to use, 
+        and the file path for each discovered skill.
     """
     _ensure_skills_prompt_read(ctx)
     skills = find_skills(ctx.deps.skills_dirs)
@@ -33,12 +33,12 @@ def list_skills(ctx: RunContext[AppConfig]) -> str:
         
     result = ["Available skills for this project:"]
     for skill in skills:
-        entry = f"- {skill.config.name}: {skill.config.description}"
+        entry = f"- Name: {skill.config.name}\n  Path: {skill.path}\n  Description: {skill.config.description}"
         if skill.config.when_to_use:
-            entry += f" (When to use: {skill.config.when_to_use})"
+            entry += f"\n  When to use: {skill.config.when_to_use}"
         result.append(entry)
         
-    return "\n".join(result)
+    return "\n\n".join(result)
 
 
 def get_skill_instructions(ctx: RunContext[AppConfig], skill_name: str) -> str:
