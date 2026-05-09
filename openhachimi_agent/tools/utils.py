@@ -27,19 +27,19 @@ SKIP_DIR_NAMES = {
     "openhachimi_agent.egg-info",
 }
 DANGEROUS_COMMAND_PATTERNS = [
-    r"\brm\b",
-    r"\bunlink\b",
-    r"\bremove-item\b",
-    r"\bdel\b",
-    r"\berase\b",
-    r"\brmdir\b",
-    r"\brd\b",
-    r"\bgit\s+reset\s+--hard\b",
-    r"\bgit\s+clean\b",
-    r"\bformat\b",
-    r"\bshutdown\b",
-    r"\brestart-computer\b",
-    r"\bstop-process\b",
+    r"(?<!-)\brm\b",
+    r"(?<!-)\bunlink\b",
+    r"(?<!-)\bremove-item\b",
+    r"(?<!-)\bdel\b",
+    r"(?<!-)\berase\b",
+    r"(?<!-)\brmdir\b",
+    r"(?<!-)\brd\b",
+    r"(?<!-)\bgit\s+reset\s+--hard\b",
+    r"(?<!-)\bgit\s+clean\b",
+    r"(?<!-)\bformat\b",
+    r"(?<!-)\bshutdown\b",
+    r"(?<!-)\brestart-computer\b",
+    r"(?<!-)\bstop-process\b",
 ]
 
 logger = logging.getLogger(__name__)
