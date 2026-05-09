@@ -96,6 +96,12 @@ def new_session(role: str | None = None):
     return service.new_session(role)
 
 
+@app.get("/session/latest")
+def latest_session(role: str | None = None):
+    logger.info("http latest session request role=%s", role)
+    return service.latest_session(role)
+
+
 @app.post("/role")
 def switch_role(request: RoleSwitchRequest):
     logger.info("http switch role request role=%s", request.role.strip())

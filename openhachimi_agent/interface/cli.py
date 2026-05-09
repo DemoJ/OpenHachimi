@@ -100,7 +100,7 @@ async def run_embedded_cli() -> None:
     service = AgentService(config)
     server_url = "embedded"
     current_role = config.default_role_name
-    current_session_id = service.new_session(current_role).session_id
+    current_session_id = service.latest_session(current_role).session_id
     print_welcome(state_payload(service.state()), server_url, current_role, current_session_id)
 
     while True:
@@ -220,7 +220,7 @@ def run_cli() -> None:
         roles_info = request_json(server_url, "GET", "/roles")
         current_role = roles_info["current_role"]
         from urllib.parse import urlencode
-        new_resp = request_json(server_url, "POST", f"/new?{urlencode({'role': current_role})}")
+        new_resp = request_json(server_url, "GET", f"/session/latest?{urlencode({'role': current_role})}")
         current_session_id = new_resp["session_id"]
     except URLError as exc:
         raise SystemExit(f"无法连接 OpenHachimi 后台服务：{server_url}，请先运行 python main.py serve") from exc

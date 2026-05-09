@@ -98,6 +98,23 @@ class AgentService:
             current_role=self.config.default_role_name,
         )
 
+    def latest_session(self, role_name: str | None = None) -> CommandResponse:
+        role = role_name or self.config.default_role_name
+        from openhachimi_agent.storage.memory import load_latest_session_id, create_session_id, save_latest_session_id
+        session_id = load_latest_session_id(self.config.memory_dir, role)
+        if not session_id or session_id == "legacy":
+            session_id = create_session_id()
+            save_latest_session_id(self.config.memory_dir, role, session_id)
+            logger.info("no latest session found, created new session role=%s session_id=%s", role, session_id)
+        else:
+            logger.info("loaded latest session role=%s session_id=%s", role, session_id)
+        
+        return CommandResponse(
+            message="已恢复上一次的对话上下文。",
+            role=role,
+            session_id=session_id,
+        )
+
     def new_session(self, role_name: str | None = None) -> CommandResponse:
         role = role_name or self.config.default_role_name
         session_id = start_new_session(self.config.memory_dir, role)
