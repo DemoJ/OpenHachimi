@@ -180,23 +180,93 @@ def get_command_shell() -> tuple[list[str], str]:
     logger.debug("selected command shell=%s", Path(shell_path).name)
     return [shell_path, "-lc"], Path(shell_path).name
 
+_prompt_read_cache: dict[tuple[int, int], set[str]] = {}
+
 def check_prompt_read(ctx: object, prompt_filename: str) -> bool:
     """检查 Agent 是否已经读取过指定的系统提示词文件。"""
     if not hasattr(ctx, "messages"):
         return False
         
     messages = getattr(ctx, "messages", [])
-    for msg in messages:
+    if not messages:
+        return False
+        
+    cache_key = (id(messages), id(messages[0]))
+    
+    global _prompt_read_cache
+    if cache_key not in _prompt_read_cache:
+        if len(_prompt_read_cache) > 100:
+            _prompt_read_cache.clear()
+        _prompt_read_cache[cache_key] = set()
+        
+    cache = _prompt_read_cache[cache_key]
+    if prompt_filename in cache:
+        return True
+
+    # 逆序遍历，通常系统提示词会在较近的交互中出现，提高查找效率
+    for msg in reversed(messages):
         parts = getattr(msg, "parts", [])
         for part in parts:
             if part.__class__.__name__ == "ToolReturnPart":
                 content = str(getattr(part, "content", ""))
-                # 例如返回内容中包含 path: openhachimi_agent/system_prompts/browser.md
-                if prompt_filename in content:
+                tool_name = str(getattr(part, "tool_name", ""))
+                
+                # 方案 A：通过 read_file 显式读取了该文件（检查 tool_name 与文件路径的组合）
+                if tool_name == "read_file" and prompt_filename in content:
+                    cache.add(prompt_filename)
                     return True
+                    
+                # 方案 B：由系统自动注入了该提示词
+                injection_marker = f"[系统自动注入子提示词：{prompt_filename}]"
+                if injection_marker in content:
+                    cache.add(prompt_filename)
+                    return True
+
             elif part.__class__.__name__ == "SystemPromptPart":
-                # 如果这个提示词本身就由系统主动注入(例如包含文件名的引述不代表已读，如果是全量文本注入则代表已读)
-                # 我们这里主要检查 ToolReturnPart
                 pass
     return False
+
+def inject_prompt_if_unread(ctx: object, prompt_name: str, original_result: str | dict[str, object]) -> str | dict[str, object]:
+    """如果指定的系统提示词尚未阅读过，则加载它并将其注入到工具的返回结果中。"""
+    prompt_filename = f"system_prompts/{prompt_name}.md"
+    if check_prompt_read(ctx, prompt_filename):
+        return original_result
+
+    from openhachimi_agent.content.prompts import load_system_prompt
+    try:
+        content = load_system_prompt(prompt_name)
+    except Exception as e:
+        logger.warning("未能加载系统提示词 %s：%s", prompt_name, e)
+        return original_result
+
+    # 立即添加到缓存中，防止同一次 Run 中后续的工具调用重复注入
+    if hasattr(ctx, "messages"):
+        messages = getattr(ctx, "messages", [])
+        if messages:
+            cache_key = (id(messages), id(messages[0]))
+            global _prompt_read_cache
+            if cache_key in _prompt_read_cache:
+                _prompt_read_cache[cache_key].add(prompt_filename)
+
+    injection = (
+        f"\\n\\n[系统自动注入子提示词：{prompt_filename}]\\n"
+        f"由于你是首次使用该类型工具，请务必遵循以下操作规范：\\n{content}\\n\\n"
+        "[以上为系统自动注入的指引，以下为工具实际执行结果]\\n"
+    )
+
+    if isinstance(original_result, str):
+        return injection + original_result
+    elif isinstance(original_result, dict):
+        # 如果原始返回是字典，把注入的信息加到一个特定的字段，或者附加在主要输出字段上
+        new_result = dict(original_result)
+        # 如果字典中有 "output" 字段（如命令工具或浏览器状态）
+        if "output" in new_result and isinstance(new_result["output"], str):
+            new_result["output"] = injection + new_result["output"]
+        elif "message" in new_result and isinstance(new_result["message"], str):
+            new_result["message"] = injection + new_result["message"]
+        else:
+            new_result["_system_instruction"] = injection.strip()
+        return new_result
+        
+    return original_result
 

@@ -9,14 +9,7 @@ from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.tools.utils import check_prompt_read
-
-
-def _ensure_skills_prompt_read(ctx: RunContext[AppConfig]) -> None:
-    if not check_prompt_read(ctx, "system_prompts/skills.md"):
-        raise ModelRetry(
-            "🛑 拦截：在操作技能(Skills)前，必须首先调用 read_file 读取 openhachimi_agent/system_prompts/skills.md 了解技能安装与管理工作流。"
-        )
+from openhachimi_agent.tools.utils import inject_prompt_if_unread
 
 
 def list_skills(ctx: RunContext[AppConfig]) -> str:
@@ -26,7 +19,6 @@ def list_skills(ctx: RunContext[AppConfig]) -> str:
         A formatted string listing the name, description, when to use, 
         and the file path for each discovered skill.
     """
-    _ensure_skills_prompt_read(ctx)
     skills = find_skills(ctx.deps.skills_dirs)
     if not skills:
         return "No skills found in the current project."
@@ -38,7 +30,7 @@ def list_skills(ctx: RunContext[AppConfig]) -> str:
             entry += f"\n  When to use: {skill.config.when_to_use}"
         result.append(entry)
         
-    return "\n\n".join(result)
+    return inject_prompt_if_unread(ctx, "skills", "\n\n".join(result))
 
 
 def get_skill_instructions(ctx: RunContext[AppConfig], skill_name: str) -> str:
@@ -50,13 +42,12 @@ def get_skill_instructions(ctx: RunContext[AppConfig], skill_name: str) -> str:
     Returns:
         The markdown body of the skill, or an error message if not found.
     """
-    _ensure_skills_prompt_read(ctx)
     skills = find_skills(ctx.deps.skills_dirs)
     
     for skill in skills:
         if skill.config.name == skill_name:
             if skill.config.disable_model_invocation:
-                return f"Skill '{skill_name}' is marked with disable_model_invocation=true. You should not run this skill directly."
-            return skill.body
+                return inject_prompt_if_unread(ctx, "skills", f"Skill '{skill_name}' is marked with disable_model_invocation=true. You should not run this skill directly.")
+            return inject_prompt_if_unread(ctx, "skills", skill.body)
             
-    return f"Skill '{skill_name}' not found. Please check available skills using list_skills."
+    return inject_prompt_if_unread(ctx, "skills", f"Skill '{skill_name}' not found. Please check available skills using list_skills.")
