@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic_ai import RunContext
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.web import web_fetch
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ async def _api_search_raw(query: str) -> list[dict]:
         logger.warning("API Search failed for '%s': %s", query, e)
         return []
 
-async def _http_fetch(ctx: RunContext[AppConfig], url: str) -> str | None:
+async def _http_fetch(ctx: RunContext[AgentDeps], url: str) -> str | None:
     """Level 2: HTTP Fetch (web_fetch)"""
     try:
         def _do_fetch():
@@ -38,7 +39,7 @@ async def _http_fetch(ctx: RunContext[AppConfig], url: str) -> str | None:
         logger.warning("HTTP Fetch failed for '%s': %s", url, e)
         return None
 
-async def _browser_fetch(ctx: RunContext[AppConfig], url: str) -> str | None:
+async def _browser_fetch(ctx: RunContext[AgentDeps], url: str) -> str | None:
     """Level 3: Headless Browser Fetch"""
     try:
         from openhachimi_agent.tools.browser import _get_browser_manager
@@ -52,16 +53,17 @@ async def _browser_fetch(ctx: RunContext[AppConfig], url: str) -> str | None:
         return None
 
 
-async def deep_search(ctx: RunContext[AppConfig], query: str, target_urls: list[str] | None = None, source_type: Literal["general", "tech", "news"] = "general") -> str:
+async def deep_search(ctx: RunContext[AgentDeps], query: str, target_urls: list[str] | None = None, source_type: Literal["general", "tech", "news"] = "general") -> str:
     """
     深度搜索与网页抓取工具 (Deep Search Tool)
     
     用于执行单次强大的搜索引擎查询，并自带三级降级抓取机制（API -> HTTP -> Browser）。
     当你需要搜索特定信息时调用此工具。如果需要执行多次搜索以完成一个复杂任务，请先使用 create_todos 规划 TODO 列表，
     然后再多次调用此工具。
-    
-    参数：
-    - query: 具体的搜索关键词或短语
+
+    【信息检索原则】：务必查阅顶部的当前真实时间。严禁在搜索词中编造或使用过期的年份，必须准确基于当前年份和月份进行检索。
+
+    参数：    - query: 具体的搜索关键词或短语
     - target_urls: （可选）如果你确切知道目标页面的 URL，可以填在这里，底层会直接尝试抓取这些页面。
     - source_type: 数据源偏好 ("general" 普通搜索, "tech" 针对 GitHub/HackerNews 等技术源, "news" 新闻源)
     """

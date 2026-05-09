@@ -8,6 +8,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import normalize_relative_path, read_text_file, resolve_workspace_path
 
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def write_file(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     path: str,
     content: str,
     overwrite: bool = True,
@@ -40,7 +41,7 @@ def write_file(
 
 
 def make_directory(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     path: str,
     parents: bool = True,
     exist_ok: bool = True,
@@ -61,7 +62,7 @@ def make_directory(
 
 
 def replace_in_file(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     path: str,
     old_text: str,
     new_text: str,
@@ -93,7 +94,7 @@ def replace_in_file(
 
 
 def delete_path(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     path: str,
 ) -> dict[str, object]:
     """在工作区内安全地删除文件或文件夹（自动递归删除）。"""

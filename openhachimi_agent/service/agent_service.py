@@ -20,6 +20,7 @@ from pydantic_ai.messages import (
 from openhachimi_agent.agent.factory import build_agent
 from openhachimi_agent.content.roles import list_role_names
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
 from openhachimi_agent.transport.api_models import AgentState, ChatResponse, CommandResponse, RolesResponse
 
@@ -221,7 +222,7 @@ class AgentService:
                     agent.run(
                         message,
                         message_history=history,
-                        deps=self.config,
+                        deps=AgentDeps(config=self.config, session_id=actual_session_id),
                         event_stream_handler=handle_stream_events,
                     ),
                     timeout=self.config.agent_timeout_seconds,

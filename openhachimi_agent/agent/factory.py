@@ -10,6 +10,7 @@ from openhachimi_agent.content.prompts import load_system_prompt
 from openhachimi_agent.content.roles import load_role_content
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools import WORKSPACE_TOOLSET
 
 
@@ -28,12 +29,12 @@ def build_agent(config: AppConfig, role_name: str) -> Agent:
         bool(config.openai_base_url),
     )
     import datetime
-    
+
     current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     system_prompt = f"[系统环境] 当前真实时间: {current_time}\n\n" + load_system_prompt()
-    
+
     role_content = load_role_content(config.roles_dir, role_name)
-    
+
     # 动态扫描可用技能，将轻量级菜单注入到系统提示词中
     skills = find_skills(config.skills_dirs)
     if skills:
@@ -54,7 +55,7 @@ def build_agent(config: AppConfig, role_name: str) -> Agent:
         OpenAIChatModel(config.model_name, provider=provider),
         system_prompt=system_prompt,
         instructions=role_content,
-        deps_type=AppConfig,
+        deps_type=AgentDeps,
         toolsets=[WORKSPACE_TOOLSET],
         defer_model_check=True,
     )

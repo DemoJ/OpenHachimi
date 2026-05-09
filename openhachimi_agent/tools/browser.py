@@ -8,7 +8,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.tools.utils import inject_prompt_if_unread
+from openhachimi_agent.core.deps import AgentDeps
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +25,14 @@ def _get_browser_manager(config: AppConfig):
     return _browser_manager
 
 
-async def browser_navigate(ctx: RunContext[AppConfig], url: str) -> str:
+async def browser_navigate(ctx: RunContext[AgentDeps], url: str) -> str:
     """导航浏览器到指定的网址。使用该工具前请确保需要访问网页，完成后使用 browser_get_state 获取页面信息。"""
     bm = _get_browser_manager(ctx.deps)
     result = await bm.navigate(url)
-    return inject_prompt_if_unread(ctx, "browser", result)
+    return result
 
 
-async def browser_get_state(ctx: RunContext[AppConfig]) -> str:
+async def browser_get_state(ctx: RunContext[AgentDeps]) -> str:
     """获取当前浏览器的页面状态（提取出交互元素的精简树结构和 ID）。
     
     返回结果将包含：当前URL、页面标题、以及所有交互元素的列表（带 [ID] 前缀）。
@@ -40,30 +40,30 @@ async def browser_get_state(ctx: RunContext[AppConfig]) -> str:
     """
     bm = _get_browser_manager(ctx.deps)
     result = await bm.get_state()
-    return inject_prompt_if_unread(ctx, "browser", result)
+    return result
 
 
-async def browser_click(ctx: RunContext[AppConfig], element_id: int) -> str:
+async def browser_click(ctx: RunContext[AgentDeps], element_id: int) -> str:
     """点击浏览器页面中指定 ID 的元素。
     
     参数 `element_id` 必须是之前调用 browser_get_state 获取到的页面状态中元素前的数字 ID。
     """
     bm = _get_browser_manager(ctx.deps)
     result = await bm.click(element_id)
-    return inject_prompt_if_unread(ctx, "browser", result)
+    return result
 
 
-async def browser_type(ctx: RunContext[AppConfig], element_id: int, text: str) -> str:
+async def browser_type(ctx: RunContext[AgentDeps], element_id: int, text: str) -> str:
     """在浏览器页面中指定 ID 的输入框（或文本区域）中输入文本。
     
     参数 `element_id` 必须是之前调用 browser_get_state 获取到的页面状态中元素前的数字 ID。
     """
     bm = _get_browser_manager(ctx.deps)
     result = await bm.type_text(element_id, text)
-    return inject_prompt_if_unread(ctx, "browser", result)
+    return result
 
 
-async def browser_scroll(ctx: RunContext[AppConfig], direction: str, amount: int = 600) -> str:
+async def browser_scroll(ctx: RunContext[AgentDeps], direction: str, amount: int = 600) -> str:
     """滚动当前浏览器页面。
     
     当 browser_get_state 输出中显示“下方还有 Npx 内容”时，必须调用此工具滚动查看更多内容。
@@ -80,4 +80,4 @@ async def browser_scroll(ctx: RunContext[AppConfig], direction: str, amount: int
     """
     bm = _get_browser_manager(ctx.deps)
     result = await bm.scroll(direction, amount)
-    return inject_prompt_if_unread(ctx, "browser", result)
+    return result

@@ -10,6 +10,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     assert_safe_command,
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 async def run_command(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     command: str,
     cwd: str = ".",
     wait_seconds: int = 5,
@@ -77,10 +78,10 @@ async def run_command(
         "output_truncated": truncated,
         "message": "命令正在后台运行，可能在等待输入" if is_running else "命令执行完毕",
     }
-    return inject_prompt_if_unread(ctx, "commands", result)
+    return result
 
 
-def command_status(ctx: RunContext[AppConfig], command_id: str) -> dict[str, object]:
+def command_status(ctx: RunContext[AgentDeps], command_id: str) -> dict[str, object]:
     """检查后台运行中的命令状态，获取最新的输出日志。"""
     from openhachimi_agent.service.process import process_manager
     proc = process_manager.get_process(command_id)
@@ -97,13 +98,13 @@ def command_status(ctx: RunContext[AppConfig], command_id: str) -> dict[str, obj
         "output_truncated": truncated,
         "message": "命令仍在运行" if is_running else "命令已结束",
     }
-    return inject_prompt_if_unread(ctx, "commands", result)
+    return result
 
 
 from typing import Literal
 
 async def send_command_input(
-    ctx: RunContext[AppConfig], 
+    ctx: RunContext[AgentDeps], 
     command_id: str, 
     text: str = "",
     special_key: Literal["enter", "up", "down", "space", "esc", "ctrl-c", "none"] = "none"
@@ -151,4 +152,4 @@ async def send_command_input(
         "output": output,
         "output_truncated": truncated,
     }
-    return inject_prompt_if_unread(ctx, "commands", result)
+    return result

@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 from pydantic_ai import RunContext
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import trim_output
 
 
@@ -139,7 +140,7 @@ def _maybe_pretty_json(text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def web_fetch(ctx: RunContext[AppConfig], url: str) -> str:
+def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     """Fetch a public HTTP/HTTPS URL without opening a browser.
 
     Use this before browser tools for public pages, JSON APIs, RSS, Atom, and
@@ -170,7 +171,7 @@ def web_fetch(ctx: RunContext[AppConfig], url: str) -> str:
     return "\n".join(header) + "\n" + trimmed
 
 
-def discover_web_resources(ctx: RunContext[AppConfig], url: str) -> str:
+def discover_web_resources(ctx: RunContext[AgentDeps], url: str) -> str:
     """Discover RSS/Atom/JSON/API-like public resource links from a web page.
 
     Prefer discovered RSS, Atom, JSON, or documented API links before using the

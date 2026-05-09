@@ -180,28 +180,36 @@ def get_command_shell() -> tuple[list[str], str]:
     logger.debug("selected command shell=%s", Path(shell_path).name)
     return [shell_path, "-lc"], Path(shell_path).name
 
-_prompt_read_cache: dict[tuple[int, int], set[str]] = {}
+_prompt_read_cache: dict[str, set[str]] = {}
+
+def _get_session_id(ctx: object) -> str | None:
+    deps = getattr(ctx, "deps", None)
+    if deps and hasattr(deps, "session_id"):
+        return str(getattr(deps, "session_id"))
+    return None
 
 def check_prompt_read(ctx: object, prompt_filename: str) -> bool:
     """检查 Agent 是否已经读取过指定的系统提示词文件。"""
-    if not hasattr(ctx, "messages"):
+    session_id = _get_session_id(ctx)
+    if not session_id:
         return False
         
+    global _prompt_read_cache
+    if session_id not in _prompt_read_cache:
+        # 限制缓存大小，防止内存泄漏 (简单的淘汰策略)
+        if len(_prompt_read_cache) > 1000:
+            # 移除最旧的元素 (Python 3.7+ 字典保持插入顺序)
+            oldest_key = next(iter(_prompt_read_cache))
+            del _prompt_read_cache[oldest_key]
+        _prompt_read_cache[session_id] = set()
+        
+    cache = _prompt_read_cache[session_id]
+    if prompt_filename in cache:
+        return True
+
     messages = getattr(ctx, "messages", [])
     if not messages:
         return False
-        
-    cache_key = (id(messages), id(messages[0]))
-    
-    global _prompt_read_cache
-    if cache_key not in _prompt_read_cache:
-        if len(_prompt_read_cache) > 100:
-            _prompt_read_cache.clear()
-        _prompt_read_cache[cache_key] = set()
-        
-    cache = _prompt_read_cache[cache_key]
-    if prompt_filename in cache:
-        return True
 
     # 逆序遍历，通常系统提示词会在较近的交互中出现，提高查找效率
     for msg in reversed(messages):
@@ -240,18 +248,16 @@ def inject_prompt_if_unread(ctx: object, prompt_name: str, original_result: str 
         return original_result
 
     # 立即添加到缓存中，防止同一次 Run 中后续的工具调用重复注入
-    if hasattr(ctx, "messages"):
-        messages = getattr(ctx, "messages", [])
-        if messages:
-            cache_key = (id(messages), id(messages[0]))
-            global _prompt_read_cache
-            if cache_key in _prompt_read_cache:
-                _prompt_read_cache[cache_key].add(prompt_filename)
+    session_id = _get_session_id(ctx)
+    if session_id:
+        global _prompt_read_cache
+        if session_id in _prompt_read_cache:
+            _prompt_read_cache[session_id].add(prompt_filename)
 
     injection = (
-        f"\\n\\n[系统自动注入子提示词：{prompt_filename}]\\n"
-        f"由于你是首次使用该类型工具，请务必遵循以下操作规范：\\n{content}\\n\\n"
-        "[以上为系统自动注入的指引，以下为工具实际执行结果]\\n"
+        f"\n\n[系统自动注入子提示词：{prompt_filename}]\n"
+        f"由于你是首次使用该类型工具，请务必遵循以下操作规范：\n{content}\n\n"
+        "[以上为系统自动注入的指引，以下为工具实际执行结果]\n"
     )
 
     if isinstance(original_result, str):

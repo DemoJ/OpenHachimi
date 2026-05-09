@@ -7,6 +7,7 @@ import logging
 from pydantic_ai import RunContext
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     normalize_relative_path,
@@ -19,7 +20,7 @@ from openhachimi_agent.tools.utils import (
 logger = logging.getLogger(__name__)
 
 
-def git_status(ctx: RunContext[AppConfig], cwd: str = ".") -> dict[str, object]:
+def git_status(ctx: RunContext[AgentDeps], cwd: str = ".") -> dict[str, object]:
     """查看当前工作区的 Git 状态。"""
     logger.debug("tool git_status cwd=%s", cwd)
     target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
@@ -38,7 +39,7 @@ def git_status(ctx: RunContext[AppConfig], cwd: str = ".") -> dict[str, object]:
 
 
 def git_diff(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     path: str | None = None,
     staged: bool = False,
     ref: str | None = None,

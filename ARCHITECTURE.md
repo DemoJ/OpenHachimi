@@ -426,7 +426,7 @@ logging:
 ### 添加新工具
 
 1. 在 `tools/` 下创建新模块或使用现有模块
-2. 定义工具函数，签名：`def tool(ctx: RunContext[AppConfig], ...)`
+2. 定义工具函数，签名：`def tool(ctx: RunContext[AgentDeps], ...)`
 3. 在 `tools/registry.py` 的 `WORKSPACE_TOOLSET` 中注册
 4. 在 `tools/__init__.py` 的 `__all__` 中导出
 

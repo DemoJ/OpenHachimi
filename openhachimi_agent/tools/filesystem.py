@@ -9,6 +9,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import (
     MAX_LIST_ENTRIES,
     MAX_READ_LINES,
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def list_files(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     path: str = ".",
     recursive: bool = False,
     max_entries: int = MAX_LIST_ENTRIES,
@@ -67,7 +68,7 @@ def list_files(
 
 
 def find_files(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     pattern: str,
     path: str = ".",
     max_entries: int = MAX_SEARCH_RESULTS,
@@ -105,7 +106,7 @@ def find_files(
 
 
 def search_text(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     query: str,
     path: str = ".",
     file_pattern: str = "*",
@@ -168,7 +169,7 @@ def search_text(
 
 
 def read_file(
-    ctx: RunContext[AppConfig],
+    ctx: RunContext[AgentDeps],
     path: str,
     start_line: int = 1,
     end_line: int | None = None,

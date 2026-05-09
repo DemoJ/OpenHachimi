@@ -9,10 +9,10 @@ from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.tools.utils import inject_prompt_if_unread
+from openhachimi_agent.core.deps import AgentDeps
 
 
-def list_skills(ctx: RunContext[AppConfig]) -> str:
+def list_skills(ctx: RunContext[AgentDeps]) -> str:
     """Lists available Claude Skills for the current project.
     
     Returns:
@@ -30,10 +30,10 @@ def list_skills(ctx: RunContext[AppConfig]) -> str:
             entry += f"\n  When to use: {skill.config.when_to_use}"
         result.append(entry)
         
-    return inject_prompt_if_unread(ctx, "skills", "\n\n".join(result))
+    return "\n\n".join(result)
 
 
-def get_skill_instructions(ctx: RunContext[AppConfig], skill_name: str) -> str:
+def get_skill_instructions(ctx: RunContext[AgentDeps], skill_name: str) -> str:
     """Gets the specific markdown instructions for a named skill.
     
     Args:
@@ -47,7 +47,7 @@ def get_skill_instructions(ctx: RunContext[AppConfig], skill_name: str) -> str:
     for skill in skills:
         if skill.config.name == skill_name:
             if skill.config.disable_model_invocation:
-                return inject_prompt_if_unread(ctx, "skills", f"Skill '{skill_name}' is marked with disable_model_invocation=true. You should not run this skill directly.")
-            return inject_prompt_if_unread(ctx, "skills", skill.body)
+                return f"Skill '{skill_name}' is marked with disable_model_invocation=true. You should not run this skill directly."
+            return skill.body
             
-    return inject_prompt_if_unread(ctx, "skills", f"Skill '{skill_name}' not found. Please check available skills using list_skills.")
+    return f"Skill '{skill_name}' not found. Please check available skills using list_skills."
