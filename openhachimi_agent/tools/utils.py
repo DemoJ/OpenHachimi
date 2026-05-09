@@ -22,6 +22,7 @@ SKIP_DIR_NAMES = {
     ".tmp",
     ".tmp-ensurepip",
     ".venv",
+    ".browser_data",
     "__pycache__",
     "openhachimi_agent.egg-info",
 }

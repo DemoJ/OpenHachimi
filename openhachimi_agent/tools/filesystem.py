@@ -41,11 +41,16 @@ def list_files(
     entries: list[dict[str, object]] = []
 
     for item in iter_workspace_items(target_dir, recursive):
+        try:
+            size = item.stat().st_size if item.is_file() else None
+        except Exception:
+            size = None
+            
         entries.append(
             {
                 "path": normalize_relative_path(ctx.deps.base_dir, item),
                 "type": "directory" if item.is_dir() else "file",
-                "size": item.stat().st_size if item.is_file() else None,
+                "size": size,
             }
         )
         if len(entries) >= max_entries:
@@ -130,7 +135,12 @@ def search_text(
         if not (fnmatch.fnmatch(item.name, file_pattern) or fnmatch.fnmatch(relative_path, file_pattern)):
             continue
 
-        text = item.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = item.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.debug("读取文件 %s 失败：%s", item, e)
+            continue
+
         for line_number, line in enumerate(text.splitlines(), start=1):
             haystack = line if case_sensitive else line.lower()
             if normalized_query in haystack:
