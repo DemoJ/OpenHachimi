@@ -135,13 +135,13 @@ class TelegramBot:
         logger.info("telegram bot handler initialized")
 
     def _get_session(self, user_id: int) -> dict[str, str]:
-        """获取用户 session，若不存在则新建。"""
+        """获取用户 session，若不存在则尝试恢复上次会话。"""
         if user_id not in self._sessions:
             role = self.config.default_role_name
-            resp = self.service.new_session(role)
+            resp = self.service.latest_session(role)
             self._sessions[user_id] = {"role": role, "session_id": resp.session_id}
             logger.info(
-                "telegram new session user_id=%d role=%s session_id=%s",
+                "telegram restored session user_id=%d role=%s session_id=%s",
                 user_id, role, resp.session_id,
             )
         return self._sessions[user_id]
