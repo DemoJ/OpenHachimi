@@ -11,31 +11,41 @@ from openhachimi_agent.tools.filesystem import find_files, list_files, read_file
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
+from openhachimi_agent.tools.research import deep_search
+from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder
 
+_REGULAR_TOOLS = [
+    list_files,
+    find_files,
+    search_text,
+    read_file,
+    write_file,
+    make_directory,
+    replace_in_file,
+    delete_path,
+    run_command,
+    command_status,
+    send_command_input,
+    git_status,
+    git_diff,
+    list_skills,
+    get_skill_instructions,
+    discover_web_resources,
+    web_fetch,
+    browser_navigate,
+    browser_get_state,
+    browser_click,
+    browser_type,
+    browser_scroll,
+    deep_search,
+]
+
+_PLANNING_TOOLS = [
+    create_todos,
+    update_todo,
+    get_todos,
+]
 
 WORKSPACE_TOOLSET = FunctionToolset(
-    tools=[
-        list_files,
-        find_files,
-        search_text,
-        read_file,
-        write_file,
-        make_directory,
-        replace_in_file,
-        delete_path,
-        run_command,
-        command_status,
-        send_command_input,
-        git_status,
-        git_diff,
-        list_skills,
-        get_skill_instructions,
-        discover_web_resources,
-        web_fetch,
-        browser_navigate,
-        browser_get_state,
-        browser_click,
-        browser_type,
-        browser_scroll,
-    ]
+    tools=[with_todo_reminder(tool) for tool in _REGULAR_TOOLS] + _PLANNING_TOOLS
 )

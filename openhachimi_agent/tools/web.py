@@ -144,6 +144,10 @@ def web_fetch(ctx: RunContext[AppConfig], url: str) -> str:
 
     Use this before browser tools for public pages, JSON APIs, RSS, Atom, and
     other stable text endpoints. Do not use it for private/local files.
+    
+    IMPORTANT: DO NOT use this tool to guess news sites or manually gather broad 
+    information for abstract queries (e.g., "AI news"). For broad queries, 
+    ALWAYS use the `intelligent_search` tool instead.
     """
     del ctx
     target_url = _validate_public_url(url)

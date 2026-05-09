@@ -27,7 +27,11 @@ def build_agent(config: AppConfig, role_name: str) -> Agent:
         config.model_name,
         bool(config.openai_base_url),
     )
-    system_prompt = load_system_prompt()
+    import datetime
+    
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    system_prompt = f"[系统环境] 当前真实时间: {current_time}\n\n" + load_system_prompt()
+    
     role_content = load_role_content(config.roles_dir, role_name)
     
     # 动态扫描可用技能，将轻量级菜单注入到系统提示词中

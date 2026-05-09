@@ -7,6 +7,8 @@ from openhachimi_agent.tools.filesystem import find_files, list_files, read_file
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.registry import WORKSPACE_TOOLSET
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
+from openhachimi_agent.tools.research import deep_search
+from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos
 
 __all__ = [
     "WORKSPACE_TOOLSET",
@@ -27,4 +29,8 @@ __all__ = [
     "browser_click",
     "browser_type",
     "browser_scroll",
+    "deep_search",
+    "create_todos",
+    "update_todo",
+    "get_todos",
 ]
