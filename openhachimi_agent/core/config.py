@@ -100,6 +100,11 @@ def load_config() -> AppConfig:
     paths_config = _as_mapping(raw_config.get("paths"), "paths")
     logging_config = _as_mapping(raw_config.get("logging"), "logging")
 
+    skills_dirs = [user_dir / "skills"]
+    external_skills_dir = _config_string(paths_config, "external_skills_dir")
+    if external_skills_dir:
+        skills_dirs.append(_resolve_config_path(base_dir, external_skills_dir, base_dir))
+
     return AppConfig(
         base_dir=base_dir,
         user_dir=user_dir,
@@ -125,9 +130,7 @@ def load_config() -> AppConfig:
         ),
         log_level=_config_string(logging_config, "level", "INFO").upper(),
         log_console=_config_bool(logging_config, "console", False),
-        skills_dirs=[
-            user_dir / "skills",
-        ],
+        skills_dirs=skills_dirs,
         browser_headless=_config_bool(app_config, "browser_headless", True),
         browser_channel=_config_string(app_config, "browser_channel") or None,
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,

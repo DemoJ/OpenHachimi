@@ -17,6 +17,7 @@ llm:
 paths:
   roles_dir: user/roles
   memory_dir: .memory
+  external_skills_dir: ""    # 可选配置，外部技能目录的绝对路径，例如 C:\Users\xxx\.agents\skills
 
 logging:
   level: INFO
