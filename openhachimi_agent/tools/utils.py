@@ -9,7 +9,24 @@ import shutil
 import subprocess
 import logging
 from pathlib import Path
+from typing import TypeVar
 from pydantic_ai.exceptions import ModelRetry
+
+K = TypeVar('K')
+V = TypeVar('V')
+
+class BoundedDict(dict[K, V]):
+    """带有最大容量限制的字典，当超出时移除最早插入的元素 (FIFO)。"""
+    def __init__(self, max_size: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_size = max_size
+
+    def __setitem__(self, key: K, value: V):
+        if key not in self:
+            if len(self) >= self.max_size:
+                oldest_key = next(iter(self))
+                del self[oldest_key]
+        super().__setitem__(key, value)
 
 MAX_LIST_ENTRIES = 200
 MAX_READ_LINES = 200

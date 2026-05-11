@@ -81,16 +81,39 @@ def _status_from_stream_event(event: object) -> str:
 class AgentService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self._agents = {}  # 缓存 Agent 实例，避免每次请求重复扫描磁盘和初始化
+        self._agents = {}  # 缓存 (Agent 实例, 最后修改时间)，支持热重载
         logger.info(
             "service initialized model=%s",
             self.config.model_name,
         )
 
     def _get_agent(self, role_name: str):
-        if role_name not in self._agents:
-            self._agents[role_name] = build_agent(self.config, role_name)
-        return self._agents[role_name]
+        # 计算依赖文件（角色文件和技能目录）的最新修改时间
+        paths_to_check = [self.config.roles_dir / f"{role_name}.md"]
+        paths_to_check.extend(self.config.skills_dirs)
+        
+        current_mtime = 0.0
+        try:
+            for path in paths_to_check:
+                if not path.exists():
+                    continue
+                if path.is_file():
+                    current_mtime = max(current_mtime, path.stat().st_mtime)
+                elif path.is_dir():
+                    for p in path.rglob('*'):
+                        if p.is_file():
+                            current_mtime = max(current_mtime, p.stat().st_mtime)
+        except Exception as e:
+            logger.debug("Failed to check mtime for agent dependencies: %s", e)
+
+        cached = self._agents.get(role_name)
+        if cached is None or cached[1] < current_mtime:
+            if cached is not None:
+                logger.info("rebuilding agent due to dependency updates role=%s", role_name)
+            agent = build_agent(self.config, role_name)
+            self._agents[role_name] = (agent, current_mtime)
+            
+        return self._agents[role_name][0]
 
     def state(self) -> AgentState:
         return AgentState(

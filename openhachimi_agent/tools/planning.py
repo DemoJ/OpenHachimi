@@ -65,8 +65,6 @@ def _save_state(ctx: RunContext[AgentDeps], state: TodoState):
 def _get_state(ctx: RunContext[AgentDeps]) -> TodoState:
     session_id = ctx.deps.session_id
     if session_id not in _SESSION_TODO_STATES:
-        if len(_SESSION_TODO_STATES) > 1000:
-            _SESSION_TODO_STATES.clear() # simple eviction
         _SESSION_TODO_STATES[session_id] = _load_state(ctx)
     return _SESSION_TODO_STATES[session_id]
 
