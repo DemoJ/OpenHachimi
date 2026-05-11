@@ -30,8 +30,7 @@ def build_agent(config: AppConfig, role_name: str) -> Agent:
     )
     import datetime
 
-    current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    system_prompt = f"[系统环境] 当前真实时间: {current_time}\n\n" + load_system_prompt()
+    system_prompt = load_system_prompt()
 
     role_content = load_role_content(config.roles_dir, role_name)
 
@@ -51,7 +50,7 @@ def build_agent(config: AppConfig, role_name: str) -> Agent:
         api_key=config.openai_api_key,
     )
 
-    return Agent(
+    agent = Agent(
         OpenAIChatModel(config.model_name, provider=provider),
         system_prompt=system_prompt,
         instructions=role_content,
@@ -59,3 +58,10 @@ def build_agent(config: AppConfig, role_name: str) -> Agent:
         toolsets=[WORKSPACE_TOOLSET],
         defer_model_check=True,
     )
+
+    @agent.system_prompt
+    def _inject_time() -> str:
+        current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        return f"[系统环境] 当前真实时间: {current_time}\n"
+
+    return agent

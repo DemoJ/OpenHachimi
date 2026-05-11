@@ -264,7 +264,3 @@ def run_update(*, force: bool = False) -> None:
     print(f"\n[ok] 更新完成：{local_short} -> {new_local_short}")
     print(f"     版本号：{local_version} -> {remote_version}")
     _print_restart_hint()
-
-
-def main() -> None:
-    run_update(force="--force" in sys.argv[1:])

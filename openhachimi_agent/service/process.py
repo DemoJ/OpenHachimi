@@ -22,7 +22,7 @@ class RunningProcess:
         self.cwd = cwd.as_posix()
         self.shell_name = shell_name
         
-        logger.info(f"Starting process {self.id}: {command} in {cwd}")
+        logger.info("Starting process %s: %s in %s", self.id, command, cwd)
         
         self.process = subprocess.Popen(
             command,
@@ -30,10 +30,7 @@ class RunningProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE,
-            text=True,
-            bufsize=1,  # Line buffered where possible
-            encoding="utf-8",
-            errors="replace",
+            bufsize=0,  # Unbuffered binary mode
         )
         
         self.output_buffer: list[str] = []
@@ -55,20 +52,36 @@ class RunningProcess:
         self.stderr_thread.start()
 
     def _read_stream(self, stream, stream_name: str) -> None:
-        """逐字符读取流，以确保即使没有换行符的交互式提示也能被捕获。"""
+        """分块读取流，减少系统调用和锁竞争。使用增量解码器处理跨块字符，兼顾交互提示符的实时性。"""
         if stream is None:
             return
             
+        import codecs
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            
         try:
             while True:
-                # 逐字符读取对于交互式提示非常重要（如 "Confirm? [y/N]: "）
-                char = stream.read(1)
-                if not char:
+                # unbuffered 模式下 read 会在有数据时立即返回
+                chunk = stream.read(4096)
+                if not chunk:
                     break
+                
+                text = decoder.decode(chunk)
+                if text:
+                    with self._lock:
+                        self.output_buffer.append(text)
+                        
+            final_text = decoder.decode(b"", final=True)
+            if final_text:
                 with self._lock:
-                    self.output_buffer.append(char)
+                    self.output_buffer.append(final_text)
         except Exception as e:
             logger.debug("Error reading %s for process %s: %s", stream_name, self.id, e)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def get_output(self, limit: int = 12000) -> tuple[str, bool]:
         """获取当前进程已输出的合并文本。"""
@@ -86,7 +99,7 @@ class RunningProcess:
         """向进程的标准输入发送文本。"""
         if self.is_running() and self.process.stdin:
             try:
-                self.process.stdin.write(text)
+                self.process.stdin.write(text.encode("utf-8"))
                 self.process.stdin.flush()
                 logger.info("Sent input to process %s", self.id)
             except Exception as e:
@@ -103,14 +116,45 @@ class RunningProcess:
             logger.info("Terminating process %s", self.id)
             self.process.terminate()
 
+    def cleanup(self) -> None:
+        """释放资源，关闭所有相关的文件描述符。"""
+        try:
+            if self.process.stdin:
+                self.process.stdin.close()
+        except Exception:
+            pass
+        if self.is_running():
+            self.terminate()
+            try:
+                self.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        else:
+            self.process.wait()
+
 
 class ProcessManager:
     """全局进程管理。"""
 
-    def __init__(self):
+    def __init__(self, max_history: int = 50):
         self._processes: dict[str, RunningProcess] = {}
+        self.max_history = max_history
+
+    def _cleanup_old_processes(self) -> None:
+        """清理已结束的进程，防止内存泄漏。"""
+        finished_ids = [p_id for p_id, p in self._processes.items() if not p.is_running()]
+        
+        if len(self._processes) >= self.max_history:
+            # 清理超出限制数量的已结束进程
+            excess = len(self._processes) - self.max_history + 1
+            for p_id in finished_ids[:excess]:
+                proc = self._processes.pop(p_id, None)
+                if proc:
+                    proc.cleanup()
         
     def start_process(self, command: list[str], cwd: Path, shell_name: str) -> RunningProcess:
+        self._cleanup_old_processes()
         proc = RunningProcess(command, cwd, shell_name)
         self._processes[proc.id] = proc
         return proc

@@ -8,7 +8,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse
 
 from openhachimi_agent.app_logging import configure_logging
@@ -17,12 +17,11 @@ from openhachimi_agent.interface.telegram import telegram_lifespan
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.transport.api_models import ChatRequest, RoleSwitchRequest
 
-
-config = load_config()
-configure_logging(config)
 logger = logging.getLogger(__name__)
-service = AgentService(config)
-logger.info("server module initialized")
+
+
+def get_service(request: Request) -> AgentService:
+    return request.app.state.service
 
 
 @asynccontextmanager
@@ -32,6 +31,11 @@ async def lifespan(app: FastAPI):
     负责在服务启动/停止时，统一管理所有渠道（当前为 Telegram Bot）的生命周期。
     各渠道以异步上下文管理器的形式嵌套，共享同一 asyncio 事件循环，无需额外线程。
     """
+    config = load_config()
+    configure_logging(config)
+    app.state.service = AgentService(config)
+    logger.info("server module initialized")
+
     async with telegram_lifespan(config):
         logger.info("all channels started")
         yield
@@ -50,26 +54,26 @@ def health() -> dict[str, str]:
 
 
 @app.get("/state")
-def state():
+def state(service: AgentService = Depends(get_service)):
     return service.state()
 
 
 @app.get("/roles")
-def roles():
+def roles(service: AgentService = Depends(get_service)):
     return service.list_roles()
 
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+async def chat(request: ChatRequest, service: AgentService = Depends(get_service)):
     logger.info("http chat request message_chars=%d stream=false", len(request.message))
     try:
-        return service.send_message(request.message, request.role, request.session_id)
+        return await service.send_message(request.message, request.role, request.session_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/chat/stream")
-def chat_stream(request: ChatRequest):
+def chat_stream(request: ChatRequest, service: AgentService = Depends(get_service)):
     logger.info("http chat request message_chars=%d stream=true", len(request.message))
 
     async def sse_generator():
@@ -91,19 +95,19 @@ def chat_stream(request: ChatRequest):
 
 
 @app.post("/new")
-def new_session(role: str | None = None):
+def new_session(role: str | None = None, service: AgentService = Depends(get_service)):
     logger.info("http new session request role=%s", role)
     return service.new_session(role)
 
 
 @app.get("/session/latest")
-def latest_session(role: str | None = None):
+def latest_session(role: str | None = None, service: AgentService = Depends(get_service)):
     logger.info("http latest session request role=%s", role)
     return service.latest_session(role)
 
 
 @app.post("/role")
-def switch_role(request: RoleSwitchRequest):
+def switch_role(request: RoleSwitchRequest, service: AgentService = Depends(get_service)):
     logger.info("http switch role request role=%s", request.role.strip())
     try:
         return service.switch_role(request.role.strip())

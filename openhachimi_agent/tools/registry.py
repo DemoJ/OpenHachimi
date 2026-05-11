@@ -59,28 +59,27 @@ _PLANNING_TOOLS = [
     get_todos,
 ]
 
-# 组装横切关注点 (Middlewares)
-commands_with_middleware = apply_middlewares(_COMMAND_TOOLS, [with_prompt_injection("commands")])
-browser_with_middleware = apply_middlewares(_BROWSER_TOOLS, [with_prompt_injection("browser")])
-skills_with_middleware = apply_middlewares(_SKILLS_TOOLS, [with_prompt_injection("skills")])
-
-# 重新拆分读写工具，以便应用 TODO 提醒 (仅对执行类操作进行进度打断)
-_ALL_APPLIED_TOOLS = commands_with_middleware + browser_with_middleware + skills_with_middleware + _FILE_TOOLS + _OTHER_TOOLS
-
-_MUTATION_TOOL_NAMES = {
-    "write_file", "make_directory", "replace_in_file", "delete_path",
-    "run_command", "send_command_input",
-    "browser_navigate", "browser_click", "browser_type", "browser_scroll"
+# 组装横切关注点 (Middlewares) 和 TODO 提醒
+_MUTATION_FUNCS = {
+    write_file, make_directory, replace_in_file, delete_path,
+    run_command, send_command_input,
+    browser_navigate, browser_click, browser_type, browser_scroll,
 }
 
 _FINAL_TOOLS = []
-for tool in _ALL_APPLIED_TOOLS:
-    # Unwrap __name__ to check if it's a mutation tool
-    # Because functools.wraps preserves __name__
-    if tool.__name__ in _MUTATION_TOOL_NAMES:
-        _FINAL_TOOLS.append(with_todo_reminder(tool))
-    else:
-        _FINAL_TOOLS.append(tool)
+for _orig_tools, _middlewares in [
+    (_COMMAND_TOOLS, [with_prompt_injection("commands")]),
+    (_BROWSER_TOOLS, [with_prompt_injection("browser")]),
+    (_SKILLS_TOOLS, [with_prompt_injection("skills")]),
+    (_FILE_TOOLS, []),
+    (_OTHER_TOOLS, []),
+]:
+    _wrapped_tools = apply_middlewares(_orig_tools, _middlewares) if _middlewares else _orig_tools
+    for _orig, _wrapped in zip(_orig_tools, _wrapped_tools):
+        if _orig in _MUTATION_FUNCS:
+            _FINAL_TOOLS.append(with_todo_reminder(_wrapped))
+        else:
+            _FINAL_TOOLS.append(_wrapped)
 
 WORKSPACE_TOOLSET = FunctionToolset(
     tools=_FINAL_TOOLS + _PLANNING_TOOLS

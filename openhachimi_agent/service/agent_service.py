@@ -81,10 +81,16 @@ def _status_from_stream_event(event: object) -> str:
 class AgentService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self._agents = {}  # 缓存 Agent 实例，避免每次请求重复扫描磁盘和初始化
         logger.info(
             "service initialized model=%s",
             self.config.model_name,
         )
+
+    def _get_agent(self, role_name: str):
+        if role_name not in self._agents:
+            self._agents[role_name] = build_agent(self.config, role_name)
+        return self._agents[role_name]
 
     def state(self) -> AgentState:
         return AgentState(
@@ -143,10 +149,10 @@ class AgentService:
             session_id=session_id,
         )
 
-    def send_message(self, message: str, role: str | None = None, session_id: str | None = None) -> ChatResponse:
+    async def send_message(self, message: str, role: str | None = None, session_id: str | None = None) -> ChatResponse:
         start_time = time.perf_counter()
         role = role or self.config.default_role_name
-        agent = build_agent(self.config, role)
+        agent = self._get_agent(role)
         
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
         
@@ -158,7 +164,7 @@ class AgentService:
             len(history),
         )
         try:
-            result = agent.run_sync(message, message_history=history, deps=self.config)
+            result = await agent.run(message, message_history=history, deps=AgentDeps(config=self.config, session_id=actual_session_id))
         except Exception:
             logger.exception(
                 "chat failed role=%s session_id=%s stream=false",
@@ -168,7 +174,8 @@ class AgentService:
             raise
             
         new_history = list(result.all_messages())
-        save_message_history(
+        await asyncio.to_thread(
+            save_message_history,
             self.config.memory_dir,
             role,
             actual_session_id,
@@ -191,7 +198,7 @@ class AgentService:
     async def stream_message(self, message: str, role: str | None = None, session_id: str | None = None) -> AsyncIterator[str]:
         start_time = time.perf_counter()
         role = role or self.config.default_role_name
-        agent = build_agent(self.config, role)
+        agent = self._get_agent(role)
         
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
         
