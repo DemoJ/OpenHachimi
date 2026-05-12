@@ -11,6 +11,7 @@ import html
 import logging
 import re
 import time
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -132,6 +133,8 @@ class TelegramBot:
         self.service = AgentService(config)
         # 按 user_id 存储各自的 {role, session_id}
         self._sessions: dict[int, dict[str, str]] = {}
+        # 按 user_id 存储队列锁，实现每个用户独立的消息排队机制
+        self._user_locks: dict[int, asyncio.Lock] = {}
         logger.info("telegram bot handler initialized")
 
     def _get_session(self, user_id: int) -> dict[str, str]:
@@ -188,6 +191,8 @@ class TelegramBot:
         user_id = update.effective_user.id
         session = self._get_session(user_id)
         role = session["role"]
+        old_session_id = session["session_id"]
+        self.service.stop_session(old_session_id)
         resp = self.service.new_session(role)
         self._sessions[user_id] = {"role": role, "session_id": resp.session_id}
         logger.info("cmd /new user_id=%d role=%s session_id=%s", user_id, role, resp.session_id)
@@ -223,6 +228,8 @@ class TelegramBot:
             )
             return
         role_name = args[0].strip()
+        old_session_id = self._get_session(user_id)["session_id"]
+        self.service.stop_session(old_session_id)
         try:
             resp = self.service.switch_role(role_name)
             self._sessions[user_id] = {"role": resp.role, "session_id": resp.session_id}
@@ -246,108 +253,113 @@ class TelegramBot:
         role = session["role"]
         session_id = session["session_id"]
 
-        logger.info(
-            "telegram message user_id=%d role=%s session_id=%s chars=%d",
-            user_id, role, session_id, len(user_text),
-        )
+        if user_id not in self._user_locks:
+            self._user_locks[user_id] = asyncio.Lock()
+        lock = self._user_locks[user_id]
 
-        # 先发出占位消息
-        placeholder = await update.message.reply_text("⏳ 思考中……")
+        async with lock:
+            logger.info(
+                "telegram message user_id=%d role=%s session_id=%s chars=%d",
+                user_id, role, session_id, len(user_text),
+            )
 
-        accumulated = ""
-        last_edit_time = time.monotonic()
-        sent_parts: list = [placeholder]
+            # 先发出占位消息
+            placeholder = await update.message.reply_text("⏳ 思考中……")
 
-        async def flush(final: bool = False) -> None:
-            """将累积内容同步到 Telegram 消息。
+            accumulated = ""
+            last_edit_time = time.monotonic()
+            sent_parts: list = [placeholder]
 
-            final=False：以纯文本发出（流式过程中，Markdown 可能不完整）
-            final=True：转换为 HTML 渲染（完整内容，格式正确）
-            """
-            nonlocal last_edit_time, sent_parts
-            if not accumulated:
-                return
+            async def flush(final: bool = False) -> None:
+                """将累积内容同步到 Telegram 消息。
 
-            parts = _split_long_text(accumulated)
+                final=False：以纯文本发出（流式过程中，Markdown 可能不完整）
+                final=True：转换为 HTML 渲染（完整内容，格式正确）
+                """
+                nonlocal last_edit_time, sent_parts
+                if not accumulated:
+                    return
 
-            for i, part in enumerate(parts):
-                is_last_part = (i == len(parts) - 1)
+                parts = _split_long_text(accumulated)
 
-                if final:
-                    # 最终渲染：转换为 HTML，若失败则回退到纯文本
-                    try:
-                        display = _md_to_tg_html(part)
-                        parse_mode = constants.ParseMode.HTML
-                    except Exception as exc:
-                        logger.warning(
-                            "markdown to html conversion failed, fallback to plain text: %s",
-                            _exception_text(exc),
-                            exc_info=True,
-                        )
-                        display = part
+                for i, part in enumerate(parts):
+                    is_last_part = (i == len(parts) - 1)
+
+                    if final:
+                        # 最终渲染：转换为 HTML，若失败则回退到纯文本
+                        try:
+                            display = _md_to_tg_html(part)
+                            parse_mode = constants.ParseMode.HTML
+                        except Exception as exc:
+                            logger.warning(
+                                "markdown to html conversion failed, fallback to plain text: %s",
+                                _exception_text(exc),
+                                exc_info=True,
+                            )
+                            display = part
+                            parse_mode = None
+                    else:
+                        # 流式过程：纯文本 + 光标符号
+                        display = part + (" ▌" if is_last_part else "")
                         parse_mode = None
-                else:
-                    # 流式过程：纯文本 + 光标符号
-                    display = part + (" ▌" if is_last_part else "")
-                    parse_mode = None
 
-                if i < len(sent_parts):
-                    try:
-                        await sent_parts[i].edit_text(display, parse_mode=parse_mode)
-                    except TelegramError as exc:
-                        if _is_message_not_modified(exc):
-                            continue
-                        logger.warning(
-                            "telegram edit_text failed user_id=%d part=%d final=%s: %s",
-                            user_id,
-                            i,
-                            final,
-                            _exception_text(exc),
-                            exc_info=True,
-                        )
+                    if i < len(sent_parts):
+                        try:
+                            await sent_parts[i].edit_text(display, parse_mode=parse_mode)
+                        except TelegramError as exc:
+                            if _is_message_not_modified(exc):
+                                continue
+                            logger.warning(
+                                "telegram edit_text failed user_id=%d part=%d final=%s: %s",
+                                user_id,
+                                i,
+                                final,
+                                _exception_text(exc),
+                                exc_info=True,
+                            )
+                            try:
+                                new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
+                                sent_parts[i] = new_msg
+                            except Exception as fallback_exc:
+                                raise RuntimeError(
+                                    "Telegram 更新回复失败，且发送备用消息也失败："
+                                    f"edit={_exception_text(exc)}; "
+                                    f"reply={_exception_text(fallback_exc)}"
+                                ) from fallback_exc
+                    else:
                         try:
                             new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
-                            sent_parts[i] = new_msg
-                        except Exception as fallback_exc:
-                            raise RuntimeError(
-                                "Telegram 更新回复失败，且发送备用消息也失败："
-                                f"edit={_exception_text(exc)}; "
-                                f"reply={_exception_text(fallback_exc)}"
-                            ) from fallback_exc
-                else:
-                    try:
-                        new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
-                        sent_parts.append(new_msg)
-                    except Exception as exc:
-                        raise RuntimeError(f"Telegram 发送分段回复失败：{_exception_text(exc)}") from exc
+                            sent_parts.append(new_msg)
+                        except Exception as exc:
+                            raise RuntimeError(f"Telegram 发送分段回复失败：{_exception_text(exc)}") from exc
 
-            last_edit_time = time.monotonic()
+                last_edit_time = time.monotonic()
 
-        try:
-            async for chunk in self.service.stream_message(user_text, role, session_id):
-                accumulated += chunk
-                if time.monotonic() - last_edit_time >= _EDIT_INTERVAL:
-                    await flush(final=False)
-
-            # 流结束，转换为 HTML 完整渲染
-            await flush(final=True)
-
-        except Exception as exc:
-            logger.exception("telegram stream error user_id=%d", user_id)
-            err_text = f"⚠️ 调用 Agent 时出错：{_exception_text(exc)}"
             try:
-                await sent_parts[0].edit_text(err_text)
-            except Exception as edit_exc:
-                logger.warning(
-                    "telegram failed to edit error message user_id=%d: %s",
-                    user_id,
-                    _exception_text(edit_exc),
-                    exc_info=True,
-                )
+                async for chunk in self.service.stream_message(user_text, role, session_id):
+                    accumulated += chunk
+                    if time.monotonic() - last_edit_time >= _EDIT_INTERVAL:
+                        await flush(final=False)
+
+                # 流结束，转换为 HTML 完整渲染
+                await flush(final=True)
+
+            except Exception as exc:
+                logger.exception("telegram stream error user_id=%d", user_id)
+                err_text = f"⚠️ 调用 Agent 时出错：{_exception_text(exc)}"
                 try:
-                    await update.message.reply_text(err_text)
-                except Exception:
-                    logger.exception("telegram failed to send error message user_id=%d", user_id)
+                    await sent_parts[0].edit_text(err_text)
+                except Exception as edit_exc:
+                    logger.warning(
+                        "telegram failed to edit error message user_id=%d: %s",
+                        user_id,
+                        _exception_text(edit_exc),
+                        exc_info=True,
+                    )
+                    try:
+                        await update.message.reply_text(err_text)
+                    except Exception:
+                        logger.exception("telegram failed to send error message user_id=%d", user_id)
 
 
 @asynccontextmanager
@@ -388,8 +400,8 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
     app.add_handler(CommandHandler("stop", bot.cmd_stop))
     app.add_handler(CommandHandler("roles", bot.cmd_roles))
     app.add_handler(CommandHandler("role", bot.cmd_role))
-    # 普通文本消息处理器（非命令）
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    # 普通文本消息处理器（非命令），设置为 block=False 以免阻塞后续的 /stop 等命令
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message, block=False))
 
     # 启动 Bot（连接失败时不阻断 HTTP 服务，仅记录错误）
     try:

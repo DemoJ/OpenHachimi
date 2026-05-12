@@ -119,6 +119,7 @@ async def run_embedded_cli() -> None:
             return
 
         if user_input in NEW_SESSION_COMMANDS:
+            service.stop_session(current_session_id)
             response = service.new_session(current_role)
             current_session_id = response.session_id
             print(response.message)
@@ -148,6 +149,7 @@ async def run_embedded_cli() -> None:
                 print("请在 /role 后面填写角色名称，例如：/role default")
                 print()
                 continue
+            service.stop_session(current_session_id)
             try:
                 response = service.switch_role(role_name)
                 current_role = response.role
@@ -249,6 +251,10 @@ def run_cli() -> None:
             return
 
         if user_input in NEW_SESSION_COMMANDS:
+            try:
+                request_json(server_url, "POST", "/stop", {"session_id": current_session_id})
+            except Exception:
+                pass
             from urllib.parse import urlencode
             payload = request_json(server_url, "POST", f"/new?{urlencode({'role': current_role})}")
             current_session_id = payload["session_id"]
@@ -274,6 +280,10 @@ def run_cli() -> None:
             continue
 
         if user_input == "/role" or user_input.startswith("/role "):
+            try:
+                request_json(server_url, "POST", "/stop", {"session_id": current_session_id})
+            except Exception:
+                pass
             result = switch_role(server_url, user_input)
             if result:
                 current_role, current_session_id = result
