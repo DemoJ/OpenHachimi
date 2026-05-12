@@ -140,6 +140,9 @@ class TelegramBot:
     def _get_session(self, user_id: int) -> dict[str, str]:
         """获取用户 session，若不存在则尝试恢复上次会话。"""
         if user_id not in self._sessions:
+            if len(self._sessions) >= 1000:
+                oldest_user = next(iter(self._sessions))
+                self._sessions.pop(oldest_user, None)
             role = self.config.default_role_name
             resp = self.service.latest_session(role)
             self._sessions[user_id] = {"role": role, "session_id": resp.session_id}
@@ -147,7 +150,21 @@ class TelegramBot:
                 "telegram restored session user_id=%d role=%s session_id=%s",
                 user_id, role, resp.session_id,
             )
+        else:
+            session = self._sessions.pop(user_id)
+            self._sessions[user_id] = session
         return self._sessions[user_id]
+
+    def _get_user_lock(self, user_id: int) -> asyncio.Lock:
+        if user_id not in self._user_locks:
+            if len(self._user_locks) >= 1000:
+                oldest_user = next(iter(self._user_locks))
+                self._user_locks.pop(oldest_user, None)
+            self._user_locks[user_id] = asyncio.Lock()
+        else:
+            lock = self._user_locks.pop(user_id)
+            self._user_locks[user_id] = lock
+        return self._user_locks[user_id]
 
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/start 命令：欢迎语 + 新建会话。"""
@@ -192,7 +209,7 @@ class TelegramBot:
         session = self._get_session(user_id)
         role = session["role"]
         old_session_id = session["session_id"]
-        self.service.stop_session(old_session_id)
+        await self.service.stop_session(old_session_id)
         resp = self.service.new_session(role)
         self._sessions[user_id] = {"role": role, "session_id": resp.session_id}
         logger.info("cmd /new user_id=%d role=%s session_id=%s", user_id, role, resp.session_id)
@@ -202,7 +219,7 @@ class TelegramBot:
         """/stop 命令：停止当前正在执行的任务。"""
         user_id = update.effective_user.id
         session = self._get_session(user_id)
-        resp = self.service.stop_session(session["session_id"])
+        resp = await self.service.stop_session(session["session_id"])
         logger.info("cmd /stop user_id=%d role=%s session_id=%s", user_id, session["role"], session["session_id"])
         await update.message.reply_text(f"🛑 {resp.message}")
 
@@ -229,7 +246,7 @@ class TelegramBot:
             return
         role_name = args[0].strip()
         old_session_id = self._get_session(user_id)["session_id"]
-        self.service.stop_session(old_session_id)
+        await self.service.stop_session(old_session_id)
         try:
             resp = self.service.switch_role(role_name)
             self._sessions[user_id] = {"role": resp.role, "session_id": resp.session_id}
@@ -253,9 +270,7 @@ class TelegramBot:
         role = session["role"]
         session_id = session["session_id"]
 
-        if user_id not in self._user_locks:
-            self._user_locks[user_id] = asyncio.Lock()
-        lock = self._user_locks[user_id]
+        lock = self._get_user_lock(user_id)
 
         async with lock:
             logger.info(

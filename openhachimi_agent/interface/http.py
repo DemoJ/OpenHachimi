@@ -116,6 +116,6 @@ def switch_role(request: RoleSwitchRequest, service: AgentService = Depends(get_
 
 
 @app.post("/stop")
-def stop_session(request: StopRequest, service: AgentService = Depends(get_service)):
+async def stop_session(request: StopRequest, service: AgentService = Depends(get_service)):
     logger.info("http stop session request session_id=%s", request.session_id)
-    return service.stop_session(request.session_id)
+    return await service.stop_session(request.session_id)

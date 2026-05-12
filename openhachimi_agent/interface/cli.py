@@ -119,14 +119,14 @@ async def run_embedded_cli() -> None:
             return
 
         if user_input in NEW_SESSION_COMMANDS:
-            service.stop_session(current_session_id)
+            await service.stop_session(current_session_id)
             response = service.new_session(current_role)
             current_session_id = response.session_id
             print(response.message)
             continue
 
         if user_input in STOP_COMMANDS:
-            response = service.stop_session(current_session_id)
+            response = await service.stop_session(current_session_id)
             print(response.message)
             continue
 
@@ -149,7 +149,7 @@ async def run_embedded_cli() -> None:
                 print("请在 /role 后面填写角色名称，例如：/role default")
                 print()
                 continue
-            service.stop_session(current_session_id)
+            await service.stop_session(current_session_id)
             try:
                 response = service.switch_role(role_name)
                 current_role = response.role

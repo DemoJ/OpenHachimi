@@ -89,11 +89,13 @@ class AgentService:
             self.config.model_name,
         )
 
-    def stop_session(self, session_id: str) -> CommandResponse:
+    async def stop_session(self, session_id: str) -> CommandResponse:
         logger.info("stop requested for session_id=%s", session_id)
         if session_id in self._running_tasks:
             task = self._running_tasks[session_id]
             task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
             return CommandResponse(
                 message="已成功中断当前任务。",
                 role=self.config.default_role_name,
@@ -104,6 +106,20 @@ class AgentService:
             role=self.config.default_role_name,
             session_id=session_id,
         )
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        if session_id not in self._session_locks:
+            # 防止长期运行导致无限制增长，保留最多 1000 个活跃 lock（LRU 策略）
+            if len(self._session_locks) >= 1000:
+                oldest_session = next(iter(self._session_locks))
+                self._session_locks.pop(oldest_session, None)
+            self._session_locks[session_id] = asyncio.Lock()
+        else:
+            # 将被访问的 lock 移到字典末尾，更新其“活跃度”
+            lock = self._session_locks.pop(session_id)
+            self._session_locks[session_id] = lock
+            
+        return self._session_locks[session_id]
 
     def _get_agent(self, role_name: str):
         # 计算依赖文件（角色文件和技能目录）的最新修改时间
@@ -197,9 +213,7 @@ class AgentService:
         
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
 
-        if actual_session_id not in self._session_locks:
-            self._session_locks[actual_session_id] = asyncio.Lock()
-        lock = self._session_locks[actual_session_id]
+        lock = self._get_session_lock(actual_session_id)
 
         async with lock:
             logger.info(
@@ -259,9 +273,7 @@ class AgentService:
         
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
 
-        if actual_session_id not in self._session_locks:
-            self._session_locks[actual_session_id] = asyncio.Lock()
-        lock = self._session_locks[actual_session_id]
+        lock = self._get_session_lock(actual_session_id)
 
         async with lock:
             output_chars = 0
@@ -296,9 +308,6 @@ class AgentService:
                         ),
                         timeout=self.config.agent_timeout_seconds,
                     )
-                except asyncio.CancelledError as exc:
-                    result_holder["error"] = exc
-                    logger.info("chat stream cancelled role=%s session_id=%s", role, actual_session_id)
                 except asyncio.TimeoutError as exc:
                     result_holder["error"] = TimeoutError(
                         "Agent 执行超时："
@@ -314,6 +323,10 @@ class AgentService:
                         actual_session_id,
                         self.config.agent_timeout_seconds,
                     )
+                except asyncio.CancelledError:
+                    # Let CancelledError propagate natively
+                    logger.info("chat stream cancelled role=%s session_id=%s", role, actual_session_id)
+                    raise
                 except Exception as exc:
                     result_holder["error"] = exc
                     logger.exception(
@@ -382,11 +395,13 @@ class AgentService:
                     output_chars += len(chunk)
                     yield chunk
         
-                await task
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    yield "\n\n【任务已被手动中断】"
+                    return
+
                 if error := result_holder.get("error"):
-                    if isinstance(error, asyncio.CancelledError):
-                        yield "\n\n【任务已被手动中断】"
-                        return
                     raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
         
                 result = result_holder["result"]
