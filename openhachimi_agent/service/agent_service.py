@@ -95,7 +95,7 @@ class AgentService:
             task = self._running_tasks[session_id]
             task.cancel()
             return CommandResponse(
-                message="已发送中断信号，正在停止当前任务...",
+                message="已成功中断当前任务。",
                 role=self.config.default_role_name,
                 session_id=session_id,
             )
