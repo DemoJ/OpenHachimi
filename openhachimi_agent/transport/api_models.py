@@ -24,6 +24,10 @@ class RoleSwitchRequest(BaseModel):
     role: str = Field(min_length=1)
 
 
+class StopRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+
+
 class CommandResponse(BaseModel):
     message: str
     role: str

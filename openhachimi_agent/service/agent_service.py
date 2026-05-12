@@ -82,9 +82,26 @@ class AgentService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self._agents = {}  # 缓存 (Agent 实例, 最后修改时间)，支持热重载
+        self._running_tasks: dict[str, asyncio.Task] = {}
         logger.info(
             "service initialized model=%s",
             self.config.model_name,
+        )
+
+    def stop_session(self, session_id: str) -> CommandResponse:
+        logger.info("stop requested for session_id=%s", session_id)
+        if session_id in self._running_tasks:
+            task = self._running_tasks[session_id]
+            task.cancel()
+            return CommandResponse(
+                message="已发送中断信号，正在停止当前任务...",
+                role=self.config.default_role_name,
+                session_id=session_id,
+            )
+        return CommandResponse(
+            message="当前没有正在运行的任务。",
+            role=self.config.default_role_name,
+            session_id=session_id,
         )
 
     def _get_agent(self, role_name: str):
@@ -187,7 +204,18 @@ class AgentService:
             len(history),
         )
         try:
-            result = await agent.run(message, message_history=history, deps=AgentDeps(config=self.config, session_id=actual_session_id))
+            async def run_agent():
+                return await agent.run(message, message_history=history, deps=AgentDeps(config=self.config, session_id=actual_session_id))
+            
+            task = asyncio.create_task(run_agent())
+            self._running_tasks[actual_session_id] = task
+            try:
+                result = await task
+            finally:
+                self._running_tasks.pop(actual_session_id, None)
+        except asyncio.CancelledError:
+            logger.info("chat cancelled role=%s session_id=%s stream=false", role, actual_session_id)
+            return ChatResponse(output="【任务已被手动中断】", role=role, session_id=actual_session_id)
         except Exception:
             logger.exception(
                 "chat failed role=%s session_id=%s stream=false",
@@ -257,6 +285,9 @@ class AgentService:
                     ),
                     timeout=self.config.agent_timeout_seconds,
                 )
+            except asyncio.CancelledError as exc:
+                result_holder["error"] = exc
+                logger.info("chat stream cancelled role=%s session_id=%s", role, actual_session_id)
             except asyncio.TimeoutError as exc:
                 result_holder["error"] = TimeoutError(
                     "Agent 执行超时："
@@ -283,96 +314,103 @@ class AgentService:
                 await stream_queue.put(_STREAM_DONE)
 
         task = asyncio.create_task(run_agent())
+        self._running_tasks[actual_session_id] = task
 
-        while True:
-            try:
-                item = await asyncio.wait_for(
-                    stream_queue.get(),
-                    timeout=self.config.stream_idle_timeout_seconds,
-                )
-            except asyncio.TimeoutError as exc:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-                logger.error(
-                    "chat stream idle timeout role=%s session_id=%s idle_timeout_seconds=%d chunks=%d output_chars=%d duration_ms=%.0f last_chunk=%s",
-                    role,
-                    actual_session_id,
-                    self.config.stream_idle_timeout_seconds,
-                    chunk_count,
-                    output_chars,
-                    elapsed_ms,
-                    last_chunk_preview,
-                )
-                last_chunk_detail = f"最后片段={last_chunk_preview!r}，" if last_chunk_preview else ""
-                raise TimeoutError(
-                    "流式回复超时："
-                    f"{self.config.stream_idle_timeout_seconds}s 内没有收到新的模型片段或工具状态。"
-                    f"已收到片段数={chunk_count}，已输出字符数={output_chars}，"
-                    f"{last_chunk_detail}"
-                    f"模型={self.config.model_name}，"
-                    f"base_url={self.config.openai_base_url or '默认'}，"
-                    f"role={role}，session_id={actual_session_id}。"
-                    "如果刚显示了几个字就停住，通常是后续模型请求、工具调用、浏览器或网络代理卡住。"
-                ) from exc
-            if item is _STREAM_DONE:
-                break
-
-            chunk = str(item)
-            compact_chunk = " ".join(chunk.split())
-            if len(compact_chunk) > 120:
-                compact_chunk = compact_chunk[:117] + "..."
-            if compact_chunk:
-                last_chunk_preview = compact_chunk
-            if first_chunk_ms is None:
-                first_chunk_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(
-                    "chat first chunk role=%s session_id=%s first_chunk_ms=%.0f chunk_chars=%d",
-                    role,
-                    actual_session_id,
-                    first_chunk_ms,
-                    len(chunk),
-                )
-            chunk_count += 1
-            output_chars += len(chunk)
-            yield chunk
-
-        await task
-        if error := result_holder.get("error"):
-            raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
-
-        result = result_holder["result"]
-        new_history = list(result.all_messages())  # type: ignore[attr-defined]
-        history_json = result.all_messages_json()  # type: ignore[attr-defined]
-        await asyncio.to_thread(
-            save_message_history,
-            self.config.memory_dir,
-            role,
-            actual_session_id,
-            history_json,
-        )
-
-        if not chunk_count:
-            output = str(result.output)  # type: ignore[attr-defined]
-            if output:
-                output_chars = len(output)
-                chunk_count = 1
-                logger.info(
-                    "chat produced non-streamed output role=%s session_id=%s output_chars=%d",
-                    role,
-                    actual_session_id,
-                    output_chars,
-                )
-                yield output
-
-        logger.info(
-            "chat finished role=%s session_id=%s output_chars=%d chunks=%d first_chunk_ms=%s history_messages=%d duration_ms=%.0f stream=true",
-            role,
-            actual_session_id,
-            output_chars,
-            chunk_count,
-            f"{first_chunk_ms:.0f}" if first_chunk_ms is not None else None,
-            len(new_history),
-            (time.perf_counter() - start_time) * 1000,
-        )
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(
+                        stream_queue.get(),
+                        timeout=self.config.stream_idle_timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    logger.error(
+                        "chat stream idle timeout role=%s session_id=%s idle_timeout_seconds=%d chunks=%d output_chars=%d duration_ms=%.0f last_chunk=%s",
+                        role,
+                        actual_session_id,
+                        self.config.stream_idle_timeout_seconds,
+                        chunk_count,
+                        output_chars,
+                        elapsed_ms,
+                        last_chunk_preview,
+                    )
+                    last_chunk_detail = f"最后片段={last_chunk_preview!r}，" if last_chunk_preview else ""
+                    raise TimeoutError(
+                        "流式回复超时："
+                        f"{self.config.stream_idle_timeout_seconds}s 内没有收到新的模型片段或工具状态。"
+                        f"已收到片段数={chunk_count}，已输出字符数={output_chars}，"
+                        f"{last_chunk_detail}"
+                        f"模型={self.config.model_name}，"
+                        f"base_url={self.config.openai_base_url or '默认'}，"
+                        f"role={role}，session_id={actual_session_id}。"
+                        "如果刚显示了几个字就停住，通常是后续模型请求、工具调用、浏览器或网络代理卡住。"
+                    ) from exc
+                if item is _STREAM_DONE:
+                    break
+    
+                chunk = str(item)
+                compact_chunk = " ".join(chunk.split())
+                if len(compact_chunk) > 120:
+                    compact_chunk = compact_chunk[:117] + "..."
+                if compact_chunk:
+                    last_chunk_preview = compact_chunk
+                if first_chunk_ms is None:
+                    first_chunk_ms = (time.perf_counter() - start_time) * 1000
+                    logger.info(
+                        "chat first chunk role=%s session_id=%s first_chunk_ms=%.0f chunk_chars=%d",
+                        role,
+                        actual_session_id,
+                        first_chunk_ms,
+                        len(chunk),
+                    )
+                chunk_count += 1
+                output_chars += len(chunk)
+                yield chunk
+    
+            await task
+            if error := result_holder.get("error"):
+                if isinstance(error, asyncio.CancelledError):
+                    yield "\n\n【任务已被手动中断】"
+                    return
+                raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
+    
+            result = result_holder["result"]
+            new_history = list(result.all_messages())  # type: ignore[attr-defined]
+            history_json = result.all_messages_json()  # type: ignore[attr-defined]
+            await asyncio.to_thread(
+                save_message_history,
+                self.config.memory_dir,
+                role,
+                actual_session_id,
+                history_json,
+            )
+    
+            if not chunk_count:
+                output = str(result.output)  # type: ignore[attr-defined]
+                if output:
+                    output_chars = len(output)
+                    chunk_count = 1
+                    logger.info(
+                        "chat produced non-streamed output role=%s session_id=%s output_chars=%d",
+                        role,
+                        actual_session_id,
+                        output_chars,
+                    )
+                    yield output
+    
+            logger.info(
+                "chat finished role=%s session_id=%s output_chars=%d chunks=%d first_chunk_ms=%s history_messages=%d duration_ms=%.0f stream=true",
+                role,
+                actual_session_id,
+                output_chars,
+                chunk_count,
+                f"{first_chunk_ms:.0f}" if first_chunk_ms is not None else None,
+                len(new_history),
+                (time.perf_counter() - start_time) * 1000,
+            )
+        finally:
+            self._running_tasks.pop(actual_session_id, None)

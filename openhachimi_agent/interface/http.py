@@ -15,7 +15,7 @@ from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.interface.telegram import telegram_lifespan
 from openhachimi_agent.service.agent_service import AgentService
-from openhachimi_agent.transport.api_models import ChatRequest, RoleSwitchRequest
+from openhachimi_agent.transport.api_models import ChatRequest, RoleSwitchRequest, StopRequest
 
 logger = logging.getLogger(__name__)
 
@@ -113,3 +113,9 @@ def switch_role(request: RoleSwitchRequest, service: AgentService = Depends(get_
         return service.switch_role(request.role.strip())
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/stop")
+def stop_session(request: StopRequest, service: AgentService = Depends(get_service)):
+    logger.info("http stop session request session_id=%s", request.session_id)
+    return service.stop_session(request.session_id)

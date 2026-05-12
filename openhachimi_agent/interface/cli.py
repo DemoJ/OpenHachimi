@@ -19,6 +19,7 @@ EXIT_COMMANDS = {"/exit", "/quit", "退出", "q"}
 NEW_SESSION_COMMANDS = {"/new", "新对话"}
 HELP_COMMANDS = {"/help", "帮助"}
 ROLE_LIST_COMMANDS = {"/roles", "/list-roles"}
+STOP_COMMANDS = {"/stop", "停止"}
 DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
 
 
@@ -123,6 +124,11 @@ async def run_embedded_cli() -> None:
             print(response.message)
             continue
 
+        if user_input in STOP_COMMANDS:
+            response = service.stop_session(current_session_id)
+            print(response.message)
+            continue
+
         if user_input in HELP_COMMANDS:
             print_help()
             continue
@@ -169,6 +175,7 @@ def print_help() -> None:
     print("  /roles  查看可用角色列表")
     print("  /role   切换角色，例如 /role default")
     print("  /new    保存当前对话并新建一段对话")
+    print("  /stop   中断当前正在执行的任务")
     print("  /exit   退出程序")
     print()
 
@@ -246,6 +253,16 @@ def run_cli() -> None:
             payload = request_json(server_url, "POST", f"/new?{urlencode({'role': current_role})}")
             current_session_id = payload["session_id"]
             print(payload["message"])
+            continue
+
+        if user_input in STOP_COMMANDS:
+            try:
+                payload = request_json(server_url, "POST", "/stop", {"session_id": current_session_id})
+                print(payload["message"])
+            except HTTPError as exc:
+                print(f"哈基米 > 停止任务失败：{error_detail(exc)}")
+            except URLError as exc:
+                print(f"哈基米 > 停止任务失败：{exc}")
             continue
 
         if user_input in HELP_COMMANDS:
