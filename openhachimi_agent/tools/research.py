@@ -43,7 +43,7 @@ async def _browser_fetch(ctx: RunContext[AgentDeps], url: str) -> str | None:
     """Level 3: Headless Browser Fetch"""
     try:
         from openhachimi_agent.tools.browser import _get_browser_manager
-        bm = _get_browser_manager(ctx.deps)
+        bm = _get_browser_manager(ctx.deps.config)
         await bm.navigate(url)
         await asyncio.sleep(2)
         state = await bm.get_state()
