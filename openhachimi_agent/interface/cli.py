@@ -1,19 +1,21 @@
 """命令行交互逻辑。"""
 
+import asyncio
 import codecs
 import json
 import logging
 import os
+import threading
+from typing import AsyncIterator, Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.service.agent_service import AgentService
 
-
 logger = logging.getLogger(__name__)
-
 
 EXIT_COMMANDS = {"/exit", "/quit", "退出", "q"}
 NEW_SESSION_COMMANDS = {"/new", "新对话"}
@@ -87,90 +89,6 @@ def print_welcome(state: dict[str, object], server_url: str, current_role: str, 
     print()
 
 
-def state_payload(state: object) -> dict[str, object]:
-    return {
-        "model": state.model,
-        "base_url": state.base_url,
-    }
-
-
-async def run_embedded_cli() -> None:
-    config = load_config()
-    configure_logging(config)
-    logger.info("starting embedded cli")
-    service = AgentService(config)
-    server_url = "embedded"
-    current_role = config.default_role_name
-    current_session_id = service.latest_session(current_role).session_id
-    print_welcome(state_payload(service.state()), server_url, current_role, current_session_id)
-
-    while True:
-        try:
-            user_input = input("你 > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已退出对话。")
-            return
-
-        if not user_input:
-            continue
-
-        if user_input in EXIT_COMMANDS:
-            print("已退出对话。")
-            return
-
-        if user_input in NEW_SESSION_COMMANDS:
-            await service.stop_session(current_session_id)
-            response = service.new_session(current_role)
-            current_session_id = response.session_id
-            print(response.message)
-            continue
-
-        if user_input in STOP_COMMANDS:
-            response = await service.stop_session(current_session_id)
-            print(response.message)
-            continue
-
-        if user_input in HELP_COMMANDS:
-            print_help()
-            continue
-
-        if user_input in ROLE_LIST_COMMANDS:
-            roles = service.list_roles()
-            print("可用角色：")
-            for role_name in roles.roles:
-                marker = "（当前）" if role_name == current_role else ""
-                print(f"  - {role_name}{marker}")
-            print()
-            continue
-
-        if user_input == "/role" or user_input.startswith("/role "):
-            role_name = user_input[6:].strip()
-            if not role_name:
-                print("请在 /role 后面填写角色名称，例如：/role default")
-                print()
-                continue
-            await service.stop_session(current_session_id)
-            try:
-                response = service.switch_role(role_name)
-                current_role = response.role
-                current_session_id = response.session_id
-                print(response.message)
-            except (FileNotFoundError, ValueError) as exc:
-                print(f"哈基米 > 切换角色失败：{exc}")
-            print()
-            continue
-
-        try:
-            print("哈基米 > ", end="", flush=True)
-            async for chunk in service.stream_message(user_input, current_role, current_session_id):
-                print(chunk, end="", flush=True)
-        except Exception as exc:
-            print(f"\n哈基米 > 调用模型时出错：{exc}")
-            continue
-
-        print("\n")
-
-
 def print_help() -> None:
     print("命令说明：")
     print("  /help   查看帮助信息")
@@ -182,63 +100,129 @@ def print_help() -> None:
     print()
 
 
-def print_roles(server_url: str, current_role: str) -> None:
-    payload = request_json(server_url, "GET", "/roles")
+class CliBackend(Protocol):
+    async def get_state(self) -> dict[str, object]: ...
+    async def list_roles(self) -> list[str]: ...
+    async def latest_session(self, role: str) -> tuple[str, str]: ...
+    async def new_session(self, role: str) -> tuple[str, str, str]: ...
+    async def stop_session(self, session_id: str) -> str: ...
+    async def switch_role(self, role: str) -> tuple[str, str, str]: ...
+    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str]: ...
 
-    print("可用角色：")
-    for role_name in payload["roles"]:
-        marker = "（当前）" if role_name == current_role else ""
-        print(f"  - {role_name}{marker}")
-    print()
+
+class EmbeddedBackend:
+    def __init__(self, service: AgentService):
+        self.service = service
+
+    async def get_state(self) -> dict[str, object]:
+        state = self.service.state()
+        return {
+            "model": state.model,
+            "base_url": state.base_url,
+        }
+
+    async def list_roles(self) -> list[str]:
+        return self.service.list_roles().roles
+
+    async def latest_session(self, role: str) -> tuple[str, str]:
+        resp = self.service.latest_session(role)
+        return resp.role, resp.session_id
+
+    async def new_session(self, role: str) -> tuple[str, str, str]:
+        resp = self.service.new_session(role)
+        return resp.role, resp.session_id, resp.message
+
+    async def stop_session(self, session_id: str) -> str:
+        resp = await self.service.stop_session(session_id)
+        return resp.message
+
+    async def switch_role(self, role: str) -> tuple[str, str, str]:
+        resp = self.service.switch_role(role)
+        return resp.role, resp.session_id, resp.message
+
+    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str]:
+        async for chunk in self.service.stream_message(message, role, session_id):
+            yield chunk
 
 
-def switch_role(server_url: str, user_input: str) -> tuple[str, str] | None:
-    if user_input == "/role":
-        print("请在 /role 后面填写角色名称，例如：/role default")
-        print()
-        return None
+class HttpBackend:
+    def __init__(self, server_url: str):
+        self.server_url = server_url
 
-    role_name = user_input[6:].strip()
-    if not role_name:
-        print("请在 /role 后面填写角色名称，例如：/role default")
-        print()
-        return None
+    async def get_state(self) -> dict[str, object]:
+        return await asyncio.to_thread(request_json, self.server_url, "GET", "/state")
 
+    async def list_roles(self) -> list[str]:
+        resp = await asyncio.to_thread(request_json, self.server_url, "GET", "/roles")
+        return resp.get("roles", [])
+
+    async def latest_session(self, role: str) -> tuple[str, str]:
+        qs = urlencode({'role': role})
+        resp = await asyncio.to_thread(request_json, self.server_url, "GET", f"/session/latest?{qs}")
+        return resp["role"], resp["session_id"]
+
+    async def new_session(self, role: str) -> tuple[str, str, str]:
+        qs = urlencode({'role': role})
+        resp = await asyncio.to_thread(request_json, self.server_url, "POST", f"/new?{qs}")
+        return resp["role"], resp["session_id"], resp["message"]
+
+    async def stop_session(self, session_id: str) -> str:
+        try:
+            resp = await asyncio.to_thread(request_json, self.server_url, "POST", "/stop", {"session_id": session_id})
+            return resp.get("message", "")
+        except HTTPError as exc:
+            raise RuntimeError(error_detail(exc)) from exc
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    async def switch_role(self, role: str) -> tuple[str, str, str]:
+        try:
+            resp = await asyncio.to_thread(request_json, self.server_url, "POST", "/role", {"role": role})
+            return resp["role"], resp["session_id"], resp["message"]
+        except HTTPError as exc:
+            raise RuntimeError(error_detail(exc)) from exc
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str]:
+        q: asyncio.Queue[str | Exception | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def _run():
+            try:
+                for chunk in request_stream(self.server_url, "/chat/stream", {"message": message, "role": role, "session_id": session_id}):
+                    loop.call_soon_threadsafe(q.put_nowait, chunk)
+                loop.call_soon_threadsafe(q.put_nowait, None)
+            except Exception as e:
+                loop.call_soon_threadsafe(q.put_nowait, e)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                if isinstance(item, HTTPError):
+                    raise RuntimeError(error_detail(item)) from item
+                raise RuntimeError(str(item)) from item
+            yield item
+
+
+async def run_interactive_loop(backend: CliBackend, server_url: str, current_role: str) -> None:
     try:
-        payload = request_json(server_url, "POST", "/role", {"role": role_name})
-    except HTTPError as exc:
-        print(f"哈基米 > 切换角色失败：{error_detail(exc)}")
-        print()
-        return None
-
-    print(payload["message"])
-    print()
-    return payload["role"], payload["session_id"]
-
-
-def run_cli() -> None:
-    try:
-        configure_logging(load_config())
-    except Exception:
-        logging.basicConfig(level=logging.INFO)
-        logger.exception("failed to configure logging from local config")
-    server_url = get_server_url()
-    logger.info("starting cli client server_url=%s", server_url)
-    try:
-        state = request_json(server_url, "GET", "/state")
-        roles_info = request_json(server_url, "GET", "/roles")
-        current_role = roles_info["current_role"]
-        from urllib.parse import urlencode
-        new_resp = request_json(server_url, "GET", f"/session/latest?{urlencode({'role': current_role})}")
-        current_session_id = new_resp["session_id"]
-    except URLError as exc:
-        raise SystemExit(f"无法连接 OpenHachimi 后台服务：{server_url}，请先运行 python main.py serve") from exc
+        current_role, current_session_id = await backend.latest_session(current_role)
+        state = await backend.get_state()
+    except Exception as exc:
+        print(f"初始化失败：{exc}")
+        return
 
     print_welcome(state, server_url, current_role, current_session_id)
 
     while True:
         try:
-            user_input = input("你 > ").strip()
+            user_input = await asyncio.to_thread(input, "你 > ")
+            user_input = user_input.strip()
         except (EOFError, KeyboardInterrupt):
             print("\n已退出对话。")
             return
@@ -252,22 +236,21 @@ def run_cli() -> None:
 
         if user_input in NEW_SESSION_COMMANDS:
             try:
-                request_json(server_url, "POST", "/stop", {"session_id": current_session_id})
+                await backend.stop_session(current_session_id)
             except Exception:
                 pass
-            from urllib.parse import urlencode
-            payload = request_json(server_url, "POST", f"/new?{urlencode({'role': current_role})}")
-            current_session_id = payload["session_id"]
-            print(payload["message"])
+            try:
+                current_role, current_session_id, msg = await backend.new_session(current_role)
+                print(msg)
+            except Exception as exc:
+                print(f"哈基米 > 新建会话失败：{exc}")
             continue
 
         if user_input in STOP_COMMANDS:
             try:
-                payload = request_json(server_url, "POST", "/stop", {"session_id": current_session_id})
-                print(payload["message"])
-            except HTTPError as exc:
-                print(f"哈基米 > 停止任务失败：{error_detail(exc)}")
-            except URLError as exc:
+                msg = await backend.stop_session(current_session_id)
+                print(msg)
+            except Exception as exc:
                 print(f"哈基米 > 停止任务失败：{exc}")
             continue
 
@@ -276,33 +259,71 @@ def run_cli() -> None:
             continue
 
         if user_input in ROLE_LIST_COMMANDS:
-            print_roles(server_url, current_role)
+            try:
+                roles = await backend.list_roles()
+                print("可用角色：")
+                for r in roles:
+                    marker = "（当前）" if r == current_role else ""
+                    print(f"  - {r}{marker}")
+                print()
+            except Exception as exc:
+                print(f"哈基米 > 获取角色列表失败：{exc}")
             continue
 
         if user_input == "/role" or user_input.startswith("/role "):
+            role_name = user_input[6:].strip()
+            if not role_name:
+                print("请在 /role 后面填写角色名称，例如：/role default\n")
+                continue
             try:
-                request_json(server_url, "POST", "/stop", {"session_id": current_session_id})
+                await backend.stop_session(current_session_id)
             except Exception:
                 pass
-            result = switch_role(server_url, user_input)
-            if result:
-                current_role, current_session_id = result
+            try:
+                current_role, current_session_id, msg = await backend.switch_role(role_name)
+                print(msg)
+            except Exception as exc:
+                print(f"哈基米 > 切换角色失败：{exc}")
+            print()
             continue
 
         try:
             print("哈基米 > ", end="", flush=True)
-            req_payload = {
-                "message": user_input,
-                "role": current_role,
-                "session_id": current_session_id
-            }
-            for chunk in request_stream(server_url, "/chat/stream", req_payload):
+            async for chunk in backend.stream_message(user_input, current_role, current_session_id):
                 print(chunk, end="", flush=True)
-        except HTTPError as exc:
-            print(f"\n哈基米 > 调用模型时出错：{error_detail(exc)}")
-            continue
-        except URLError as exc:
+        except Exception as exc:
             print(f"\n哈基米 > 调用模型时出错：{exc}")
-            continue
-
+        
         print("\n")
+
+
+async def run_embedded_cli() -> None:
+    config = load_config()
+    configure_logging(config)
+    logger.info("starting embedded cli")
+    service = AgentService(config)
+    backend = EmbeddedBackend(service)
+    await run_interactive_loop(backend, "embedded", config.default_role_name)
+
+
+def run_cli() -> None:
+    try:
+        configure_logging(load_config())
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+        logger.exception("failed to configure logging from local config")
+        
+    server_url = get_server_url()
+    logger.info("starting cli client server_url=%s", server_url)
+    
+    try:
+        roles_info = request_json(server_url, "GET", "/roles")
+        current_role = roles_info["current_role"]
+    except URLError as exc:
+        raise SystemExit(f"无法连接 OpenHachimi 后台服务：{server_url}，请先运行 python main.py serve") from exc
+
+    backend = HttpBackend(server_url)
+    try:
+        asyncio.run(run_interactive_loop(backend, server_url, current_role))
+    except KeyboardInterrupt:
+        print("\n已退出对话。")

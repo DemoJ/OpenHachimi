@@ -13,21 +13,9 @@ from openhachimi_agent.core.deps import AgentDeps
 logger = logging.getLogger(__name__)
 
 
-# 我们在模块级别持有一个全局 browser_manager 的引用，但最好通过延迟初始化
-# 或者依赖注入来处理。这里采用延迟初始化的方式：
-_browser_manager = None
-
-def _get_browser_manager(config: AppConfig):
-    global _browser_manager
-    if _browser_manager is None:
-        from openhachimi_agent.service.browser import BrowserManager
-        _browser_manager = BrowserManager(config)
-    return _browser_manager
-
-
 async def browser_navigate(ctx: RunContext[AgentDeps], url: str) -> str:
     """导航浏览器到指定的网址。使用该工具前请确保需要访问网页，完成后使用 browser_get_state 获取页面信息。"""
-    bm = _get_browser_manager(ctx.deps.config)
+    bm = ctx.deps.browser_manager
     result = await bm.navigate(url)
     return result
 
@@ -38,7 +26,7 @@ async def browser_get_state(ctx: RunContext[AgentDeps]) -> str:
     返回结果将包含：当前URL、页面标题、以及所有交互元素的列表（带 [ID] 前缀）。
     你可以通过阅读这些信息了解页面长什么样，并使用提供的 [ID] 调用 browser_click 或 browser_type。
     """
-    bm = _get_browser_manager(ctx.deps.config)
+    bm = ctx.deps.browser_manager
     result = await bm.get_state()
     return result
 
@@ -48,7 +36,7 @@ async def browser_click(ctx: RunContext[AgentDeps], element_id: int) -> str:
     
     参数 `element_id` 必须是之前调用 browser_get_state 获取到的页面状态中元素前的数字 ID。
     """
-    bm = _get_browser_manager(ctx.deps.config)
+    bm = ctx.deps.browser_manager
     result = await bm.click(element_id)
     return result
 
@@ -58,7 +46,7 @@ async def browser_type(ctx: RunContext[AgentDeps], element_id: int, text: str) -
     
     参数 `element_id` 必须是之前调用 browser_get_state 获取到的页面状态中元素前的数字 ID。
     """
-    bm = _get_browser_manager(ctx.deps.config)
+    bm = ctx.deps.browser_manager
     result = await bm.type_text(element_id, text)
     return result
 
@@ -78,6 +66,6 @@ async def browser_scroll(ctx: RunContext[AgentDeps], direction: str, amount: int
     
     滚动完成后必须调用 browser_get_state 查看新视口中的内容。
     """
-    bm = _get_browser_manager(ctx.deps.config)
+    bm = ctx.deps.browser_manager
     result = await bm.scroll(direction, amount)
     return result

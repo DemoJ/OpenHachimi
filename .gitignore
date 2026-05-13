@@ -17,3 +17,8 @@ user/skills/*
 # Keep test/dummy skills tracked
 !user/skills/dummy/
 .browser_data
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+coverage.xml

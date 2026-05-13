@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from openhachimi_agent.core.config import AppConfig
 
@@ -7,6 +8,7 @@ from openhachimi_agent.core.config import AppConfig
 class AgentDeps:
     config: AppConfig
     session_id: str
+    browser_manager: Any = None
 
     @property
     def base_dir(self) -> Path:
