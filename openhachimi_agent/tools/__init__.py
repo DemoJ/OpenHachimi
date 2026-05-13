@@ -1,6 +1,9 @@
 """工作区工具包。"""
 
-from openhachimi_agent.tools.browser import browser_click, browser_get_state, browser_navigate, browser_scroll, browser_type
+from openhachimi_agent.tools.browser import (
+    browser_click, browser_get_state, browser_navigate, browser_scroll, browser_type,
+    browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab
+)
 from openhachimi_agent.tools.command import run_command
 from openhachimi_agent.tools.editing import make_directory, replace_in_file, write_file
 from openhachimi_agent.tools.filesystem import find_files, list_files, read_file, search_text
@@ -29,6 +32,10 @@ __all__ = [
     "browser_click",
     "browser_type",
     "browser_scroll",
+    "browser_list_tabs",
+    "browser_new_tab",
+    "browser_switch_tab",
+    "browser_close_tab",
     "deep_search",
     "create_todos",
     "update_todo",

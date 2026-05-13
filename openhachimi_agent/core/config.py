@@ -30,6 +30,9 @@ class AppConfig:
     skills_dirs: list[Path]
     browser_headless: bool
     browser_channel: str | None
+    browser_user_agent: str | None
+    browser_window_size: str | None
+    browser_idle_timeout: int
     telegram_bot_token: str | None
     telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
     agent_timeout_seconds: int
@@ -133,6 +136,9 @@ def load_config() -> AppConfig:
         skills_dirs=skills_dirs,
         browser_headless=_config_bool(app_config, "browser_headless", True),
         browser_channel=_config_string(app_config, "browser_channel") or None,
+        browser_user_agent=_config_string(app_config, "browser_user_agent") or None,
+        browser_window_size=_config_string(app_config, "browser_window_size") or None,
+        browser_idle_timeout=_config_int(app_config, "browser_idle_timeout", 300, minimum=0),
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
         agent_timeout_seconds=_config_int(app_config, "agent_timeout_seconds", 300),

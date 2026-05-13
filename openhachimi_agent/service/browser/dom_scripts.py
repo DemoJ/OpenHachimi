@@ -1,56 +1,109 @@
 """JavaScript scripts for browser DOM manipulation and analysis."""
 
 DETECT_HUMAN_VERIFICATION_SCRIPT = """
-() => {
+(patterns) => {
+    if (!patterns) return null;
+    
+    // Check titles
     const title = (document.title || '').toLowerCase();
-    const titlePatterns = [
-        'just a moment...',
-        'attention required! | cloudflare',
-        'verify you are human'
-    ];
-    if (titlePatterns.includes(title) || title.startsWith('checking your browser')) {
-        return 'title_match: ' + title;
+    for (const p of patterns.titles) {
+        if (title.includes(p)) return 'title_match: ' + p;
     }
 
+    // Check iframes
     const iframes = Array.from(document.querySelectorAll('iframe'));
     for (const iframe of iframes) {
         const src = (iframe.src || '').toLowerCase();
-        if (src.includes('challenges.cloudflare.com') || 
-            src.includes('newassets.hcaptcha.com')) {
-            return 'iframe_match: ' + src.substring(0, 60);
+        for (const p of patterns.iframes) {
+            if (src.includes(p)) return 'iframe_match: ' + p;
         }
     }
 
-    if (document.querySelector('#cf-challenge-error-title') || document.querySelector('.cf-turnstile')) {
-        return 'cf_challenge_element';
+    // Check elements
+    for (const sel of patterns.elements) {
+        if (document.querySelector(sel)) return 'element_match: ' + sel;
     }
     
+    // Check short body text
     const text = (document.body ? document.body.innerText : '').trim().toLowerCase();
     if (text.length > 0 && text.length < 500) {
-        const shortPatterns = [
-            'checking your browser before accessing',
-            'verify you are human',
-            'please stand by, while we are checking your browser',
-            'cf-challenge',
-            '拖动滑块完成拼图',
-            '请完成安全验证'
-        ];
-        for (const p of shortPatterns) {
+        for (const p of patterns.short_texts) {
             if (text.includes(p)) return 'short_page_pattern: ' + p;
         }
     }
 
-    const elements = Array.from(document.querySelectorAll('[id],[class]')).slice(0, 200);
-    for (const el of elements) {
-        const id = (el.id || '').toLowerCase();
-        const cls = (el.className || '');
-        const clsStr = (typeof cls === 'string' ? cls : '').toLowerCase();
-        if (id === 'px-captcha' || clsStr.includes('geetest_panel') || clsStr.includes('yidun_popup')) {
-            return 'captcha_overlay: ' + (id || clsStr);
+    return null;
+}
+"""
+
+MUTATION_OBSERVER_SCRIPT = """
+(patterns) => {
+    if (window._hachimiCaptchaObserverInjected) return;
+    window._hachimiCaptchaObserverInjected = true;
+    
+    let debounceTimer = null;
+    
+    function checkCaptcha() {
+        if (!patterns) return;
+        
+        // Quick element check
+        for (const sel of patterns.elements) {
+            if (document.querySelector(sel)) {
+                if (window.onCaptchaDetected) window.onCaptchaDetected('element_match: ' + sel);
+                return;
+            }
+        }
+        
+        // Quick iframe check
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (const iframe of iframes) {
+            const src = (iframe.src || '').toLowerCase();
+            for (const p of patterns.iframes) {
+                if (src.includes(p)) {
+                    if (window.onCaptchaDetected) window.onCaptchaDetected('iframe_match: ' + p);
+                    return;
+                }
+            }
+        }
+        
+        // Quick text check (only if short)
+        const text = (document.body ? document.body.innerText : '').trim().toLowerCase();
+        if (text.length > 0 && text.length < 500) {
+            for (const p of patterns.short_texts) {
+                if (text.includes(p)) {
+                    if (window.onCaptchaDetected) window.onCaptchaDetected('short_page_pattern: ' + p);
+                    return;
+                }
+            }
         }
     }
     
-    return null;
+    // Initial check
+    setTimeout(checkCaptcha, 1000);
+
+    const observer = new MutationObserver((mutations) => {
+        let hasSignificantChange = false;
+        for (const m of mutations) {
+            if (m.addedNodes.length > 0) {
+                hasSignificantChange = true;
+                break;
+            }
+        }
+        
+        if (hasSignificantChange) {
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(checkCaptcha, 800);
+        }
+    });
+
+    if (document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
+    } else {
+        document.addEventListener('DOMContentLoaded', () => {
+            observer.observe(document.body, { childList: true, subtree: true });
+            checkCaptcha();
+        });
+    }
 }
 """
 

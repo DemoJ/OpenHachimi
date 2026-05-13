@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import socket
 import sys
 import shutil
@@ -12,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import Error as PlaywrightError
+from playwright_stealth import Stealth
 
 from openhachimi_agent.core.config import AppConfig
 
@@ -357,6 +359,10 @@ class BrowserLifecycleMixin:
                     port = self._find_free_port()
                     browser_env = self._browser_process_env(headless)
                     
+                    window_size = self.config.browser_window_size
+                    if not window_size:
+                        window_size = f"{random.randint(1366, 1920)},{random.randint(768, 1080)}"
+                        
                     args = [
                         chrome_path,
                         f"--remote-debugging-port={port}",
@@ -368,13 +374,17 @@ class BrowserLifecycleMixin:
                         "--disable-renderer-backgrounding",
                         "--disable-background-timer-throttling",
                         "--password-store=basic",
-                        "--window-size=1280,900",
+                        f"--window-size={window_size}",
                     ]
+                    
+                    if self.config.browser_user_agent:
+                        args.append(f"--user-agent={self.config.browser_user_agent}")
+                        
                     if sys.platform == "linux":
                         args.extend([
                             "--no-sandbox",
                             "--disable-gpu",
-                            "--enable-automation",
+                            "--disable-blink-features=AutomationControlled",
                         ])
                     if headless:
                         args.extend(["--headless=new"])
@@ -458,6 +468,13 @@ class BrowserLifecycleMixin:
                     self._page = active_page if active_page else valid_pages[-1]
                 else:
                     self._page = await self._context.new_page()
+                    
+                # 注入 stealth_async 以抹除自动化特征
+                try:
+                    await Stealth().apply_stealth_async(self._page)
+                except Exception as e:
+                    logger.warning("为页面注入 stealth 脚本时发生错误: %s", e)
+                    
                 logger.info("Playwright 浏览器已启动并绑定到活动页面。")
             except PlaywrightError as e:
                 if "closed" in str(e).lower():

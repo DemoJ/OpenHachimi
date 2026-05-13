@@ -1,15 +1,18 @@
 """Main browser manager facade."""
 
 import asyncio
+import json
 import logging
 import random
 import sys
+import time
 
 from playwright.async_api import Browser, BrowserContext, Page
 
 from openhachimi_agent.core.config import AppConfig
 from .lifecycle import BrowserLifecycleMixin
-from .dom_scripts import DETECT_HUMAN_VERIFICATION_SCRIPT, GET_STATE_SCRIPT
+from .dom_scripts import DETECT_HUMAN_VERIFICATION_SCRIPT, GET_STATE_SCRIPT, MUTATION_OBSERVER_SCRIPT
+from .captcha_patterns import CAPTCHA_PATTERNS
 from .utils import _human_verification_message
 
 logger = logging.getLogger(__name__)
@@ -31,44 +34,226 @@ class BrowserManager(BrowserLifecycleMixin):
         # 存储当前页面的可交互元素映射表：id -> locator
         # 这样 LLM 只需要返回一个数字 ID 就能点击
         self._element_mapping: dict[int, str] = {}
+        
+        self._captcha_detected_reason: str | None = None
+        self._captcha_setup_context_id = None
+        
+        self._last_activity_time: float = time.time()
+        self._idle_monitor_task: asyncio.Task | None = None
+
+    def _record_activity(self):
+        """记录浏览器活跃时间戳"""
+        self._last_activity_time = time.time()
+
+    async def _idle_monitor_loop(self):
+        """后台轮询，检测浏览器空闲是否超时"""
+        timeout = self.config.browser_idle_timeout
+        if timeout <= 0:
+            return
+            
+        while True:
+            await asyncio.sleep(30)
+            
+            # 只有在浏览器存活时才检测
+            if self._browser and getattr(self._browser, "is_connected", lambda: True)():
+                idle_time = time.time() - self._last_activity_time
+                if idle_time > timeout:
+                    logger.info("浏览器已空闲超过 %d 秒，自动触发 close() 释放资源。", timeout)
+                    try:
+                        await self.close()
+                    except Exception as e:
+                        logger.error("自动关闭空闲浏览器失败: %s", e)
+
+    async def _handle_captcha_detected(self, reason: str):
+        if not self._captcha_detected_reason:
+            self._captcha_detected_reason = reason
+            logger.warning("MutationObserver detected captcha: %s", reason)
+
+    async def _ensure_browser(self):
+        page = await super()._ensure_browser()
+        
+        self._record_activity()
+        
+        # 懒加载启动监控协程
+        if not self._idle_monitor_task or self._idle_monitor_task.done():
+            if self.config.browser_idle_timeout > 0:
+                self._idle_monitor_task = asyncio.create_task(self._idle_monitor_loop())
+        
+        # 避免在同一个 context 重复注入
+        current_context_id = id(self._context)
+        if self._captcha_setup_context_id != current_context_id:
+            try:
+                # 尝试清除之前的状态
+                self._captcha_detected_reason = None
+                await self._context.expose_function("onCaptchaDetected", self._handle_captcha_detected)
+                await self._context.add_init_script(f"({MUTATION_OBSERVER_SCRIPT})({json.dumps(CAPTCHA_PATTERNS)})")
+                self._captcha_setup_context_id = current_context_id
+            except Exception as e:
+                logger.debug("Failed to setup captcha observer on context: %s", e)
+                
+            # 对当前页面立即执行一次
+            try:
+                await page.evaluate(MUTATION_OBSERVER_SCRIPT, CAPTCHA_PATTERNS)
+            except Exception:
+                pass
+                
+        return page
 
     async def _detect_human_verification(self) -> str | None:
         """Detect common CAPTCHA/challenge pages and ask for human takeover."""
+        if self._captcha_detected_reason:
+            return self._captcha_detected_reason
+            
         if not self._page or self._page.is_closed():
             return None
 
         try:
-            signal = await self._page.evaluate(DETECT_HUMAN_VERIFICATION_SCRIPT)
+            signal = await self._page.evaluate(DETECT_HUMAN_VERIFICATION_SCRIPT, CAPTCHA_PATTERNS)
         except Exception as exc:
             logger.debug("human verification detection failed: %s", exc)
             return None
 
         if signal:
+            self._captcha_detected_reason = str(signal)
             logger.warning("human verification detected url=%s reason=%s", self._page.url, signal)
             return str(signal)
         return None
 
+    def _get_valid_pages(self):
+        """获取当前上下文中除了内置页面外所有的有效标签页。"""
+        if not self._context or not self._context.pages:
+            return []
+        return [p for p in self._context.pages if not (".top-chrome" in p.url or "chrome-extension://" in p.url)]
+
     async def _update_active_page(self):
-        """自动切换到最新标签页，并强制将其置于前台显示。"""
-        if self._context and self._context.pages:
-            valid_pages = [p for p in self._context.pages if not (".top-chrome" in p.url or "chrome-extension://" in p.url)]
-            if valid_pages:
-                newest_page = valid_pages[-1]
-                if self._page != newest_page:
-                    logger.info("检测到新标签页，自动切换当前页面。")
-                    self._page = newest_page
-                
+        """确保当前有一个激活的标签页置于前台显示。"""
+        valid_pages = self._get_valid_pages()
+        if not valid_pages:
+            return
+            
+        # 仅在当前页面丢失/关闭时，才自动回退到最新标签页
+        if not self._page or self._page.is_closed() or self._page not in valid_pages:
+            self._page = valid_pages[-1]
+            logger.info("当前标签页已失效或未绑定，自动回退到标签页: %s", self._page.url)
+            
+        try:
+            # 每次执行动作前，强制把 Agent 正在操作的标签页切到最前面
+            await self._page.bring_to_front()
+        except Exception:
+            pass
+
+    async def list_tabs(self) -> str:
+        """获取并列出当前打开的所有标签页。"""
+        self._record_activity()
+        valid_pages = self._get_valid_pages()
+        if not valid_pages:
+            return "当前没有打开任何标签页。"
+            
+        lines = ["[打开的标签页列表]"]
+        for i, p in enumerate(valid_pages):
             try:
-                # 每次执行动作前，强制把 Agent 正在操作的标签页切到最前面，防止在后台默默执行
-                await self._page.bring_to_front()
+                title = await p.title()
+            except Exception:
+                title = "Unknown Title"
+            active_mark = " (当前活动)" if p == self._page else ""
+            lines.append(f"[{i}] {title} - {p.url}{active_mark}")
+            
+        return "\n".join(lines)
+
+    async def new_tab(self, url: str = None) -> str:
+        """新建一个标签页并将其激活。"""
+        self._record_activity()
+        await self._ensure_browser()
+        
+        try:
+            new_page = await self._context.new_page()
+            self._page = new_page
+            
+            # 手动注入一次 observer 以防 context hook 还没生效
+            try:
+                await new_page.evaluate(MUTATION_OBSERVER_SCRIPT, CAPTCHA_PATTERNS)
             except Exception:
                 pass
+                
+            if url:
+                if not url.startswith("http"):
+                    url = "https://" + url
+                self._captcha_detected_reason = None
+                await new_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if reason := await self._detect_human_verification():
+                    return _human_verification_message(new_page.url, reason)
+                return f"已新建标签页并成功导航到：{new_page.url}"
+                
+            return "已新建空白标签页并激活。"
+        except Exception as e:
+            logger.error("Failed to create new tab: %s", e)
+            return f"新建标签页失败：{e}"
+
+    async def switch_tab(self, tab_index: int) -> str:
+        """切换到指定索引的标签页。"""
+        self._record_activity()
+        valid_pages = self._get_valid_pages()
+        if not valid_pages:
+            return "当前没有打开任何标签页。"
+            
+        if tab_index < 0 or tab_index >= len(valid_pages):
+            return f"无效的标签页索引 {tab_index}。当前有效索引范围: 0 到 {len(valid_pages) - 1}。"
+            
+        self._page = valid_pages[tab_index]
+        await self._update_active_page()
+        
+        try:
+            title = await self._page.title()
+        except Exception:
+            title = "Unknown Title"
+            
+        if reason := await self._detect_human_verification():
+            return _human_verification_message(self._page.url, reason)
+            
+        return f"已成功切换到标签页 [{tab_index}] {title} - {self._page.url}"
+
+    async def close_tab(self, tab_index: int = None) -> str:
+        """关闭指定索引的标签页。如果不传则关闭当前活动的标签页。"""
+        self._record_activity()
+        valid_pages = self._get_valid_pages()
+        if not valid_pages:
+            return "当前没有打开任何标签页。"
+            
+        if tab_index is not None:
+            if tab_index < 0 or tab_index >= len(valid_pages):
+                return f"无效的标签页索引 {tab_index}。当前有效索引范围: 0 到 {len(valid_pages) - 1}。"
+            target_page = valid_pages[tab_index]
+        else:
+            target_page = self._page
+            
+        try:
+            await target_page.close()
+            # 刷新页面列表
+            remaining_pages = self._get_valid_pages()
+            if not remaining_pages:
+                self._page = None
+                return "标签页已关闭。目前所有标签页都已关闭，请新建标签页或重新导航。"
+                
+            # 如果关掉的是当前激活的页面，自动更新到最新的标签页
+            if target_page == self._page:
+                self._page = remaining_pages[-1]
+                await self._update_active_page()
+                return f"标签页已关闭，自动切换到剩余的标签页：{self._page.url}。"
+                
+            return "标签页已关闭。"
+        except Exception as e:
+            logger.error("Failed to close tab: %s", e)
+            return f"关闭标签页失败：{e}"
 
     async def navigate(self, url: str) -> str:
         """导航到指定网页。"""
+        self._record_activity()
         if not url.startswith("http"):
             url = "https://" + url
             
+        # 导航前重置检测状态
+        self._captcha_detected_reason = None
+        
         page = await self._ensure_browser()
         await self._update_active_page()
         page = self._page
@@ -95,6 +280,7 @@ class BrowserManager(BrowserLifecycleMixin):
 
     async def get_state(self) -> str:
         """获取当前页面的完整可访问性树（包含元素 ID），供大模型阅读。"""
+        self._record_activity()
         await self._update_active_page()
         
         if not self._page or self._page.is_closed():
@@ -173,6 +359,7 @@ class BrowserManager(BrowserLifecycleMixin):
 
     async def click(self, element_id: int) -> str:
         """点击指定 ID 的元素。"""
+        self._record_activity()
         if not self._page or self._page.is_closed():
             return "当前没有打开的页面。"
             
@@ -199,8 +386,9 @@ class BrowserManager(BrowserLifecycleMixin):
         except Exception as e:
             return f"点击失败：{e}"
 
-    async def type_text(self, element_id: int, text: str) -> str:
+    async def type_text(self, element_id: int, text: str, simulate_typing: bool = False) -> str:
         """在指定 ID 的输入框中输入文本。"""
+        self._record_activity()
         await self._update_active_page()
         
         if not self._page or self._page.is_closed():
@@ -210,35 +398,47 @@ class BrowserManager(BrowserLifecycleMixin):
             return f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。"
             
         selector = self._element_mapping[element_id]
-        logger.info("Browser typing text in element_id=%d selector=%s", element_id, selector)
+        logger.info("Browser typing text in element_id=%d selector=%s simulate_typing=%s", element_id, selector, simulate_typing)
         
         try:
             locator = self._page.locator(selector).first
-            try:
-                await locator.click(timeout=5000)
-            except Exception:
-                await locator.click(timeout=3000, force=True)
-            await asyncio.sleep(random.uniform(0.1, 0.4))
             
-            is_mac = sys.platform == "darwin"
-            modifier = "Meta" if is_mac else "Control"
-            
-            try:
-                await self._page.keyboard.press(f"{modifier}+A")
-                await self._page.keyboard.press("Backspace")
-                await asyncio.sleep(0.1)
-            except Exception:
-                pass
+            if not simulate_typing:
+                # 默认使用原子的 fill 操作，速度快且能稳定触发框架的 v-model/onChange，自带清空机制
+                await locator.fill(text, timeout=10000)
+            else:
+                # 模拟逐字敲击（针对必须触发下拉联想建议的动态搜索框）
+                try:
+                    await locator.click(timeout=5000)
+                except Exception:
+                    await locator.click(timeout=3000, force=True)
+                await asyncio.sleep(random.uniform(0.1, 0.4))
                 
-            await locator.press_sequentially(text, delay=random.randint(10, 30), timeout=10000)
+                # 先清空已有内容
+                try:
+                    await locator.clear(timeout=3000)
+                except Exception:
+                    # 极少情况下的回退逻辑
+                    is_mac = sys.platform == "darwin"
+                    modifier = "Meta" if is_mac else "Control"
+                    try:
+                        await self._page.keyboard.press(f"{modifier}+A")
+                        await self._page.keyboard.press("Backspace")
+                        await asyncio.sleep(0.1)
+                    except Exception:
+                        pass
+                        
+                await locator.press_sequentially(text, delay=random.randint(10, 30), timeout=10000)
+                
             if reason := await self._detect_human_verification():
                 return _human_verification_message(self._page.url, reason)
             return f"成功在元素 [{element_id}] 输入文本。"
         except Exception as e:
             return f"输入文本失败：{e}"
 
-    async def scroll(self, direction: str, amount: int = 600) -> str:
-        """滚动页面。"""
+    async def scroll(self, direction: str, amount: int = 600, element_id: int | None = None) -> str:
+        """滚动页面或局部容器。"""
+        self._record_activity()
         await self._update_active_page()
         
         if not self._page or self._page.is_closed():
@@ -249,21 +449,70 @@ class BrowserManager(BrowserLifecycleMixin):
             return f"不支持的滚动方向：{direction}，请使用 up / down / top / bottom。"
         
         try:
-            if direction == "top":
-                await self._page.evaluate("window.scrollTo(0, 0)")
-                result_msg = "已滚动到页面顶部。"
-            elif direction == "bottom":
-                await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                result_msg = "已滚动到页面底部。"
-            elif direction == "down":
-                await self._page.evaluate(f"window.scrollBy(0, {amount})")
-                result_msg = f"已向下滚动 {amount}px。"
-            else:  # up
-                await self._page.evaluate(f"window.scrollBy(0, -{amount})")
-                result_msg = f"已向上滚动 {amount}px。"
+            if element_id is not None:
+                if element_id not in self._element_mapping:
+                    return f"找不到 ID 为 {element_id} 的元素，无法进行局部滚动。请先调用 browser_get_state 刷新状态或直接进行全局滚动。"
+                selector = self._element_mapping[element_id]
+                
+                scroll_script = f"""
+                (selector) => {{
+                    const el = document.querySelector(selector);
+                    if (!el) return false;
+                    
+                    let container = el;
+                    while (container && container !== document.body && container !== document.documentElement) {{
+                        if (container.scrollHeight > container.clientHeight) {{
+                            const style = window.getComputedStyle(container);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {{
+                                break;
+                            }}
+                        }}
+                        container = container.parentElement;
+                    }}
+                    
+                    if (!container || container === document.body || container === document.documentElement) {{
+                        container = window;
+                    }}
+                    
+                    if ('{direction}' === 'top') {{
+                        container.scrollTo(0, 0);
+                    }} else if ('{direction}' === 'bottom') {{
+                        if (container === window) {{
+                            container.scrollTo(0, document.body.scrollHeight);
+                        }} else {{
+                            container.scrollTo(0, container.scrollHeight);
+                        }}
+                    }} else if ('{direction}' === 'down') {{
+                        container.scrollBy(0, {amount});
+                    }} else {{ // up
+                        container.scrollBy(0, -{amount});
+                    }}
+                    return true;
+                }}
+                """
+                
+                success = await self._page.evaluate(scroll_script, selector)
+                if not success:
+                    return f"找不到该元素或局部滚动失败，可能是页面 DOM 发生了变化。"
+                
+                direction_cn = {"top": "顶部", "bottom": "底部", "down": f"向下 {amount}px", "up": f"向上 {amount}px"}[direction]
+                result_msg = f"已针对元素 [{element_id}] 所在的局部容器滚动到 {direction_cn}。"
+            else:
+                if direction == "top":
+                    await self._page.evaluate("window.scrollTo(0, 0)")
+                    result_msg = "已滚动到全局页面顶部。"
+                elif direction == "bottom":
+                    await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    result_msg = "已滚动到全局页面底部。"
+                elif direction == "down":
+                    await self._page.evaluate(f"window.scrollBy(0, {amount})")
+                    result_msg = f"已全局向下滚动 {amount}px。"
+                else:  # up
+                    await self._page.evaluate(f"window.scrollBy(0, -{amount})")
+                    result_msg = f"已全局向上滚动 {amount}px。"
             
             await asyncio.sleep(0.8)
-            logger.info("Browser scroll direction=%s amount=%d", direction, amount)
+            logger.info("Browser scroll direction=%s amount=%d element_id=%s", direction, amount, element_id)
             if reason := await self._detect_human_verification():
                 return _human_verification_message(self._page.url, reason)
             return result_msg + " 请调用 browser_get_state 查看滚动后的页面内容。"

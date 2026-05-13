@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pydantic_ai import FunctionToolset
 
-from openhachimi_agent.tools.browser import browser_click, browser_get_state, browser_navigate, browser_scroll, browser_type
+from openhachimi_agent.tools.browser import (
+    browser_click, browser_get_state, browser_navigate, browser_scroll, browser_type,
+    browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab
+)
 from openhachimi_agent.tools.command import command_status, run_command, send_command_input
 from openhachimi_agent.tools.editing import delete_path, make_directory, replace_in_file, write_file
 from openhachimi_agent.tools.filesystem import find_files, list_files, read_file, search_text
@@ -27,6 +30,10 @@ _BROWSER_TOOLS = [
     browser_type,
     browser_scroll,
     browser_get_state,
+    browser_list_tabs,
+    browser_new_tab,
+    browser_switch_tab,
+    browser_close_tab,
 ]
 
 _SKILLS_TOOLS = [
@@ -64,6 +71,7 @@ _MUTATION_FUNCS = {
     write_file, make_directory, replace_in_file, delete_path,
     run_command, send_command_input,
     browser_navigate, browser_click, browser_type, browser_scroll,
+    browser_new_tab, browser_switch_tab, browser_close_tab,
 }
 
 _FINAL_TOOLS = []

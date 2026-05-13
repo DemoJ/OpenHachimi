@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.core.config import AppConfig
+import openhachimi_agent.service.browser  # Ensure module is loaded for mock.patch
 
 @pytest.fixture
 def agent_service(mock_config):
