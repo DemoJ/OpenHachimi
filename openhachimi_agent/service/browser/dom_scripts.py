@@ -111,32 +111,47 @@ GET_STATE_SCRIPT = """
 (maxElements) => {
     let idCounter = 1;
     const elements = [];
-    const interactiveNodes = [];
+    let isTruncated = false;
     
-    const nodes = document.querySelectorAll('*');
     const winHeight = window.innerHeight;
-    const winWidth  = window.innerWidth;
     
-    for (const node of nodes) {
-        if (elements.length >= maxElements) break;
+    function traverse(node, isInsideInteractive) {
+        if (isTruncated) return;
+        if (elements.length >= maxElements) {
+            isTruncated = true;
+            return;
+        }
         
-        // 1. 过滤无意义标签
+        // 1. 过滤文本节点等非元素节点
+        if (node.nodeType !== 1) return; // Node.ELEMENT_NODE
+        
+        // 2. 过滤无意义标签
         const tagName = node.tagName.toLowerCase();
-        if (['script','style','noscript','meta','link','head'].includes(tagName)) continue;
+        if (['script', 'style', 'noscript', 'meta', 'link', 'head'].includes(tagName)) return;
         
-        // 2. 尺寸过滤：零尺寸 = 未渲染，直接跳过
+        // 3. 剪枝：跳过不可见元素树，极大地提升性能
+        let isVisible = true;
+        if (node.checkVisibility) {
+            isVisible = node.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+        } else {
+            const rect = node.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) {
+                isVisible = false;
+            } else {
+                const style = window.getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                    isVisible = false;
+                }
+            }
+        }
+        if (!isVisible) return;
+        
         const rect = node.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) continue;
         
-        // 3. CSS 可见性过滤
-        const style = window.getComputedStyle(node);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-        
-        // 4. 计算元素相对视口的位置（用于输出标记，不用于过滤）
-        let position;
-        if (rect.bottom < 0)       position = 'above';    // 视口上方
-        else if (rect.top > winHeight) position = 'below'; // 视口下方
-        else                           position = 'viewport'; // 当前可见
+        // 4. 计算元素相对视口的位置
+        let position = 'viewport';
+        if (rect.bottom < 0) position = 'above';
+        else if (rect.top > winHeight) position = 'below';
         
         // 5. 交互性检测
         const isEditable = tagName === 'input' || tagName === 'textarea' ||
@@ -144,37 +159,27 @@ GET_STATE_SCRIPT = """
                            node.getAttribute('role') === 'textbox' ||
                            node.getAttribute('role') === 'combobox';
                            
-        let isInteractive = isEditable || tagName === 'a' || tagName === 'button' || tagName === 'select' ||
-                            node.getAttribute('role') === 'button' || node.getAttribute('role') === 'link' ||
-                            node.getAttribute('role') === 'menuitem' || node.getAttribute('role') === 'option' ||
-                            (node.hasAttribute('tabindex') && node.getAttribute('tabindex') !== '-1') ||
-                            style.cursor === 'pointer' || style.cursor === 'text';
+        const role = node.getAttribute('role');
+        const tabIndex = node.getAttribute('tabindex');
         
-        // 6. 物理遮挡剔除（仅对视口内元素有意义，视口外无浮层覆盖问题）
-        if (isInteractive && position === 'viewport') {
-            const centerX = rect.left + rect.width / 2;
-            const centerY = rect.top  + rect.height / 2;
-            if (centerX >= 0 && centerX <= winWidth && centerY >= 0 && centerY <= winHeight) {
-                const topEl = document.elementFromPoint(centerX, centerY);
-                if (topEl && topEl !== node && !node.contains(topEl) && !topEl.contains(node)) {
-                    let p1 = node, common = null, depth = 0;
-                    while (p1 && depth < 5) {
-                        if (p1.contains(topEl)) { common = p1; break; }
-                        p1 = p1.parentElement;
-                        depth++;
-                    }
-                    if (!common) isInteractive = false;
-                }
-            }
+        let isInteractive = isEditable || tagName === 'a' || tagName === 'button' || tagName === 'select' ||
+                            role === 'button' || role === 'link' ||
+                            role === 'menuitem' || role === 'option' ||
+                            (node.hasAttribute('tabindex') && tabIndex !== '-1');
+                            
+        if (!isInteractive) {
+            const style = window.getComputedStyle(node);
+            if (style.cursor === 'pointer' || style.cursor === 'text') isInteractive = true;
         }
+        
+        // 6. 移除 elementFromPoint 检测以避免 Layout Thrashing
         
         // 7. 文本提取
         let text = '';
         if (isInteractive) {
             if (isEditable) {
-                let val = (node.value || node.innerText || '').trim();
-                if (!val) val = node.getAttribute('placeholder') || node.getAttribute('aria-label') || node.getAttribute('data-testid') || '';
-                text = val;
+                text = (node.value || node.innerText || '').trim();
+                if (!text) text = node.getAttribute('placeholder') || node.getAttribute('aria-label') || node.getAttribute('data-testid') || '';
             } else {
                 text = node.getAttribute('aria-label') || node.getAttribute('alt') || node.innerText || node.value || node.getAttribute('data-testid') || '';
             }
@@ -182,48 +187,61 @@ GET_STATE_SCRIPT = """
             // 非交互节点只取直属文本，避免父子俄罗斯套娃
             let directText = '';
             for (let child of node.childNodes) {
-                if (child.nodeType === 3) directText += child.textContent;
+                if (child.nodeType === 3) directText += child.textContent; // Node.TEXT_NODE
             }
             directText = directText.trim();
             if (directText) {
                 text = node.getAttribute('aria-label') || node.getAttribute('alt') || directText;
-            } else {
-                continue;
             }
         }
         
         text = text.replace(/\\n/g, ' ').replace(/\\s+/g, ' ').trim();
         if (text.length > 120) text = text.substring(0, 120) + '...';
-        if (!text && !isInteractive) continue;
         
-        // 8. 祖先去重
-        if (!isInteractive) {
-            if (interactiveNodes.some(parent => parent.contains(node))) continue;
+        let shouldInclude = isInteractive || text;
+        
+        // 8. 祖先去重优化 (DFS 向下传递状态)
+        if (shouldInclude && !isInteractive && isInsideInteractive) {
+            // 已在交互容器内，忽略非交互的纯文本节点，将其文本视作属于父容器
+            shouldInclude = false;
         }
         
-        const role = node.getAttribute('role') || tagName;
-        const elData = {
-            id: idCounter++,
-            tag: tagName,
-            role: role,
-            text: text,
-            type: node.type || undefined,
-            isInteractive: isInteractive,
-            position: position,
-        };
+        if (shouldInclude) {
+            const elData = {
+                id: idCounter++,
+                tag: tagName,
+                role: role || tagName,
+                text: text,
+                type: node.type || undefined,
+                isInteractive: isInteractive,
+                position: position,
+            };
+            
+            node.setAttribute('data-agent-id', elData.id);
+            elements.push(elData);
+        }
         
-        node.setAttribute('data-agent-id', elData.id);
-        elements.push(elData);
-        if (isInteractive) interactiveNodes.push(node);
+        const nextIsInsideInteractive = isInsideInteractive || isInteractive;
+        
+        // 递归遍历子节点
+        let child = node.firstElementChild;
+        while (child) {
+            traverse(child, nextIsInsideInteractive);
+            child = child.nextElementSibling;
+        }
+    }
+    
+    if (document.body) {
+        traverse(document.body, false);
     }
     
     return {
         url: document.location.href,
         title: document.title,
         elements: elements,
-        truncated: elements.length >= maxElements,
+        truncated: isTruncated,
         scrollY: Math.round(window.scrollY),
-        scrollHeight: Math.round(document.body.scrollHeight),
+        scrollHeight: Math.round(document.body ? document.body.scrollHeight : 0),
         clientHeight: Math.round(window.innerHeight),
     };
 }

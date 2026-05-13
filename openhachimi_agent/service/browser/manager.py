@@ -6,8 +6,9 @@ import logging
 import random
 import sys
 import time
+from functools import wraps
 
-from playwright.async_api import Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page, Error as PlaywrightError
 
 from openhachimi_agent.core.config import AppConfig
 from .lifecycle import BrowserLifecycleMixin
@@ -16,6 +17,50 @@ from .captcha_patterns import CAPTCHA_PATTERNS
 from .utils import _human_verification_message
 
 logger = logging.getLogger(__name__)
+
+
+def auto_heal_retry(max_retries=3, base_delay=1.0):
+    """
+    自动恢复重试装饰器。
+    当捕获到 Playwright 断开连接或页面崩溃的异常时，触发 _ensure_browser 重连并重试操作。
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            last_err = None
+            for attempt in range(max_retries):
+                try:
+                    return await func(self, *args, **kwargs)
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e).lower()
+                    # 检查是否为连接断开或目标关闭类型的错误
+                    is_disconnect = (
+                        isinstance(e, PlaywrightError) and 
+                        any(kw in err_str for kw in ["closed", "disconnected", "target", "protocol error", "session"])
+                    ) or "not open" in err_str
+                    
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                        if is_disconnect:
+                            logger.warning("Browser disconnected during '%s'. Attempting to heal and retry in %.1fs...", func.__name__, delay)
+                            await asyncio.sleep(delay)
+                            # 强制重置当前页面，让 _ensure_browser 重新获取或创建
+                            if getattr(self, "_page", None):
+                                self._page = None
+                            try:
+                                await self._ensure_browser()
+                            except Exception as heal_err:
+                                logger.error("Auto-heal failed: %s", heal_err)
+                        else:
+                            logger.warning("Error during '%s': %s. Retrying in %.1fs...", func.__name__, e, delay)
+                            await asyncio.sleep(delay)
+                    else:
+                        break
+            logger.error("'%s' failed after %d retries. Last error: %s", func.__name__, max_retries, last_err)
+            return f"{func.__name__} 操作最终失败：{last_err}"
+        return wrapper
+    return decorator
 
 
 class BrowserManager(BrowserLifecycleMixin):
@@ -189,6 +234,7 @@ class BrowserManager(BrowserLifecycleMixin):
             logger.error("Failed to create new tab: %s", e)
             return f"新建标签页失败：{e}"
 
+    @auto_heal_retry()
     async def switch_tab(self, tab_index: int) -> str:
         """切换到指定索引的标签页。"""
         self._record_activity()
@@ -245,6 +291,25 @@ class BrowserManager(BrowserLifecycleMixin):
             logger.error("Failed to close tab: %s", e)
             return f"关闭标签页失败：{e}"
 
+    async def wait_for_load_state(self, state: str = "load", selector: str = None, function: str = None, timeout: int = 15000) -> bool:
+        """
+        等待页面加载状态。
+        支持的 state 策略：'load', 'domcontentloaded', 'networkidle', 'selector', 'function'
+        """
+        if not self._page or self._page.is_closed():
+            return False
+        try:
+            if state in ["load", "domcontentloaded", "networkidle"]:
+                await self._page.wait_for_load_state(state, timeout=timeout)
+            elif state == "selector" and selector:
+                await self._page.wait_for_selector(selector, state="visible", timeout=timeout)
+            elif state == "function" and function:
+                await self._page.wait_for_function(function, timeout=timeout)
+            return True
+        except Exception as e:
+            logger.debug("wait_for_load_state '%s' timeout or failed: %s", state, e)
+            return False
+
     async def navigate(self, url: str) -> str:
         """导航到指定网页。"""
         self._record_activity()
@@ -270,7 +335,7 @@ class BrowserManager(BrowserLifecycleMixin):
         logger.info("Browser navigating to: %s", url)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(random.uniform(0.8, 1.6))
+            await self.wait_for_load_state("networkidle", timeout=5000)
             if reason := await self._detect_human_verification():
                 return _human_verification_message(page.url, reason)
             return f"成功导航到：{page.url}。请使用 browser_get_state 获取页面内容。"
@@ -436,6 +501,7 @@ class BrowserManager(BrowserLifecycleMixin):
         except Exception as e:
             return f"输入文本失败：{e}"
 
+    @auto_heal_retry()
     async def scroll(self, direction: str, amount: int = 600, element_id: int | None = None) -> str:
         """滚动页面或局部容器。"""
         self._record_activity()
