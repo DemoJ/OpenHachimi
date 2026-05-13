@@ -95,14 +95,14 @@ def build_router_agent(config: AppConfig) -> Agent:
     model = OpenAIChatModel(config.model_name, provider=provider)
     
     system_prompt = (
-        "你是一个专业的任务路由分析器。"
+        "你是一个专业的任务路由分析器。\n"
         "你需要判断用户的输入任务是 'SIMPLE_TASK' 还是 'COMPLEX_TASK'。\n"
         "- SIMPLE_TASK：简单的、1-2步即可完成的任务。例如：简单的问答、翻译、查个词、看一眼特定的网页、运行一个简单的脚本、查询系统信息等。\n"
-        "- COMPLEX_TASK：复杂的、多步骤的、需要调查研究和深度规划的任务。例如：分析某人的主页、爬取数据并分析、写一个完整的项目、重构代码、修复一个疑难 Bug 等。"
+        "- COMPLEX_TASK：复杂的、多步骤的、需要调查研究和深度规划的任务。例如：分析某人的主页、爬取数据并分析、写一个完整的项目、重构代码、修复一个疑难 Bug 等。\n"
+        "请且仅回复 'SIMPLE_TASK' 或是 'COMPLEX_TASK' 这两个字符串之一，不要包含任何标点符号或其他说明。"
     )
     
     return Agent(
         model,
         system_prompt=system_prompt,
-        result_type=Literal["SIMPLE_TASK", "COMPLEX_TASK"],
     )

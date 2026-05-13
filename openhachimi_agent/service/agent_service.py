@@ -268,11 +268,11 @@ class AgentService:
                         router_agent = self._get_agent(role, "router")
                         try:
                             router_result = await router_agent.run(f"指令：{message}")
-                            task_type = router_result.data
+                            task_type = str(router_result.data).strip()
                             logger.info("Router classified task as %s", task_type)
                             
                             # 3. 如果是复杂任务，强制进入 Planner 进行规划
-                            if task_type == "COMPLEX_TASK":
+                            if "COMPLEX_TASK" in task_type:
                                 planner_agent = self._get_agent(role, "planner")
                                 if stream:
                                     await stream_queue.put("\n\n[System] 检测到复杂任务，正在进行前置深度调研与规划...\n")
