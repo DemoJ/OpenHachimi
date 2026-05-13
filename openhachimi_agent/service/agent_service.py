@@ -18,7 +18,7 @@ from pydantic_ai.messages import (
     TextPartDelta,
 )
 
-from openhachimi_agent.agent.factory import build_agent
+from openhachimi_agent.agent.factory import build_executor_agent, build_planner_agent, build_router_agent
 from openhachimi_agent.content.roles import list_role_names
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -121,7 +121,8 @@ class AgentService:
             self._session_locks[session_id] = lock
         return lock
 
-    def _get_agent(self, role_name: str):
+    def _get_agent(self, role_name: str, agent_type: str = "executor"):
+        cache_key = f"{role_name}:{agent_type}"
         # 计算依赖文件（角色文件和技能目录）的最新修改时间
         paths_to_check = [self.config.roles_dir / f"{role_name}.md"]
         paths_to_check.extend(self.config.skills_dirs)
@@ -140,14 +141,21 @@ class AgentService:
         except Exception as e:
             logger.debug("Failed to check mtime for agent dependencies: %s", e)
 
-        cached = self._agents.get(role_name)
+        cached = self._agents.get(cache_key)
         if cached is None or cached[1] < current_mtime:
             if cached is not None:
-                logger.info("rebuilding agent due to dependency updates role=%s", role_name)
-            agent = build_agent(self.config, role_name)
-            self._agents[role_name] = (agent, current_mtime)
+                logger.info("rebuilding %s agent due to dependency updates role=%s", agent_type, role_name)
+                
+            if agent_type == "router":
+                agent = build_router_agent(self.config)
+            elif agent_type == "planner":
+                agent = build_planner_agent(self.config, role_name)
+            else:
+                agent = build_executor_agent(self.config, role_name)
+                
+            self._agents[cache_key] = (agent, current_mtime)
             
-        return self._agents[role_name][0]
+        return self._agents[cache_key][0]
 
     def state(self) -> AgentState:
         return AgentState(
@@ -209,7 +217,6 @@ class AgentService:
     async def _run_with_session(self, message: str, role: str | None, session_id: str | None, stream: bool) -> AsyncIterator[object]:
         start_time = time.perf_counter()
         role = role or self.config.default_role_name
-        agent = self._get_agent(role)
         
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
         lock = self._get_session_lock(actual_session_id)
@@ -239,25 +246,61 @@ class AgentService:
                     if actual_session_id not in self._session_states:
                         self._session_states[actual_session_id] = {}
                     session_state = self._session_states[actual_session_id]
+                    
+                    deps = AgentDeps(
+                        config=self.config, 
+                        session_id=actual_session_id, 
+                        browser_manager=self.browser_manager,
+                        process_manager=self.process_manager,
+                        session_state=session_state
+                    )
 
+                    # 1. 检查是否存在正在进行的 TODO
+                    has_active_todos = False
+                    if "todo_state" in session_state:
+                        todo_state = session_state["todo_state"]
+                        if todo_state.is_active and todo_state.tasks:
+                            if any(t.status != "done" for t in todo_state.tasks.values()):
+                                has_active_todos = True
+                    
+                    # 2. 如果没有活动的 TODO，且是一句新的指令，通过 Router 判断复杂度
+                    if not has_active_todos and len(history) % 2 == 0:  # 假设新的一轮，只有在没有活动 TODO 时才做 router 判断
+                        router_agent = self._get_agent(role, "router")
+                        try:
+                            router_result = await router_agent.run(f"指令：{message}")
+                            task_type = router_result.data
+                            logger.info("Router classified task as %s", task_type)
+                            
+                            # 3. 如果是复杂任务，强制进入 Planner 进行规划
+                            if task_type == "COMPLEX_TASK":
+                                planner_agent = self._get_agent(role, "planner")
+                                if stream:
+                                    await stream_queue.put("\n\n[System] 检测到复杂任务，正在进行前置深度调研与规划...\n")
+                                planner_result = await planner_agent.run(
+                                    f"请针对以下复杂任务，通过只读工具（搜索、读取文件）充分了解背景，并使用 create_todos 创建一个详细的执行计划。\n任务：{message}",
+                                    message_history=history,
+                                    deps=deps
+                                )
+                                # 将规划历史记录附加到执行前
+                                history.extend(planner_result.all_messages())
+                        except Exception as router_e:
+                            logger.warning("Router failed: %s. Defaulting to direct execution.", router_e)
+                            
+                    # 4. 最后交给 Executor Agent 执行
+                    executor_agent = self._get_agent(role, "executor")
+                    
                     kwargs = {
                         "message_history": history,
-                        "deps": AgentDeps(
-                            config=self.config, 
-                            session_id=actual_session_id, 
-                            browser_manager=self.browser_manager,
-                            process_manager=self.process_manager,
-                            session_state=session_state
-                        ),
+                        "deps": deps,
                     }
                     if stream:
                         kwargs["event_stream_handler"] = handle_stream_events
                         result = await asyncio.wait_for(
-                            agent.run(message, **kwargs),
+                            executor_agent.run(message, **kwargs),
                             timeout=self.config.agent_timeout_seconds,
                         )
                     else:
-                        result = await agent.run(message, **kwargs)
+                        result = await executor_agent.run(message, **kwargs)
                     result_holder["result"] = result
                 except asyncio.TimeoutError as exc:
                     if stream:

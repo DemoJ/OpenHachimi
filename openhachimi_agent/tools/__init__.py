@@ -8,13 +8,15 @@ from openhachimi_agent.tools.command import run_command
 from openhachimi_agent.tools.editing import make_directory, replace_in_file, write_file
 from openhachimi_agent.tools.filesystem import find_files, list_files, read_file, search_text
 from openhachimi_agent.tools.git import git_diff, git_status
-from openhachimi_agent.tools.registry import WORKSPACE_TOOLSET
+from openhachimi_agent.tools.registry import WORKSPACE_TOOLSET, PLANNER_TOOLSET, EXECUTOR_TOOLSET
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import deep_search
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos
 
 __all__ = [
     "WORKSPACE_TOOLSET",
+    "PLANNER_TOOLSET",
+    "EXECUTOR_TOOLSET",
     "list_files",
     "find_files",
     "search_text",
