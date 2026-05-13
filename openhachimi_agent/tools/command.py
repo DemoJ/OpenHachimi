@@ -49,10 +49,8 @@ async def run_command(
 
     shell_command, shell_name = get_command_shell()
     
-    from openhachimi_agent.service.process import process_manager
-
     # 使用 ProcessManager 启动后台进程
-    proc = process_manager.start_process(
+    proc = ctx.deps.process_manager.start_process(
         [*shell_command, command],
         cwd=target_cwd,
         shell_name=shell_name,
@@ -83,8 +81,7 @@ async def run_command(
 
 def command_status(ctx: RunContext[AgentDeps], command_id: str) -> dict[str, object]:
     """检查后台运行中的命令状态，获取最新的输出日志。"""
-    from openhachimi_agent.service.process import process_manager
-    proc = process_manager.get_process(command_id)
+    proc = ctx.deps.process_manager.get_process(command_id)
     if not proc:
         return {"error": f"找不到命令 ID: {command_id}"}
         
@@ -115,8 +112,7 @@ async def send_command_input(
     如果需要发送特殊按键（如回车、方向键），请使用 `special_key` 参数。
     不要在 text 中发送像 "\\n" 或 "\\r" 这样的转义字符，请直接使用 special_key="enter"。
     """
-    from openhachimi_agent.service.process import process_manager
-    proc = process_manager.get_process(command_id)
+    proc = ctx.deps.process_manager.get_process(command_id)
     if not proc:
         return {"error": f"找不到命令 ID: {command_id}"}
         

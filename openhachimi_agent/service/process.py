@@ -167,6 +167,4 @@ class ProcessManager:
         if proc:
             proc.terminate()
 
-
-# 单例实例，跨请求共享进程状态
-process_manager = ProcessManager()
+

@@ -30,8 +30,6 @@ class TodoState:
     tool_calls_since_update: int = 0
     is_active: bool = False
 
-_SESSION_TODO_STATES: dict[str, TodoState] = {}
-
 def _get_todos_file_path(ctx: RunContext[AgentDeps]) -> Path:
     todos_dir = ctx.deps.config.memory_dir / "todos"
     todos_dir.mkdir(parents=True, exist_ok=True)
@@ -63,16 +61,10 @@ def _save_state(ctx: RunContext[AgentDeps], state: TodoState):
         logger.warning("Failed to save TODO state to %s: %s", path, e)
 
 def _get_state(ctx: RunContext[AgentDeps]) -> TodoState:
-    session_id = ctx.deps.session_id
-    if session_id not in _SESSION_TODO_STATES:
-        if len(_SESSION_TODO_STATES) >= 100:
-            oldest = next(iter(_SESSION_TODO_STATES))
-            _SESSION_TODO_STATES.pop(oldest, None)
-        _SESSION_TODO_STATES[session_id] = _load_state(ctx)
-    else:
-        state = _SESSION_TODO_STATES.pop(session_id)
-        _SESSION_TODO_STATES[session_id] = state
-    return _SESSION_TODO_STATES[session_id]
+    session_state = ctx.deps.session_state
+    if "todo_state" not in session_state:
+        session_state["todo_state"] = _load_state(ctx)
+    return session_state["todo_state"]
 
 
 def create_todos(ctx: RunContext[AgentDeps], tasks: list[dict | str]) -> str:

@@ -86,7 +86,11 @@ class AgentService:
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         from openhachimi_agent.service.browser import BrowserManager
+        from openhachimi_agent.service.process import ProcessManager
+        from openhachimi_agent.tools.utils import BoundedDict
         self.browser_manager = BrowserManager(config)
+        self.process_manager = ProcessManager()
+        self._session_states: BoundedDict[str, dict] = BoundedDict(100)
         logger.info(
             "service initialized model=%s",
             self.config.model_name,
@@ -232,9 +236,19 @@ class AgentService:
 
             async def run_agent() -> None:
                 try:
+                    if actual_session_id not in self._session_states:
+                        self._session_states[actual_session_id] = {}
+                    session_state = self._session_states[actual_session_id]
+
                     kwargs = {
                         "message_history": history,
-                        "deps": AgentDeps(config=self.config, session_id=actual_session_id, browser_manager=self.browser_manager),
+                        "deps": AgentDeps(
+                            config=self.config, 
+                            session_id=actual_session_id, 
+                            browser_manager=self.browser_manager,
+                            process_manager=self.process_manager,
+                            session_state=session_state
+                        ),
                     }
                     if stream:
                         kwargs["event_stream_handler"] = handle_stream_events

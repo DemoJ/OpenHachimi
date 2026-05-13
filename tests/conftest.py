@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 import pytest
 import os
 from pathlib import Path
@@ -46,5 +47,7 @@ def mock_agent_deps(mock_config, mock_browser_manager):
     return AgentDeps(
         config=mock_config,
         session_id="test_session_123",
-        browser_manager=mock_browser_manager
+        browser_manager=mock_browser_manager,
+        process_manager=MagicMock(),
+        session_state={}
     )

@@ -197,30 +197,17 @@ def get_command_shell() -> tuple[list[str], str]:
     logger.debug("selected command shell=%s", Path(shell_path).name)
     return [shell_path, "-lc"], Path(shell_path).name
 
-_prompt_read_cache: dict[str, set[str]] = {}
-
-def _get_session_id(ctx: object) -> str | None:
-    deps = getattr(ctx, "deps", None)
-    if deps and hasattr(deps, "session_id"):
-        return str(getattr(deps, "session_id"))
-    return None
-
 def check_prompt_read(ctx: object, prompt_filename: str) -> bool:
     """检查 Agent 是否已经读取过指定的系统提示词文件。"""
-    session_id = _get_session_id(ctx)
-    if not session_id:
+    deps = getattr(ctx, "deps", None)
+    if not deps:
         return False
         
-    global _prompt_read_cache
-    if session_id not in _prompt_read_cache:
-        # 限制缓存大小，防止内存泄漏 (简单的淘汰策略)
-        if len(_prompt_read_cache) > 1000:
-            # 移除最旧的元素 (Python 3.7+ 字典保持插入顺序)
-            oldest_key = next(iter(_prompt_read_cache))
-            del _prompt_read_cache[oldest_key]
-        _prompt_read_cache[session_id] = set()
+    session_state = getattr(deps, "session_state", {})
+    if "prompt_read_cache" not in session_state:
+        session_state["prompt_read_cache"] = set()
         
-    cache = _prompt_read_cache[session_id]
+    cache = session_state["prompt_read_cache"]
     if prompt_filename in cache:
         return True
 
@@ -265,11 +252,12 @@ def inject_prompt_if_unread(ctx: object, prompt_name: str, original_result: str 
         return original_result
 
     # 立即添加到缓存中，防止同一次 Run 中后续的工具调用重复注入
-    session_id = _get_session_id(ctx)
-    if session_id:
-        global _prompt_read_cache
-        if session_id in _prompt_read_cache:
-            _prompt_read_cache[session_id].add(prompt_filename)
+    deps = getattr(ctx, "deps", None)
+    if deps:
+        session_state = getattr(deps, "session_state", {})
+        if "prompt_read_cache" not in session_state:
+            session_state["prompt_read_cache"] = set()
+        session_state["prompt_read_cache"].add(prompt_filename)
 
     injection = (
         f"\n\n[系统自动注入子提示词：{prompt_filename}]\n"
