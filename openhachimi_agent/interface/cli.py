@@ -303,7 +303,14 @@ async def run_embedded_cli() -> None:
     logger.info("starting embedded cli")
     service = AgentService(config)
     backend = EmbeddedBackend(service)
-    await run_interactive_loop(backend, "embedded", config.default_role_name)
+    try:
+        await run_interactive_loop(backend, "embedded", config.default_role_name)
+    finally:
+        # 确保退出时清理浏览器进程，防止 Chrome 残留
+        try:
+            await service.browser_manager.close()
+        except Exception as exc:
+            logger.debug("browser cleanup on exit failed: %s", exc)
 
 
 def run_cli() -> None:

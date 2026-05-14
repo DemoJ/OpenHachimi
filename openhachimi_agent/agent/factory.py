@@ -52,7 +52,20 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str) -> Age
 
     if agent_type == "planner":
         toolsets = [PLANNER_TOOLSET]
-        extra_prompt = "\n\n[System Role] 你现在是 **Planner Agent (规划者)**。你**没有**执行破坏性操作（如写文件、命令行、浏览器深度交互）的权限。你的唯一任务是通过阅读文件和搜索网络，充分了解任务背景，然后使用 `create_todos` 制定详尽的执行计划。"
+        extra_prompt = (
+            "\n\n[System Role] 你现在是 **Planner Agent (规划者)**。\n"
+            "你的唯一职责是：理解用户目标，然后使用 `create_todos` 制定一个可执行的步骤计划。\n"
+            "你自己不要去执行任何调研、搜索或网络请求，那是 Executor 的事。\n\n"
+            "Executor 拥有以下工具能力：\n"
+            "- 浏览器：browser_navigate（打开URL）、browser_get_state（读取页面）、browser_click、browser_type、browser_scroll、browser_new_tab 等\n"
+            "- 网络：web_fetch（HTTP抓取）、web_search（搜索引擎）、discover_web_resources\n"
+            "- 文件：read_file、write_file、replace_in_file、list_files、find_files、search_text\n"
+            "- 命令行：run_command、send_command_input\n"
+            "- Git：git_status、git_diff\n\n"
+            "请基于对以上 Executor 工具能力的理解来制定执行计划。\n"
+            "如果用户提供了明确的 URL 或文件路径，计划应从直接访问该目标开始，不要先去搜索。\n"
+            "你可以使用本地文件读取工具来了解项目上下文，但不要发起任何网络请求。"
+        )
     else:
         toolsets = [EXECUTOR_TOOLSET]
         extra_prompt = "\n\n[System Role] 你现在是 **Executor Agent (执行者)**。你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作（写代码、运行命令等），并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
@@ -64,6 +77,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str) -> Age
         deps_type=AgentDeps,
         toolsets=toolsets,
         defer_model_check=True,
+        retries=3,  # 允许工具调用失败后最多重试 3 次，避免因单次输出格式问题导致整体失败
     )
 
     @agent.system_prompt

@@ -88,21 +88,23 @@ def test_all_done_deactivates_plan(mock_ctx):
     assert _get_state(mock_ctx).is_active is False
 
 
-def test_execution_guard_requires_single_in_progress_task(mock_ctx):
+def test_execution_guard_allows_without_in_progress_task(mock_ctx):
+    """execution_guard 采用软提醒策略，即使没有 in-progress 任务也允许执行。"""
     def mutating_tool(ctx):
         return {"ok": True}
 
     guarded = with_execution_guard(mutating_tool)
     create_todos(mock_ctx, ["Task 1"])
 
-    with pytest.raises(Exception, match="必须先用 update_todo"):
-        guarded(mock_ctx)
+    # 不再抛异常，而是正常执行（软提醒通过日志）
+    assert guarded(mock_ctx) == {"ok": True}
 
     update_todo(mock_ctx, 1, "in-progress")
     assert guarded(mock_ctx) == {"ok": True}
 
 
-def test_execution_guard_respects_allowed_tools(mock_ctx):
+def test_execution_guard_allows_non_authorized_tools(mock_ctx):
+    """allowed_tools 限制改为软提醒，不再硬阻塞。"""
     def write_file(ctx):
         return {"ok": True}
 
@@ -112,5 +114,5 @@ def test_execution_guard_respects_allowed_tools(mock_ctx):
     ])
     update_todo(mock_ctx, 1, "in-progress")
 
-    with pytest.raises(Exception, match="未授权工具"):
-        guarded(mock_ctx)
+    # 不再抛异常，仅记录 warning 日志
+    assert guarded(mock_ctx) == {"ok": True}

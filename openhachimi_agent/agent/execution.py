@@ -7,21 +7,10 @@ import json
 import time
 from functools import wraps
 from typing import Any, Callable
-from urllib.parse import urlsplit, urlunsplit
-
-from pydantic_ai.exceptions import ModelRetry
 
 
-_NAVIGATION_TOOLS = {"browser_navigate", "browser_new_tab", "web_fetch"}
 _LEDGER_LIMIT = 200
 
-
-def _canonical_url(url: str) -> str:
-    parts = urlsplit(url.strip())
-    scheme = parts.scheme.lower()
-    netloc = parts.netloc.lower()
-    path = parts.path.rstrip("/") or "/"
-    return urlunsplit((scheme, netloc, path, parts.query, ""))
 
 
 def _summarize(value: object, max_chars: int = 800) -> str:
@@ -95,74 +84,6 @@ def _append_ledger_event(
         del ledger[: len(ledger) - _LEDGER_LIMIT]
 
 
-def _extract_url_arg(tool_name: str, bound_args: dict[str, object]) -> str | None:
-    if tool_name == "browser_new_tab" and bound_args.get("url") is None:
-        return None
-    value = bound_args.get("url")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _target_urls_from_task_frame(session_state: dict[str, Any]) -> list[str]:
-    task_frame = session_state.get("task_frame")
-    if not isinstance(task_frame, dict):
-        return []
-    urls: list[str] = []
-    for entity in task_frame.get("target_entities", []):
-        if isinstance(entity, dict) and entity.get("type") == "url" and entity.get("value"):
-            urls.append(str(entity["value"]))
-    return urls
-
-
-def _action_violation(tool_name: str, bound_args: dict[str, object], session_state: dict[str, Any]) -> str:
-    task_frame = session_state.get("task_frame")
-    if not isinstance(task_frame, dict):
-        return ""
-
-    if task_frame.get("allowed_autonomy") != "narrow" or tool_name not in _NAVIGATION_TOOLS:
-        return ""
-
-    target_urls = _target_urls_from_task_frame(session_state)
-    if not target_urls:
-        return ""
-
-    url = _extract_url_arg(tool_name, bound_args)
-    if not url:
-        return ""
-
-    observations = session_state.setdefault("task_frame_observations", {})
-    observed = set(observations.get("target_urls_observed", [])) if isinstance(observations, dict) else set()
-    canonical_targets = {_canonical_url(target_url) for target_url in target_urls}
-    canonical_url = _canonical_url(url)
-
-    if canonical_targets.intersection(observed):
-        return ""
-    if canonical_url in canonical_targets:
-        return ""
-
-    return (
-        "Action would navigate/fetch a different URL before observing the user-provided primary target. "
-        f"Requested target URLs: {', '.join(target_urls)}; attempted URL: {url}. "
-        "Recalibrate to the TaskFrame instead of substituting a search result or guessed site."
-    )
-
-
-def _record_success_observation(tool_name: str, bound_args: dict[str, object], session_state: dict[str, Any]) -> None:
-    if tool_name not in _NAVIGATION_TOOLS:
-        return
-    url = _extract_url_arg(tool_name, bound_args)
-    if not url:
-        return
-    canonical_url = _canonical_url(url)
-    target_urls = _target_urls_from_task_frame(session_state)
-    canonical_targets = {_canonical_url(target_url) for target_url in target_urls}
-    if canonical_url not in canonical_targets:
-        return
-    observations = session_state.setdefault("task_frame_observations", {})
-    observed = observations.setdefault("target_urls_observed", [])
-    if canonical_url not in observed:
-        observed.append(canonical_url)
 
 
 def get_execution_ledger(ctx: object) -> list[dict[str, Any]]:
@@ -178,7 +99,11 @@ def get_ledger_length(session_state: dict[str, Any]) -> int:
 
 
 def get_replan_signal(session_state: dict[str, Any], since_seq: int = 0) -> dict[str, object] | None:
-    """Return a compact replan signal when the latest new ledger event is blocked/failed."""
+    """Return a compact replan signal when there are consecutive failures in new ledger events.
+    
+    只有在新事件中存在连续 >= 2 次 blocked/failed 且尾部没有被 succeeded 覆盖时才触发 replan。
+    单次 blocked（通常是 ModelRetry 后已成功重试）不应触发昂贵的重规划。
+    """
 
     ledger = session_state.get("execution_ledger", [])
     if not isinstance(ledger, list):
@@ -190,8 +115,21 @@ def get_replan_signal(session_state: dict[str, Any], since_seq: int = 0) -> dict
     if not new_events:
         return None
 
+    # 检查尾部是否以 blocked/failed 结尾
     latest = new_events[-1]
     if latest.get("status") not in {"blocked", "failed"}:
+        return None
+
+    # 统计尾部连续的 blocked/failed 次数
+    consecutive_failures = 0
+    for event in reversed(new_events):
+        if event.get("status") in {"blocked", "failed"}:
+            consecutive_failures += 1
+        else:
+            break
+
+    # 单次失败不触发 replan，通常是 ModelRetry 后已自动重试成功
+    if consecutive_failures < 2:
         return None
 
     notable_events = [
@@ -213,7 +151,8 @@ def get_replan_signal(session_state: dict[str, Any], since_seq: int = 0) -> dict
         )
 
     return {
-        "reason": "latest execution ledger event requires replan",
+        "reason": "consecutive execution failures require replan",
+        "consecutive_failures": consecutive_failures,
         "latest_status": latest.get("status"),
         "events": summary,
     }
@@ -238,19 +177,6 @@ def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, ob
         ]
         if unfinished:
             issues.append({"type": "unfinished_todos", "items": unfinished})
-
-    task_frame = session_state.get("task_frame")
-    if isinstance(task_frame, dict):
-        target_urls = _target_urls_from_task_frame(session_state)
-        if target_urls and task_frame.get("allowed_autonomy") == "narrow":
-            observations = session_state.get("task_frame_observations", {})
-            observed = set(observations.get("target_urls_observed", [])) if isinstance(observations, dict) else set()
-            missing = [
-                target_url for target_url in target_urls
-                if _canonical_url(target_url) not in observed
-            ]
-            if missing:
-                issues.append({"type": "target_urls_not_observed", "items": missing})
 
     ledger = session_state.get("execution_ledger", [])
     if isinstance(ledger, list) and ledger:
@@ -283,17 +209,12 @@ def with_execution_ledger(func: Callable) -> Callable:
         async def async_wrapper(ctx, *args, **kwargs):
             session_state = _get_session_state(ctx)
             bound_args = _bind_tool_args(func, ctx, args, kwargs)
-            violation = _action_violation(tool_name, bound_args, session_state)
-            if violation:
-                _append_ledger_event(session_state, tool_name=tool_name, status="blocked", args=bound_args, violation=violation)
-                raise ModelRetry(violation)
             _append_ledger_event(session_state, tool_name=tool_name, status="started", args=bound_args)
             try:
                 result = await func(ctx, *args, **kwargs)
             except Exception as exc:
                 _append_ledger_event(session_state, tool_name=tool_name, status="failed", args=bound_args, result=exc)
                 raise
-            _record_success_observation(tool_name, bound_args, session_state)
             _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
             return result
         return async_wrapper
@@ -302,17 +223,12 @@ def with_execution_ledger(func: Callable) -> Callable:
     def sync_wrapper(ctx, *args, **kwargs):
         session_state = _get_session_state(ctx)
         bound_args = _bind_tool_args(func, ctx, args, kwargs)
-        violation = _action_violation(tool_name, bound_args, session_state)
-        if violation:
-            _append_ledger_event(session_state, tool_name=tool_name, status="blocked", args=bound_args, violation=violation)
-            raise ModelRetry(violation)
         _append_ledger_event(session_state, tool_name=tool_name, status="started", args=bound_args)
         try:
             result = func(ctx, *args, **kwargs)
         except Exception as exc:
             _append_ledger_event(session_state, tool_name=tool_name, status="failed", args=bound_args, result=exc)
             raise
-        _record_success_observation(tool_name, bound_args, session_state)
         _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
         return result
     return sync_wrapper

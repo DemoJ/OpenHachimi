@@ -14,7 +14,7 @@ from openhachimi_agent.tools.filesystem import find_files, list_files, read_file
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
-from openhachimi_agent.tools.research import deep_search
+from openhachimi_agent.tools.research import web_search
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
 from openhachimi_agent.agent.execution import with_execution_ledger
@@ -58,7 +58,7 @@ _OTHER_TOOLS = [
     git_diff,
     web_fetch,
     discover_web_resources,
-    deep_search,
+    web_search,
 ]
 
 _PLANNING_TOOLS = [
@@ -95,17 +95,35 @@ for _orig_tools, _middlewares in [
         else:
             _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_wrapped))
 
-# 规划器专属 Toolset：拥有只读能力、创建 TODO 能力，但没有直接破坏性执行权限
+# ── Planner 专用工具集 ──
+# Planner 是纯规划者：只需要本地只读工具来理解项目上下文，然后基于对
+# Executor 工具能力的了解来制定计划。不应该有任何网络执行类工具（web_search、
+# web_fetch、browser_* 等），否则 Planner 会"提前调研"导致目标漂移。
+_PLANNER_CONTEXT_FUNCS = {
+    list_files, find_files, search_text, read_file,   # 本地文件只读
+    git_status, git_diff,                              # Git 只读
+    list_skills, get_skill_instructions,               # 技能查询
+}
+_planner_allowed_names = {f.__name__ for f in _PLANNER_CONTEXT_FUNCS}
+_PLANNER_CONTEXT_TOOLS = [
+    tool for tool in _READ_ONLY_FINAL_TOOLS
+    if getattr(tool, "__name__", "") in _planner_allowed_names
+]
+
 PLANNER_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS]
+    tools=_PLANNER_CONTEXT_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS],
+    max_retries=3,
 )
 
-# 执行器专属 Toolset：拥有所有执行权限、只读权限和更新 TODO 能力
+# ── Executor 专用工具集 ──
+# Executor 拥有所有执行权限、只读权限和更新 TODO 能力
 EXECUTOR_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)]
+    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)],
+    max_retries=3,
 )
 
 # 保持后向兼容（部分遗留代码可能仍引用这个）
 WORKSPACE_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS + _UPDATE_TODO_TOOL]
+    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS + _UPDATE_TODO_TOOL],
+    max_retries=3,
 )

@@ -31,6 +31,7 @@ class BrowserLifecycleMixin:
     self._page: Page | None
     self._chrome_process
     self._chrome_stderr_file
+    self._chrome_cdp_port: int | None  # 记录当前 CDP 端口，用于复用检测
     self._lock: asyncio.Lock
     """
 
@@ -355,83 +356,111 @@ class BrowserLifecycleMixin:
                 user_data_dir.mkdir(parents=True, exist_ok=True)
                 
                 try:
-                    chrome_path = self._find_chrome_executable()
-                    port = self._find_free_port()
-                    browser_env = self._browser_process_env(headless)
-                    
-                    window_size = self.config.browser_window_size
-                    if not window_size:
-                        window_size = f"{random.randint(1366, 1920)},{random.randint(768, 1080)}"
-                        
-                    args = [
-                        chrome_path,
-                        f"--remote-debugging-port={port}",
-                        f"--user-data-dir={user_data_dir}",
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                        "--disable-dev-shm-usage",
-                        "--disable-background-networking",
-                        "--disable-renderer-backgrounding",
-                        "--disable-background-timer-throttling",
-                        "--password-store=basic",
-                        f"--window-size={window_size}",
-                    ]
-                    
-                    if self.config.browser_user_agent:
-                        args.append(f"--user-agent={self.config.browser_user_agent}")
-                        
-                    if sys.platform == "linux":
-                        args.extend([
-                            "--no-sandbox",
-                            "--disable-gpu",
-                            "--disable-blink-features=AutomationControlled",
-                        ])
-                    if headless:
-                        args.extend(["--headless=new"])
-                        
-                    logger.info(
-                        "以 CDP 接管模式启动原生浏览器: path=%s port=%s headless=%s display=%s wayland=%s",
-                        chrome_path,
-                        port,
-                        headless,
-                        browser_env.get("DISPLAY"),
-                        browser_env.get("WAYLAND_DISPLAY"),
-                    )
-                    chrome_stderr_path = self.config.log_dir / "chrome-browser.log"
-                    chrome_stderr_path.parent.mkdir(parents=True, exist_ok=True)
-                    self._chrome_stderr_file = chrome_stderr_path.open("ab", buffering=0)
-                    self._chrome_process = subprocess.Popen(
-                        args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=self._chrome_stderr_file,
-                        env=browser_env,
-                    )
-                    
-                    # 等待调试端口就绪
-                    max_retries = 30
                     cdp_endpoint = ""
-                    for _ in range(max_retries):
-                        if self._chrome_process.poll() is not None:
+
+                    # ── 优先尝试复用已有的 Chrome 进程 ──────────────────────────────────
+                    # 若 _chrome_process 仍在运行（poll() is None）且记录了端口，先尝试直接连接，
+                    # 避免因 _context 意外置 None 而再次拉起新进程（会导致桌面出现多个浏览器窗口）。
+                    existing_port = getattr(self, "_chrome_cdp_port", None)
+                    if existing_port and self._chrome_process and self._chrome_process.poll() is None:
+                        logger.info("检测到已有 Chrome 进程（port=%s），尝试复用 CDP 连接...", existing_port)
+                        cdp_endpoint = self._get_cdp_websocket_url(existing_port) or ""
+                        if cdp_endpoint:
+                            logger.info("成功复用已有 Chrome 进程 CDP 端口 %s。", existing_port)
+                        else:
+                            logger.warning("已有 Chrome 进程 CDP 端口 %s 不可达，将重新启动浏览器。", existing_port)
+                            # 旧进程不可达则终止它，下面会重新启动
+                            try:
+                                self._chrome_process.terminate()
+                                self._chrome_process.wait(timeout=3)
+                            except Exception:
+                                self._chrome_process.kill()
+                            self._chrome_process = None
+                            self._chrome_cdp_port = None
+                            if self._chrome_stderr_file:
+                                self._chrome_stderr_file.close()
+                                self._chrome_stderr_file = None
+
+                    # ── 若没有可复用的进程，则启动新的 Chrome ─────────────────────────
+                    if not cdp_endpoint:
+                        chrome_path = self._find_chrome_executable()
+                        port = self._find_free_port()
+                        browser_env = self._browser_process_env(headless)
+                        
+                        window_size = self.config.browser_window_size
+                        if not window_size:
+                            window_size = f"{random.randint(1366, 1920)},{random.randint(768, 1080)}"
+                            
+                        args = [
+                            chrome_path,
+                            f"--remote-debugging-port={port}",
+                            f"--user-data-dir={user_data_dir}",
+                            "--no-first-run",
+                            "--no-default-browser-check",
+                            "--disable-dev-shm-usage",
+                            "--disable-background-networking",
+                            "--disable-renderer-backgrounding",
+                            "--disable-background-timer-throttling",
+                            "--password-store=basic",
+                            f"--window-size={window_size}",
+                        ]
+                        
+                        if self.config.browser_user_agent:
+                            args.append(f"--user-agent={self.config.browser_user_agent}")
+                            
+                        if sys.platform == "linux":
+                            args.extend([
+                                "--no-sandbox",
+                                "--disable-gpu",
+                                "--disable-blink-features=AutomationControlled",
+                            ])
+                        if headless:
+                            args.extend(["--headless=new"])
+                            
+                        logger.info(
+                            "以 CDP 接管模式启动原生浏览器: path=%s port=%s headless=%s display=%s wayland=%s",
+                            chrome_path,
+                            port,
+                            headless,
+                            browser_env.get("DISPLAY"),
+                            browser_env.get("WAYLAND_DISPLAY"),
+                        )
+                        chrome_stderr_path = self.config.log_dir / "chrome-browser.log"
+                        chrome_stderr_path.parent.mkdir(parents=True, exist_ok=True)
+                        self._chrome_stderr_file = chrome_stderr_path.open("ab", buffering=0)
+                        self._chrome_process = subprocess.Popen(
+                            args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=self._chrome_stderr_file,
+                            env=browser_env,
+                        )
+                        # 记录本次使用的 CDP 端口，供后续复用检测
+                        self._chrome_cdp_port = port
+                        
+                        # 等待调试端口就绪
+                        max_retries = 30
+                        for _ in range(max_retries):
+                            if self._chrome_process.poll() is not None:
+                                stderr_tail = self._tail_chrome_stderr()
+                                detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
+                                raise RuntimeError(
+                                    f"Chrome 进程已退出，无法建立 CDP 连接（退出码 {self._chrome_process.returncode}）。{detail}"
+                                )
+                            if websocket_url := self._get_cdp_websocket_url(port):
+                                cdp_endpoint = websocket_url
+                                break
+                            await asyncio.sleep(0.5)
+                            
+                        if not cdp_endpoint:
                             stderr_tail = self._tail_chrome_stderr()
                             detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
                             raise RuntimeError(
-                                f"Chrome 进程已退出，无法建立 CDP 连接（退出码 {self._chrome_process.returncode}）。{detail}"
+                                f"等待浏览器 CDP 端口 {port} 就绪超时。"
+                                "请查看 Chrome stderr 判断是否为显示环境、权限、沙箱或 profile 锁定问题。"
+                                f"{detail}"
                             )
-                        if websocket_url := self._get_cdp_websocket_url(port):
-                            cdp_endpoint = websocket_url
-                            break
-                        await asyncio.sleep(0.5)
-                        
-                    if not cdp_endpoint:
-                        stderr_tail = self._tail_chrome_stderr()
-                        detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
-                        raise RuntimeError(
-                            f"等待浏览器 CDP 端口 {port} 就绪超时。"
-                            "请查看 Chrome stderr 判断是否为显示环境、权限、沙箱或 profile 锁定问题。"
-                            f"{detail}"
-                        )
-                        
-                    # Playwright 接管
+                    
+                    # Playwright 接管（无论是复用还是新启动）
                     self._browser = await self._playwright.chromium.connect_over_cdp(cdp_endpoint)
                     
                     if self._browser.contexts:
@@ -444,6 +473,7 @@ class BrowserLifecycleMixin:
                     if self._chrome_process:
                         self._chrome_process.kill()
                         self._chrome_process = None
+                    self._chrome_cdp_port = None
                     if self._chrome_stderr_file:
                         self._chrome_stderr_file.close()
                         self._chrome_stderr_file = None
@@ -529,6 +559,8 @@ class BrowserLifecycleMixin:
                     logger.error("关闭 Chrome 进程失败: %s", e)
                 finally:
                     self._chrome_process = None
+            # 清除 CDP 端口记录，避免下次 _ensure_browser 误用已失效端口
+            self._chrome_cdp_port = None
             if self._chrome_stderr_file:
                 try:
                     self._chrome_stderr_file.close()
@@ -537,3 +569,4 @@ class BrowserLifecycleMixin:
                 self._chrome_stderr_file = None
                     
             logger.info("Playwright 浏览器已关闭。")
+
