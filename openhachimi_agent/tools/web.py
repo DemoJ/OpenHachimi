@@ -141,14 +141,14 @@ def _maybe_pretty_json(text: str) -> str:
 
 
 def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
-    """Fetch a public HTTP/HTTPS URL without opening a browser.
+    """通过 HTTP 抓取指定 URL 的公开页面或 API 内容（不启动浏览器）。
 
-    Use this before browser tools for public pages, JSON APIs, RSS, Atom, and
-    other stable text endpoints. Do not use it for private/local files.
-    
-    IMPORTANT: DO NOT use this tool to guess news sites or manually gather broad 
-    information for abstract queries (e.g., "AI news"). For broad queries, 
-    ALWAYS use the `intelligent_search` tool instead.
+    适用于公开 HTML 页面、JSON API、RSS、Atom 等文本端点。
+    如果返回 'Fetch failed' + 'Hint'，说明该页面有反爬保护，请改用 browser_navigate。
+
+    【工具选择建议】：
+    - 先用 web_search 获取相关链接，再用本工具读取页面内容
+    - 若本工具失败（403 / 429 等），升级到 browser_navigate + browser_get_state
     """
     del ctx
     target_url = _validate_public_url(url)

@@ -80,6 +80,7 @@ def _validate_tasks(tasks: dict[int, TodoTask]) -> None:
     if not tasks:
         raise ModelRetry("TODO 任务列表不能为空")
 
+    valid_ids = list(tasks.keys())
     for task_id, task in tasks.items():
         if task_id != task.id:
             raise ModelRetry(f"任务 ID 不一致：key={task_id}, id={task.id}")
@@ -91,7 +92,10 @@ def _validate_tasks(tasks: dict[int, TodoTask]) -> None:
             if dep_id == task_id:
                 raise ModelRetry(f"任务 {task_id} 不能依赖自身")
             if dep_id not in tasks:
-                raise ModelRetry(f"任务 {task_id} 依赖不存在的任务 {dep_id}")
+                raise ModelRetry(
+                    f"任务 {task_id} 依赖不存在的任务 {dep_id}。"
+                    f"当前所有有效任务 ID 为：{valid_ids}，请只在 depends_on 中填写这些 ID。"
+                )
 
     visiting: set[int] = set()
     visited: set[int] = set()
@@ -100,7 +104,8 @@ def _validate_tasks(tasks: dict[int, TodoTask]) -> None:
         if task_id in visited:
             return
         if task_id in visiting:
-            raise ModelRetry("TODO 依赖中存在循环依赖")
+            cycle_path = list(visiting) + [task_id]
+            raise ModelRetry(f"TODO 依赖中存在循环依赖，涉及任务：{cycle_path}。请重新设计 depends_on，确保依赖关系是有向无环图。")
         visiting.add(task_id)
         for dep_id in tasks[task_id].depends_on:
             visit(dep_id)
@@ -147,12 +152,26 @@ def create_todos(
     if not tasks:
         raise ModelRetry("TODO 任务列表不能为空")
 
+    def _coerce_int(val, field_name: str) -> int | None:
+        """尝试将值强制转为 int，失败时返回 None 而非立即报错。"""
+        if val is None:
+            return None
+        if isinstance(val, int):
+            return val
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            logger.warning("create_todos: 无法将 %s=%r 转为整数，已忽略", field_name, val)
+            return None
+
     new_tasks: dict[int, TodoTask] = {}
     next_id = 1
+    # 预扫描最大 ID，兼容整数和字符串形式（如 LLM 返回 "1" 而非 1）
     for item in tasks:
         if isinstance(item, dict) and "id" in item:
-            if isinstance(item["id"], int) and item["id"] >= next_id:
-                next_id = item["id"] + 1
+            coerced = _coerce_int(item["id"], "id")
+            if coerced is not None and coerced >= next_id:
+                next_id = coerced + 1
 
     for item in tasks:
         if isinstance(item, str):
@@ -162,20 +181,25 @@ def create_todos(
                 raise ModelRetry(f"重复的任务 ID：{t_id}")
             new_tasks[t_id] = TodoTask(id=t_id, description=item)
         else:
-            t_id = item.get("id")
+            raw_id = item.get("id")
+            t_id = _coerce_int(raw_id, "id")
             if t_id is None:
+                # ID 无法转换则自动分配
                 t_id = next_id
                 next_id += 1
-            if not isinstance(t_id, int):
-                raise ModelRetry("任务 ID 必须是整数")
             if t_id in new_tasks:
-                raise ModelRetry(f"重复的任务 ID：{t_id}")
-            
+                raise ModelRetry(f"重复的任务 ID：{t_id}，请为每个任务指定唯一 ID")
+
             desc = item.get("description", "Unnamed Task")
-            parent_id = item.get("parent_id")
-            depends_on = item.get("depends_on", [])
-            if not isinstance(depends_on, list):
-                depends_on = []
+            raw_parent = item.get("parent_id")
+            parent_id = _coerce_int(raw_parent, "parent_id")
+
+            raw_depends = item.get("depends_on", [])
+            if not isinstance(raw_depends, list):
+                raw_depends = []
+            # 同时兼容整数和字符串形式的依赖 ID
+            depends_on = [c for dep in raw_depends if (c := _coerce_int(dep, "depends_on")) is not None]
+
             allowed_tools = item.get("allowed_tools", [])
             if not isinstance(allowed_tools, list):
                 allowed_tools = []
@@ -187,7 +211,7 @@ def create_todos(
                 id=t_id,
                 description=str(desc),
                 parent_id=parent_id,
-                depends_on=[dep for dep in depends_on if isinstance(dep, int)],
+                depends_on=depends_on,
                 allowed_tools=[str(tool) for tool in allowed_tools],
                 success_criteria=str(item.get("success_criteria", "")),
                 verification=str(item.get("verification", "")),
@@ -294,7 +318,11 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
 
 
 def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str) -> TodoTask | None:
-    """Return the active in-progress task that authorizes a mutating tool call."""
+    """检查当前是否有匹配的 in-progress 任务。
+
+    采用软提醒策略：即使没有 in-progress 任务也允许执行，
+    避免 LLM 并行调用 update_todo + 其他工具时因竞态条件而失败。
+    """
 
     state = _get_state(ctx)
     if not state.is_active or not state.tasks:
@@ -308,16 +336,20 @@ def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str) -> Tod
 
     in_progress = [task for task in state.tasks.values() if task.status == "in-progress"]
     if len(in_progress) != 1:
-        raise ModelRetry(
-            "当前存在活动 TODO，执行写文件、命令或浏览器操作前，必须先用 update_todo 将且仅将一个任务标记为 in-progress。"
+        # 软提醒：不阻塞执行，仅记录日志
+        logger.warning(
+            "执行 %s 时没有恰好一个 in-progress TODO（当前 %d 个），建议使用 update_todo 更新状态。",
+            tool_name, len(in_progress)
         )
+        return None
 
     task = in_progress[0]
     if not _all_dependencies_done(state, task):
-        raise ModelRetry(f"任务 {task.id} 的依赖尚未完成，不能执行 {tool_name}。")
+        logger.warning("任务 %d 的依赖尚未完成，但仍允许执行 %s。", task.id, tool_name)
+        return task
     if task.allowed_tools and tool_name not in task.allowed_tools:
         allowed = ", ".join(task.allowed_tools)
-        raise ModelRetry(f"当前任务 {task.id} 未授权工具 {tool_name}，允许工具：{allowed}")
+        logger.warning("当前任务 %d 未授权工具 %s（允许：%s），但仍允许执行。", task.id, tool_name, allowed)
     return task
 
 

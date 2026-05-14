@@ -74,6 +74,7 @@ class BrowserManager(BrowserLifecycleMixin):
         self._page: Page | None = None
         self._chrome_process = None
         self._chrome_stderr_file = None
+        self._chrome_cdp_port: int | None = None  # 记录当前 CDP 端口，用于复用检测
         self._lock = asyncio.Lock()
         
         # 存储当前页面的可交互元素映射表：id -> locator

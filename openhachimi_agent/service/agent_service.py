@@ -20,7 +20,7 @@ from pydantic_ai.messages import (
 
 from openhachimi_agent.agent.factory import build_executor_agent, build_planner_agent, build_router_agent
 from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
-from openhachimi_agent.agent.intent import build_task_frame, classify_intent_heuristic, coerce_task_frame, extract_urls
+from openhachimi_agent.agent.intent import build_task_frame, classify_intent_heuristic, coerce_task_frame
 from openhachimi_agent.content.roles import list_role_names
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -248,10 +248,6 @@ class AgentService:
                     if actual_session_id not in self._session_states:
                         self._session_states[actual_session_id] = {}
                     session_state = self._session_states[actual_session_id]
-                    requested_urls = extract_urls(message)
-                    if requested_urls:
-                        session_state["requested_urls"] = requested_urls
-                    
                     deps = AgentDeps(
                         config=self.config, 
                         session_id=actual_session_id, 
@@ -316,17 +312,12 @@ class AgentService:
                             if stream:
                                 heartbeat_task = asyncio.create_task(planner_heartbeat())
                             try:
-                                explicit_url_instruction = ""
-                                if requested_urls:
-                                    explicit_url_instruction = (
-                                        "用户明确指定了以下 URL，这是任务目标的一部分，不是搜索关键词。"
-                                        "计划必须保持这些 URL 不变；不得把目标替换成搜索结果、相似站点、猜测站点或其他 URL："
-                                        f"{', '.join(requested_urls)}\n"
-                                    )
                                 planner_result = await planner_agent.run(
-                                    "请针对以下 TaskFrame，通过只读工具（搜索、读取文件）充分了解背景，并使用 create_todos 创建一个详细的执行计划。\n"
+                                    "请针对以下 TaskFrame 制定执行计划。\n"
+                                    "你只需要制定计划（使用 create_todos），不需要自己执行任何调研或搜索。\n"
+                                    "Executor 拥有浏览器、文件操作、命令行、web_fetch、web_search 等全部工具，请基于对这些工具能力的理解来规划步骤。\n"
+                                    "如果用户提供了明确的 URL 或文件路径，计划应从直接访问该目标开始。\n"
                                     "TaskFrame 是任务契约：计划必须继承 goal、target_entities、invariants，不得扩大或替换目标。\n"
-                                    f"{explicit_url_instruction}"
                                     "计划中的每个任务应尽量包含 description、depends_on、success_criteria、verification、risk_level；"
                                     "如果某一步只允许特定工具，可填写 allowed_tools。\n"
                                     f"TaskFrame：{task_frame.model_dump_json(ensure_ascii=False)}\n"
@@ -360,13 +351,15 @@ class AgentService:
                     }
 
                     async def run_executor_once(run_message: str):
+                        run_kwargs = {**kwargs, "max_model_requests": 60}
                         if stream:
-                            kwargs["event_stream_handler"] = handle_stream_events
-                            return await asyncio.wait_for(
-                                executor_agent.run(run_message, **kwargs),
-                                timeout=self.config.agent_timeout_seconds,
-                            )
-                        return await executor_agent.run(run_message, **kwargs)
+                            run_kwargs["event_stream_handler"] = handle_stream_events
+                            return await executor_agent.run(run_message, **run_kwargs)
+                        
+                        return await asyncio.wait_for(
+                            executor_agent.run(run_message, **run_kwargs),
+                            timeout=self.config.agent_timeout_seconds,
+                        )
 
                     async def replan_after_execution_signal(signal: dict[str, object]) -> None:
                         planner_agent = self._get_agent(role, "planner")

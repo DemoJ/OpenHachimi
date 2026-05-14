@@ -10,7 +10,7 @@ from openhachimi_agent.tools.filesystem import find_files, list_files, read_file
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.registry import WORKSPACE_TOOLSET, PLANNER_TOOLSET, EXECUTOR_TOOLSET
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
-from openhachimi_agent.tools.research import deep_search
+from openhachimi_agent.tools.research import web_search
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "git_diff",
     "discover_web_resources",
     "web_fetch",
+    "web_search",
     "browser_navigate",
     "browser_get_state",
     "browser_click",
@@ -38,7 +39,6 @@ __all__ = [
     "browser_new_tab",
     "browser_switch_tab",
     "browser_close_tab",
-    "deep_search",
     "create_todos",
     "update_todo",
     "get_todos",

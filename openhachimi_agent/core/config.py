@@ -141,6 +141,6 @@ def load_config() -> AppConfig:
         browser_idle_timeout=_config_int(app_config, "browser_idle_timeout", 300, minimum=0),
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
-        agent_timeout_seconds=_config_int(app_config, "agent_timeout_seconds", 300),
+        agent_timeout_seconds=300,
         stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
     )
