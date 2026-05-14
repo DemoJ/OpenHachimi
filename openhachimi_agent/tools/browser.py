@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 
 from pydantic_ai import RunContext
-from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps

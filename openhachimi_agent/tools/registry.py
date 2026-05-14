@@ -15,8 +15,9 @@ from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import deep_search
-from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder
+from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
+from openhachimi_agent.agent.execution import with_execution_ledger
 
 _COMMAND_TOOLS = [
     run_command,
@@ -90,21 +91,21 @@ for _orig_tools, _middlewares in [
     _wrapped_tools = apply_middlewares(_orig_tools, _middlewares) if _middlewares else _orig_tools
     for _orig, _wrapped in zip(_orig_tools, _wrapped_tools):
         if _orig in _MUTATION_FUNCS:
-            _EXECUTION_FINAL_TOOLS.append(with_todo_reminder(_wrapped))
+            _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_wrapped))))
         else:
-            _READ_ONLY_FINAL_TOOLS.append(_wrapped)
+            _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_wrapped))
 
 # 规划器专属 Toolset：拥有只读能力、创建 TODO 能力，但没有直接破坏性执行权限
 PLANNER_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _PLANNING_TOOLS
+    tools=_READ_ONLY_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS]
 )
 
 # 执行器专属 Toolset：拥有所有执行权限、只读权限和更新 TODO 能力
 EXECUTOR_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + _UPDATE_TODO_TOOL + [get_todos]
+    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)]
 )
 
 # 保持后向兼容（部分遗留代码可能仍引用这个）
 WORKSPACE_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + _PLANNING_TOOLS + _UPDATE_TODO_TOOL
+    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS + _UPDATE_TODO_TOOL]
 )

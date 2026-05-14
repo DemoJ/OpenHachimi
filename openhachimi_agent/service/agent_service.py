@@ -19,6 +19,8 @@ from pydantic_ai.messages import (
 )
 
 from openhachimi_agent.agent.factory import build_executor_agent, build_planner_agent, build_router_agent
+from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
+from openhachimi_agent.agent.intent import build_task_frame, classify_intent_heuristic, coerce_task_frame, extract_urls
 from openhachimi_agent.content.roles import list_role_names
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -246,6 +248,9 @@ class AgentService:
                     if actual_session_id not in self._session_states:
                         self._session_states[actual_session_id] = {}
                     session_state = self._session_states[actual_session_id]
+                    requested_urls = extract_urls(message)
+                    if requested_urls:
+                        session_state["requested_urls"] = requested_urls
                     
                     deps = AgentDeps(
                         config=self.config, 
@@ -265,42 +270,169 @@ class AgentService:
                     
                     # 2. 如果没有活动的 TODO，且是一句新的指令，通过 Router 判断复杂度
                     if not has_active_todos and len(history) % 2 == 0:  # 假设新的一轮，只有在没有活动 TODO 时才做 router 判断
-                        router_agent = self._get_agent(role, "router")
+                        task_frame = None
                         try:
+                            router_agent = self._get_agent(role, "router")
                             router_result = await router_agent.run(f"指令：{message}")
-                            task_type = router_result.data
-                            logger.info("Router classified task as %s", task_type)
-                            
-                            # 3. 如果是复杂任务，强制进入 Planner 进行规划
-                            if task_type == "COMPLEX_TASK":
-                                planner_agent = self._get_agent(role, "planner")
-                                if stream:
-                                    await stream_queue.put("\n\n[System] 检测到复杂任务，正在进行前置深度调研与规划...\n")
+                            router_data = getattr(router_result, "data", getattr(router_result, "output", None))
+                            task_frame = coerce_task_frame(router_data, message)
+                        except Exception as router_e:
+                            decision = classify_intent_heuristic(message)
+                            if not (decision.task_kind == "browser" and decision.target_urls and decision.risk != "high"):
+                                decision.requires_plan = True
+                            decision.rationale = f"router failed: {router_e.__class__.__name__}"
+                            task_frame = build_task_frame(message, decision)
+                            logger.warning("Router failed: %s. Falling back to conservative planning.", router_e)
+
+                        logger.info(
+                            "Task frame kind=%s complexity=%s risk=%s confidence=%.2f requires_plan=%s autonomy=%s targets=%s rationale=%s",
+                            task_frame.task_kind,
+                            task_frame.complexity,
+                            task_frame.risk,
+                            task_frame.confidence,
+                            task_frame.requires_plan,
+                            task_frame.allowed_autonomy,
+                            [entity.value for entity in task_frame.target_entities],
+                            task_frame.rationale,
+                        )
+
+                        session_state["task_frame"] = task_frame.model_dump(mode="json")
+
+                        # 3. 如果是复杂/高风险/低置信任务，强制进入 Planner 进行规划
+                        if task_frame.requires_plan or task_frame.confidence < 0.5:
+                            planner_agent = self._get_agent(role, "planner")
+                            if stream:
+                                await stream_queue.put(
+                                    "\n\n[System] 检测到任务需要前置规划，正在进行只读调研与计划拆解...\n"
+                                )
+                            heartbeat_task: asyncio.Task | None = None
+
+                            async def planner_heartbeat() -> None:
+                                interval = max(5, min(20, self.config.stream_idle_timeout_seconds // 2))
+                                while True:
+                                    await asyncio.sleep(interval)
+                                    await stream_queue.put("\n[System] 规划仍在进行中，等待模型返回计划...\n")
+
+                            if stream:
+                                heartbeat_task = asyncio.create_task(planner_heartbeat())
+                            try:
+                                explicit_url_instruction = ""
+                                if requested_urls:
+                                    explicit_url_instruction = (
+                                        "用户明确指定了以下 URL，这是任务目标的一部分，不是搜索关键词。"
+                                        "计划必须保持这些 URL 不变；不得把目标替换成搜索结果、相似站点、猜测站点或其他 URL："
+                                        f"{', '.join(requested_urls)}\n"
+                                    )
                                 planner_result = await planner_agent.run(
-                                    f"请针对以下复杂任务，通过只读工具（搜索、读取文件）充分了解背景，并使用 create_todos 创建一个详细的执行计划。\n任务：{message}",
+                                    "请针对以下 TaskFrame，通过只读工具（搜索、读取文件）充分了解背景，并使用 create_todos 创建一个详细的执行计划。\n"
+                                    "TaskFrame 是任务契约：计划必须继承 goal、target_entities、invariants，不得扩大或替换目标。\n"
+                                    f"{explicit_url_instruction}"
+                                    "计划中的每个任务应尽量包含 description、depends_on、success_criteria、verification、risk_level；"
+                                    "如果某一步只允许特定工具，可填写 allowed_tools。\n"
+                                    f"TaskFrame：{task_frame.model_dump_json(ensure_ascii=False)}\n"
+                                    f"用户原始任务：{message}",
                                     message_history=history,
                                     deps=deps
                                 )
-                                # 将规划历史记录附加到执行前
-                                history.extend(planner_result.all_messages())
-                        except Exception as router_e:
-                            logger.warning("Router failed: %s. Defaulting to direct execution.", router_e)
+                            finally:
+                                if heartbeat_task is not None:
+                                    heartbeat_task.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError):
+                                        await heartbeat_task
+                            # 将规划历史记录附加到执行前
+                            history.extend(planner_result.all_messages())
                             
                     # 4. 最后交给 Executor Agent 执行
                     executor_agent = self._get_agent(role, "executor")
+                    task_frame_payload = session_state.get("task_frame")
+                    executor_message = message
+                    if task_frame_payload:
+                        executor_message = (
+                            "请执行以下用户任务。必须遵守 TaskFrame 中的 goal、target_entities、invariants、allowed_autonomy 和 replan_triggers；"
+                            "如果工具观察结果与 TaskFrame 冲突，应停止当前动作并重新校准目标。\n"
+                            f"TaskFrame：{json.dumps(task_frame_payload, ensure_ascii=False)}\n"
+                            f"用户原始任务：{message}"
+                        )
                     
                     kwargs = {
                         "message_history": history,
                         "deps": deps,
                     }
+
+                    async def run_executor_once(run_message: str):
+                        if stream:
+                            kwargs["event_stream_handler"] = handle_stream_events
+                            return await asyncio.wait_for(
+                                executor_agent.run(run_message, **kwargs),
+                                timeout=self.config.agent_timeout_seconds,
+                            )
+                        return await executor_agent.run(run_message, **kwargs)
+
+                    async def replan_after_execution_signal(signal: dict[str, object]) -> None:
+                        planner_agent = self._get_agent(role, "planner")
+                        if stream:
+                            await stream_queue.put("\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n")
+                        planner_result = await planner_agent.run(
+                            "Executor 在执行时触发了 TaskFrame 偏差或工具失败。请基于 TaskFrame、当前 TODO 和 execution ledger 摘要修订计划。\n"
+                            "要求：保持 TaskFrame 的 goal、target_entities、invariants 不变；不要扩大任务目标；"
+                            "如果原计划错误，请调用 create_todos 重建一个更窄、更可执行的计划。\n"
+                            f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
+                            f"Execution ledger replan signal：{json.dumps(signal, ensure_ascii=False)}\n"
+                            f"用户原始任务：{message}",
+                            message_history=history,
+                            deps=deps,
+                        )
+                        history.extend(planner_result.all_messages())
+
+                    ledger_start_seq = get_ledger_length(session_state)
                     if stream:
                         kwargs["event_stream_handler"] = handle_stream_events
-                        result = await asyncio.wait_for(
-                            executor_agent.run(message, **kwargs),
-                            timeout=self.config.agent_timeout_seconds,
+                    try:
+                        result = await run_executor_once(executor_message)
+                    except Exception:
+                        signal = get_replan_signal(session_state, ledger_start_seq)
+                        if signal and not session_state.get("replan_attempted"):
+                            session_state["replan_attempted"] = True
+                            logger.info(
+                                "triggering replan role=%s session_id=%s signal=%s",
+                                role,
+                                actual_session_id,
+                                json.dumps(signal, ensure_ascii=False),
+                            )
+                            await replan_after_execution_signal(signal)
+                            retry_message = (
+                                "请根据刚刚修订后的计划继续执行用户任务。必须遵守 TaskFrame 和新的 TODO；"
+                                "如果再次遇到同类偏差，请停止并向用户说明阻塞原因。\n"
+                                f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
+                                f"用户原始任务：{message}"
+                            )
+                            result = await run_executor_once(retry_message)
+                        else:
+                            raise
+
+                    verification_signal = get_final_verification_signal(session_state)
+                    if verification_signal and not session_state.get("final_verification_repair_attempted"):
+                        session_state["final_verification_repair_attempted"] = True
+                        logger.info(
+                            "triggering final verification repair role=%s session_id=%s signal=%s",
+                            role,
+                            actual_session_id,
+                            json.dumps(verification_signal, ensure_ascii=False),
                         )
-                    else:
-                        result = await executor_agent.run(message, **kwargs)
+                        if stream:
+                            await stream_queue.put("\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n")
+                        repair_message = (
+                            "最终验证器发现当前执行结果尚不足以宣称完成。请只补齐验证器指出的缺口，"
+                            "继续严格遵守 TaskFrame、TODO 和执行记录；完成后必须更新 TODO 或提供足够证据。\n"
+                            f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
+                            f"Final verification signal：{json.dumps(verification_signal, ensure_ascii=False)}\n"
+                            f"用户原始任务：{message}"
+                        )
+                        result = await run_executor_once(repair_message)
+                        verification_signal = get_final_verification_signal(session_state)
+
+                    if verification_signal:
+                        result_holder["final_verification_signal"] = verification_signal
                     result_holder["result"] = result
                 except asyncio.TimeoutError as exc:
                     if stream:
@@ -415,6 +547,11 @@ class AgentService:
 
                     if error := result_holder.get("error"):
                         raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
+                    if final_signal := result_holder.get("final_verification_signal"):
+                        yield (
+                            "\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
+                            f"{json.dumps(final_signal, ensure_ascii=False)}"
+                        )
                 else:
                     try:
                         await task
@@ -473,8 +610,14 @@ class AgentService:
                         len(new_history),
                         (time.perf_counter() - start_time) * 1000,
                     )
+                    output = result.output  # type: ignore[attr-defined]
+                    if final_signal := result_holder.get("final_verification_signal"):
+                        output = (
+                            f"{output}\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
+                            f"{json.dumps(final_signal, ensure_ascii=False)}"
+                        )
                     yield ChatResponse(
-                        output=result.output,  # type: ignore[attr-defined]
+                        output=output,
                         role=role,
                         session_id=actual_session_id,
                     )

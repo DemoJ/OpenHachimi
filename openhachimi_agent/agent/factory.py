@@ -1,7 +1,6 @@
 """Agent 构建逻辑。"""
 
 import logging
-from typing import Literal
 
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -13,6 +12,7 @@ from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET
+from openhachimi_agent.agent.intent import TaskFrame
 
 
 logger = logging.getLogger(__name__)
@@ -95,14 +95,19 @@ def build_router_agent(config: AppConfig) -> Agent:
     model = OpenAIChatModel(config.model_name, provider=provider)
     
     system_prompt = (
-        "你是一个专业的任务路由分析器。"
-        "你需要判断用户的输入任务是 'SIMPLE_TASK' 还是 'COMPLEX_TASK'。\n"
-        "- SIMPLE_TASK：简单的、1-2步即可完成的任务。例如：简单的问答、翻译、查个词、看一眼特定的网页、运行一个简单的脚本、查询系统信息等。\n"
-        "- COMPLEX_TASK：复杂的、多步骤的、需要调查研究和深度规划的任务。例如：分析某人的主页、爬取数据并分析、写一个完整的项目、重构代码、修复一个疑难 Bug 等。"
+        "你是一个专业的任务框架分析器。请只做任务理解，不要执行任务。\n"
+        "你需要把用户请求整理成 TaskFrame：目标、目标实体、不可变约束、复杂度、风险和是否需要先规划。\n"
+        "- task_kind 可选：qa, code_change, file_ops, shell, browser, research, unknown。\n"
+        "- simple：1-2 步即可完成，且低风险。\n"
+        "- complex：需要跨文件/多工具/多步骤调研、代码修改、复杂网页操作或系统性分析。\n"
+        "- high risk：删除、覆盖、部署、发布、涉及密钥、登录态或不可逆操作。\n"
+        "- 如果用户明确给出 URL、文件路径、函数名等目标实体，必须放入 target_entities，并在 invariants 中说明不能替换或扩大目标。\n"
+        "- 简单的显式 URL 访问/打开/查看任务应为 browser + simple + requires_plan=false + allowed_autonomy=narrow。\n"
+        "不确定时降低 confidence，并将 requires_plan 设为 true。"
     )
     
     return Agent(
         model,
         system_prompt=system_prompt,
-        result_type=Literal["SIMPLE_TASK", "COMPLEX_TASK"],
+        output_type=TaskFrame,
     )

@@ -2,7 +2,6 @@
 
 import logging
 import json
-import os
 from dataclasses import dataclass, field, asdict
 from typing import Literal
 from functools import wraps
@@ -10,7 +9,8 @@ import inspect
 from pathlib import Path
 
 from pydantic_ai import RunContext
-from openhachimi_agent.core.config import AppConfig
+from pydantic_ai.exceptions import ModelRetry
+
 from openhachimi_agent.core.deps import AgentDeps
 
 logger = logging.getLogger(__name__)
@@ -19,13 +19,20 @@ logger = logging.getLogger(__name__)
 class TodoTask:
     id: int
     description: str
-    status: Literal["pending", "in-progress", "done"] = "pending"
+    status: Literal["pending", "in-progress", "done", "blocked"] = "pending"
     notes: str = ""
     parent_id: int | None = None
     depends_on: list[int] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    success_criteria: str = ""
+    verification: str = ""
+    risk_level: Literal["low", "medium", "high"] = "low"
+    evidence: str = ""
 
 @dataclass
 class TodoState:
+    goal: str = ""
+    invariants: list[str] = field(default_factory=list)
     tasks: dict[int, TodoTask] = field(default_factory=dict)
     tool_calls_since_update: int = 0
     is_active: bool = False
@@ -42,6 +49,8 @@ def _load_state(ctx: RunContext[AgentDeps]) -> TodoState:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         state = TodoState(
+            goal=str(data.get("goal", "")),
+            invariants=[str(item) for item in data.get("invariants", []) if item],
             tool_calls_since_update=data.get("tool_calls_since_update", 0),
             is_active=data.get("is_active", False)
         )
@@ -67,12 +76,64 @@ def _get_state(ctx: RunContext[AgentDeps]) -> TodoState:
     return session_state["todo_state"]
 
 
-def create_todos(ctx: RunContext[AgentDeps], tasks: list[dict | str]) -> str:
+def _validate_tasks(tasks: dict[int, TodoTask]) -> None:
+    if not tasks:
+        raise ModelRetry("TODO 任务列表不能为空")
+
+    for task_id, task in tasks.items():
+        if task_id != task.id:
+            raise ModelRetry(f"任务 ID 不一致：key={task_id}, id={task.id}")
+        if not task.description.strip():
+            raise ModelRetry(f"任务 {task_id} 的 description 不能为空")
+        if task.parent_id == task_id:
+            raise ModelRetry(f"任务 {task_id} 不能把自己设为父任务")
+        for dep_id in task.depends_on:
+            if dep_id == task_id:
+                raise ModelRetry(f"任务 {task_id} 不能依赖自身")
+            if dep_id not in tasks:
+                raise ModelRetry(f"任务 {task_id} 依赖不存在的任务 {dep_id}")
+
+    visiting: set[int] = set()
+    visited: set[int] = set()
+
+    def visit(task_id: int) -> None:
+        if task_id in visited:
+            return
+        if task_id in visiting:
+            raise ModelRetry("TODO 依赖中存在循环依赖")
+        visiting.add(task_id)
+        for dep_id in tasks[task_id].depends_on:
+            visit(dep_id)
+        visiting.remove(task_id)
+        visited.add(task_id)
+
+    for task_id in tasks:
+        visit(task_id)
+
+
+def _all_dependencies_done(state: TodoState, task: TodoTask) -> bool:
+    return all(state.tasks[dep_id].status == "done" for dep_id in task.depends_on)
+
+
+def _refresh_active_flag(state: TodoState) -> None:
+    if state.tasks and all(t.status == "done" for t in state.tasks.values()):
+        state.is_active = False
+
+
+def create_todos(
+    ctx: RunContext[AgentDeps],
+    tasks: list[dict | str],
+    goal: str = "",
+    invariants: list[str] | None = None,
+) -> str:
     """
     创建一个全新的 TODO 任务列表，用于规划复杂的步骤。
     
     当你需要执行一个包含多个步骤的复杂任务时（如搜集多方面信息、写复杂代码、进行深度研究），
     请首先调用此工具将模糊意图拆解为具体的 TODO 列表。
+    
+    goal 参数用于记录本计划要完成的用户目标。
+    invariants 参数用于记录计划和执行过程不可违反的约束，例如“用户指定 URL 不能被替换”。
     
     tasks 参数可以是一个简单的字符串列表（代表每个任务的描述），
     也可以是包含详细配置的字典列表（推荐用于复杂任务），支持如下字段：
@@ -83,11 +144,10 @@ def create_todos(ctx: RunContext[AgentDeps], tasks: list[dict | str]) -> str:
     
     调用后，请逐一执行工具完成任务，并使用 update_todo 及时更新状态。
     """
-    state = _get_state(ctx)
-    state.tasks.clear()
-    state.tool_calls_since_update = 0
-    state.is_active = True
-    
+    if not tasks:
+        raise ModelRetry("TODO 任务列表不能为空")
+
+    new_tasks: dict[int, TodoTask] = {}
     next_id = 1
     for item in tasks:
         if isinstance(item, dict) and "id" in item:
@@ -98,32 +158,67 @@ def create_todos(ctx: RunContext[AgentDeps], tasks: list[dict | str]) -> str:
         if isinstance(item, str):
             t_id = next_id
             next_id += 1
-            state.tasks[t_id] = TodoTask(id=t_id, description=item)
+            if t_id in new_tasks:
+                raise ModelRetry(f"重复的任务 ID：{t_id}")
+            new_tasks[t_id] = TodoTask(id=t_id, description=item)
         else:
             t_id = item.get("id")
             if t_id is None:
                 t_id = next_id
                 next_id += 1
+            if not isinstance(t_id, int):
+                raise ModelRetry("任务 ID 必须是整数")
+            if t_id in new_tasks:
+                raise ModelRetry(f"重复的任务 ID：{t_id}")
             
             desc = item.get("description", "Unnamed Task")
             parent_id = item.get("parent_id")
             depends_on = item.get("depends_on", [])
             if not isinstance(depends_on, list):
                 depends_on = []
+            allowed_tools = item.get("allowed_tools", [])
+            if not isinstance(allowed_tools, list):
+                allowed_tools = []
+            risk_level = item.get("risk_level", "low")
+            if risk_level not in {"low", "medium", "high"}:
+                risk_level = "low"
             
-            state.tasks[t_id] = TodoTask(
+            new_tasks[t_id] = TodoTask(
                 id=t_id,
-                description=desc,
+                description=str(desc),
                 parent_id=parent_id,
-                depends_on=depends_on
+                depends_on=[dep for dep in depends_on if isinstance(dep, int)],
+                allowed_tools=[str(tool) for tool in allowed_tools],
+                success_criteria=str(item.get("success_criteria", "")),
+                verification=str(item.get("verification", "")),
+                risk_level=risk_level,
             )
-        
+
+    _validate_tasks(new_tasks)
+
+    state = _get_state(ctx)
+    task_frame = ctx.deps.session_state.get("task_frame", {})
+    state.goal = goal or str(task_frame.get("goal", ""))
+    inherited_invariants = task_frame.get("invariants", [])
+    merged_invariants = list(invariants or [])
+    if isinstance(inherited_invariants, list):
+        merged_invariants.extend(str(item) for item in inherited_invariants if item)
+    state.invariants = list(dict.fromkeys(merged_invariants))
+    state.tasks = new_tasks
+    state.tool_calls_since_update = 0
+    state.is_active = True
     _save_state(ctx, state)
     logger.info("Created %d TODO tasks for session %s.", len(tasks), ctx.deps.session_id)
     return get_todos(ctx)
 
 
-def update_todo(ctx: RunContext[AgentDeps], task_id: int, status: Literal["pending", "in-progress", "done"], notes: str = "") -> str:
+def update_todo(
+    ctx: RunContext[AgentDeps],
+    task_id: int,
+    status: Literal["pending", "in-progress", "done", "blocked"],
+    notes: str = "",
+    evidence: str = "",
+) -> str:
     """
     更新某个 TODO 任务的状态。
     当你开始一个任务或完成一个任务时，必须调用此工具更新状态。
@@ -137,13 +232,21 @@ def update_todo(ctx: RunContext[AgentDeps], task_id: int, status: Literal["pendi
     task = state.tasks.get(task_id)
     if not task:
         return f"错误：未找到 ID 为 {task_id} 的任务。"
+    if status in {"in-progress", "done"} and not _all_dependencies_done(state, task):
+        missing = [dep_id for dep_id in task.depends_on if state.tasks[dep_id].status != "done"]
+        return f"错误：任务 {task_id} 的依赖尚未完成：{missing}"
+    if status == "done" and task.success_criteria and not (notes or evidence):
+        return f"错误：任务 {task_id} 设置了成功标准，标记 done 时必须提供 notes 或 evidence。"
         
     task.status = status
     if notes:
         task.notes = notes
+    if evidence:
+        task.evidence = evidence
         
     # 重置调用计数器
     state.tool_calls_since_update = 0
+    _refresh_active_flag(state)
     _save_state(ctx, state)
     logger.info("Updated TODO %d to %s for session %s", task_id, status, ctx.deps.session_id)
     
@@ -157,6 +260,12 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
         return "当前没有活动的 TODO 任务。"
         
     lines = ["## 当前 TODO 列表："]
+    if state.goal:
+        lines.append(f"目标：{state.goal}")
+    if state.invariants:
+        lines.append("不可变约束：")
+        for invariant in state.invariants:
+            lines.append(f"- {invariant}")
     valid_ids = set(state.tasks.keys())
     
     def render_task(task: TodoTask, depth: int):
@@ -169,7 +278,9 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
             
         deps_str = f" [依赖: {', '.join(map(str, task.depends_on))}]" if task.depends_on else ""
         note_str = f" (备注: {task.notes})" if task.notes else ""
-        lines.append(f"{indent}{box} {task.id}. {task.description}{deps_str}{note_str}")
+        criteria_str = f" [验收: {task.success_criteria}]" if task.success_criteria else ""
+        evidence_str = f" [证据: {task.evidence}]" if task.evidence else ""
+        lines.append(f"{indent}{box} {task.id}. {task.description}{deps_str}{criteria_str}{note_str}{evidence_str}")
         
         children = [t for t in state.tasks.values() if t.parent_id == task.id]
         for child in children:
@@ -180,6 +291,52 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
             render_task(task, 0)
         
     return "\n".join(lines)
+
+
+def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str) -> TodoTask | None:
+    """Return the active in-progress task that authorizes a mutating tool call."""
+
+    state = _get_state(ctx)
+    if not state.is_active or not state.tasks:
+        return None
+
+    pending = [task for task in state.tasks.values() if task.status != "done"]
+    if not pending:
+        state.is_active = False
+        _save_state(ctx, state)
+        return None
+
+    in_progress = [task for task in state.tasks.values() if task.status == "in-progress"]
+    if len(in_progress) != 1:
+        raise ModelRetry(
+            "当前存在活动 TODO，执行写文件、命令或浏览器操作前，必须先用 update_todo 将且仅将一个任务标记为 in-progress。"
+        )
+
+    task = in_progress[0]
+    if not _all_dependencies_done(state, task):
+        raise ModelRetry(f"任务 {task.id} 的依赖尚未完成，不能执行 {tool_name}。")
+    if task.allowed_tools and tool_name not in task.allowed_tools:
+        allowed = ", ".join(task.allowed_tools)
+        raise ModelRetry(f"当前任务 {task.id} 未授权工具 {tool_name}，允许工具：{allowed}")
+    return task
+
+
+def with_execution_guard(func):
+    """Block mutating tools when an active plan has no valid in-progress task."""
+
+    tool_name = getattr(func, "__name__", "unknown_tool")
+    if inspect.iscoroutinefunction(func):
+        @wraps(func)
+        async def async_wrapper(ctx, *args, **kwargs):
+            get_current_task_for_tool(ctx, tool_name)
+            return await func(ctx, *args, **kwargs)
+        return async_wrapper
+
+    @wraps(func)
+    def sync_wrapper(ctx, *args, **kwargs):
+        get_current_task_for_tool(ctx, tool_name)
+        return func(ctx, *args, **kwargs)
+    return sync_wrapper
 
 
 def with_todo_reminder(func):

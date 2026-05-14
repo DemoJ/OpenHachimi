@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 from openhachimi_agent.service.agent_service import AgentService
+from openhachimi_agent.agent.intent import extract_urls
 from openhachimi_agent.core.config import AppConfig
 import openhachimi_agent.service.browser  # Ensure module is loaded for mock.patch
 
@@ -48,3 +49,8 @@ async def test_stop_session(agent_service):
     # Call stop_session when no task
     resp2 = await agent_service.stop_session("non_existent_session")
     assert resp2.message == "当前没有正在运行的任务。"
+
+
+def test_extract_requested_urls():
+    assert extract_urls("请访问 https://example.com/a，然后总结") == ["https://example.com/a"]
+    assert extract_urls("没有链接") == []
