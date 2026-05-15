@@ -17,7 +17,7 @@ from pathlib import Path
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 
-from openhachimi_agent.content.skills import find_skills, parse_skill
+from openhachimi_agent.content.skills import find_skills, parse_skill, Skill
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 

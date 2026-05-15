@@ -12,7 +12,7 @@ from openhachimi_agent.tools.command import command_status, run_command, send_co
 from openhachimi_agent.tools.editing import delete_path, make_directory, replace_in_file, write_file
 from openhachimi_agent.tools.filesystem import find_files, list_files, read_file, search_text
 from openhachimi_agent.tools.git import git_diff, git_status
-from openhachimi_agent.tools.skills import get_skill_instructions, list_skills
+from openhachimi_agent.tools.skills import get_skill_instructions, list_skills, install_skill
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import web_search
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
