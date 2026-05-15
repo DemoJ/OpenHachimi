@@ -351,7 +351,8 @@ class AgentService:
                     }
 
                     async def run_executor_once(run_message: str):
-                        run_kwargs = {**kwargs, "max_model_requests": 60}
+                        from pydantic_ai.usage import UsageLimits
+                        run_kwargs = {**kwargs, "usage_limits": UsageLimits(request_limit=60)}
                         if stream:
                             run_kwargs["event_stream_handler"] = handle_stream_events
                             return await executor_agent.run(run_message, **run_kwargs)
