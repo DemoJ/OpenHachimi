@@ -76,6 +76,7 @@ _MUTATION_FUNCS = {
     run_command, send_command_input,
     browser_navigate, browser_click, browser_type, browser_scroll,
     browser_new_tab, browser_switch_tab, browser_close_tab,
+    install_skill,
 }
 
 _READ_ONLY_FINAL_TOOLS = []
@@ -84,7 +85,7 @@ _EXECUTION_FINAL_TOOLS = []
 for _orig_tools, _middlewares in [
     (_COMMAND_TOOLS, [with_prompt_injection("commands")]),
     (_BROWSER_TOOLS, [with_prompt_injection("browser")]),
-    (_SKILLS_TOOLS, [with_prompt_injection("skills")]),
+    (_SKILLS_TOOLS, []),
     (_FILE_TOOLS, []),
     (_OTHER_TOOLS, []),
 ]:

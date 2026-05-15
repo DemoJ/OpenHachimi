@@ -7,6 +7,7 @@ YAML frontmatter and a Markdown body.
 
 import os
 import re
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -16,13 +17,15 @@ from pydantic import BaseModel, Field
 
 from openhachimi_agent.core.config import AppConfig
 
+logger = logging.getLogger(__name__)
+
 
 class SkillConfig(BaseModel):
     """Represents the YAML frontmatter of a SKILL.md file."""
     name: str
     description: str
     disable_model_invocation: bool = Field(default=False, alias="disable-model-invocation")
-    allowed_tools: Optional[str] = Field(default=None, alias="allowed-tools")
+    allowed_tools: Optional[list[str]] = Field(default=None, alias="allowed-tools")
     when_to_use: Optional[str] = None
     arguments: Optional[list[str]] = None
     context: Optional[str] = None
@@ -41,26 +44,33 @@ def parse_skill(path: Path) -> Skill | None:
     try:
         content = path.read_text(encoding="utf-8")
     except Exception as e:
+        logger.warning("Failed to read skill file %s: %s", path, e)
         return None
 
-    # Parse YAML frontmatter
-    # Matches --- at start, non-greedy match for frontmatter, then ---, then the rest
-    match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", content, re.DOTALL)
-    
-    if not match:
-        # Some skills might just be raw markdown without frontmatter, but according
-        # to Claude docs, 'name' and 'description' in frontmatter are required.
+    # Allow leading whitespace/newlines before the first '---'
+    content_stripped = content.lstrip()
+    if not content_stripped.startswith("---"):
+        logger.warning("Skill file %s missing YAML frontmatter (must start with '---')", path)
+        return None
+
+    # Split into maximum 3 parts: ['', 'frontmatter', 'body']
+    parts = content_stripped.split("---", 2)
+    if len(parts) < 3:
+        logger.warning("Skill file %s has unclosed YAML frontmatter", path)
         return None
         
-    frontmatter_str = match.group(1)
-    body_str = match.group(2)
+    frontmatter_str = parts[1]
+    body_str = parts[2]
     
     try:
         frontmatter_data = yaml.safe_load(frontmatter_str) or {}
         config = SkillConfig(**frontmatter_data)
         return Skill(path=path, config=config, body=body_str.strip())
+    except yaml.YAMLError as e:
+        logger.warning("Invalid YAML in skill file %s: %s", path, e)
+        return None
     except Exception as e:
-        # Ignore skills with invalid frontmatter or missing required fields
+        logger.warning("Invalid config in skill file %s: %s", path, e)
         return None
 
 

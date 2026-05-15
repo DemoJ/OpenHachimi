@@ -336,6 +336,23 @@ class AgentService:
                     # 4. 最后交给 Executor Agent 执行
                     executor_agent = self._get_agent(role, "executor")
                     task_frame_payload = session_state.get("task_frame")
+                    
+                    if task_frame_payload:
+                        relevant_skills = task_frame_payload.get("relevant_skills", [])
+                        if relevant_skills:
+                            from openhachimi_agent.content.skills import find_skills
+                            from openhachimi_agent.agent.factory import build_executor_agent
+                            skills = find_skills(self.config.skills_dirs)
+                            allowed_tools_set = set()
+                            is_restricted = False
+                            for s in skills:
+                                if s.config.name in relevant_skills and s.config.allowed_tools:
+                                    is_restricted = True
+                                    allowed_tools_set.update(s.config.allowed_tools)
+                            if is_restricted:
+                                logger.info("sandboxing executor agent for role=%s restricted_tools=%s", role, allowed_tools_set)
+                                executor_agent = build_executor_agent(self.config, role, allowed_tools=allowed_tools_set)
+
                     executor_message = message
                     if task_frame_payload:
                         executor_message = (

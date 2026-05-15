@@ -62,6 +62,7 @@ class TaskFrame(BaseModel):
     target_entities: list[TargetEntity] = Field(default_factory=list)
     invariants: list[str] = Field(default_factory=list)
     allowed_autonomy: AllowedAutonomy = "bounded"
+    relevant_skills: list[str] = Field(default_factory=list)
     replan_triggers: list[str] = Field(default_factory=list)
     direct_execution_reason: str = ""
     rationale: str = ""
@@ -162,6 +163,7 @@ def classify_intent_heuristic(message: str) -> IntentDecision:
         requires_user_confirmation=risk == "high",
         target_urls=target_urls,
         must_preserve_targets=bool(target_urls),
+        relevant_skills=[],
         rationale="heuristic fallback (conservative)",
     )
 
@@ -219,3 +221,4 @@ def coerce_task_frame(value: object, message: str) -> TaskFrame:
             if entity.value not in existing_urls:
                 frame.target_entities.append(entity)
     return frame
+me
