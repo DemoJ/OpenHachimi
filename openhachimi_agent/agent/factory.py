@@ -85,7 +85,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     )
 
     if agent_type == "executor":
-        @agent.result_validator
+        @agent.output_validator
         def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
             from openhachimi_agent.agent.execution import get_final_verification_signal
             import json
