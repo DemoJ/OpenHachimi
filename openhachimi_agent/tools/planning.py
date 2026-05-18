@@ -3,7 +3,8 @@
 import logging
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Literal, TypedDict
+from typing import Literal
+from typing_extensions import TypedDict
 from functools import wraps
 import inspect
 from pathlib import Path
