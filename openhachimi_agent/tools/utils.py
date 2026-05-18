@@ -140,7 +140,11 @@ def assert_safe_command(command: str) -> None:
     normalized = command.lower()
     for pattern in DANGEROUS_COMMAND_PATTERNS:
         if re.search(pattern, normalized):
-            raise ValueError(f"命令包含高风险操作，已拒绝执行：{command}")
+            raise ModelRetry(
+                f"命令包含高风险操作，已拒绝执行：{command}。\n"
+                f"❌ 警告：严禁使用 shell 命令 (如 rm, del 等) 删除文件！\n"
+                f"✅ 请改用专门的 `delete_path` 工具来安全地删除文件或目录。"
+            )
 
 
 def run_subprocess(
