@@ -84,6 +84,22 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         retries=3,  # 允许工具调用失败后最多重试 3 次，避免因单次输出格式问题导致整体失败
     )
 
+    if agent_type == "executor":
+        @agent.result_validator
+        def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
+            from openhachimi_agent.agent.execution import get_final_verification_signal
+            import json
+            from pydantic_ai.exceptions import ModelRetry
+            
+            signal = get_final_verification_signal(ctx.deps.session_state)
+            if signal:
+                raise ModelRetry(
+                    f"[系统拦截] 你不能现在就结束任务并回复最终结果！当前 TODO 列表中仍有未完成的任务，或最后一次执行失败。\n"
+                    f"验证详情：{json.dumps(signal, ensure_ascii=False)}\n"
+                    f"请务必先调用 `update_todo` 工具将所有完成的任务状态更新为 done，或者继续调用工具执行未完成的步骤。"
+                )
+            return result
+
     @agent.system_prompt
     def _inject_time() -> str:
         current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
