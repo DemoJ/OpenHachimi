@@ -3,7 +3,7 @@
 import logging
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Literal
+from typing import Literal, TypedDict
 from functools import wraps
 import inspect
 from pathlib import Path
@@ -14,6 +14,16 @@ from pydantic_ai.exceptions import ModelRetry
 from openhachimi_agent.core.deps import AgentDeps
 
 logger = logging.getLogger(__name__)
+
+class TodoTaskInput(TypedDict, total=False):
+    id: int
+    description: str
+    parent_id: int
+    depends_on: list[int]
+    allowed_tools: list[str]
+    success_criteria: str
+    verification: str
+    risk_level: Literal["low", "medium", "high"]
 
 @dataclass
 class TodoTask:
@@ -127,7 +137,7 @@ def _refresh_active_flag(state: TodoState) -> None:
 
 def create_todos(
     ctx: RunContext[AgentDeps],
-    tasks: list[dict | str],
+    tasks: list[TodoTaskInput | str],
     goal: str = "",
     invariants: list[str] | None = None,
 ) -> str:
@@ -137,15 +147,11 @@ def create_todos(
     当你需要执行一个包含多个步骤的复杂任务时（如搜集多方面信息、写复杂代码、进行深度研究），
     请首先调用此工具将模糊意图拆解为具体的 TODO 列表。
     
-    goal 参数用于记录本计划要完成的用户目标。
-    invariants 参数用于记录计划和执行过程不可违反的约束，例如“用户指定 URL 不能被替换”。
-    
-    tasks 参数可以是一个简单的字符串列表（代表每个任务的描述），
-    也可以是包含详细配置的字典列表（推荐用于复杂任务），支持如下字段：
-    - id (int, 可选): 指定任务 ID（方便在依赖中引用）。如果未提供，将自动分配。
-    - description (str): 任务描述。
-    - parent_id (int, 可选): 指定父任务的 ID，用于构建层级/子任务结构。
-    - depends_on (list[int], 可选): 依赖的任务 ID 列表，表示这些任务完成后才能开始当前任务。
+    参数说明：
+    - goal: 记录本计划要完成的用户目标。
+    - invariants: 记录计划和执行过程不可违反的约束列表（例如 ["不可修改 API 签名", "必须保持向后兼容"]）。如果没有约束，必须省略此参数或传入空数组 []，绝不要传入字符串 'None' 或 'null'。
+    - tasks: 任务列表。可以是简单的字符串列表（代表每个任务的描述），也可以是包含详细配置的字典列表（推荐用于复杂任务）。
+      支持的字段包括 id, description, parent_id, depends_on, allowed_tools, success_criteria, verification, risk_level。
     
     调用后，请逐一执行工具完成任务，并使用 update_todo 及时更新状态。
     """
