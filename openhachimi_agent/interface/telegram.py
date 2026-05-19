@@ -12,6 +12,7 @@ import logging
 import re
 import time
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 _EDIT_INTERVAL = 1.5
 # 单条 Telegram 消息最大字符数（官方限制 4096，留余量）
 _MAX_MSG_LEN = 4000
+# 临时工具进度消息最多保留最近几条，避免长链路任务刷屏
+_MAX_LIVE_TOOL_LINES = 6
+# Telegram typing 状态持续时间较短，需要周期性刷新
+_TYPING_INTERVAL = 4.0
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -125,6 +130,35 @@ def _md_to_tg_html(text: str) -> str:
     return text
 
 
+def _trim_tool_line(text: str, max_len: int = 140) -> str:
+    compact = " ".join(text.split())
+    if len(compact) > max_len:
+        return compact[: max_len - 3] + "..."
+    return compact
+
+
+def _build_live_display(final_text: str, system_text: str, tool_lines: list[str]) -> str:
+    sections: list[str] = []
+    if tool_lines:
+        sections.append("工具进度：\n" + "\n".join(f"• {line}" for line in tool_lines[-_MAX_LIVE_TOOL_LINES:]))
+    if system_text.strip():
+        sections.append(system_text.strip())
+    if final_text.strip():
+        sections.append("回复：\n" + final_text.strip())
+    else:
+        sections.append("⏳ 正在处理……")
+    return "\n\n".join(sections)
+
+
+async def _keep_typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    while True:
+        await ctx.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.TYPING)
+        await asyncio.sleep(_TYPING_INTERVAL)
+
+
 class TelegramBot:
     """Telegram Bot 主体，封装会话状态与消息处理逻辑。"""
 
@@ -135,6 +169,8 @@ class TelegramBot:
         self._sessions: dict[int, dict[str, str]] = {}
         # 按 user_id 存储队列锁，实现每个用户独立的消息排队机制
         self._user_locks: dict[int, asyncio.Lock] = {}
+        # 按 user_id 存储工具调试输出开关覆盖值
+        self._debug_tools_overrides: dict[int, bool] = {}
         logger.info("telegram bot handler initialized")
 
     def _get_session(self, user_id: int) -> dict[str, str]:
@@ -155,7 +191,12 @@ class TelegramBot:
             self._sessions[user_id] = session
         return self._sessions[user_id]
 
-    def _get_user_lock(self, user_id: int) -> asyncio.Lock:
+    def _set_debug_tools_enabled(self, user_id: int, enabled: bool) -> None:
+        self._debug_tools_overrides[user_id] = enabled
+
+    def _is_debug_tools_enabled(self, user_id: int) -> bool:
+        return self._debug_tools_overrides.get(user_id, self.config.show_tool_events)
+
         if user_id not in self._user_locks:
             if len(self._user_locks) >= 1000:
                 oldest_user = next(iter(self._user_locks))
@@ -185,6 +226,7 @@ class TelegramBot:
             "  /roles — 查看角色列表\n"
             "  /role &lt;名称&gt; — 切换角色\n"
             "  /stop — 中断当前正在执行的任务\n"
+            "  /debug_tools — 开关工具调用调试输出\n"
             "  /help — 查看帮助"
         )
         await update.message.reply_text(welcome, parse_mode=constants.ParseMode.HTML)
@@ -198,6 +240,7 @@ class TelegramBot:
             "<code>/roles</code> — 列出全部可用角色\n"
             "<code>/role &lt;名称&gt;</code> — 切换到指定角色\n"
             "<code>/stop</code> — 中断当前正在执行的任务\n"
+            "<code>/debug_tools on|off</code> — 开关工具调用调试输出\n"
             "<code>/help</code> — 查看本帮助\n\n"
             "直接发送文字消息即可与 Agent 对话。"
         )
@@ -255,6 +298,19 @@ class TelegramBot:
         except (FileNotFoundError, ValueError) as exc:
             await update.message.reply_text(f"❌ 切换角色失败：{exc}")
 
+    async def cmd_debug_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        user_id = update.effective_user.id
+        arg = (ctx.args[0].strip().lower() if ctx.args else "")
+        if arg in {"on", "true", "1", "开"}:
+            enabled = True
+        elif arg in {"off", "false", "0", "关"}:
+            enabled = False
+        else:
+            enabled = not self._is_debug_tools_enabled(user_id)
+        self._set_debug_tools_enabled(user_id, enabled)
+        status = "开启" if enabled else "关闭"
+        await update.message.reply_text(f"工具调用调试输出已{status}。")
+
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """普通文本消息处理器：流式调用 Agent 并以「编辑消息」实现打字效果。
 
@@ -281,17 +337,35 @@ class TelegramBot:
             # 先发出占位消息
             placeholder = await update.message.reply_text("⏳ 思考中……")
 
+            final_text = ""
+            system_text = ""
+            tool_lines: list[str] = []
+            debug_text = ""
+            debug_tools_enabled = self._is_debug_tools_enabled(user_id)
             accumulated = ""
             last_edit_time = time.monotonic()
             sent_parts: list = [placeholder]
+            finalized_parts = 0
+            typing_task = asyncio.create_task(_keep_typing(update, ctx))
 
             async def flush(final: bool = False) -> None:
                 """将累积内容同步到 Telegram 消息。
 
-                final=False：以纯文本发出（流式过程中，Markdown 可能不完整）
-                final=True：转换为 HTML 渲染（完整内容，格式正确）
+                final=False：显示临时工具进度与已生成正文。
+                final=True：只渲染最终正文，清理临时工具进度。
                 """
-                nonlocal last_edit_time, sent_parts
+                nonlocal last_edit_time, sent_parts, accumulated, finalized_parts
+                if final:
+                    final_chunks = []
+                    if final_text.strip():
+                        final_chunks.append(final_text.strip())
+                    if system_text.strip():
+                        final_chunks.append(system_text.strip())
+                    if debug_tools_enabled and debug_text.strip():
+                        final_chunks.append("工具调用调试信息：\n" + debug_text.strip())
+                    accumulated = "\n\n".join(final_chunks)
+                else:
+                    accumulated = _build_live_display(final_text, system_text, tool_lines)
                 if not accumulated:
                     return
 
@@ -314,13 +388,13 @@ class TelegramBot:
                             display = part
                             parse_mode = None
                     else:
-                        # 流式过程：纯文本 + 光标符号
                         display = part + (" ▌" if is_last_part else "")
                         parse_mode = None
 
-                    if i < len(sent_parts):
+                    target_index = finalized_parts + i
+                    if target_index < len(sent_parts):
                         try:
-                            await sent_parts[i].edit_text(display, parse_mode=parse_mode)
+                            await sent_parts[target_index].edit_text(display, parse_mode=parse_mode)
                         except TelegramError as exc:
                             if _is_message_not_modified(exc):
                                 continue
@@ -334,7 +408,7 @@ class TelegramBot:
                             )
                             try:
                                 new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
-                                sent_parts[i] = new_msg
+                                sent_parts[target_index] = new_msg
                             except Exception as fallback_exc:
                                 raise RuntimeError(
                                     "Telegram 更新回复失败，且发送备用消息也失败："
@@ -348,16 +422,33 @@ class TelegramBot:
                         except Exception as exc:
                             raise RuntimeError(f"Telegram 发送分段回复失败：{_exception_text(exc)}") from exc
 
+                if final:
+                    finalized_parts = max(finalized_parts, len(parts))
+                    tool_lines.clear()
                 last_edit_time = time.monotonic()
 
             try:
-                async for chunk in self.service.stream_message(user_text, role, session_id):
-                    accumulated += chunk
-                    if time.monotonic() - last_edit_time >= _EDIT_INTERVAL:
-                        await flush(final=False)
+                async for event in self.service.stream_events(user_text, role, session_id):
+                    if event.type == "text":
+                        final_text += event.text
+                        tool_lines.clear()
+                    elif event.type == "system":
+                        system_text += event.text
+                    elif event.type == "tool":
+                        if final_text.strip():
+                            await flush(final=True)
+                            final_text = ""
+                            system_text = ""
+                        if debug_tools_enabled:
+                            debug_text += f"[工具] {event.text}\n"
+                        tool_lines.append(_trim_tool_line(event.text))
+                        if time.monotonic() - last_edit_time >= _EDIT_INTERVAL:
+                            await flush(final=False)
 
                 # 流结束，转换为 HTML 完整渲染
                 await flush(final=True)
+                if finalized_parts == 0:
+                    await sent_parts[0].edit_text("任务已完成，但没有生成文本回复。")
 
             except Exception as exc:
                 logger.exception("telegram stream error user_id=%d", user_id)
@@ -375,6 +466,10 @@ class TelegramBot:
                         await update.message.reply_text(err_text)
                     except Exception:
                         logger.exception("telegram failed to send error message user_id=%d", user_id)
+            finally:
+                typing_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await typing_task
 
 
 @asynccontextmanager
@@ -415,6 +510,7 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
     app.add_handler(CommandHandler("stop", bot.cmd_stop))
     app.add_handler(CommandHandler("roles", bot.cmd_roles))
     app.add_handler(CommandHandler("role", bot.cmd_role))
+    app.add_handler(CommandHandler("debug_tools", bot.cmd_debug_tools))
     # 普通文本消息处理器（非命令），设置为 block=False 以免阻塞后续的 /stop 等命令
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message, block=False))
 
@@ -431,6 +527,7 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
             BotCommand("roles", "🎭 查看可用角色列表"),
             BotCommand("role",  "🔄 切换角色（如：/role default）"),
             BotCommand("stop",  "🛑 中断当前正在执行的任务"),
+            BotCommand("debug_tools", "🛠️ 开关工具调用调试输出"),
             BotCommand("help",  "📖 查看帮助"),
         ])
         logger.info("telegram bot commands menu registered")

@@ -22,6 +22,7 @@ NEW_SESSION_COMMANDS = {"/new", "新对话"}
 HELP_COMMANDS = {"/help", "帮助"}
 ROLE_LIST_COMMANDS = {"/roles", "/list-roles"}
 STOP_COMMANDS = {"/stop", "停止"}
+DEBUG_TOOLS_COMMANDS = {"/debug_tools", "/debug-tools"}
 DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
 
 
@@ -60,7 +61,12 @@ def request_stream(server_url: str, path: str, payload: dict[str, object]):
                     data_json = json.loads(data_str)
                     if "error" in data_json:
                         raise URLError(data_json["error"])
-                    if "text" in data_json:
+                    event_type = data_json.get("type")
+                    if event_type == "tool":
+                        yield f"\n[工具] {data_json.get('text', '')}\n"
+                    elif event_type in {"text", "system"}:
+                        yield data_json.get("text", "")
+                    elif "text" in data_json:
                         yield data_json["text"]
                 except json.JSONDecodeError:
                     pass
@@ -85,7 +91,7 @@ def print_welcome(state: dict[str, object], server_url: str, current_role: str, 
     print(f"当前角色：{current_role}")
     print(f"当前会话：{current_session_id}")
     print("输入内容后回车即可对话。")
-    print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/new 新建对话，/exit 退出程序。")
+    print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/debug_tools 开关工具调试，/new 新建对话，/exit 退出程序。")
     print()
 
 
@@ -96,6 +102,7 @@ def print_help() -> None:
     print("  /role   切换角色，例如 /role default")
     print("  /new    保存当前对话并新建一段对话")
     print("  /stop   中断当前正在执行的任务")
+    print("  /debug_tools on|off  开关工具调用调试输出")
     print("  /exit   退出程序")
     print()
 
@@ -107,7 +114,7 @@ class CliBackend(Protocol):
     async def new_session(self, role: str) -> tuple[str, str, str]: ...
     async def stop_session(self, session_id: str) -> str: ...
     async def switch_role(self, role: str) -> tuple[str, str, str]: ...
-    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str]: ...
+    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str]: ...
 
 
 class EmbeddedBackend:
@@ -119,6 +126,7 @@ class EmbeddedBackend:
         return {
             "model": state.model,
             "base_url": state.base_url,
+            "show_tool_events": state.show_tool_events,
         }
 
     async def list_roles(self) -> list[str]:
@@ -140,8 +148,8 @@ class EmbeddedBackend:
         resp = self.service.switch_role(role)
         return resp.role, resp.session_id, resp.message
 
-    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str]:
-        async for chunk in self.service.stream_message(message, role, session_id):
+    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str]:
+        async for chunk in self.service.stream_message(message, role, session_id, include_tool_events=include_tool_events):
             yield chunk
 
 
@@ -184,13 +192,18 @@ class HttpBackend:
         except Exception as exc:
             raise RuntimeError(str(exc)) from exc
 
-    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str]:
+    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str]:
         q: asyncio.Queue[str | Exception | None] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
         def _run():
             try:
-                for chunk in request_stream(self.server_url, "/chat/stream", {"message": message, "role": role, "session_id": session_id}):
+                for chunk in request_stream(self.server_url, "/chat/stream", {
+                    "message": message,
+                    "role": role,
+                    "session_id": session_id,
+                    "include_tool_events": include_tool_events,
+                }):
                     loop.call_soon_threadsafe(q.put_nowait, chunk)
                 loop.call_soon_threadsafe(q.put_nowait, None)
             except Exception as e:
@@ -218,6 +231,10 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
         return
 
     print_welcome(state, server_url, current_role, current_session_id)
+    show_tool_events = state.get("show_tool_events")
+    if show_tool_events is None:
+        show_tool_events = os.getenv("OPENHACHIMI_SHOW_TOOL_EVENTS", "").strip().lower() in {"1", "true", "yes", "on"}
+    show_tool_events = bool(show_tool_events)
 
     while True:
         try:
@@ -270,6 +287,18 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
                 print(f"哈基米 > 获取角色列表失败：{exc}")
             continue
 
+        if user_input == "/debug_tools" or user_input.startswith("/debug_tools ") or user_input.startswith("/debug-tools "):
+            arg = user_input.split(maxsplit=1)[1].strip().lower() if " " in user_input else ""
+            if arg in {"on", "true", "1", "开"}:
+                show_tool_events = True
+            elif arg in {"off", "false", "0", "关"}:
+                show_tool_events = False
+            else:
+                show_tool_events = not show_tool_events
+            status = "开启" if show_tool_events else "关闭"
+            print(f"工具调用调试输出已{status}。")
+            continue
+
         if user_input == "/role" or user_input.startswith("/role "):
             role_name = user_input[6:].strip()
             if not role_name:
@@ -289,7 +318,7 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
 
         try:
             print("哈基米 > ", end="", flush=True)
-            async for chunk in backend.stream_message(user_input, current_role, current_session_id):
+            async for chunk in backend.stream_message(user_input, current_role, current_session_id, show_tool_events):
                 print(chunk, end="", flush=True)
         except Exception as exc:
             print(f"\n哈基米 > 调用模型时出错：{exc}")

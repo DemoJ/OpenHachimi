@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -24,6 +25,14 @@ from openhachimi_agent.service.agent_runtime.context import OperationState
 
 logger = logging.getLogger(__name__)
 STREAM_DONE = object()
+
+
+@dataclass
+class StreamEventItem:
+    type: Literal["text", "tool", "system"]
+    text: str
+    tool_name: str | None = None
+    temporary: bool = False
 
 
 @dataclass
@@ -70,22 +79,26 @@ def summarize_tool_args(args: object, max_chars: int = 160) -> str:
     return text
 
 
-def status_from_stream_event(event: object) -> str:
+def event_item_from_stream_event(event: object) -> StreamEventItem | None:
+    if chunk := text_from_stream_event(event):
+        return StreamEventItem(type="text", text=chunk)
+
     if isinstance(event, FunctionToolCallEvent):
         tool_name = event.part.tool_name
         args = summarize_tool_args(event.part.args_as_dict())
-        if args:
-            return f"\n[工具] 正在调用 {tool_name}：{args}\n"
-        return f"\n[工具] 正在调用 {tool_name}\n"
+        text = f"正在调用 {tool_name}：{args}" if args else f"正在调用 {tool_name}"
+        return StreamEventItem(type="tool", text=text, tool_name=tool_name, temporary=True)
 
     if isinstance(event, FunctionToolResultEvent):
         result = event.result
         outcome = getattr(result, "outcome", "success")
         if outcome == "success":
-            return f"[工具] {result.tool_name} 完成\n"
-        return f"[工具] {result.tool_name} 结束：{outcome}\n"
+            text = f"{result.tool_name} 完成"
+        else:
+            text = f"{result.tool_name} 结束：{outcome}"
+        return StreamEventItem(type="tool", text=text, tool_name=result.tool_name, temporary=True)
 
-    return ""
+    return None
 
 
 def _update_operation_from_event(operation_state: OperationState, event: object) -> None:
@@ -101,16 +114,14 @@ def _update_operation_from_event(operation_state: OperationState, event: object)
 
 
 def build_stream_event_handler(
-    stream_queue: asyncio.Queue[str | object],
+    stream_queue: asyncio.Queue[StreamEventItem | object],
     operation_state: OperationState,
 ) -> Callable[[object, object], Awaitable[None]]:
     async def handle_stream_events(_ctx: object, stream_event: object) -> None:
         async for event in stream_event:  # type: ignore[attr-defined]
             _update_operation_from_event(operation_state, event)
-            if chunk := text_from_stream_event(event):
-                await stream_queue.put(chunk)
-            if status := status_from_stream_event(event):
-                await stream_queue.put(status)
+            if item := event_item_from_stream_event(event):
+                await stream_queue.put(item)
 
     return handle_stream_events
 
@@ -165,9 +176,13 @@ async def _cancel_stalled_task(task: asyncio.Task, exc: OperationStalledError) -
     )
 
 
+def system_stream_event(text: str) -> StreamEventItem:
+    return StreamEventItem(type="system", text=text)
+
+
 async def consume_stream_queue(
     *,
-    stream_queue: asyncio.Queue[str | object],
+    stream_queue: asyncio.Queue[StreamEventItem | object],
     task: asyncio.Task,
     config: AppConfig,
     role: str,
@@ -175,7 +190,7 @@ async def consume_stream_queue(
     start_time: float,
     stats: StreamStats,
     operation_state: OperationState,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[StreamEventItem]:
     while True:
         try:
             item = await asyncio.wait_for(
@@ -190,11 +205,14 @@ async def consume_stream_queue(
             except OperationStalledError as exc:
                 await _cancel_stalled_task(task, exc)
                 raise
-            yield _heartbeat_message(operation_state)
+            yield system_stream_event(_heartbeat_message(operation_state))
             continue
 
         if item is STREAM_DONE:
             break
+
+        if not isinstance(item, StreamEventItem):
+            continue
 
         try:
             _raise_if_operation_stalled(operation_state, config)
@@ -202,7 +220,7 @@ async def consume_stream_queue(
             await _cancel_stalled_task(task, exc)
             raise
 
-        chunk = str(item)
+        chunk = item.text
         compact_chunk = " ".join(chunk.split())
         if len(compact_chunk) > 120:
             compact_chunk = compact_chunk[:117] + "..."
@@ -219,4 +237,4 @@ async def consume_stream_queue(
             )
         stats.chunk_count += 1
         stats.output_chars += len(chunk)
-        yield chunk
+        yield item

@@ -17,6 +17,7 @@ from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
+from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 
 
 logger = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ async def _replan_after_execution_signal(
 ) -> None:
     planner_agent = get_agent(ctx.role, "planner")
     if ctx.stream and ctx.stream_queue is not None:
-        await ctx.stream_queue.put("\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n")
+        await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n"))
     planner_result = await planner_agent.run(
         "Executor 在执行时触发了 TaskFrame 偏差或工具失败。请基于 TaskFrame、当前 TODO 和 execution ledger 摘要修订计划。\n"
         "要求：保持 TaskFrame 的 goal、target_entities、invariants 不变；不要扩大任务目标；"
@@ -173,7 +174,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     if verification_signal and ctx.turn_state.final_verification_repair_attempts < 1:
         ctx.turn_state.final_verification_repair_attempts += 1
         if ctx.stream and ctx.stream_queue is not None:
-            await ctx.stream_queue.put("\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n")
+            await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n"))
         repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal)
         result = await run_executor_once(
             executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent),

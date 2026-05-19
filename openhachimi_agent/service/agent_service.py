@@ -27,9 +27,11 @@ from openhachimi_agent.service.agent_runtime.router import resolve_task_frame, s
 from openhachimi_agent.service.agent_runtime.streaming import (
     STREAM_DONE,
     OperationStalledError,
+    StreamEventItem,
     StreamStats,
     build_stream_event_handler,
     consume_stream_queue,
+    system_stream_event,
 )
 from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
 from openhachimi_agent.transport.api_models import AgentState, ChatResponse, CommandResponse, RolesResponse
@@ -130,6 +132,7 @@ class AgentService:
         return AgentState(
             model=self.config.model_name,
             base_url=self.config.openai_base_url or None,
+            show_tool_events=self.config.show_tool_events,
         )
 
     def list_roles(self) -> RolesResponse:
@@ -210,7 +213,7 @@ class AgentService:
                 process_manager=self.process_manager,
                 session_state=session_state,
             )
-            stream_queue: asyncio.Queue[str | object] = asyncio.Queue()
+            stream_queue: asyncio.Queue[StreamEventItem | object] = asyncio.Queue()
             stream_stats = StreamStats()
             result_holder: dict[str, object] = {}
             ctx = AgentRunContext(
@@ -332,7 +335,7 @@ class AgentService:
             try:
                 if stream:
                     try:
-                        async for chunk in consume_stream_queue(
+                        async for event in consume_stream_queue(
                             stream_queue=stream_queue,
                             task=task,
                             config=self.config,
@@ -342,7 +345,7 @@ class AgentService:
                             stats=stream_stats,
                             operation_state=ctx.operation_state,
                         ):
-                            yield chunk
+                            yield event
                     except OperationStalledError as exc:
                         stalled_detail = {"operation": exc.operation, "stalled_for": exc.stalled_for, "timeout": exc.timeout}
                         if has_active_todos(session_state):
@@ -352,28 +355,28 @@ class AgentService:
                                 detail=stalled_detail,
                                 deps=deps,
                             )
-                            yield (
+                            yield system_stream_event(
                                 "\n\n[System] 当前任务已暂停："
                                 f"{exc} 旧计划已挂起，不会影响下一轮对话；"
                                 "如需恢复，请明确说明“继续刚才的任务”。"
                             )
                         else:
                             fail_current_plan(session_state, reason="operation_stalled", detail=stalled_detail)
-                            yield f"\n\n[System] 当前任务已失败：{exc} 未生成可恢复计划，下一轮将重新理解用户请求。"
+                            yield system_stream_event(f"\n\n[System] 当前任务已失败：{exc} 未生成可恢复计划，下一轮将重新理解用户请求。")
                         return
 
                     try:
                         await task
                     except asyncio.CancelledError:
                         if task.cancelled():
-                            yield "\n\n【任务已被手动中断】"
+                            yield system_stream_event("\n\n【任务已被手动中断】")
                             return
                         raise
 
                     if error := result_holder.get("error"):
                         raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
                     if final_signal := result_holder.get("final_verification_signal"):
-                        yield (
+                        yield system_stream_event(
                             "\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
                             f"{json.dumps(final_signal, ensure_ascii=False)}"
                         )
@@ -413,7 +416,7 @@ class AgentService:
                                 actual_session_id,
                                 stream_stats.output_chars,
                             )
-                            yield output
+                            yield StreamEventItem(type="text", text=output)
 
                     logger.info(
                         "chat finished role=%s session_id=%s output_chars=%d chunks=%d first_chunk_ms=%s history_messages=%d duration_ms=%.0f stream=true",
@@ -455,6 +458,20 @@ class AgentService:
             return result  # type: ignore[return-value]
         raise RuntimeError("No result returned from _run_with_session")
 
-    async def stream_message(self, message: str, role: str | None = None, session_id: str | None = None) -> AsyncIterator[str]:
-        async for chunk in self._run_with_session(message, role, session_id, stream=True):
-            yield chunk  # type: ignore[misc]
+    async def stream_events(self, message: str, role: str | None = None, session_id: str | None = None) -> AsyncIterator[StreamEventItem]:
+        async for event in self._run_with_session(message, role, session_id, stream=True):
+            if isinstance(event, StreamEventItem):
+                yield event
+
+    async def stream_message(
+        self,
+        message: str,
+        role: str | None = None,
+        session_id: str | None = None,
+        include_tool_events: bool = False,
+    ) -> AsyncIterator[str]:
+        async for event in self.stream_events(message, role, session_id):
+            if event.type in {"text", "system"}:
+                yield event.text
+            elif include_tool_events and event.type == "tool":
+                yield f"\n[工具] {event.text}\n"

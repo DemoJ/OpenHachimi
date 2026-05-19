@@ -9,7 +9,8 @@ app:
   telegram_proxy_url: ""     # 代理地址（可选），在无法直连 Telegram 的环境下配置。支持 HTTP/SOCKS5，例如：
                              #   socks5://127.0.0.1:1080
                              #   http://192.168.1.1:7890
-  stream_idle_timeout_seconds: 60   # 流式输出长时间无新内容时的超时；用于发现模型/工具卡住
+  stream_idle_timeout_seconds: 60   # 流式队列无新事件时的进展检查/心跳间隔；实际卡住判定会按操作类型使用更长阈值
+  show_tool_events: false           # 是否默认输出完整工具调用调试信息；正式使用建议 false，可用 /debug_tools 临时切换
 
 llm:
   api_key: sk-xxxxxxxx

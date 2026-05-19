@@ -78,8 +78,21 @@ def chat_stream(request: ChatRequest, service: AgentService = Depends(get_servic
 
     async def sse_generator():
         try:
-            async for chunk in service.stream_message(request.message, request.role, request.session_id):
-                yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            include_tool_events = request.include_tool_events
+            if include_tool_events is None:
+                include_tool_events = service.config.show_tool_events
+            async for event in service.stream_events(request.message, request.role, request.session_id):
+                if include_tool_events:
+                    payload = {
+                        "type": event.type,
+                        "text": event.text,
+                        "temporary": event.temporary,
+                    }
+                    if event.tool_name:
+                        payload["tool_name"] = event.tool_name
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                elif event.type in {"text", "system"}:
+                    yield f"data: {json.dumps({'text': event.text}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
         except Exception as exc:
             logger.exception("stream error")

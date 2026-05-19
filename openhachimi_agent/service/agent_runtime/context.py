@@ -59,7 +59,7 @@ class AgentRunContext:
     deps: AgentDeps
     session_state: dict[str, Any]
     stream: bool
-    stream_queue: asyncio.Queue[str | object] | None = None
+    stream_queue: asyncio.Queue[object] | None = None
     stream_event_handler: Callable[[object, object], Awaitable[None]] | None = None
     turn_state: TurnState = field(default_factory=TurnState)
     operation_state: OperationState = field(default_factory=OperationState)
