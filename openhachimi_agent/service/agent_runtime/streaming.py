@@ -33,6 +33,7 @@ class StreamEventItem:
     text: str
     tool_name: str | None = None
     temporary: bool = False
+    counted_as_output: bool = True
 
 
 @dataclass
@@ -87,7 +88,7 @@ def event_item_from_stream_event(event: object) -> StreamEventItem | None:
         tool_name = event.part.tool_name
         args = summarize_tool_args(event.part.args_as_dict())
         text = f"正在调用 {tool_name}：{args}" if args else f"正在调用 {tool_name}"
-        return StreamEventItem(type="tool", text=text, tool_name=tool_name, temporary=True)
+        return StreamEventItem(type="tool", text=text, tool_name=tool_name, temporary=True, counted_as_output=False)
 
     if isinstance(event, FunctionToolResultEvent):
         result = event.result
@@ -96,7 +97,7 @@ def event_item_from_stream_event(event: object) -> StreamEventItem | None:
             text = f"{result.tool_name} 完成"
         else:
             text = f"{result.tool_name} 结束：{outcome}"
-        return StreamEventItem(type="tool", text=text, tool_name=result.tool_name, temporary=True)
+        return StreamEventItem(type="tool", text=text, tool_name=result.tool_name, temporary=True, counted_as_output=False)
 
     return None
 
@@ -235,6 +236,7 @@ async def consume_stream_queue(
                 stats.first_chunk_ms,
                 len(chunk),
             )
-        stats.chunk_count += 1
-        stats.output_chars += len(chunk)
+        if item.counted_as_output:
+            stats.chunk_count += 1
+            stats.output_chars += len(chunk)
         yield item

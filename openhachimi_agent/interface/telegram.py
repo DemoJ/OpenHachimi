@@ -441,6 +441,7 @@ class TelegramBot:
                             system_text = ""
                         if debug_tools_enabled:
                             debug_text += f"[工具] {event.text}\n"
+                            await flush(final=False)
                         tool_lines.append(_trim_tool_line(event.text))
                         if time.monotonic() - last_edit_time >= _EDIT_INTERVAL:
                             await flush(final=False)
