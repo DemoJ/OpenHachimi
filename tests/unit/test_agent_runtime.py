@@ -156,7 +156,7 @@ async def test_stream_idle_yields_heartbeat_without_cancelling_task():
 
     chunk = await stream.__anext__()
 
-    assert "当前任务仍在运行" in chunk
+    assert "当前任务仍在运行" in chunk.text
     assert not task.done()
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):

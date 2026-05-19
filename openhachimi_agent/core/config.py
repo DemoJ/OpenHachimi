@@ -37,7 +37,7 @@ class AppConfig:
     telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
     agent_timeout_seconds: int
     stream_idle_timeout_seconds: int
-    show_tool_events: bool
+    show_tool_events: bool = False
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
