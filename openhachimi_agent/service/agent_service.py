@@ -15,6 +15,8 @@ from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
     complete_current_plan,
+    fail_current_plan,
+    has_active_todos,
     mark_turn_finished,
     mark_turn_started,
     suspend_current_plan,
@@ -238,21 +240,31 @@ class AgentService:
                     result_holder["result"] = outcome.result
                     if outcome.final_verification_signal:
                         result_holder["final_verification_signal"] = outcome.final_verification_signal
-                        suspend_current_plan(
-                            session_state,
-                            reason="final_verification_failed",
-                            detail=outcome.final_verification_signal,
-                            deps=deps,
-                        )
+                        if has_active_todos(session_state):
+                            suspend_current_plan(
+                                session_state,
+                                reason="final_verification_failed",
+                                detail=outcome.final_verification_signal,
+                                deps=deps,
+                            )
+                        else:
+                            fail_current_plan(
+                                session_state,
+                                reason="final_verification_failed",
+                                detail=outcome.final_verification_signal,
+                            )
                     else:
                         complete_current_plan(session_state)
                 except asyncio.TimeoutError as exc:
-                    suspend_current_plan(
-                        session_state,
-                        reason="operation_timeout",
-                        detail=str(exc),
-                        deps=deps,
-                    )
+                    if has_active_todos(session_state):
+                        suspend_current_plan(
+                            session_state,
+                            reason="operation_timeout",
+                            detail=str(exc),
+                            deps=deps,
+                        )
+                    else:
+                        fail_current_plan(session_state, reason="operation_timeout", detail=str(exc))
                     if stream:
                         result_holder["error"] = TimeoutError(
                             "Agent 执行超时："
@@ -276,12 +288,15 @@ class AgentService:
                             actual_session_id,
                         )
                 except asyncio.CancelledError:
-                    suspend_current_plan(
-                        session_state,
-                        reason="cancelled",
-                        detail="agent task cancelled",
-                        deps=deps,
-                    )
+                    if has_active_todos(session_state):
+                        suspend_current_plan(
+                            session_state,
+                            reason="cancelled",
+                            detail="agent task cancelled",
+                            deps=deps,
+                        )
+                    else:
+                        fail_current_plan(session_state, reason="cancelled", detail="agent task cancelled")
                     logger.info(
                         "chat stream cancelled role=%s session_id=%s" if stream else "chat cancelled role=%s session_id=%s stream=false",
                         role,
@@ -289,12 +304,15 @@ class AgentService:
                     )
                     raise
                 except Exception as exc:
-                    suspend_current_plan(
-                        session_state,
-                        reason="error",
-                        detail=str(exc),
-                        deps=deps,
-                    )
+                    if has_active_todos(session_state):
+                        suspend_current_plan(
+                            session_state,
+                            reason="error",
+                            detail=str(exc),
+                            deps=deps,
+                        )
+                    else:
+                        fail_current_plan(session_state, reason="error", detail=str(exc))
                     result_holder["error"] = exc
                     logger.exception(
                         "chat failed role=%s session_id=%s stream=%s",
@@ -326,17 +344,22 @@ class AgentService:
                         ):
                             yield chunk
                     except OperationStalledError as exc:
-                        suspend_current_plan(
-                            session_state,
-                            reason="operation_stalled",
-                            detail={"operation": exc.operation, "stalled_for": exc.stalled_for, "timeout": exc.timeout},
-                            deps=deps,
-                        )
-                        yield (
-                            "\n\n[System] 当前任务已暂停："
-                            f"{exc} 旧计划已挂起，不会影响下一轮对话；"
-                            "如需恢复，请明确说明“继续刚才的任务”。"
-                        )
+                        stalled_detail = {"operation": exc.operation, "stalled_for": exc.stalled_for, "timeout": exc.timeout}
+                        if has_active_todos(session_state):
+                            suspend_current_plan(
+                                session_state,
+                                reason="operation_stalled",
+                                detail=stalled_detail,
+                                deps=deps,
+                            )
+                            yield (
+                                "\n\n[System] 当前任务已暂停："
+                                f"{exc} 旧计划已挂起，不会影响下一轮对话；"
+                                "如需恢复，请明确说明“继续刚才的任务”。"
+                            )
+                        else:
+                            fail_current_plan(session_state, reason="operation_stalled", detail=stalled_detail)
+                            yield f"\n\n[System] 当前任务已失败：{exc} 未生成可恢复计划，下一轮将重新理解用户请求。"
                         return
 
                     try:

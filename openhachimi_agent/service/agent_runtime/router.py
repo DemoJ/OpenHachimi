@@ -16,6 +16,7 @@ from openhachimi_agent.agent.intent import (
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
     has_active_todos,
+    has_restorable_suspended_plan,
     restore_suspended_plan,
     should_route_new_turn,
     suspend_current_plan,
@@ -77,7 +78,11 @@ async def should_route_message(ctx: AgentRunContext, get_agent: Callable[[str, s
     if not should_route_new_turn(ctx.session_state):
         return False
 
-    needs_continuation_decision = has_active_todos(ctx.session_state) or bool(ctx.session_state.get("suspended_plan"))
+    has_restorable_plan = has_restorable_suspended_plan(ctx.session_state)
+    if ctx.session_state.get("suspended_plan") and not has_restorable_plan:
+        ctx.session_state.pop("suspended_plan", None)
+
+    needs_continuation_decision = has_active_todos(ctx.session_state) or has_restorable_plan
     if not needs_continuation_decision:
         return True
 
@@ -91,7 +96,7 @@ async def should_route_message(ctx: AgentRunContext, get_agent: Callable[[str, s
 
     if decision.action == "continue_active_plan" and has_active_todos(ctx.session_state):
         return False
-    if decision.action == "resume_suspended_plan" and ctx.session_state.get("suspended_plan"):
+    if decision.action == "resume_suspended_plan" and has_restorable_plan:
         restore_suspended_plan(ctx.session_state, deps=ctx.deps)
         return False
 

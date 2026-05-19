@@ -521,44 +521,48 @@ class BrowserManager(BrowserLifecycleMixin):
                     return f"找不到 ID 为 {element_id} 的元素，无法进行局部滚动。请先调用 browser_get_state 刷新状态或直接进行全局滚动。"
                 selector = self._element_mapping[element_id]
                 
-                scroll_script = f"""
-                (selector) => {{
+                scroll_script = """
+                ({ selector, direction, amount }) => {
                     const el = document.querySelector(selector);
                     if (!el) return false;
-                    
+
                     let container = el;
-                    while (container && container !== document.body && container !== document.documentElement) {{
-                        if (container.scrollHeight > container.clientHeight) {{
+                    while (container && container !== document.body && container !== document.documentElement) {
+                        if (container.scrollHeight > container.clientHeight) {
                             const style = window.getComputedStyle(container);
-                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {{
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
                                 break;
-                            }}
-                        }}
+                            }
+                        }
                         container = container.parentElement;
-                    }}
-                    
-                    if (!container || container === document.body || container === document.documentElement) {{
+                    }
+
+                    if (!container || container === document.body || container === document.documentElement) {
                         container = window;
-                    }}
-                    
-                    if ('{direction}' === 'top') {{
+                    }
+
+                    if (direction === 'top') {
                         container.scrollTo(0, 0);
-                    }} else if ('{direction}' === 'bottom') {{
-                        if (container === window) {{
+                    } else if (direction === 'bottom') {
+                        if (container === window) {
                             container.scrollTo(0, document.body.scrollHeight);
-                        }} else {{
+                        } else {
                             container.scrollTo(0, container.scrollHeight);
-                        }}
-                    }} else if ('{direction}' === 'down') {{
-                        container.scrollBy(0, {amount});
-                    }} else {{ // up
-                        container.scrollBy(0, -{amount});
-                    }}
+                        }
+                    } else if (direction === 'down') {
+                        container.scrollBy(0, amount);
+                    } else {
+                        container.scrollBy(0, -amount);
+                    }
                     return true;
-                }}
+                }
                 """
-                
-                success = await self._page.evaluate(scroll_script, selector)
+
+                success = await self._page.evaluate(scroll_script, {
+                    "selector": selector,
+                    "direction": direction,
+                    "amount": amount,
+                })
                 if not success:
                     return f"找不到该元素或局部滚动失败，可能是页面 DOM 发生了变化。"
                 
@@ -572,10 +576,10 @@ class BrowserManager(BrowserLifecycleMixin):
                     await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     result_msg = "已滚动到全局页面底部。"
                 elif direction == "down":
-                    await self._page.evaluate(f"window.scrollBy(0, {amount})")
+                    await self._page.evaluate("(amount) => window.scrollBy(0, amount)", amount)
                     result_msg = f"已全局向下滚动 {amount}px。"
                 else:  # up
-                    await self._page.evaluate(f"window.scrollBy(0, -{amount})")
+                    await self._page.evaluate("(amount) => window.scrollBy(0, -amount)", amount)
                     result_msg = f"已全局向上滚动 {amount}px。"
             
             await asyncio.sleep(0.8)

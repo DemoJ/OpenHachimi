@@ -59,18 +59,66 @@ def _load_state(ctx: RunContext[AgentDeps]) -> TodoState:
         return TodoState()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        state = TodoState(
-            goal=str(data.get("goal", "")),
-            invariants=[str(item) for item in data.get("invariants", []) if item],
-            tool_calls_since_update=data.get("tool_calls_since_update", 0),
-            is_active=data.get("is_active", False)
-        )
-        for k, v in data.get("tasks", {}).items():
-            state.tasks[int(k)] = TodoTask(**v)
-        return state
     except Exception as e:
         logger.warning("Failed to load TODO state from %s: %s", path, e)
         return TodoState()
+
+    state = TodoState(
+        goal=str(data.get("goal", "")),
+        invariants=[str(item) for item in data.get("invariants", []) if item],
+        tool_calls_since_update=data.get("tool_calls_since_update", 0),
+        is_active=data.get("is_active", False)
+    )
+
+    raw_tasks = data.get("tasks", {})
+    if not isinstance(raw_tasks, dict):
+        logger.warning("TODO state %s has invalid tasks payload: %r", path, type(raw_tasks).__name__)
+        return state
+
+    for k, v in raw_tasks.items():
+        try:
+            task_id = int(k)
+            if not isinstance(v, dict):
+                raise ValueError(f"task payload must be object, got {type(v).__name__}")
+
+            status = v.get("status", "pending")
+            if status not in {"pending", "in-progress", "done", "blocked"}:
+                status = "pending"
+
+            parent_id = v.get("parent_id")
+            if parent_id is not None:
+                parent_id = int(parent_id)
+
+            depends_on = v.get("depends_on", [])
+            if not isinstance(depends_on, list):
+                depends_on = []
+            depends_on = [int(dep_id) for dep_id in depends_on]
+
+            allowed_tools = v.get("allowed_tools", [])
+            if not isinstance(allowed_tools, list):
+                allowed_tools = []
+
+            risk_level = v.get("risk_level", "low")
+            if risk_level not in {"low", "medium", "high"}:
+                risk_level = "low"
+
+            state.tasks[task_id] = TodoTask(
+                id=task_id,
+                description=str(v.get("description", "Unnamed Task")),
+                status=status,
+                notes=str(v.get("notes", "")),
+                parent_id=parent_id,
+                depends_on=depends_on,
+                allowed_tools=[str(tool) for tool in allowed_tools],
+                success_criteria=str(v.get("success_criteria", "")),
+                verification=str(v.get("verification", "")),
+                risk_level=risk_level,
+                evidence=str(v.get("evidence", "")),
+            )
+        except Exception as e:
+            logger.warning("Skipped corrupted TODO task %r from %s: %s", k, path, e)
+
+    return state
 
 def _save_state(ctx: RunContext[AgentDeps], state: TodoState):
     path = _get_todos_file_path(ctx)
@@ -136,11 +184,30 @@ def _refresh_active_flag(state: TodoState) -> None:
         state.is_active = False
 
 
+def _normalize_invariants(invariants: list[str] | str | None) -> list[str]:
+    if invariants is None:
+        return []
+    if isinstance(invariants, list):
+        return [str(item) for item in invariants if item]
+    text = invariants.strip()
+    if not text or text.lower() in {"none", "null"}:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [text]
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if item]
+    if parsed is None:
+        return []
+    return [str(parsed)]
+
+
 def create_todos(
     ctx: RunContext[AgentDeps],
     tasks: list[TodoTaskInput | str],
     goal: str = "",
-    invariants: list[str] | None = None,
+    invariants: list[str] | str | None = None,
 ) -> str:
     """
     创建一个全新的 TODO 任务列表，用于规划复杂的步骤。
@@ -231,7 +298,7 @@ def create_todos(
     task_frame = ctx.deps.session_state.get("task_frame", {})
     state.goal = goal or str(task_frame.get("goal", ""))
     inherited_invariants = task_frame.get("invariants", [])
-    merged_invariants = list(invariants or [])
+    merged_invariants = _normalize_invariants(invariants)
     if isinstance(inherited_invariants, list):
         merged_invariants.extend(str(item) for item in inherited_invariants if item)
     state.invariants = list(dict.fromkeys(merged_invariants))
@@ -421,6 +488,5 @@ def _inject_reminder_if_needed(ctx: RunContext[AgentDeps], result: str | dict | 
             else:
                 new_result["_todo_reminder"] = reminder.strip()
             return new_result
-            
-    _save_state(ctx, state)
+
     return result

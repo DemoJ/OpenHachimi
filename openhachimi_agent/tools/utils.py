@@ -46,15 +46,18 @@ SKIP_DIR_NAMES = {
 DANGEROUS_COMMAND_PATTERNS = [
     r"(?<!-)\brm\b",
     r"(?<!-)\bunlink\b",
+    r"(?<!-)\brmdir\b",
+    r"(?<!-)\bgit\s+reset\s+--hard\b",
+    r"(?<!-)\bgit\s+clean\b",
+    r"(?<!-)\bshutdown\b",
+]
+
+WINDOWS_DANGEROUS_COMMAND_PATTERNS = [
     r"(?<!-)\bremove-item\b",
     r"(?<!-)\bdel\b",
     r"(?<!-)\berase\b",
-    r"(?<!-)\brmdir\b",
     r"(?<!-)\brd\b",
-    r"(?<!-)\bgit\s+reset\s+--hard\b",
-    r"(?<!-)\bgit\s+clean\b",
-    r"(?<!-)\bformat\b",
-    r"(?<!-)\bshutdown\b",
+    r"(?:^|[;&|]\s*)(?:cmd(?:\.exe)?\s+/c\s+)?format(?:\s|$)",
     r"(?<!-)\brestart-computer\b",
     r"(?<!-)\bstop-process\b",
 ]
@@ -138,7 +141,11 @@ def trim_output(text: str, max_chars: int = MAX_COMMAND_OUTPUT_CHARS) -> tuple[s
 def assert_safe_command(command: str) -> None:
     """阻止明显危险的命令，保留测试、构建、查询类命令。"""
     normalized = command.lower()
-    for pattern in DANGEROUS_COMMAND_PATTERNS:
+    patterns = list(DANGEROUS_COMMAND_PATTERNS)
+    if platform.system() == "Windows":
+        patterns.extend(WINDOWS_DANGEROUS_COMMAND_PATTERNS)
+
+    for pattern in patterns:
         if re.search(pattern, normalized):
             raise ModelRetry(
                 f"命令包含高风险操作，已拒绝执行：{command}。\n"

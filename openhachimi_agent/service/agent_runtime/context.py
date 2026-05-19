@@ -73,6 +73,16 @@ def has_active_todos(session_state: dict[str, Any]) -> bool:
     return any(getattr(task, "status", None) != "done" for task in tasks.values())
 
 
+def has_restorable_suspended_plan(session_state: dict[str, Any]) -> bool:
+    if not session_state.get("suspended_plan"):
+        return False
+    todo_state = session_state.get("todo_state")
+    tasks = getattr(todo_state, "tasks", None)
+    if not isinstance(tasks, dict):
+        return False
+    return any(getattr(task, "status", None) != "done" for task in tasks.values())
+
+
 def _current_todo_state(session_state: dict[str, Any]) -> Any:
     return session_state.get("todo_state")
 
@@ -124,6 +134,21 @@ def complete_current_plan(session_state: dict[str, Any]) -> None:
             todo_state.is_active = False
     session_state["plan_status"] = "completed"
     session_state["active_plan_lease"] = {"status": "completed"}
+    session_state.pop("suspended_plan", None)
+
+
+def fail_current_plan(session_state: dict[str, Any], reason: str, detail: object | None = None) -> None:
+    session_state["plan_status"] = "failed"
+    session_state["last_plan_error"] = {
+        "reason": reason,
+        "detail": detail,
+        "task_frame": session_state.get("task_frame"),
+    }
+    session_state["active_plan_lease"] = {
+        "status": "failed",
+        "reason": reason,
+        "detail": detail,
+    }
     session_state.pop("suspended_plan", None)
 
 
