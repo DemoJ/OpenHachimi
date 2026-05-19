@@ -20,7 +20,14 @@ TaskKind = Literal[
 Complexity = Literal["simple", "complex"]
 RiskLevel = Literal["low", "medium", "high"]
 AllowedAutonomy = Literal["narrow", "bounded", "broad"]
+PlanContinuationAction = Literal["continue_active_plan", "resume_suspended_plan", "start_new_task"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>()\"'，。；、]+", re.IGNORECASE)
+
+
+class PlanContinuationDecision(BaseModel):
+    action: PlanContinuationAction = "start_new_task"
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    rationale: str = ""
 
 
 class IntentDecision(BaseModel):

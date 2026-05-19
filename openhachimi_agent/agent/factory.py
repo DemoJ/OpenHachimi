@@ -12,7 +12,7 @@ from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET
-from openhachimi_agent.agent.intent import TaskFrame
+from openhachimi_agent.agent.intent import PlanContinuationDecision, TaskFrame
 
 
 logger = logging.getLogger(__name__)
@@ -140,16 +140,18 @@ def build_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[s
     return _build_base_agent(config, role_name, "executor", allowed_tools=allowed_tools)
 
 
-def build_router_agent(config: AppConfig) -> Agent:
-    """创建用于路由决策的轻量级 Agent。"""
+def _build_router_model(config: AppConfig) -> OpenAIChatModel:
     provider = OpenAIProvider(
         base_url=config.openai_base_url or None,
         api_key=config.openai_api_key,
     )
-    
-    # 尽可能使用小模型（如果有配置的话，这里为了简单重用同一个配置，但实际中可以用更便宜的模型）
-    model = OpenAIChatModel(config.model_name, provider=provider)
-    
+    return OpenAIChatModel(config.model_name, provider=provider)
+
+
+def build_router_agent(config: AppConfig) -> Agent:
+    """创建用于路由决策的轻量级 Agent。"""
+    model = _build_router_model(config)
+
     skills = find_skills(config.skills_dirs)
     skills_info = "当前可用技能列表（技能名: 描述）：\n"
     if skills:
@@ -176,4 +178,23 @@ def build_router_agent(config: AppConfig) -> Agent:
         model,
         system_prompt=system_prompt,
         output_type=TaskFrame,
+    )
+
+
+def build_continuation_agent(config: AppConfig) -> Agent:
+    """创建用于判断用户是否要继续旧计划的轻量级 Agent。"""
+    system_prompt = (
+        "你是一个对话连续性判断器。只判断用户最新消息是否是在要求继续/恢复当前未完成计划，"
+        "还是提出了一个新的任务或问题。不要执行任务。\n"
+        "可选 action：\n"
+        "- continue_active_plan：用户明确要继续当前仍 active 的计划。\n"
+        "- resume_suspended_plan：用户明确要恢复已挂起的计划。\n"
+        "- start_new_task：用户提出新目标、新问题、切换话题，或意图不明确。\n"
+        "判断依据要结合用户原话、当前 TODO 摘要、挂起原因和 TaskFrame；"
+        "不确定时选择 start_new_task，避免旧计划绑架新对话。"
+    )
+    return Agent(
+        _build_router_model(config),
+        system_prompt=system_prompt,
+        output_type=PlanContinuationDecision,
     )

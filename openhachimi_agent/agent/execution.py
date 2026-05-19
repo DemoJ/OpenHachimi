@@ -165,7 +165,7 @@ def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, ob
 
     todo_state = session_state.get("todo_state")
     tasks = getattr(todo_state, "tasks", None)
-    if isinstance(tasks, dict) and tasks:
+    if getattr(todo_state, "is_active", False) and isinstance(tasks, dict) and tasks:
         unfinished = [
             {
                 "id": getattr(task, "id", task_id),
@@ -180,7 +180,12 @@ def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, ob
 
     ledger = session_state.get("execution_ledger", [])
     if isinstance(ledger, list) and ledger:
-        latest = ledger[-1]
+        turn_start_seq = int(session_state.get("current_turn_ledger_start_seq", 0) or 0)
+        current_turn_events = [
+            event for event in ledger
+            if isinstance(event, dict) and int(event.get("seq", 0)) > turn_start_seq
+        ]
+        latest = current_turn_events[-1] if current_turn_events else None
         if isinstance(latest, dict) and latest.get("status") in {"blocked", "failed"}:
             issues.append(
                 {

@@ -8,28 +8,32 @@ import time
 import weakref
 from collections.abc import AsyncIterator
 
-from pydantic_ai.messages import (
-    FunctionToolCallEvent,
-    FunctionToolResultEvent,
-    ModelMessage,
-    PartDeltaEvent,
-    PartStartEvent,
-    TextPart,
-    TextPartDelta,
-)
-
-from openhachimi_agent.agent.factory import build_executor_agent, build_planner_agent, build_router_agent
-from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
-from openhachimi_agent.agent.intent import build_task_frame, classify_intent_heuristic, coerce_task_frame
+from openhachimi_agent.agent.factory import build_continuation_agent, build_executor_agent, build_planner_agent, build_router_agent
 from openhachimi_agent.content.roles import list_role_names
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.service.agent_runtime.context import (
+    AgentRunContext,
+    complete_current_plan,
+    mark_turn_finished,
+    mark_turn_started,
+    suspend_current_plan,
+)
+from openhachimi_agent.service.agent_runtime.executor import execute_task
+from openhachimi_agent.service.agent_runtime.planner import needs_planning, run_planner
+from openhachimi_agent.service.agent_runtime.router import resolve_task_frame, should_route_message
+from openhachimi_agent.service.agent_runtime.streaming import (
+    STREAM_DONE,
+    OperationStalledError,
+    StreamStats,
+    build_stream_event_handler,
+    consume_stream_queue,
+)
 from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
 from openhachimi_agent.transport.api_models import AgentState, ChatResponse, CommandResponse, RolesResponse
 
 
 logger = logging.getLogger(__name__)
-_STREAM_DONE = object()
 
 
 def _error_message(exc: BaseException) -> str:
@@ -38,47 +42,6 @@ def _error_message(exc: BaseException) -> str:
         return f"{exc.__class__.__name__}: {text}"
     return exc.__class__.__name__
 
-
-def _text_from_stream_event(event: object) -> str:
-    if isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-        return event.delta.content_delta
-    if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-        return event.part.content
-    return ""
-
-
-def _summarize_tool_args(args: object, max_chars: int = 160) -> str:
-    if args in (None, "", {}):
-        return ""
-    if isinstance(args, str):
-        text = args
-    else:
-        try:
-            text = json.dumps(args, ensure_ascii=False)
-        except TypeError:
-            text = str(args)
-    text = " ".join(text.split())
-    if len(text) > max_chars:
-        return text[: max_chars - 3] + "..."
-    return text
-
-
-def _status_from_stream_event(event: object) -> str:
-    if isinstance(event, FunctionToolCallEvent):
-        tool_name = event.part.tool_name
-        args = _summarize_tool_args(event.part.args_as_dict())
-        if args:
-            return f"\n[工具] 正在调用 {tool_name}：{args}\n"
-        return f"\n[工具] 正在调用 {tool_name}\n"
-
-    if isinstance(event, FunctionToolResultEvent):
-        result = event.result
-        outcome = getattr(result, "outcome", "success")
-        if outcome == "success":
-            return f"[工具] {result.tool_name} 完成\n"
-        return f"[工具] {result.tool_name} 结束：{outcome}\n"
-
-    return ""
 
 
 class AgentService:
@@ -150,6 +113,8 @@ class AgentService:
                 
             if agent_type == "router":
                 agent = build_router_agent(self.config)
+            elif agent_type == "continuation":
+                agent = build_continuation_agent(self.config)
             elif agent_type == "planner":
                 agent = build_planner_agent(self.config, role_name)
             else:
@@ -219,7 +184,7 @@ class AgentService:
     async def _run_with_session(self, message: str, role: str | None, session_id: str | None, stream: bool) -> AsyncIterator[object]:
         start_time = time.perf_counter()
         role = role or self.config.default_role_name
-        
+
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
         lock = self._get_session_lock(actual_session_id)
 
@@ -233,219 +198,61 @@ class AgentService:
                 str(stream).lower(),
             )
 
+            if actual_session_id not in self._session_states:
+                self._session_states[actual_session_id] = {}
+            session_state = self._session_states[actual_session_id]
+            deps = AgentDeps(
+                config=self.config,
+                session_id=actual_session_id,
+                browser_manager=self.browser_manager,
+                process_manager=self.process_manager,
+                session_state=session_state,
+            )
             stream_queue: asyncio.Queue[str | object] = asyncio.Queue()
+            stream_stats = StreamStats()
             result_holder: dict[str, object] = {}
-
-            async def handle_stream_events(_ctx: object, stream_event: object) -> None:
-                async for event in stream_event:  # type: ignore[attr-defined]
-                    if chunk := _text_from_stream_event(event):
-                        await stream_queue.put(chunk)
-                    if status := _status_from_stream_event(event):
-                        await stream_queue.put(status)
+            ctx = AgentRunContext(
+                config=self.config,
+                role=role,
+                session_id=actual_session_id,
+                message=message,
+                history=history,
+                deps=deps,
+                session_state=session_state,
+                stream=stream,
+                stream_queue=stream_queue,
+            )
+            ctx.stream_event_handler = build_stream_event_handler(stream_queue, ctx.operation_state)
+            should_route = await should_route_message(ctx, self._get_agent)
 
             async def run_agent() -> None:
+                mark_turn_started(session_state)
                 try:
-                    if actual_session_id not in self._session_states:
-                        self._session_states[actual_session_id] = {}
-                    session_state = self._session_states[actual_session_id]
-                    deps = AgentDeps(
-                        config=self.config, 
-                        session_id=actual_session_id, 
-                        browser_manager=self.browser_manager,
-                        process_manager=self.process_manager,
-                        session_state=session_state
-                    )
-
-                    # 1. 检查是否存在正在进行的 TODO
-                    has_active_todos = False
-                    if "todo_state" in session_state:
-                        todo_state = session_state["todo_state"]
-                        if todo_state.is_active and todo_state.tasks:
-                            if any(t.status != "done" for t in todo_state.tasks.values()):
-                                has_active_todos = True
-                    
-                    # 2. 如果没有活动的 TODO，且是一句新的指令，通过 Router 判断复杂度
-                    if not has_active_todos and len(history) % 2 == 0:  # 假设新的一轮，只有在没有活动 TODO 时才做 router 判断
-                        task_frame = None
-                        try:
-                            router_agent = self._get_agent(role, "router")
-                            router_result = await router_agent.run(f"指令：{message}")
-                            router_data = getattr(router_result, "data", getattr(router_result, "output", None))
-                            task_frame = coerce_task_frame(router_data, message)
-                        except Exception as router_e:
-                            decision = classify_intent_heuristic(message)
-                            if not (decision.task_kind == "browser" and decision.target_urls and decision.risk != "high"):
-                                decision.requires_plan = True
-                            decision.rationale = f"router failed: {router_e.__class__.__name__}"
-                            task_frame = build_task_frame(message, decision)
-                            logger.warning("Router failed: %s. Falling back to conservative planning.", router_e)
-
-                        logger.info(
-                            "Task frame kind=%s complexity=%s risk=%s confidence=%.2f requires_plan=%s autonomy=%s targets=%s rationale=%s",
-                            task_frame.task_kind,
-                            task_frame.complexity,
-                            task_frame.risk,
-                            task_frame.confidence,
-                            task_frame.requires_plan,
-                            task_frame.allowed_autonomy,
-                            [entity.value for entity in task_frame.target_entities],
-                            task_frame.rationale,
-                        )
-
+                    if should_route:
+                        task_frame = await resolve_task_frame(ctx, self._get_agent)
                         session_state["task_frame"] = task_frame.model_dump(mode="json")
+                        if needs_planning(task_frame):
+                            await run_planner(ctx, task_frame, self._get_agent)
 
-                        # 3. 如果是复杂/高风险/低置信任务，强制进入 Planner 进行规划
-                        if task_frame.requires_plan or task_frame.confidence < 0.5:
-                            planner_agent = self._get_agent(role, "planner")
-                            if stream:
-                                await stream_queue.put(
-                                    "\n\n[System] 检测到任务需要前置规划，正在进行只读调研与计划拆解...\n"
-                                )
-                            heartbeat_task: asyncio.Task | None = None
-
-                            async def planner_heartbeat() -> None:
-                                interval = max(5, min(20, self.config.stream_idle_timeout_seconds // 2))
-                                while True:
-                                    await asyncio.sleep(interval)
-                                    await stream_queue.put("\n[System] 规划仍在进行中，等待模型返回计划...\n")
-
-                            if stream:
-                                heartbeat_task = asyncio.create_task(planner_heartbeat())
-                            try:
-                                planner_result = await planner_agent.run(
-                                    "请针对以下 TaskFrame 制定执行计划。\n"
-                                    "你只需要制定计划（使用 create_todos），不需要自己执行任何调研或搜索。\n"
-                                    "Executor 拥有浏览器、文件操作、命令行、web_fetch、web_search 等全部工具，请基于对这些工具能力的理解来规划步骤。\n"
-                                    "如果用户提供了明确的 URL 或文件路径，计划应从直接访问该目标开始。\n"
-                                    "TaskFrame 是任务契约：计划必须继承 goal、target_entities、invariants，不得扩大或替换目标。\n"
-                                    "计划中的每个任务应尽量包含 description、depends_on、success_criteria、verification、risk_level；"
-                                    "如果某一步只允许特定工具，可填写 allowed_tools。\n"
-                                    f"TaskFrame：{task_frame.model_dump_json(ensure_ascii=False)}\n"
-                                    f"用户原始任务：{message}",
-                                    message_history=history,
-                                    deps=deps
-                                )
-                            finally:
-                                if heartbeat_task is not None:
-                                    heartbeat_task.cancel()
-                                    with contextlib.suppress(asyncio.CancelledError):
-                                        await heartbeat_task
-                            # 将规划历史记录附加到执行前
-                            history.extend(planner_result.all_messages())
-                            
-                    # 4. 最后交给 Executor Agent 执行
-                    executor_agent = self._get_agent(role, "executor")
-                    task_frame_payload = session_state.get("task_frame")
-                    
-                    if task_frame_payload:
-                        relevant_skills = task_frame_payload.get("relevant_skills", [])
-                        if relevant_skills:
-                            from openhachimi_agent.content.skills import find_skills
-                            from openhachimi_agent.agent.factory import build_executor_agent
-                            skills = find_skills(self.config.skills_dirs)
-                            allowed_tools_set = set()
-                            is_restricted = False
-                            for s in skills:
-                                if s.config.name in relevant_skills and s.config.allowed_tools:
-                                    is_restricted = True
-                                    allowed_tools_set.update(s.config.allowed_tools)
-                            if is_restricted:
-                                logger.info("sandboxing executor agent for role=%s restricted_tools=%s", role, allowed_tools_set)
-                                executor_agent = build_executor_agent(self.config, role, allowed_tools=allowed_tools_set)
-
-                    executor_message = message
-                    if task_frame_payload:
-                        executor_message = (
-                            "请执行以下用户任务。必须遵守 TaskFrame 中的 goal、target_entities、invariants、allowed_autonomy 和 replan_triggers；"
-                            "如果工具观察结果与 TaskFrame 冲突，应停止当前动作并重新校准目标。\n"
-                            f"TaskFrame：{json.dumps(task_frame_payload, ensure_ascii=False)}\n"
-                            f"用户原始任务：{message}"
-                        )
-                    
-                    kwargs = {
-                        "message_history": history,
-                        "deps": deps,
-                    }
-
-                    async def run_executor_once(run_message: str):
-                        from pydantic_ai.usage import UsageLimits
-                        run_kwargs = {**kwargs, "usage_limits": UsageLimits(request_limit=60)}
-                        if stream:
-                            run_kwargs["event_stream_handler"] = handle_stream_events
-                            return await executor_agent.run(run_message, **run_kwargs)
-                        
-                        return await asyncio.wait_for(
-                            executor_agent.run(run_message, **run_kwargs),
-                            timeout=self.config.agent_timeout_seconds,
-                        )
-
-                    async def replan_after_execution_signal(signal: dict[str, object]) -> None:
-                        planner_agent = self._get_agent(role, "planner")
-                        if stream:
-                            await stream_queue.put("\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n")
-                        planner_result = await planner_agent.run(
-                            "Executor 在执行时触发了 TaskFrame 偏差或工具失败。请基于 TaskFrame、当前 TODO 和 execution ledger 摘要修订计划。\n"
-                            "要求：保持 TaskFrame 的 goal、target_entities、invariants 不变；不要扩大任务目标；"
-                            "如果原计划错误，请调用 create_todos 重建一个更窄、更可执行的计划。\n"
-                            f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
-                            f"Execution ledger replan signal：{json.dumps(signal, ensure_ascii=False)}\n"
-                            f"用户原始任务：{message}",
-                            message_history=history,
+                    outcome = await execute_task(ctx, self._get_agent)
+                    result_holder["result"] = outcome.result
+                    if outcome.final_verification_signal:
+                        result_holder["final_verification_signal"] = outcome.final_verification_signal
+                        suspend_current_plan(
+                            session_state,
+                            reason="final_verification_failed",
+                            detail=outcome.final_verification_signal,
                             deps=deps,
                         )
-                        history.extend(planner_result.all_messages())
-
-                    ledger_start_seq = get_ledger_length(session_state)
-                    if stream:
-                        kwargs["event_stream_handler"] = handle_stream_events
-                    try:
-                        result = await run_executor_once(executor_message)
-                    except Exception:
-                        signal = get_replan_signal(session_state, ledger_start_seq)
-                        if signal and not session_state.get("replan_attempted"):
-                            session_state["replan_attempted"] = True
-                            logger.info(
-                                "triggering replan role=%s session_id=%s signal=%s",
-                                role,
-                                actual_session_id,
-                                json.dumps(signal, ensure_ascii=False),
-                            )
-                            await replan_after_execution_signal(signal)
-                            retry_message = (
-                                "请根据刚刚修订后的计划继续执行用户任务。必须遵守 TaskFrame 和新的 TODO；"
-                                "如果再次遇到同类偏差，请停止并向用户说明阻塞原因。\n"
-                                f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
-                                f"用户原始任务：{message}"
-                            )
-                            result = await run_executor_once(retry_message)
-                        else:
-                            raise
-
-                    verification_signal = get_final_verification_signal(session_state)
-                    if verification_signal and not session_state.get("final_verification_repair_attempted"):
-                        session_state["final_verification_repair_attempted"] = True
-                        logger.info(
-                            "triggering final verification repair role=%s session_id=%s signal=%s",
-                            role,
-                            actual_session_id,
-                            json.dumps(verification_signal, ensure_ascii=False),
-                        )
-                        if stream:
-                            await stream_queue.put("\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n")
-                        repair_message = (
-                            "最终验证器发现当前执行结果尚不足以宣称完成。请只补齐验证器指出的缺口，"
-                            "继续严格遵守 TaskFrame、TODO 和执行记录；完成后必须更新 TODO 或提供足够证据。\n"
-                            f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
-                            f"Final verification signal：{json.dumps(verification_signal, ensure_ascii=False)}\n"
-                            f"用户原始任务：{message}"
-                        )
-                        result = await run_executor_once(repair_message)
-                        verification_signal = get_final_verification_signal(session_state)
-
-                    if verification_signal:
-                        result_holder["final_verification_signal"] = verification_signal
-                    result_holder["result"] = result
+                    else:
+                        complete_current_plan(session_state)
                 except asyncio.TimeoutError as exc:
+                    suspend_current_plan(
+                        session_state,
+                        reason="operation_timeout",
+                        detail=str(exc),
+                        deps=deps,
+                    )
                     if stream:
                         result_holder["error"] = TimeoutError(
                             "Agent 执行超时："
@@ -469,10 +276,25 @@ class AgentService:
                             actual_session_id,
                         )
                 except asyncio.CancelledError:
-                    # Let CancelledError propagate natively
-                    logger.info("chat stream cancelled role=%s session_id=%s" if stream else "chat cancelled role=%s session_id=%s stream=false", role, actual_session_id)
+                    suspend_current_plan(
+                        session_state,
+                        reason="cancelled",
+                        detail="agent task cancelled",
+                        deps=deps,
+                    )
+                    logger.info(
+                        "chat stream cancelled role=%s session_id=%s" if stream else "chat cancelled role=%s session_id=%s stream=false",
+                        role,
+                        actual_session_id,
+                    )
                     raise
                 except Exception as exc:
+                    suspend_current_plan(
+                        session_state,
+                        reason="error",
+                        detail=str(exc),
+                        deps=deps,
+                    )
                     result_holder["error"] = exc
                     logger.exception(
                         "chat failed role=%s session_id=%s stream=%s",
@@ -481,72 +303,41 @@ class AgentService:
                         str(stream).lower(),
                     )
                 finally:
+                    mark_turn_finished(session_state)
                     if stream:
-                        await stream_queue.put(_STREAM_DONE)
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await stream_queue.put(STREAM_DONE)
 
             task = asyncio.create_task(run_agent())
             self._running_tasks[actual_session_id] = task
 
             try:
                 if stream:
-                    output_chars = 0
-                    chunk_count = 0
-                    first_chunk_ms: float | None = None
-                    last_chunk_preview = ""
-                    
-                    while True:
-                        try:
-                            item = await asyncio.wait_for(
-                                stream_queue.get(),
-                                timeout=self.config.stream_idle_timeout_seconds,
-                            )
-                        except asyncio.TimeoutError as exc:
-                            elapsed_ms = (time.perf_counter() - start_time) * 1000
-                            task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
-                            logger.error(
-                                "chat stream idle timeout role=%s session_id=%s idle_timeout_seconds=%d chunks=%d output_chars=%d duration_ms=%.0f last_chunk=%s",
-                                role,
-                                actual_session_id,
-                                self.config.stream_idle_timeout_seconds,
-                                chunk_count,
-                                output_chars,
-                                elapsed_ms,
-                                last_chunk_preview,
-                            )
-                            last_chunk_detail = f"最后片段={last_chunk_preview!r}，" if last_chunk_preview else ""
-                            raise TimeoutError(
-                                "流式回复超时："
-                                f"{self.config.stream_idle_timeout_seconds}s 内没有收到新的模型片段或工具状态。"
-                                f"已收到片段数={chunk_count}，已输出字符数={output_chars}，"
-                                f"{last_chunk_detail}"
-                                f"模型={self.config.model_name}，"
-                                f"base_url={self.config.openai_base_url or '默认'}，"
-                                f"role={role}，session_id={actual_session_id}。"
-                                "如果刚显示了几个字就停住，通常是后续模型请求、工具调用、浏览器或网络代理卡住。"
-                            ) from exc
-                        if item is _STREAM_DONE:
-                            break
-            
-                        chunk = str(item)
-                        compact_chunk = " ".join(chunk.split())
-                        if len(compact_chunk) > 120:
-                            compact_chunk = compact_chunk[:117] + "..."
-                        if compact_chunk:
-                            last_chunk_preview = compact_chunk
-                        if first_chunk_ms is None:
-                            first_chunk_ms = (time.perf_counter() - start_time) * 1000
-                            logger.info(
-                                "chat first chunk role=%s session_id=%s first_chunk_ms=%.0f chunk_chars=%d",
-                                role,
-                                actual_session_id,
-                                first_chunk_ms,
-                                len(chunk),
-                            )
-                        chunk_count += 1
-                        output_chars += len(chunk)
-                        yield chunk
+                    try:
+                        async for chunk in consume_stream_queue(
+                            stream_queue=stream_queue,
+                            task=task,
+                            config=self.config,
+                            role=role,
+                            session_id=actual_session_id,
+                            start_time=start_time,
+                            stats=stream_stats,
+                            operation_state=ctx.operation_state,
+                        ):
+                            yield chunk
+                    except OperationStalledError as exc:
+                        suspend_current_plan(
+                            session_state,
+                            reason="operation_stalled",
+                            detail={"operation": exc.operation, "stalled_for": exc.stalled_for, "timeout": exc.timeout},
+                            deps=deps,
+                        )
+                        yield (
+                            "\n\n[System] 当前任务已暂停："
+                            f"{exc} 旧计划已挂起，不会影响下一轮对话；"
+                            "如需恢复，请明确说明“继续刚才的任务”。"
+                        )
+                        return
 
                     try:
                         await task
@@ -575,11 +366,10 @@ class AgentService:
                     if error := result_holder.get("error"):
                         raise error
 
-                # Common history saving
                 result = result_holder["result"]
                 new_history = list(result.all_messages())  # type: ignore[attr-defined]
                 history_json = result.all_messages_json()  # type: ignore[attr-defined]
-                
+
                 await asyncio.to_thread(
                     save_message_history,
                     self.config.memory_dir,
@@ -589,26 +379,26 @@ class AgentService:
                 )
 
                 if stream:
-                    if not chunk_count:
+                    if not stream_stats.chunk_count:
                         output = str(result.output)  # type: ignore[attr-defined]
                         if output:
-                            output_chars = len(output)
-                            chunk_count = 1
+                            stream_stats.output_chars = len(output)
+                            stream_stats.chunk_count = 1
                             logger.info(
                                 "chat produced non-streamed output role=%s session_id=%s output_chars=%d",
                                 role,
                                 actual_session_id,
-                                output_chars,
+                                stream_stats.output_chars,
                             )
                             yield output
-            
+
                     logger.info(
                         "chat finished role=%s session_id=%s output_chars=%d chunks=%d first_chunk_ms=%s history_messages=%d duration_ms=%.0f stream=true",
                         role,
                         actual_session_id,
-                        output_chars,
-                        chunk_count,
-                        f"{first_chunk_ms:.0f}" if first_chunk_ms is not None else None,
+                        stream_stats.output_chars,
+                        stream_stats.chunk_count,
+                        f"{stream_stats.first_chunk_ms:.0f}" if stream_stats.first_chunk_ms is not None else None,
                         len(new_history),
                         (time.perf_counter() - start_time) * 1000,
                     )
@@ -632,7 +422,6 @@ class AgentService:
                         role=role,
                         session_id=actual_session_id,
                     )
-
             finally:
                 self._running_tasks.pop(actual_session_id, None)
                 if not task.done():

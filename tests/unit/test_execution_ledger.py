@@ -88,3 +88,21 @@ def test_final_verifier_detects_latest_failed_event(mock_agent_deps):
 
     assert signal is not None
     assert signal["issues"][0]["type"] == "latest_execution_not_successful"
+
+
+def test_final_verifier_ignores_suspended_todos(mock_agent_deps):
+    ctx = MockRunContext(deps=mock_agent_deps)
+    create_todos(ctx, ["Open the page"])
+    mock_agent_deps.session_state["todo_state"].is_active = False
+
+    assert get_final_verification_signal(mock_agent_deps.session_state) is None
+
+
+def test_final_verifier_ignores_previous_turn_failed_event(mock_agent_deps):
+    mock_agent_deps.session_state["execution_ledger"] = [
+        {"seq": 1, "tool_name": "run_command", "status": "failed", "result_preview": "old boom"},
+        {"seq": 2, "tool_name": "read_file", "status": "succeeded", "result_preview": "ok"},
+    ]
+    mock_agent_deps.session_state["current_turn_ledger_start_seq"] = 1
+
+    assert get_final_verification_signal(mock_agent_deps.session_state) is None
