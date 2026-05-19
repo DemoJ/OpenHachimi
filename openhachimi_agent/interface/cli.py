@@ -13,6 +13,8 @@ from urllib.request import Request, urlopen
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
+from openhachimi_agent.interface.presenter import ToolProgressPresenter
+from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.service.agent_service import AgentService
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,7 @@ ROLE_LIST_COMMANDS = {"/roles", "/list-roles"}
 STOP_COMMANDS = {"/stop", "停止"}
 DEBUG_TOOLS_COMMANDS = {"/debug_tools", "/debug-tools"}
 DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
+_MAX_LIVE_TOOL_LINES = 6
 
 
 def get_server_url() -> str:
@@ -62,10 +65,13 @@ def request_stream(server_url: str, path: str, payload: dict[str, object]):
                     if "error" in data_json:
                         raise URLError(data_json["error"])
                     event_type = data_json.get("type")
-                    if event_type == "tool":
-                        yield f"\n[工具] {data_json.get('text', '')}\n"
-                    elif event_type in {"text", "system"}:
-                        yield data_json.get("text", "")
+                    if event_type in {"text", "tool", "system"}:
+                        yield StreamEventItem(
+                            type=event_type,
+                            text=data_json.get("text", ""),
+                            tool_name=data_json.get("tool_name"),
+                            temporary=bool(data_json.get("temporary", False)),
+                        )
                     elif "text" in data_json:
                         yield data_json["text"]
                 except json.JSONDecodeError:
@@ -114,7 +120,7 @@ class CliBackend(Protocol):
     async def new_session(self, role: str) -> tuple[str, str, str]: ...
     async def stop_session(self, session_id: str) -> str: ...
     async def switch_role(self, role: str) -> tuple[str, str, str]: ...
-    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str]: ...
+    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str | StreamEventItem]: ...
 
 
 class EmbeddedBackend:
@@ -148,9 +154,9 @@ class EmbeddedBackend:
         resp = self.service.switch_role(role)
         return resp.role, resp.session_id, resp.message
 
-    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str]:
-        async for chunk in self.service.stream_message(message, role, session_id, include_tool_events=include_tool_events):
-            yield chunk
+    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str | StreamEventItem]:
+        async for event in self.service.stream_events(message, role, session_id):
+            yield event
 
 
 class HttpBackend:
@@ -192,7 +198,7 @@ class HttpBackend:
         except Exception as exc:
             raise RuntimeError(str(exc)) from exc
 
-    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str]:
+    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str | StreamEventItem]:
         q: asyncio.Queue[str | Exception | None] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
@@ -202,7 +208,7 @@ class HttpBackend:
                     "message": message,
                     "role": role,
                     "session_id": session_id,
-                    "include_tool_events": include_tool_events,
+                    "include_tool_events": True,
                 }):
                     loop.call_soon_threadsafe(q.put_nowait, chunk)
                 loop.call_soon_threadsafe(q.put_nowait, None)
@@ -318,8 +324,16 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
 
         try:
             print("哈基米 > ", end="", flush=True)
-            async for chunk in backend.stream_message(user_input, current_role, current_session_id, show_tool_events):
-                print(chunk, end="", flush=True)
+            presenter = ToolProgressPresenter(mode="cli")
+            async for event in backend.stream_message(user_input, current_role, current_session_id, show_tool_events):
+                if isinstance(event, StreamEventItem):
+                    for action in presenter.handle_event(event):
+                        if action.type == "tool":
+                            print(f"\n[工具] {action.text}", flush=True)
+                        elif action.type in {"text", "system"}:
+                            print(action.text, end="", flush=True)
+                else:
+                    print(event, end="", flush=True)
         except Exception as exc:
             print(f"\n哈基米 > 调用模型时出错：{exc}")
         

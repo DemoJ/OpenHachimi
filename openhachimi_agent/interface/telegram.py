@@ -28,6 +28,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_service import AgentService
 
 
@@ -130,26 +131,6 @@ def _md_to_tg_html(text: str) -> str:
     return text
 
 
-def _trim_tool_line(text: str, max_len: int = 140) -> str:
-    compact = " ".join(text.split())
-    if len(compact) > max_len:
-        return compact[: max_len - 3] + "..."
-    return compact
-
-
-def _build_live_display(final_text: str, system_text: str, tool_lines: list[str]) -> str:
-    sections: list[str] = []
-    if tool_lines:
-        sections.append("工具进度：\n" + "\n".join(f"• {line}" for line in tool_lines[-_MAX_LIVE_TOOL_LINES:]))
-    if system_text.strip():
-        sections.append(system_text.strip())
-    if final_text.strip():
-        sections.append("回复：\n" + final_text.strip())
-    else:
-        sections.append("⏳ 正在处理……")
-    return "\n\n".join(sections)
-
-
 async def _keep_typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
@@ -197,6 +178,7 @@ class TelegramBot:
     def _is_debug_tools_enabled(self, user_id: int) -> bool:
         return self._debug_tools_overrides.get(user_id, self.config.show_tool_events)
 
+    def _get_user_lock(self, user_id: int) -> asyncio.Lock:
         if user_id not in self._user_locks:
             if len(self._user_locks) >= 1000:
                 oldest_user = next(iter(self._user_locks))
@@ -337,45 +319,80 @@ class TelegramBot:
             # 先发出占位消息
             placeholder = await update.message.reply_text("⏳ 思考中……")
 
-            final_text = ""
-            system_text = ""
-            tool_lines: list[str] = []
-            debug_text = ""
             debug_tools_enabled = self._is_debug_tools_enabled(user_id)
-            accumulated = ""
-            last_edit_time = time.monotonic()
-            sent_parts: list = [placeholder]
-            finalized_parts = 0
+            presenter = ToolProgressPresenter(
+                mode="conversation",
+                show_all_tools=debug_tools_enabled,
+                max_tool_lines=_MAX_LIVE_TOOL_LINES,
+            )
+            unused_placeholder = True
+            current_tool_text = ""
+            tool_messages: list = []
+            answer_text = ""
+            system_text = ""
+            answer_messages: list = []
+            last_answer_edit_time = time.monotonic()
             typing_task = asyncio.create_task(_keep_typing(update, ctx))
 
-            async def flush(final: bool = False) -> None:
-                """将累积内容同步到 Telegram 消息。
+            async def edit_or_send(messages: list, index: int, text: str, parse_mode=None):
+                if index < len(messages):
+                    try:
+                        await messages[index].edit_text(text, parse_mode=parse_mode)
+                        return messages[index]
+                    except TelegramError as exc:
+                        if _is_message_not_modified(exc):
+                            return messages[index]
+                        logger.warning(
+                            "telegram edit_text failed user_id=%d part=%d: %s",
+                            user_id,
+                            index,
+                            _exception_text(exc),
+                            exc_info=True,
+                        )
+                return await update.message.reply_text(text, parse_mode=parse_mode)
 
-                final=False：显示临时工具进度与已生成正文。
-                final=True：只渲染最终正文，清理临时工具进度。
-                """
-                nonlocal last_edit_time, sent_parts, accumulated, finalized_parts
-                if final:
-                    final_chunks = []
-                    if final_text.strip():
-                        final_chunks.append(final_text.strip())
-                    if system_text.strip():
-                        final_chunks.append(system_text.strip())
-                    if debug_tools_enabled and debug_text.strip():
-                        final_chunks.append("工具调用调试信息：\n" + debug_text.strip())
-                    accumulated = "\n\n".join(final_chunks)
-                else:
-                    accumulated = _build_live_display(final_text, system_text, tool_lines)
-                if not accumulated:
+            async def ensure_tool_messages() -> None:
+                nonlocal unused_placeholder, tool_messages
+                if tool_messages:
                     return
+                if unused_placeholder:
+                    tool_messages = [placeholder]
+                    unused_placeholder = False
+                else:
+                    tool_messages = [await update.message.reply_text("⏳ 工具调用中……")]
 
-                parts = _split_long_text(accumulated)
+            async def ensure_answer_messages() -> None:
+                nonlocal unused_placeholder, answer_messages
+                if answer_messages:
+                    return
+                if unused_placeholder:
+                    answer_messages = [placeholder]
+                    unused_placeholder = False
+                else:
+                    answer_messages = [await update.message.reply_text("⏳ 回复中……")]
 
+            async def render_tool_messages() -> None:
+                if not current_tool_text:
+                    return
+                await ensure_tool_messages()
+                parts = _split_long_text(current_tool_text)
                 for i, part in enumerate(parts):
-                    is_last_part = (i == len(parts) - 1)
+                    msg = await edit_or_send(tool_messages, i, part)
+                    if i >= len(tool_messages):
+                        tool_messages.append(msg)
 
+            async def render_answer_messages(final: bool = False) -> None:
+                nonlocal last_answer_edit_time
+                content = "\n\n".join(part.strip() for part in [answer_text, system_text] if part.strip())
+                if not content:
+                    return
+                await ensure_answer_messages()
+                parts = _split_long_text(content)
+                for i, part in enumerate(parts):
+                    is_last_part = i == len(parts) - 1
+                    parse_mode = None
+                    display = part
                     if final:
-                        # 最终渲染：转换为 HTML，若失败则回退到纯文本
                         try:
                             display = _md_to_tg_html(part)
                             parse_mode = constants.ParseMode.HTML
@@ -385,88 +402,78 @@ class TelegramBot:
                                 _exception_text(exc),
                                 exc_info=True,
                             )
-                            display = part
-                            parse_mode = None
-                    else:
-                        display = part + (" ▌" if is_last_part else "")
-                        parse_mode = None
+                    elif is_last_part:
+                        display = part + " ▌"
+                    msg = await edit_or_send(answer_messages, i, display, parse_mode=parse_mode)
+                    if i >= len(answer_messages):
+                        answer_messages.append(msg)
+                last_answer_edit_time = time.monotonic()
 
-                    target_index = finalized_parts + i
-                    if target_index < len(sent_parts):
-                        try:
-                            await sent_parts[target_index].edit_text(display, parse_mode=parse_mode)
-                        except TelegramError as exc:
-                            if _is_message_not_modified(exc):
-                                continue
-                            logger.warning(
-                                "telegram edit_text failed user_id=%d part=%d final=%s: %s",
-                                user_id,
-                                i,
-                                final,
-                                _exception_text(exc),
-                                exc_info=True,
-                            )
-                            try:
-                                new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
-                                sent_parts[target_index] = new_msg
-                            except Exception as fallback_exc:
-                                raise RuntimeError(
-                                    "Telegram 更新回复失败，且发送备用消息也失败："
-                                    f"edit={_exception_text(exc)}; "
-                                    f"reply={_exception_text(fallback_exc)}"
-                                ) from fallback_exc
-                    else:
-                        try:
-                            new_msg = await update.message.reply_text(display, parse_mode=parse_mode)
-                            sent_parts.append(new_msg)
-                        except Exception as exc:
-                            raise RuntimeError(f"Telegram 发送分段回复失败：{_exception_text(exc)}") from exc
+            async def finalize_answer_segment() -> None:
+                nonlocal answer_text, system_text, answer_messages
+                await render_answer_messages(final=True)
+                answer_text = ""
+                system_text = ""
+                answer_messages = []
 
-                if final:
-                    finalized_parts = max(finalized_parts, len(parts))
-                    tool_lines.clear()
-                last_edit_time = time.monotonic()
+            async def finalize_tool_segment() -> None:
+                nonlocal current_tool_text, tool_messages
+                await render_tool_messages()
+                current_tool_text = ""
+                tool_messages = []
 
             try:
                 async for event in self.service.stream_events(user_text, role, session_id):
-                    if event.type == "text":
-                        final_text += event.text
-                        tool_lines.clear()
-                    elif event.type == "system":
-                        system_text += event.text
-                    elif event.type == "tool":
-                        if final_text.strip():
-                            await flush(final=True)
-                            final_text = ""
-                            system_text = ""
-                        if debug_tools_enabled:
-                            debug_text += f"[工具] {event.text}\n"
-                            await flush(final=False)
-                        tool_lines.append(_trim_tool_line(event.text))
-                        if time.monotonic() - last_edit_time >= _EDIT_INTERVAL:
-                            await flush(final=False)
+                    for action in presenter.handle_event(event):
+                        if action.type == "tool":
+                            if answer_text.strip() or system_text.strip():
+                                await finalize_answer_segment()
+                            current_tool_text = action.text
+                            await render_tool_messages()
+                        elif action.type == "text":
+                            if current_tool_text:
+                                await finalize_tool_segment()
+                            answer_text += action.text
+                            if time.monotonic() - last_answer_edit_time >= _EDIT_INTERVAL:
+                                await render_answer_messages(final=False)
+                        elif action.type == "system":
+                            if current_tool_text:
+                                await finalize_tool_segment()
+                            system_text += action.text
+                            if time.monotonic() - last_answer_edit_time >= _EDIT_INTERVAL:
+                                await render_answer_messages(final=False)
 
-                # 流结束，转换为 HTML 完整渲染
-                await flush(final=True)
-                if finalized_parts == 0:
-                    await sent_parts[0].edit_text("任务已完成，但没有生成文本回复。")
+                for action in presenter.finalize():
+                    if action.type == "tool":
+                        current_tool_text = action.text
+                        await render_tool_messages()
+                        current_tool_text = ""
+                if current_tool_text:
+                    await finalize_tool_segment()
+                if answer_text.strip() or system_text.strip():
+                    await finalize_answer_segment()
+                if unused_placeholder:
+                    await placeholder.edit_text("任务已完成，但没有生成文本回复。")
 
             except Exception as exc:
                 logger.exception("telegram stream error user_id=%d", user_id)
                 err_text = f"⚠️ 调用 Agent 时出错：{_exception_text(exc)}"
                 try:
-                    await sent_parts[0].edit_text(err_text)
+                    if answer_messages:
+                        await answer_messages[0].edit_text(err_text)
+                    elif tool_messages:
+                        await tool_messages[0].edit_text(err_text)
+                    elif unused_placeholder:
+                        await placeholder.edit_text(err_text)
+                    else:
+                        await update.message.reply_text(err_text)
                 except Exception as edit_exc:
                     logger.warning(
-                        "telegram failed to edit error message user_id=%d: %s",
+                        "telegram failed to send error message user_id=%d: %s",
                         user_id,
                         _exception_text(edit_exc),
                         exc_info=True,
                     )
-                    try:
-                        await update.message.reply_text(err_text)
-                    except Exception:
-                        logger.exception("telegram failed to send error message user_id=%d", user_id)
             finally:
                 typing_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
