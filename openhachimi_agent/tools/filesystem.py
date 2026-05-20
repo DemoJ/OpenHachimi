@@ -13,6 +13,7 @@ from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import (
     MAX_LIST_ENTRIES,
     MAX_READ_LINES,
+    MAX_READ_LINES_PER_CALL,
     MAX_SEARCH_RESULTS,
     iter_workspace_items,
     normalize_relative_path,
@@ -184,11 +185,17 @@ def read_file(
     total_lines = len(lines)
 
     if end_line is None:
-        end_line = min(total_lines, start_line + MAX_READ_LINES - 1)
-    if end_line < start_line:
+        requested_end_line = min(total_lines, start_line + MAX_READ_LINES - 1)
+    else:
+        requested_end_line = end_line
+    if requested_end_line < start_line:
         raise ModelRetry("end_line 不能小于 start_line")
 
-    selected = lines[start_line - 1 : end_line]
+    effective_end_line = min(requested_end_line, start_line + MAX_READ_LINES_PER_CALL - 1)
+    selected = lines[start_line - 1 : effective_end_line]
+    actual_end_line = start_line + len(selected) - 1 if selected else start_line - 1
+    truncated = requested_end_line > effective_end_line or actual_end_line < total_lines
+    next_start_line = actual_end_line + 1 if truncated and actual_end_line < total_lines else None
     numbered_content = "\n".join(
         f"{index}: {line}" for index, line in enumerate(selected, start=start_line)
     )
@@ -196,7 +203,9 @@ def read_file(
     return {
         "path": normalize_relative_path(ctx.deps.base_dir, target_file),
         "start_line": start_line,
-        "end_line": start_line + len(selected) - 1 if selected else start_line - 1,
+        "end_line": actual_end_line,
         "total_lines": total_lines,
+        "truncated": truncated,
+        "next_start_line": next_start_line,
         "content": numbered_content,
     }

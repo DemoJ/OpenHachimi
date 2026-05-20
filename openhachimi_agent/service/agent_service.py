@@ -38,6 +38,7 @@ from openhachimi_agent.transport.api_models import AgentState, ChatResponse, Com
 
 
 logger = logging.getLogger(__name__)
+AGENT_DEPENDENCY_MTIME_TTL_SECONDS = 2.0
 
 
 def _error_message(exc: BaseException) -> str:
@@ -52,6 +53,7 @@ class AgentService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self._agents = {}  # 缓存 (Agent 实例, 最后修改时间)，支持热重载
+        self._agent_dependency_mtime_cache: tuple[float, float] | None = None
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         from openhachimi_agent.service.browser import BrowserManager
@@ -90,25 +92,35 @@ class AgentService:
             self._session_locks[session_id] = lock
         return lock
 
-    def _get_agent(self, role_name: str, agent_type: str = "executor"):
-        cache_key = f"{role_name}:{agent_type}"
-        # 计算依赖文件（角色文件和技能目录）的最新修改时间
-        paths_to_check = [self.config.roles_dir / f"{role_name}.md"]
-        paths_to_check.extend(self.config.skills_dirs)
-        
+    def _get_agent_dependency_mtime(self, role_name: str) -> float:
+        now = time.monotonic()
+        if self._agent_dependency_mtime_cache is not None:
+            checked_at, cached_mtime = self._agent_dependency_mtime_cache
+            if now - checked_at < AGENT_DEPENDENCY_MTIME_TTL_SECONDS:
+                return cached_mtime
+
         current_mtime = 0.0
+        paths_to_check = [self.config.roles_dir / f"{role_name}.md"]
         try:
             for path in paths_to_check:
-                if not path.exists():
-                    continue
-                if path.is_file():
+                if path.exists() and path.is_file():
                     current_mtime = max(current_mtime, path.stat().st_mtime)
-                elif path.is_dir():
-                    for p in path.rglob('*'):
-                        if p.is_file():
-                            current_mtime = max(current_mtime, p.stat().st_mtime)
-        except Exception as e:
-            logger.debug("Failed to check mtime for agent dependencies: %s", e)
+
+            for skills_dir in self.config.skills_dirs:
+                if not skills_dir.exists() or not skills_dir.is_dir():
+                    continue
+                for skill_file in skills_dir.rglob("SKILL.md"):
+                    if skill_file.is_file():
+                        current_mtime = max(current_mtime, skill_file.stat().st_mtime)
+        except Exception as exc:
+            logger.debug("Failed to check mtime for agent dependencies: %s", exc)
+
+        self._agent_dependency_mtime_cache = (now, current_mtime)
+        return current_mtime
+
+    def _get_agent(self, role_name: str, agent_type: str = "executor"):
+        cache_key = f"{role_name}:{agent_type}"
+        current_mtime = self._get_agent_dependency_mtime(role_name)
 
         cached = self._agents.get(cache_key)
         if cached is None or cached[1] < current_mtime:

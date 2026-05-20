@@ -7,6 +7,7 @@ tried before opening a browser unless the user explicitly asks for browser use.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -140,7 +141,7 @@ def _maybe_pretty_json(text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
+async def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     """通过 HTTP 抓取指定 URL 的公开页面或 API 内容（不启动浏览器）。
 
     适用于公开 HTML 页面、JSON API、RSS、Atom 等文本端点。
@@ -154,12 +155,12 @@ def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     target_url = _validate_public_url(url)
     logger.info("tool web_fetch url=%s", target_url)
     try:
-        final_url, content_type, text = _request_url(target_url)
+        final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
     except WebFetchError as exc:
         if exc.status_code in {401, 403, 429, 503}:
             return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请改用 browser_navigate 等浏览器相关工具来访问此页面。"
         return f"Fetch failed: {exc}"
-    
+
     text = _maybe_pretty_json(text)
     trimmed, truncated = trim_output(text, MAX_WEB_RESPONSE_CHARS)
     header = [
@@ -171,7 +172,7 @@ def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     return "\n".join(header) + "\n" + trimmed
 
 
-def discover_web_resources(ctx: RunContext[AgentDeps], url: str) -> str:
+async def discover_web_resources(ctx: RunContext[AgentDeps], url: str) -> str:
     """Discover RSS/Atom/JSON/API-like public resource links from a web page.
 
     Prefer discovered RSS, Atom, JSON, or documented API links before using the
@@ -181,7 +182,7 @@ def discover_web_resources(ctx: RunContext[AgentDeps], url: str) -> str:
     target_url = _validate_public_url(url)
     logger.info("tool discover_web_resources url=%s", target_url)
     try:
-        final_url, content_type, text = _request_url(target_url)
+        final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
     except WebFetchError as exc:
         if exc.status_code in {401, 403, 429, 503}:
             return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请改用 browser_navigate 等浏览器相关工具来访问此页面。"

@@ -147,9 +147,9 @@ async def _keep_typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 class TelegramBot:
     """Telegram Bot 主体，封装会话状态与消息处理逻辑。"""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, service: AgentService) -> None:
         self.config = config
-        self.service = AgentService(config)
+        self.service = service
         # 按 user_id 存储各自的 {role, session_id}
         self._sessions: dict[int, dict[str, str]] = {}
         # 按 user_id 存储队列锁，实现每个用户独立的消息排队机制
@@ -458,7 +458,7 @@ class TelegramBot:
 
 
 @asynccontextmanager
-async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
+async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIterator[None]:
     """Telegram Bot 生命周期管理器，供 FastAPI lifespan 调用。
 
     若未配置 token，则跳过，不影响 HTTP 服务正常运行。
@@ -469,7 +469,7 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
         yield
         return
 
-    bot = TelegramBot(config)
+    bot = TelegramBot(config, service)
 
     # 根据配置决定是否使用代理
     proxy_url = config.telegram_proxy_url

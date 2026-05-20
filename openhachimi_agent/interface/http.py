@@ -36,10 +36,16 @@ async def lifespan(app: FastAPI):
     app.state.service = AgentService(config)
     logger.info("server module initialized")
 
-    async with telegram_lifespan(config):
-        logger.info("all channels started")
-        yield
-        logger.info("all channels stopping")
+    try:
+        async with telegram_lifespan(config, app.state.service):
+            logger.info("all channels started")
+            yield
+            logger.info("all channels stopping")
+    finally:
+        try:
+            await app.state.service.browser_manager.close()
+        except Exception as exc:
+            logger.debug("browser cleanup on server shutdown failed: %s", exc)
 
 
 app = FastAPI(title="OpenHachimi Agent", lifespan=lifespan)
