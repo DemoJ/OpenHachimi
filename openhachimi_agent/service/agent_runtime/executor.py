@@ -130,6 +130,7 @@ async def _replan_after_execution_signal(
         f"用户原始任务：{ctx.message}",
         message_history=ctx.history,
         deps=ctx.deps,
+        event_stream_handler=ctx.stream_event_handler if ctx.stream else None,
     )
     ctx.history.extend(planner_result.all_messages())
 

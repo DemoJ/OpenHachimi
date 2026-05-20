@@ -24,9 +24,7 @@ NEW_SESSION_COMMANDS = {"/new", "新对话"}
 HELP_COMMANDS = {"/help", "帮助"}
 ROLE_LIST_COMMANDS = {"/roles", "/list-roles"}
 STOP_COMMANDS = {"/stop", "停止"}
-DEBUG_TOOLS_COMMANDS = {"/debug_tools", "/debug-tools"}
 DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
-_MAX_LIVE_TOOL_LINES = 6
 
 
 def get_server_url() -> str:
@@ -70,6 +68,7 @@ def request_stream(server_url: str, path: str, payload: dict[str, object]):
                             type=event_type,
                             text=data_json.get("text", ""),
                             tool_name=data_json.get("tool_name"),
+                            tool_icon=data_json.get("tool_icon"),
                             temporary=bool(data_json.get("temporary", False)),
                         )
                     elif "text" in data_json:
@@ -97,7 +96,7 @@ def print_welcome(state: dict[str, object], server_url: str, current_role: str, 
     print(f"当前角色：{current_role}")
     print(f"当前会话：{current_session_id}")
     print("输入内容后回车即可对话。")
-    print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/debug_tools 开关工具调试，/new 新建对话，/exit 退出程序。")
+    print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/new 新建对话，/exit 退出程序。")
     print()
 
 
@@ -108,7 +107,6 @@ def print_help() -> None:
     print("  /role   切换角色，例如 /role default")
     print("  /new    保存当前对话并新建一段对话")
     print("  /stop   中断当前正在执行的任务")
-    print("  /debug_tools on|off  开关工具调用调试输出")
     print("  /exit   退出程序")
     print()
 
@@ -120,7 +118,7 @@ class CliBackend(Protocol):
     async def new_session(self, role: str) -> tuple[str, str, str]: ...
     async def stop_session(self, session_id: str) -> str: ...
     async def switch_role(self, role: str) -> tuple[str, str, str]: ...
-    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str | StreamEventItem]: ...
+    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]: ...
 
 
 class EmbeddedBackend:
@@ -132,7 +130,6 @@ class EmbeddedBackend:
         return {
             "model": state.model,
             "base_url": state.base_url,
-            "show_tool_events": state.show_tool_events,
         }
 
     async def list_roles(self) -> list[str]:
@@ -154,7 +151,7 @@ class EmbeddedBackend:
         resp = self.service.switch_role(role)
         return resp.role, resp.session_id, resp.message
 
-    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str | StreamEventItem]:
+    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]:
         async for event in self.service.stream_events(message, role, session_id):
             yield event
 
@@ -198,7 +195,7 @@ class HttpBackend:
         except Exception as exc:
             raise RuntimeError(str(exc)) from exc
 
-    async def stream_message(self, message: str, role: str, session_id: str, include_tool_events: bool = False) -> AsyncIterator[str | StreamEventItem]:
+    async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]:
         q: asyncio.Queue[str | Exception | None] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
@@ -208,7 +205,6 @@ class HttpBackend:
                     "message": message,
                     "role": role,
                     "session_id": session_id,
-                    "include_tool_events": True,
                 }):
                     loop.call_soon_threadsafe(q.put_nowait, chunk)
                 loop.call_soon_threadsafe(q.put_nowait, None)
@@ -237,10 +233,6 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
         return
 
     print_welcome(state, server_url, current_role, current_session_id)
-    show_tool_events = state.get("show_tool_events")
-    if show_tool_events is None:
-        show_tool_events = os.getenv("OPENHACHIMI_SHOW_TOOL_EVENTS", "").strip().lower() in {"1", "true", "yes", "on"}
-    show_tool_events = bool(show_tool_events)
 
     while True:
         try:
@@ -293,18 +285,6 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
                 print(f"哈基米 > 获取角色列表失败：{exc}")
             continue
 
-        if user_input == "/debug_tools" or user_input.startswith("/debug_tools ") or user_input.startswith("/debug-tools "):
-            arg = user_input.split(maxsplit=1)[1].strip().lower() if " " in user_input else ""
-            if arg in {"on", "true", "1", "开"}:
-                show_tool_events = True
-            elif arg in {"off", "false", "0", "关"}:
-                show_tool_events = False
-            else:
-                show_tool_events = not show_tool_events
-            status = "开启" if show_tool_events else "关闭"
-            print(f"工具调用调试输出已{status}。")
-            continue
-
         if user_input == "/role" or user_input.startswith("/role "):
             role_name = user_input[6:].strip()
             if not role_name:
@@ -325,7 +305,7 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
         try:
             print("哈基米 > ", end="", flush=True)
             presenter = ToolProgressPresenter(mode="cli")
-            async for event in backend.stream_message(user_input, current_role, current_session_id, show_tool_events):
+            async for event in backend.stream_message(user_input, current_role, current_session_id):
                 if isinstance(event, StreamEventItem):
                     for action in presenter.handle_event(event):
                         if action.type == "tool":

@@ -6,14 +6,12 @@ from pydantic import BaseModel, Field
 class AgentState(BaseModel):
     model: str
     base_url: str | None = None
-    show_tool_events: bool = False
 
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     role: str | None = None
     session_id: str | None = None
-    include_tool_events: bool | None = None
 
 
 class ChatResponse(BaseModel):

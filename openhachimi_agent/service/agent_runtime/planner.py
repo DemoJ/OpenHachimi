@@ -57,6 +57,7 @@ async def run_planner(ctx: AgentRunContext, task_frame: TaskFrame, get_agent: Ca
             build_planner_prompt(task_frame, ctx.message),
             message_history=ctx.history,
             deps=ctx.deps,
+            event_stream_handler=ctx.stream_event_handler if ctx.stream else None,
         )
     finally:
         if heartbeat_task is not None:

@@ -10,7 +10,6 @@ app:
                              #   socks5://127.0.0.1:1080
                              #   http://192.168.1.1:7890
   stream_idle_timeout_seconds: 60   # 流式队列无新事件时的进展检查/心跳间隔；实际卡住判定会按操作类型使用更长阈值
-  show_tool_events: false           # 是否默认输出完整工具调用调试信息；正式使用建议 false，可用 /debug_tools 临时切换
 
 llm:
   api_key: sk-xxxxxxxx

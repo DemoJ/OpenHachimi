@@ -136,9 +136,9 @@ def test_executor_message_without_task_frame_is_raw_message():
 
 
 @pytest.mark.asyncio
-async def test_stream_idle_yields_heartbeat_without_cancelling_task():
+async def test_stream_idle_logs_heartbeat_without_yielding_message(caplog):
     async def long_running():
-        await asyncio.sleep(10)
+        await asyncio.sleep(0.05)
 
     task = asyncio.create_task(long_running())
     ctx = _ctx({})
@@ -154,13 +154,12 @@ async def test_stream_idle_yields_heartbeat_without_cancelling_task():
         operation_state=ctx.operation_state,
     )
 
-    chunk = await stream.__anext__()
+    with caplog.at_level("INFO"):
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
 
-    assert "当前任务仍在运行" in chunk.text
-    assert not task.done()
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    assert "chat heartbeat" in caplog.text
+    assert task.done()
     await stream.aclose()
 
 

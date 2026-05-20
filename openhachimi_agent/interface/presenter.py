@@ -19,10 +19,8 @@ class PresenterAction:
 
 
 class ToolProgressPresenter:
-    def __init__(self, *, mode: Literal["cli", "conversation"], show_all_tools: bool = False, max_tool_lines: int = 6) -> None:
+    def __init__(self, *, mode: Literal["cli", "conversation"]) -> None:
         self.mode = mode
-        self.show_all_tools = show_all_tools
-        self.max_tool_lines = max_tool_lines
         self._tool_lines: list[str] = []
 
     def handle_event(self, event: StreamEventItem) -> list[PresenterAction]:
@@ -47,12 +45,9 @@ class ToolProgressPresenter:
         self._tool_lines = []
         return [PresenterAction(type="tool", text=summary, final=True)]
 
+    def reset_tools(self) -> None:
+        self._tool_lines = []
+
     def tool_summary(self) -> str:
-        if self.show_all_tools:
-            lines = self._tool_lines
-        else:
-            lines = self._tool_lines[-self.max_tool_lines:]
-            hidden = len(self._tool_lines) - len(lines)
-            if hidden > 0:
-                lines = [f"已折叠 {hidden} 条较早工具事件", *lines]
-        return "工具进度：\n" + "\n".join(f"• {line}" for line in lines)
+        lines = self._tool_lines
+        return "\n".join(f"• {line}" for line in lines)

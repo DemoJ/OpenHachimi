@@ -38,8 +38,6 @@ logger = logging.getLogger(__name__)
 _EDIT_INTERVAL = 1.5
 # 单条 Telegram 消息最大字符数（官方限制 4096，留余量）
 _MAX_MSG_LEN = 4000
-# 临时工具进度消息最多保留最近几条，避免长链路任务刷屏
-_MAX_LIVE_TOOL_LINES = 6
 # Telegram typing 状态持续时间较短，需要周期性刷新
 _TYPING_INTERVAL = 4.0
 
@@ -131,6 +129,12 @@ def _md_to_tg_html(text: str) -> str:
     return text
 
 
+def _live_text(text: str) -> str:
+    if len(text) <= _MAX_MSG_LEN - 2:
+        return text
+    return "…\n" + text[-(_MAX_MSG_LEN - 4):]
+
+
 async def _keep_typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
@@ -150,8 +154,6 @@ class TelegramBot:
         self._sessions: dict[int, dict[str, str]] = {}
         # 按 user_id 存储队列锁，实现每个用户独立的消息排队机制
         self._user_locks: dict[int, asyncio.Lock] = {}
-        # 按 user_id 存储工具调试输出开关覆盖值
-        self._debug_tools_overrides: dict[int, bool] = {}
         logger.info("telegram bot handler initialized")
 
     def _get_session(self, user_id: int) -> dict[str, str]:
@@ -171,12 +173,6 @@ class TelegramBot:
             session = self._sessions.pop(user_id)
             self._sessions[user_id] = session
         return self._sessions[user_id]
-
-    def _set_debug_tools_enabled(self, user_id: int, enabled: bool) -> None:
-        self._debug_tools_overrides[user_id] = enabled
-
-    def _is_debug_tools_enabled(self, user_id: int) -> bool:
-        return self._debug_tools_overrides.get(user_id, self.config.show_tool_events)
 
     def _get_user_lock(self, user_id: int) -> asyncio.Lock:
         if user_id not in self._user_locks:
@@ -208,7 +204,6 @@ class TelegramBot:
             "  /roles — 查看角色列表\n"
             "  /role &lt;名称&gt; — 切换角色\n"
             "  /stop — 中断当前正在执行的任务\n"
-            "  /debug_tools — 开关工具调用调试输出\n"
             "  /help — 查看帮助"
         )
         await update.message.reply_text(welcome, parse_mode=constants.ParseMode.HTML)
@@ -222,7 +217,6 @@ class TelegramBot:
             "<code>/roles</code> — 列出全部可用角色\n"
             "<code>/role &lt;名称&gt;</code> — 切换到指定角色\n"
             "<code>/stop</code> — 中断当前正在执行的任务\n"
-            "<code>/debug_tools on|off</code> — 开关工具调用调试输出\n"
             "<code>/help</code> — 查看本帮助\n\n"
             "直接发送文字消息即可与 Agent 对话。"
         )
@@ -280,19 +274,6 @@ class TelegramBot:
         except (FileNotFoundError, ValueError) as exc:
             await update.message.reply_text(f"❌ 切换角色失败：{exc}")
 
-    async def cmd_debug_tools(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id
-        arg = (ctx.args[0].strip().lower() if ctx.args else "")
-        if arg in {"on", "true", "1", "开"}:
-            enabled = True
-        elif arg in {"off", "false", "0", "关"}:
-            enabled = False
-        else:
-            enabled = not self._is_debug_tools_enabled(user_id)
-        self._set_debug_tools_enabled(user_id, enabled)
-        status = "开启" if enabled else "关闭"
-        await update.message.reply_text(f"工具调用调试输出已{status}。")
-
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """普通文本消息处理器：流式调用 Agent 并以「编辑消息」实现打字效果。
 
@@ -319,12 +300,7 @@ class TelegramBot:
             # 先发出占位消息
             placeholder = await update.message.reply_text("⏳ 思考中……")
 
-            debug_tools_enabled = self._is_debug_tools_enabled(user_id)
-            presenter = ToolProgressPresenter(
-                mode="conversation",
-                show_all_tools=debug_tools_enabled,
-                max_tool_lines=_MAX_LIVE_TOOL_LINES,
-            )
+            presenter = ToolProgressPresenter(mode="conversation")
             unused_placeholder = True
             current_tool_text = ""
             tool_messages: list = []
@@ -421,6 +397,7 @@ class TelegramBot:
                 await render_tool_messages()
                 current_tool_text = ""
                 tool_messages = []
+                presenter.reset_tools()
 
             try:
                 async for event in self.service.stream_events(user_text, role, session_id):
@@ -518,7 +495,6 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
     app.add_handler(CommandHandler("stop", bot.cmd_stop))
     app.add_handler(CommandHandler("roles", bot.cmd_roles))
     app.add_handler(CommandHandler("role", bot.cmd_role))
-    app.add_handler(CommandHandler("debug_tools", bot.cmd_debug_tools))
     # 普通文本消息处理器（非命令），设置为 block=False 以免阻塞后续的 /stop 等命令
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message, block=False))
 
@@ -535,7 +511,6 @@ async def telegram_lifespan(config: AppConfig) -> AsyncIterator[None]:
             BotCommand("roles", "🎭 查看可用角色列表"),
             BotCommand("role",  "🔄 切换角色（如：/role default）"),
             BotCommand("stop",  "🛑 中断当前正在执行的任务"),
-            BotCommand("debug_tools", "🛠️ 开关工具调用调试输出"),
             BotCommand("help",  "📖 查看帮助"),
         ])
         logger.info("telegram bot commands menu registered")

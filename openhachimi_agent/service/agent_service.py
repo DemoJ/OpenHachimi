@@ -132,7 +132,6 @@ class AgentService:
         return AgentState(
             model=self.config.model_name,
             base_url=self.config.openai_base_url or None,
-            show_tool_events=self.config.show_tool_events,
         )
 
     def list_roles(self) -> RolesResponse:
@@ -468,10 +467,9 @@ class AgentService:
         message: str,
         role: str | None = None,
         session_id: str | None = None,
-        include_tool_events: bool = False,
     ) -> AsyncIterator[str]:
         async for event in self.stream_events(message, role, session_id):
             if event.type in {"text", "system"}:
                 yield event.text
-            elif include_tool_events and event.type == "tool":
+            elif event.type == "tool":
                 yield f"\n[工具] {event.text}\n"
