@@ -8,12 +8,13 @@ tried before opening a browser unless the user explicitly asks for browser use.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from pydantic_ai import RunContext
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 MAX_WEB_RESPONSE_CHARS = 60000
 WEB_TIMEOUT_SECONDS = 20
 WEB_USER_AGENT = "OpenHachimi-Agent/0.1 (+https://github.com/DemoJ/OpenHachimi)"
+PATH_SAFE_CHARS = "/:@!$&'()*+,;="
+QUERY_SAFE_CHARS = "/?:@!$&'()*+,;="
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class WebFetchError(Exception):
@@ -100,16 +104,57 @@ class ResourceLinkParser(HTMLParser):
             self.title += data.strip()
 
 
-def _validate_public_url(url: str) -> str:
+def _quote_url_component(value: str, safe: str) -> str:
+    try:
+        decoded = unquote(value, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"URL 包含无效的百分号编码：{value}") from exc
+    return quote(decoded, safe=safe)
+
+
+def _normalize_host(hostname: str) -> str:
+    try:
+        ipaddress.IPv6Address(hostname)
+    except ValueError:
+        pass
+    else:
+        return f"[{hostname.lower()}]"
+
+    try:
+        return hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError(f"URL 主机名无效：{hostname}") from exc
+
+
+def _normalize_public_url(url: str) -> str:
     url = url.strip()
     if not url:
         raise ValueError("url 不能为空")
-    if not url.startswith(("http://", "https://")):
+    if CONTROL_CHAR_RE.search(url):
+        raise ValueError(f"URL 包含非法控制字符：{url}")
+    if "://" not in url:
         url = "https://" + url
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         raise ValueError(f"仅支持 http/https URL：{url}")
-    return url
+    if parsed.username or parsed.password:
+        raise ValueError("URL 不能包含用户名或密码")
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"URL 端口无效：{url}") from exc
+
+    netloc = _normalize_host(parsed.hostname)
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+
+    path = _quote_url_component(parsed.path, PATH_SAFE_CHARS)
+    query = _quote_url_component(parsed.query, QUERY_SAFE_CHARS)
+    fragment = _quote_url_component(parsed.fragment, QUERY_SAFE_CHARS)
+    return urlunsplit((scheme, netloc, path, query, fragment))
 
 
 def _request_url(url: str) -> tuple[str, str, str]:
@@ -152,7 +197,7 @@ async def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     - 若本工具失败（403 / 429 等），升级到 browser_navigate + browser_get_state
     """
     del ctx
-    target_url = _validate_public_url(url)
+    target_url = _normalize_public_url(url)
     logger.info("tool web_fetch url=%s", target_url)
     try:
         final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
@@ -179,7 +224,7 @@ async def discover_web_resources(ctx: RunContext[AgentDeps], url: str) -> str:
     browser, unless the user explicitly requests browser automation.
     """
     del ctx
-    target_url = _validate_public_url(url)
+    target_url = _normalize_public_url(url)
     logger.info("tool discover_web_resources url=%s", target_url)
     try:
         final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
