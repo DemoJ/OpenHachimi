@@ -178,8 +178,19 @@ class AgentService:
             role,
             session_id,
         )
+        lines = [
+            "已保存上一段对话，并新建对话。",
+            f"当前模型：{self.config.model_name}",
+        ]
+        if self.config.openai_base_url:
+            lines.append(f"模型服务：{self.config.openai_base_url}")
+        lines.extend([
+            f"当前角色：{role}",
+            f"当前会话：{session_id}",
+            "输入内容后回车即可继续对话。",
+        ])
         return CommandResponse(
-            message="已保存上一段对话，并新建对话。",
+            message="\n".join(lines),
             role=role,
             session_id=session_id,
         )
