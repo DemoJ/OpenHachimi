@@ -46,3 +46,22 @@ def test_format_tool_call_redacts_browser_type_text():
 
     assert "secretvalue" not in text
     assert REDACTED in text
+
+
+def test_format_tool_call_create_todos_shows_summary_only():
+    text = format_tool_call(
+        "create_todos",
+        {
+            "goal": "调查浏览器访问网页无响应的根因，定位问题并提供解决方案",
+            "tasks": [
+                {"description": "环境检查", "success_criteria": "明确列出所有可用技能"},
+                {"description": "浏览器技能详情分析", "success_criteria": "获取完整说明文档"},
+                {"description": "日志与历史记录检查", "success_criteria": "找到失败日志"},
+            ],
+        },
+    )
+
+    assert text == "✅ 创建计划：目标：调查浏览器访问网页无响应的根因，定位问题并提供解决方案；共 3 项任务"
+    assert "；计划：" not in text
+    assert "验收" not in text
+    assert "环境检查" not in text

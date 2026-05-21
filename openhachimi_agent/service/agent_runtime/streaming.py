@@ -193,14 +193,15 @@ def _tool_detail(tool_name: str, args: dict[str, object]) -> str:
         return ""
 
     if tool_name == "create_todos":
-        goal = _compact(args.get("goal", ""), 90)
-        tasks = _tasks_summary(args.get("tasks", []))
-        detail = ""
+        goal = _compact(args.get("goal", ""), 60)
+        tasks = args.get("tasks", [])
+        task_count = len(tasks) if isinstance(tasks, list) else 0
+        detail_parts = []
         if goal:
-            detail += f"目标：{goal}"
-        if tasks:
-            detail += ("；" if detail else "") + f"计划：{tasks}"
-        return detail
+            detail_parts.append(f"目标：{goal}")
+        if task_count:
+            detail_parts.append(f"共 {task_count} 项任务")
+        return "；".join(detail_parts)
 
     if tool_name == "update_todo":
         task_id = _value(args, "task_id")
