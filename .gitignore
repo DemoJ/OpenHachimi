@@ -22,3 +22,4 @@ user/skills/*
 .pytest_cache/
 .coverage
 coverage.xml
+temp_test

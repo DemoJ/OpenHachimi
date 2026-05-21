@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import json
+
 from pydantic_ai import RunContext
 
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.memory.models import MemoryAtom, MemoryScope, MemoryStability
 from openhachimi_agent.memory.privacy import PrivacyGuard
 from openhachimi_agent.memory.recall import get_memory_store
+
+
+def _normalize_tags(tags: str | list[str] | None) -> list[str]:
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        text = tags.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [part.strip() for part in text.replace("，", ",").split(",") if part.strip()]
+    return [str(item).strip() for item in tags if str(item).strip()]
 
 
 def _scope(ctx: RunContext[AgentDeps]) -> MemoryScope:
@@ -51,7 +71,7 @@ def remember(
     content: str,
     memory_type: str = "fact",
     stability: str = "stable",
-    tags: list[str] | None = None,
+    tags: str | list[str] | None = None,
 ) -> dict[str, object]:
     """显式写入长期记忆。"""
     if not ctx.deps.config.memory.enabled:
@@ -71,7 +91,7 @@ def remember(
         scope=scope,
         object=decision.text,
         keywords=[part[:32] for part in decision.text.split()[:12]],
-        tags=tags or [],
+        tags=_normalize_tags(tags),
         confidence=0.95,
         stability=MemoryStability.STABLE if stability == "stable" else MemoryStability.SITUATIONAL,
         sensitivity=decision.sensitivity,
