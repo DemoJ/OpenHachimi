@@ -33,6 +33,9 @@ from openhachimi_agent.service.agent_runtime.streaming import (
     consume_stream_queue,
     system_stream_event,
 )
+from openhachimi_agent.memory.capture import capture_turn_memories
+from openhachimi_agent.memory.models import MemoryScope
+from openhachimi_agent.memory.recall import recall_memories
 from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
 from openhachimi_agent.transport.api_models import AgentState, ChatResponse, CommandResponse, RolesResponse
 
@@ -234,12 +237,23 @@ class AgentService:
             if actual_session_id not in self._session_states:
                 self._session_states[actual_session_id] = {}
             session_state = self._session_states[actual_session_id]
+            memory_scope = MemoryScope(
+                tenant_id="local",
+                user_id="local",
+                role_name=role,
+                session_id=actual_session_id,
+                channel="cli",
+            )
+            memory_context = recall_memories(self.config, memory_scope, message)
+            session_state["memory_context"] = memory_context
             deps = AgentDeps(
                 config=self.config,
                 session_id=actual_session_id,
                 browser_manager=self.browser_manager,
                 process_manager=self.process_manager,
                 session_state=session_state,
+                memory_scope=memory_scope,
+                memory_context=memory_context,
             )
             stream_queue: asyncio.Queue[StreamEventItem | object] = asyncio.Queue()
             stream_stats = StreamStats()
@@ -431,6 +445,27 @@ class AgentService:
                     actual_session_id,
                     history_json,
                 )
+                capture_args = (
+                    self.config,
+                    memory_scope,
+                    message,
+                    str(result.output),  # type: ignore[attr-defined]
+                )
+                capture_kwargs = {
+                    "task_frame": session_state.get("task_frame") if isinstance(session_state.get("task_frame"), dict) else None,
+                    "memory_context_ids": memory_context.ids,
+                    "duration_ms": int((time.perf_counter() - start_time) * 1000),
+                }
+                if self.config.memory.capture.async_enabled:
+                    async def _capture_memory_background() -> None:
+                        try:
+                            await asyncio.to_thread(capture_turn_memories, *capture_args, **capture_kwargs)
+                        except Exception:
+                            logger.exception("memory capture failed role=%s session_id=%s", role, actual_session_id)
+
+                    asyncio.create_task(_capture_memory_background())
+                else:
+                    await asyncio.to_thread(capture_turn_memories, *capture_args, **capture_kwargs)
 
                 if stream:
                     if not stream_stats.chunk_count:

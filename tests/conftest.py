@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.config import AppConfig, MemoryConfig
 from openhachimi_agent.core.deps import AgentDeps
 
 @pytest.fixture
@@ -36,7 +36,8 @@ def mock_config(tmp_path: Path):
         telegram_bot_token=None,
         telegram_proxy_url=None,
         agent_timeout_seconds=300,
-        stream_idle_timeout_seconds=60
+        stream_idle_timeout_seconds=60,
+        memory=MemoryConfig(db_path=memory_dir / "long_term_memory.sqlite3"),
     )
     return config
 

@@ -11,6 +11,7 @@ from openhachimi_agent.content.roles import load_role_content
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.memory.recall import build_memory_context_text
 from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET
 from openhachimi_agent.agent.intent import PlanContinuationDecision, TaskFrame
 
@@ -104,6 +105,12 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     def _inject_time() -> str:
         current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         return f"[系统环境] 当前真实时间: {current_time}\n"
+
+    @agent.system_prompt
+    def _inject_memory_context(ctx: RunContext[AgentDeps]) -> str:
+        if not ctx.deps.config.memory.enabled:
+            return ""
+        return build_memory_context_text(ctx.deps.config, ctx.deps.memory_context)
 
     @agent.system_prompt
     def _inject_matched_skills(ctx: RunContext[AgentDeps]) -> str:

@@ -21,6 +21,36 @@ paths:
   memory_dir: .memory
   external_skills_dir: ""    # 可选配置，外部技能目录的绝对路径，例如 C:\Users\xxx\.agents\skills
 
+memory:
+  enabled: true
+  db_path: .memory/long_term_memory.sqlite3
+  embedding:
+    enabled: true
+    model: text-embedding-3-large
+    base_url: ""            # 留空则复用 llm.base_url
+    api_key: ""             # 留空则复用 llm.api_key
+    dimensions: 3072
+    batch_size: 32
+    timeout_seconds: 30
+  recall:
+    max_context_tokens: 1800
+    bm25_top_k: 50
+    vector_top_k: 50
+    rrf_k: 60
+    rerank_top_k: 24
+    final_l1_top_k: 10
+    final_l2_top_k: 4
+    include_l3_profile: true
+  capture:
+    enabled: true
+    async_enabled: true
+    min_turn_chars: 20
+    extract_timeout_seconds: 60
+  privacy:
+    pii_redaction: true
+    allow_secret_memory: false
+    raw_turn_retention_days: 180
+
 logging:
   level: INFO
   dir: .logs

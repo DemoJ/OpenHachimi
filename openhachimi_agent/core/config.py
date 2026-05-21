@@ -1,6 +1,6 @@
 """应用配置。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +9,54 @@ import yaml
 
 USER_DIR_NAME = "user"
 CONFIG_FILE_NAME = "config.yaml"
+
+
+@dataclass(frozen=True)
+class MemoryEmbeddingConfig:
+    enabled: bool = True
+    model: str = "text-embedding-3-large"
+    base_url: str = ""
+    api_key: str | None = None
+    dimensions: int = 3072
+    batch_size: int = 32
+    timeout_seconds: int = 30
+
+
+@dataclass(frozen=True)
+class MemoryRecallConfig:
+    max_context_tokens: int = 1800
+    bm25_top_k: int = 50
+    vector_top_k: int = 50
+    rrf_k: int = 60
+    rerank_top_k: int = 24
+    final_l1_top_k: int = 10
+    final_l2_top_k: int = 4
+    include_l3_profile: bool = True
+
+
+@dataclass(frozen=True)
+class MemoryCaptureConfig:
+    enabled: bool = True
+    async_enabled: bool = True
+    min_turn_chars: int = 20
+    extract_timeout_seconds: int = 60
+
+
+@dataclass(frozen=True)
+class MemoryPrivacyConfig:
+    pii_redaction: bool = True
+    allow_secret_memory: bool = False
+    raw_turn_retention_days: int = 180
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    enabled: bool = True
+    db_path: Path | None = None
+    embedding: MemoryEmbeddingConfig = field(default_factory=MemoryEmbeddingConfig)
+    recall: MemoryRecallConfig = field(default_factory=MemoryRecallConfig)
+    capture: MemoryCaptureConfig = field(default_factory=MemoryCaptureConfig)
+    privacy: MemoryPrivacyConfig = field(default_factory=MemoryPrivacyConfig)
 
 
 @dataclass(frozen=True)
@@ -37,6 +85,7 @@ class AppConfig:
     telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
     agent_timeout_seconds: int
     stream_idle_timeout_seconds: int
+    memory: MemoryConfig
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -79,6 +128,52 @@ def _config_int(section: dict[str, Any], key: str, default: int, minimum: int = 
     except (TypeError, ValueError) as exc:
         raise ValueError(f"config.yaml 中的 {key} 必须是整数。") from exc
     return max(minimum, parsed)
+
+
+def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: dict[str, Any]) -> MemoryConfig:
+    memory_config = _as_mapping(raw_config.get("memory"), "memory")
+    embedding_config = _as_mapping(memory_config.get("embedding"), "memory.embedding")
+    recall_config = _as_mapping(memory_config.get("recall"), "memory.recall")
+    capture_config = _as_mapping(memory_config.get("capture"), "memory.capture")
+    privacy_config = _as_mapping(memory_config.get("privacy"), "memory.privacy")
+
+    db_path_value = _config_string(memory_config, "db_path", ".memory/long_term_memory.sqlite3")
+    db_path = _resolve_config_path(base_dir, db_path_value, base_dir / ".memory" / "long_term_memory.sqlite3")
+
+    return MemoryConfig(
+        enabled=_config_bool(memory_config, "enabled", True),
+        db_path=db_path,
+        embedding=MemoryEmbeddingConfig(
+            enabled=_config_bool(embedding_config, "enabled", True),
+            model=_config_string(embedding_config, "model", "text-embedding-3-large"),
+            base_url=_config_string(embedding_config, "base_url") or _config_string(llm_config, "base_url"),
+            api_key=_config_string(embedding_config, "api_key") or _config_string(llm_config, "api_key") or None,
+            dimensions=_config_int(embedding_config, "dimensions", 3072),
+            batch_size=_config_int(embedding_config, "batch_size", 32),
+            timeout_seconds=_config_int(embedding_config, "timeout_seconds", 30),
+        ),
+        recall=MemoryRecallConfig(
+            max_context_tokens=_config_int(recall_config, "max_context_tokens", 1800),
+            bm25_top_k=_config_int(recall_config, "bm25_top_k", 50),
+            vector_top_k=_config_int(recall_config, "vector_top_k", 50),
+            rrf_k=_config_int(recall_config, "rrf_k", 60),
+            rerank_top_k=_config_int(recall_config, "rerank_top_k", 24),
+            final_l1_top_k=_config_int(recall_config, "final_l1_top_k", 10),
+            final_l2_top_k=_config_int(recall_config, "final_l2_top_k", 4),
+            include_l3_profile=_config_bool(recall_config, "include_l3_profile", True),
+        ),
+        capture=MemoryCaptureConfig(
+            enabled=_config_bool(capture_config, "enabled", True),
+            async_enabled=_config_bool(capture_config, "async_enabled", True),
+            min_turn_chars=_config_int(capture_config, "min_turn_chars", 20, minimum=0),
+            extract_timeout_seconds=_config_int(capture_config, "extract_timeout_seconds", 60),
+        ),
+        privacy=MemoryPrivacyConfig(
+            pii_redaction=_config_bool(privacy_config, "pii_redaction", True),
+            allow_secret_memory=_config_bool(privacy_config, "allow_secret_memory", False),
+            raw_turn_retention_days=_config_int(privacy_config, "raw_turn_retention_days", 180),
+        ),
+    )
 
 
 def load_config() -> AppConfig:
@@ -143,4 +238,5 @@ def load_config() -> AppConfig:
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
         agent_timeout_seconds=300,
         stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
+        memory=_load_memory_config(base_dir, raw_config, llm_config),
     )

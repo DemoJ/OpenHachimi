@@ -16,6 +16,7 @@ from openhachimi_agent.tools.skills import get_skill_instructions, list_skills, 
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import web_search
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
+from openhachimi_agent.tools.memory import forget_memory, list_memory, memory_stats, remember, search_memory
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
 from openhachimi_agent.agent.execution import with_execution_ledger
 
@@ -61,6 +62,17 @@ _OTHER_TOOLS = [
     web_search,
 ]
 
+_MEMORY_READ_TOOLS = [
+    search_memory,
+    list_memory,
+    memory_stats,
+]
+
+_MEMORY_MUTATION_TOOLS = [
+    remember,
+    forget_memory,
+]
+
 _PLANNING_TOOLS = [
     create_todos,
     get_todos,
@@ -77,6 +89,7 @@ _MUTATION_FUNCS = {
     browser_navigate, browser_click, browser_type, browser_scroll,
     browser_new_tab, browser_switch_tab, browser_close_tab,
     install_skill,
+    remember, forget_memory,
 }
 
 _READ_ONLY_FINAL_TOOLS = []
@@ -96,6 +109,12 @@ for _orig_tools, _middlewares in [
         else:
             _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_wrapped))
 
+for _tool in _MEMORY_READ_TOOLS:
+    _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_tool))
+
+for _tool in _MEMORY_MUTATION_TOOLS:
+    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_tool))))
+
 # ── Planner 专用工具集 ──
 # Planner 是纯规划者：只需要本地只读工具来理解项目上下文，然后基于对
 # Executor 工具能力的了解来制定计划。不应该有任何网络执行类工具（web_search、
@@ -104,6 +123,7 @@ _PLANNER_CONTEXT_FUNCS = {
     list_files, find_files, search_text, read_file,   # 本地文件只读
     git_status, git_diff,                              # Git 只读
     list_skills, get_skill_instructions,               # 技能查询
+    search_memory, list_memory, memory_stats,           # 长期记忆查询
 }
 _planner_allowed_names = {f.__name__ for f in _PLANNER_CONTEXT_FUNCS}
 _PLANNER_CONTEXT_TOOLS = [
