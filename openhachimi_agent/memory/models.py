@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import StrEnum
+from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -13,14 +13,19 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class MemoryLevel(StrEnum):
+class _StringEnum(str, Enum):
+    def __str__(self) -> str:
+        return self.value
+
+
+class MemoryLevel(_StringEnum):
     TURN = "L0"
     ATOM = "L1"
     BLOCK = "L2"
     PROFILE = "L3"
 
 
-class MemoryStatus(StrEnum):
+class MemoryStatus(_StringEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
     DELETED = "deleted"
@@ -28,20 +33,20 @@ class MemoryStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
-class MemorySensitivity(StrEnum):
+class MemorySensitivity(_StringEnum):
     PUBLIC = "public"
     PERSONAL = "personal"
     SENSITIVE = "sensitive"
     SECRET = "secret"
 
 
-class MemoryStability(StrEnum):
+class MemoryStability(_StringEnum):
     EPHEMERAL = "ephemeral"
     SITUATIONAL = "situational"
     STABLE = "stable"
 
 
-class MemoryJobStatus(StrEnum):
+class MemoryJobStatus(_StringEnum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
