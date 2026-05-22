@@ -6,8 +6,9 @@ import json
 import logging
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.memory.conflicts import resolve_atom_conflict
 from openhachimi_agent.memory.embeddings import EmbeddingProvider
-from openhachimi_agent.memory.models import MemoryAtom, MemoryJob, MemoryScope, MemoryStability, MemoryTurn
+from openhachimi_agent.memory.models import MemoryAtom, MemoryScope, MemoryStability, MemoryTurn
 from openhachimi_agent.memory.privacy import PrivacyGuard
 from openhachimi_agent.memory.recall import get_memory_store
 
@@ -65,8 +66,9 @@ def capture_turn_memories(
         "scope": scope.to_json_dict(),
         "user_message": user_message,
         "assistant_output": assistant_output,
+        "explicit_atom_ids": [],
     }
-    store.enqueue_job(MemoryJob(job_type="extract_atoms_from_turn", payload=payload))
+    store.enqueue_unique_job("extract_atoms_from_turn", payload, dedupe_key=f"extract:{turn_id}")
 
     if _looks_memorable(user_message):
         guard = PrivacyGuard(
@@ -94,9 +96,24 @@ def capture_turn_memories(
                 stability=MemoryStability.STABLE if any(word in user_message.lower() for word in ["以后", "偏好", "习惯", "要求", "prefer", "preference"]) else MemoryStability.SITUATIONAL,
                 sensitivity=decision.sensitivity,
             )
-            atom_id = store.add_atom(atom)
+            embedding = None
             if config.memory.embedding.enabled:
                 embedding = EmbeddingProvider(config.memory.embedding).embed_sync(atom.content)
+            decision_conflict = resolve_atom_conflict(
+                store,
+                atom,
+                embedding_vector=embedding.vector if embedding and not embedding.degraded else None,
+                embedding_model=config.memory.embedding.model if embedding and not embedding.degraded else None,
+            )
+            atom_id = decision_conflict.winner_id or atom.id
+            if decision_conflict.action != "dedupe":
+                atom_id = store.add_atom(atom)
+                if decision_conflict.action == "supersede" and decision_conflict.loser_id:
+                    store.mark_atom_superseded(decision_conflict.loser_id, atom_id, decision_conflict.conflict_group_id)
+                    store.record_conflict(scope, decision_conflict.conflict_key, atom_id, decision_conflict.loser_id, decision_conflict.reason)
+            if config.memory.embedding.enabled and decision_conflict.action != "dedupe":
+                if embedding is None:
+                    embedding = EmbeddingProvider(config.memory.embedding).embed_sync(atom.content)
                 if embedding.degraded:
                     store.set_atom_embedding_status(atom_id, "failed")
                     logger.warning(

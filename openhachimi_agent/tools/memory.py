@@ -62,8 +62,25 @@ def search_memory(ctx: RunContext[AgentDeps], query: str, top_k: int = 10, inclu
 
 def list_memory(ctx: RunContext[AgentDeps], memory_type: str | None = None, limit: int = 20) -> dict[str, object]:
     """列出长期记忆。"""
-    query = memory_type or "用户 项目 偏好 记忆 背景"
-    return search_memory(ctx, query, top_k=limit, include_archived=False)
+    if not ctx.deps.config.memory.enabled:
+        return {"enabled": False, "items": []}
+    store = get_memory_store(ctx.deps.config)
+    results = store.list_memories(_scope(ctx), memory_type=memory_type, limit=limit, include_archived=False)
+    return {
+        "enabled": True,
+        "items": [
+            {
+                "id": item.id,
+                "level": item.level,
+                "type": item.memory_type,
+                "content": item.content,
+                "confidence": item.confidence,
+                "score": item.score,
+                "updated_at": item.updated_at,
+            }
+            for item in results
+        ],
+    }
 
 
 def remember(
@@ -98,7 +115,20 @@ def remember(
     )
     store = get_memory_store(ctx.deps.config)
     memory_id = store.add_atom(atom)
-    return {"stored": True, "id": memory_id, "sensitivity": str(decision.sensitivity)}
+    embedding_status = "disabled"
+    if ctx.deps.config.memory.embedding.enabled:
+        store.enqueue_unique_job(
+            "embed_memory_item",
+            {
+                "item_id": memory_id,
+                "level": "L1",
+                "text": atom.content,
+                "model": ctx.deps.config.memory.embedding.model,
+            },
+            dedupe_key=f"embed:L1:{memory_id}",
+        )
+        embedding_status = "queued"
+    return {"stored": True, "id": memory_id, "sensitivity": str(decision.sensitivity), "embedding_status": embedding_status}
 
 
 def forget_memory(ctx: RunContext[AgentDeps], query_or_ids: str, mode: str = "soft_delete") -> dict[str, object]:
@@ -111,11 +141,32 @@ def forget_memory(ctx: RunContext[AgentDeps], query_or_ids: str, mode: str = "so
 
 
 def update_memory(ctx: RunContext[AgentDeps], memory_id: str, content: str | None = None, status: str | None = None) -> dict[str, object]:
-    """更新长期记忆。当前支持通过先删除再 remember 进行内容修正。"""
+    """更新长期记忆。"""
+    if not ctx.deps.config.memory.enabled:
+        return {"enabled": False, "updated": False}
+    store = get_memory_store(ctx.deps.config)
     if content:
-        forget_memory(ctx, memory_id)
-        stored = remember(ctx, content, memory_type="correction")
-        return {"updated": bool(stored.get("stored")), "replacement": stored}
+        guard = PrivacyGuard(
+            allow_secret_memory=ctx.deps.config.memory.privacy.allow_secret_memory,
+            pii_redaction=ctx.deps.config.memory.privacy.pii_redaction,
+        )
+        decision = guard.should_store(content)
+        if decision.action == "reject":
+            return {"updated": False, "reason": decision.reason}
+        embedding_status = "pending" if ctx.deps.config.memory.embedding.enabled else "disabled"
+        updated = store.update_atom_content(memory_id, decision.text, embedding_status=embedding_status)
+        if updated and ctx.deps.config.memory.embedding.enabled:
+            store.enqueue_unique_job(
+                "embed_memory_item",
+                {
+                    "item_id": memory_id,
+                    "level": "L1",
+                    "text": decision.text,
+                    "model": ctx.deps.config.memory.embedding.model,
+                },
+                dedupe_key=f"embed:L1:{memory_id}",
+            )
+        return {"updated": updated, "id": memory_id, "embedding_status": "queued" if updated and ctx.deps.config.memory.embedding.enabled else embedding_status}
     if status == "deleted":
         return forget_memory(ctx, memory_id)
     return {"updated": False, "reason": "no_supported_update"}

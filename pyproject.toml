@@ -13,6 +13,7 @@ dependencies = [
     "playwright-stealth>=2.0.0",
     "python-telegram-bot[socks]>=21.0",
     "ddgs>=9.14.0",
+    "sqlite-vec>=0.1.6",
 ]
 
 [project.optional-dependencies]

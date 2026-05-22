@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from html import escape
+
 from openhachimi_agent.memory.models import MemoryContext
 
 
@@ -29,8 +31,21 @@ def format_memory_context(context: MemoryContext, max_context_tokens: int = 1800
             tag = "topic-block"
         elif result.level == "L3":
             tag = "persona"
-        attrs = f'id="{result.id}" type="{result.memory_type}" confidence="{result.confidence:.2f}" updated_at="{result.updated_at}"'
-        item = f"  <{tag} {attrs}>{_clip(result.content, 900)}</{tag}>\n"
+        attrs = {
+            "id": result.id,
+            "level": result.level,
+            "type": result.memory_type,
+            "source": result.source,
+            "confidence": f"{result.confidence:.2f}",
+            "score": f"{result.score:.4f}",
+            "updated_at": result.updated_at,
+        }
+        for key in ("created_at", "valid_until", "decay_at", "stability", "access_count", "freshness_score"):
+            value = result.metadata.get(key)
+            if value is not None and value != "":
+                attrs[key] = str(value)
+        attr_text = " ".join(f'{key}="{escape(str(value), quote=True)}"' for key, value in attrs.items())
+        item = f"  <{tag} {attr_text}>{escape(_clip(result.content, 900))}</{tag}>\n"
         if used + len(item) > max_chars:
             break
         lines.append(item)

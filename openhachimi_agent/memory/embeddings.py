@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -77,4 +78,4 @@ class EmbeddingProvider:
             return EmbeddingResult(vector=[], degraded=True, reason=str(exc))
 
     async def embed(self, text: str) -> EmbeddingResult:
-        return self.embed_sync(text)
+        return await asyncio.to_thread(self.embed_sync, text)

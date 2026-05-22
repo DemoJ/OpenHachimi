@@ -50,6 +50,31 @@ class MemoryPrivacyConfig:
 
 
 @dataclass(frozen=True)
+class MemorySchedulerConfig:
+    enabled: bool = True
+    poll_interval_seconds: int = 2
+    batch_size: int = 10
+    lock_seconds: int = 300
+
+
+@dataclass(frozen=True)
+class MemoryConsolidationConfig:
+    enabled: bool = True
+    atom_limit: int = 200
+    block_limit: int = 50
+    min_atom_confidence: float = 0.55
+    min_block_atoms: int = 2
+
+
+@dataclass(frozen=True)
+class MemoryVectorConfig:
+    backend: str = "shard"
+    shard_top_dims: int = 4
+    candidate_multiplier: int = 20
+    min_bruteforce_rows: int = 200
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
     enabled: bool = True
     db_path: Path | None = None
@@ -57,6 +82,9 @@ class MemoryConfig:
     recall: MemoryRecallConfig = field(default_factory=MemoryRecallConfig)
     capture: MemoryCaptureConfig = field(default_factory=MemoryCaptureConfig)
     privacy: MemoryPrivacyConfig = field(default_factory=MemoryPrivacyConfig)
+    scheduler: MemorySchedulerConfig = field(default_factory=MemorySchedulerConfig)
+    consolidation: MemoryConsolidationConfig = field(default_factory=MemoryConsolidationConfig)
+    vector: MemoryVectorConfig = field(default_factory=MemoryVectorConfig)
 
 
 @dataclass(frozen=True)
@@ -136,6 +164,9 @@ def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: 
     recall_config = _as_mapping(memory_config.get("recall"), "memory.recall")
     capture_config = _as_mapping(memory_config.get("capture"), "memory.capture")
     privacy_config = _as_mapping(memory_config.get("privacy"), "memory.privacy")
+    scheduler_config = _as_mapping(memory_config.get("scheduler"), "memory.scheduler")
+    consolidation_config = _as_mapping(memory_config.get("consolidation"), "memory.consolidation")
+    vector_config = _as_mapping(memory_config.get("vector"), "memory.vector")
 
     db_path_value = _config_string(memory_config, "db_path", ".memory/long_term_memory.sqlite3")
     db_path = _resolve_config_path(base_dir, db_path_value, base_dir / ".memory" / "long_term_memory.sqlite3")
@@ -172,6 +203,25 @@ def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: 
             pii_redaction=_config_bool(privacy_config, "pii_redaction", True),
             allow_secret_memory=_config_bool(privacy_config, "allow_secret_memory", False),
             raw_turn_retention_days=_config_int(privacy_config, "raw_turn_retention_days", 180),
+        ),
+        scheduler=MemorySchedulerConfig(
+            enabled=_config_bool(scheduler_config, "enabled", True),
+            poll_interval_seconds=_config_int(scheduler_config, "poll_interval_seconds", 2),
+            batch_size=_config_int(scheduler_config, "batch_size", 10),
+            lock_seconds=_config_int(scheduler_config, "lock_seconds", 300),
+        ),
+        consolidation=MemoryConsolidationConfig(
+            enabled=_config_bool(consolidation_config, "enabled", True),
+            atom_limit=_config_int(consolidation_config, "atom_limit", 200),
+            block_limit=_config_int(consolidation_config, "block_limit", 50),
+            min_atom_confidence=float(consolidation_config.get("min_atom_confidence", 0.55)),
+            min_block_atoms=_config_int(consolidation_config, "min_block_atoms", 2),
+        ),
+        vector=MemoryVectorConfig(
+            backend=_config_string(vector_config, "backend", "shard"),
+            shard_top_dims=_config_int(vector_config, "shard_top_dims", 4),
+            candidate_multiplier=_config_int(vector_config, "candidate_multiplier", 20),
+            min_bruteforce_rows=_config_int(vector_config, "min_bruteforce_rows", 200),
         ),
     )
 
