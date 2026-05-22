@@ -30,6 +30,8 @@ from telegram.request import HTTPXRequest
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_service import AgentService
+from openhachimi_agent.storage.attachments import AttachmentError, AttachmentStorage
+from openhachimi_agent.transport.api_models import AttachmentRef
 
 
 logger = logging.getLogger(__name__)
@@ -154,6 +156,11 @@ class TelegramBot:
         self._sessions: dict[int, dict[str, str]] = {}
         # 按 user_id 存储队列锁，实现每个用户独立的消息排队机制
         self._user_locks: dict[int, asyncio.Lock] = {}
+        self.attachment_storage = AttachmentStorage(
+            config.attachments_dir,
+            config.max_attachment_size_bytes,
+            config.allowed_attachment_mime_types,
+        )
         logger.info("telegram bot handler initialized")
 
     def _get_session(self, user_id: int) -> dict[str, str]:
@@ -274,6 +281,69 @@ class TelegramBot:
         except (FileNotFoundError, ValueError) as exc:
             await update.message.reply_text(f"❌ 切换角色失败：{exc}")
 
+    async def _download_attachments(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[AttachmentRef]:
+        message = update.message
+        if message is None:
+            return []
+
+        attachments: list[AttachmentRef] = []
+        message_id = getattr(message, "message_id", int(time.time()))
+        namespace = f"{user_id}_{message_id}"
+
+        if message.photo:
+            photo = message.photo[-1]
+            size_bytes = getattr(photo, "file_size", None)
+            content_type = "image/jpeg"
+            self.attachment_storage.validate_metadata(filename=None, content_type=content_type, size_bytes=size_bytes)
+            target = self.attachment_storage.build_path(
+                source="telegram",
+                namespace=namespace,
+                filename=f"photo_{message_id}.jpg",
+                content_type=content_type,
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            telegram_file = await ctx.bot.get_file(photo.file_id)
+            await telegram_file.download_to_drive(custom_path=target)
+            attachments.append(
+                self.attachment_storage.to_ref(
+                    path=target,
+                    source="telegram",
+                    filename=target.name,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    metadata={"telegram_file_id": photo.file_id},
+                )
+            )
+
+        if message.document:
+            document = message.document
+            content_type = document.mime_type or "application/octet-stream"
+            filename = document.file_name or f"document_{message_id}"
+            size_bytes = document.file_size
+            self.attachment_storage.validate_metadata(filename=filename, content_type=content_type, size_bytes=size_bytes)
+            target = self.attachment_storage.build_path(
+                source="telegram",
+                namespace=namespace,
+                filename=filename,
+                content_type=content_type,
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            telegram_file = await ctx.bot.get_file(document.file_id)
+            await telegram_file.download_to_drive(custom_path=target)
+            attachments.append(
+                self.attachment_storage.to_ref(
+                    path=target,
+                    source="telegram",
+                    filename=filename,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    metadata={"telegram_file_id": document.file_id},
+                )
+            )
+
+        logger.info("telegram attachments user_id=%d count=%d", user_id, len(attachments))
+        return attachments
+
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """普通文本消息处理器：流式调用 Agent 并以「编辑消息」实现打字效果。
 
@@ -281,7 +351,18 @@ class TelegramBot:
         流结束后将完整内容转换为 Telegram HTML 格式重新渲染。
         """
         user_id = update.effective_user.id
-        user_text = (update.message.text or "").strip()
+        user_text = ((update.message.text or update.message.caption or "") if update.message else "").strip()
+        try:
+            attachments = await self._download_attachments(update, ctx, user_id)
+        except AttachmentError as exc:
+            await update.message.reply_text(f"❌ 附件无法处理：{exc}")
+            return
+        except Exception as exc:
+            logger.exception("telegram attachment download failed user_id=%d", user_id)
+            await update.message.reply_text(f"❌ 附件下载失败：{_exception_text(exc)}")
+            return
+        if not user_text and attachments:
+            user_text = "用户发送了附件，请根据附件内容协助处理。"
         if not user_text:
             return
 
@@ -293,8 +374,8 @@ class TelegramBot:
 
         async with lock:
             logger.info(
-                "telegram message user_id=%d role=%s session_id=%s chars=%d",
-                user_id, role, session_id, len(user_text),
+                "telegram message user_id=%d role=%s session_id=%s chars=%d attachment_count=%d",
+                user_id, role, session_id, len(user_text), len(attachments),
             )
 
             # 先发出占位消息
@@ -400,7 +481,7 @@ class TelegramBot:
                 presenter.reset_tools()
 
             try:
-                async for event in self.service.stream_events(user_text, role, session_id):
+                async for event in self.service.stream_events(user_text, role, session_id, attachments=attachments):
                     for action in presenter.handle_event(event):
                         if action.type == "tool":
                             if answer_text.strip() or system_text.strip():
@@ -495,8 +576,8 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
     app.add_handler(CommandHandler("stop", bot.cmd_stop))
     app.add_handler(CommandHandler("roles", bot.cmd_roles))
     app.add_handler(CommandHandler("role", bot.cmd_role))
-    # 普通文本消息处理器（非命令），设置为 block=False 以免阻塞后续的 /stop 等命令
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message, block=False))
+    # 普通消息处理器（非命令），支持文本、图片与文档，设置为 block=False 以免阻塞后续的 /stop 等命令
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, bot.handle_message, block=False))
 
     # 启动 Bot（连接失败时不阻断 HTTP 服务，仅记录错误）
     try:

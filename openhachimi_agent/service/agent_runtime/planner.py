@@ -9,6 +9,7 @@ from typing import Any
 
 from openhachimi_agent.agent.intent import TaskFrame
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
+from openhachimi_agent.service.agent_runtime.executor import message_with_attachments
 
 
 PLANNING_NOTICE = "\n\n[System] 检测到任务需要前置规划，正在进行只读调研与计划拆解...\n"
@@ -54,7 +55,7 @@ async def run_planner(ctx: AgentRunContext, task_frame: TaskFrame, get_agent: Ca
 
     try:
         planner_result = await planner_agent.run(
-            build_planner_prompt(task_frame, ctx.message),
+            build_planner_prompt(task_frame, message_with_attachments(ctx.message, ctx.attachments)),
             message_history=ctx.history,
             deps=ctx.deps,
             event_stream_handler=ctx.stream_event_handler if ctx.stream else None,

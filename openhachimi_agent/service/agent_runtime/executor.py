@@ -18,9 +18,40 @@ from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
 from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+from openhachimi_agent.transport.api_models import AttachmentRef
 
 
 logger = logging.getLogger(__name__)
+
+
+def format_attachments_for_prompt(attachments: list[AttachmentRef]) -> str:
+    if not attachments:
+        return ""
+
+    lines = [
+        "用户同时发送了以下附件：",
+        "请不要臆测附件内容；需要内容时调用文件或图片工具。不要在回复中泄露本地绝对路径。",
+    ]
+    for attachment in attachments:
+        lines.extend(
+            [
+                f"- id: {attachment.id}",
+                f"  kind: {attachment.kind}",
+                f"  filename: {attachment.filename or 'unknown'}",
+                f"  content_type: {attachment.content_type or 'unknown'}",
+                f"  size_bytes: {attachment.size_bytes if attachment.size_bytes is not None else 'unknown'}",
+                f"  local_path: {attachment.local_path}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def message_with_attachments(message: str, attachments: list[AttachmentRef]) -> str:
+    attachment_block = format_attachments_for_prompt(attachments)
+    if not attachment_block:
+        return message
+    user_message = message.strip() or "用户发送了附件，请根据附件内容协助处理。"
+    return f"{user_message}\n\n{attachment_block}"
 
 
 @dataclass
@@ -29,34 +60,35 @@ class ExecutionOutcome:
     final_verification_signal: dict[str, object] | None = None
 
 
-def _build_executor_message(task_frame_payload: dict[str, Any] | None, message: str) -> str:
+def _build_executor_message(task_frame_payload: dict[str, Any] | None, message: str, attachments: list[AttachmentRef] | None = None) -> str:
+    user_message = message_with_attachments(message, attachments or [])
     if not task_frame_payload:
-        return message
+        return user_message
 
     return (
         "请执行以下用户任务。必须遵守 TaskFrame 中的 goal、target_entities、invariants、allowed_autonomy 和 replan_triggers；"
         "如果工具观察结果与 TaskFrame 冲突，应停止当前动作并重新校准目标。\n"
         f"TaskFrame：{json.dumps(task_frame_payload, ensure_ascii=False)}\n"
-        f"用户原始任务：{message}"
+        f"用户原始任务：{user_message}"
     )
 
 
-def _build_repair_message(task_frame_payload: dict[str, Any] | None, message: str, verification_signal: dict[str, object]) -> str:
+def _build_repair_message(task_frame_payload: dict[str, Any] | None, message: str, verification_signal: dict[str, object], attachments: list[AttachmentRef] | None = None) -> str:
     return (
         "最终验证器发现当前执行结果尚不足以宣称完成。请只补齐验证器指出的缺口，"
         "继续严格遵守 TaskFrame、TODO 和执行记录；完成后必须更新 TODO 或提供足够证据。\n"
         f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
         f"Final verification signal：{json.dumps(verification_signal, ensure_ascii=False)}\n"
-        f"用户原始任务：{message}"
+        f"用户原始任务：{message_with_attachments(message, attachments or [])}"
     )
 
 
-def _build_retry_message(task_frame_payload: dict[str, Any] | None, message: str) -> str:
+def _build_retry_message(task_frame_payload: dict[str, Any] | None, message: str, attachments: list[AttachmentRef] | None = None) -> str:
     return (
         "请根据刚刚修订后的计划继续执行用户任务。必须遵守 TaskFrame 和新的 TODO；"
         "如果再次遇到同类偏差，请停止并向用户说明阻塞原因。\n"
         f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
-        f"用户原始任务：{message}"
+        f"用户原始任务：{message_with_attachments(message, attachments or [])}"
     )
 
 
@@ -139,7 +171,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     ctx.operation_state.start("model", "executor")
     task_frame_payload = _get_task_frame_payload(ctx.session_state)
     executor_agent = _build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent)
-    executor_message = _build_executor_message(task_frame_payload, ctx.message)
+    executor_message = _build_executor_message(task_frame_payload, ctx.message, ctx.attachments)
     ledger_start_seq = get_ledger_length(ctx.session_state)
     ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
 
@@ -158,7 +190,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
         if signal and ctx.turn_state.replan_attempts < 1:
             ctx.turn_state.replan_attempts += 1
             await _replan_after_execution_signal(ctx, signal, get_agent)
-            retry_message = _build_retry_message(task_frame_payload, ctx.message)
+            retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments)
             result = await run_executor_once(
                 executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent),
                 run_message=retry_message,
@@ -176,7 +208,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
         ctx.turn_state.final_verification_repair_attempts += 1
         if ctx.stream and ctx.stream_queue is not None:
             await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n"))
-        repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal)
+        repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments)
         result = await run_executor_once(
             executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent),
             run_message=repair_message,

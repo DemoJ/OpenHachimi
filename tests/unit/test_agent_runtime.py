@@ -14,6 +14,7 @@ from openhachimi_agent.service.agent_runtime.context import (
     should_route_new_turn,
 )
 from openhachimi_agent.service.agent_runtime.executor import _build_executor_message
+from openhachimi_agent.transport.api_models import AttachmentRef
 from openhachimi_agent.service.agent_runtime.router import should_route_message
 from openhachimi_agent.service.agent_runtime.streaming import OperationStalledError, StreamStats, consume_stream_queue
 
@@ -42,6 +43,7 @@ def _ctx(session_state, message="帮我处理任务"):
         role="default",
         session_id="session-1",
         message=message,
+        attachments=[],
         history=[],
         deps=SimpleNamespace(),
         session_state=session_state,
@@ -133,6 +135,26 @@ def test_executor_message_preserves_task_frame_contract():
 
 def test_executor_message_without_task_frame_is_raw_message():
     assert _build_executor_message(None, "直接回答") == "直接回答"
+
+
+def test_executor_message_with_attachments_adds_safe_summary():
+    attachment = AttachmentRef(
+        id="att_1",
+        filename="photo.jpg",
+        content_type="image/jpeg",
+        size_bytes=123,
+        local_path=".tmp/attachments/telegram/u1/photo.jpg",
+        source="telegram",
+        kind="image",
+    )
+
+    message = _build_executor_message(None, "看看这张图", [attachment])
+
+    assert "看看这张图" in message
+    assert "att_1" in message
+    assert "photo.jpg" in message
+    assert ".tmp/attachments/telegram/u1/photo.jpg" in message
+    assert "不要臆测附件内容" in message
 
 
 @pytest.mark.asyncio

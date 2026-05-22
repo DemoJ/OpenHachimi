@@ -10,6 +10,7 @@ app:
                              #   socks5://127.0.0.1:1080
                              #   http://192.168.1.1:7890
   stream_idle_timeout_seconds: 60   # 流式队列无新事件时的进展检查/心跳间隔；实际卡住判定会按操作类型使用更长阈值
+  max_attachment_size_mb: 50       # Telegram/HTTP 附件大小上限，单位 MB；文件类型不限制，是否可解析由 Agent/LLM 自行判断
 
 llm:
   api_key: sk-xxxxxxxx
@@ -19,6 +20,7 @@ llm:
 paths:
   roles_dir: user/roles
   memory_dir: .memory
+  attachments_dir: .tmp/attachments
   external_skills_dir: ""    # 可选配置，外部技能目录的绝对路径，例如 C:\Users\xxx\.agents\skills
 
 memory:

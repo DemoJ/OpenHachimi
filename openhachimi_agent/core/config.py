@@ -111,6 +111,9 @@ class AppConfig:
     browser_idle_timeout: int
     telegram_bot_token: str | None
     telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
+    attachments_dir: Path
+    max_attachment_size_bytes: int
+    allowed_attachment_mime_types: list[str]
     agent_timeout_seconds: int
     stream_idle_timeout_seconds: int
     memory: MemoryConfig
@@ -156,6 +159,17 @@ def _config_int(section: dict[str, Any], key: str, default: int, minimum: int = 
     except (TypeError, ValueError) as exc:
         raise ValueError(f"config.yaml 中的 {key} 必须是整数。") from exc
     return max(minimum, parsed)
+
+
+def _config_string_list(section: dict[str, Any], key: str, default: list[str]) -> list[str]:
+    value = section.get(key, default)
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError(f"config.yaml 中的 {key} 必须是字符串列表或逗号分隔字符串。")
 
 
 def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: dict[str, Any]) -> MemoryConfig:
@@ -286,6 +300,17 @@ def load_config() -> AppConfig:
         browser_idle_timeout=_config_int(app_config, "browser_idle_timeout", 300, minimum=0),
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
+        attachments_dir=_resolve_config_path(
+            base_dir,
+            _config_string(paths_config, "attachments_dir", ".tmp/attachments"),
+            base_dir / ".tmp" / "attachments",
+        ),
+        max_attachment_size_bytes=_config_int(app_config, "max_attachment_size_mb", 50) * 1024 * 1024,
+        allowed_attachment_mime_types=_config_string_list(
+            app_config,
+            "allowed_attachment_mime_types",
+            [],
+        ),
         agent_timeout_seconds=300,
         stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
         memory=_load_memory_config(base_dir, raw_config, llm_config),

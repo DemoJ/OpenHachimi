@@ -71,20 +71,20 @@ def roles(service: AgentService = Depends(get_service)):
 
 @app.post("/chat")
 async def chat(request: ChatRequest, service: AgentService = Depends(get_service)):
-    logger.info("http chat request message_chars=%d stream=false", len(request.message))
+    logger.info("http chat request message_chars=%d attachment_count=%d stream=false", len(request.message), len(request.attachments))
     try:
-        return await service.send_message(request.message, request.role, request.session_id)
+        return await service.send_message(request.message, request.role, request.session_id, attachments=request.attachments)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/chat/stream")
 def chat_stream(request: ChatRequest, service: AgentService = Depends(get_service)):
-    logger.info("http chat request message_chars=%d stream=true", len(request.message))
+    logger.info("http chat request message_chars=%d attachment_count=%d stream=true", len(request.message), len(request.attachments))
 
     async def sse_generator():
         try:
-            async for event in service.stream_events(request.message, request.role, request.session_id):
+            async for event in service.stream_events(request.message, request.role, request.session_id, attachments=request.attachments):
                 payload = {
                     "type": event.type,
                     "text": event.text,

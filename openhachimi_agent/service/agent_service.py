@@ -6,7 +6,7 @@ import json
 import logging
 import time
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 
 from openhachimi_agent.agent.factory import build_continuation_agent, build_executor_agent, build_planner_agent, build_router_agent
 from openhachimi_agent.content.roles import list_role_names
@@ -21,7 +21,7 @@ from openhachimi_agent.service.agent_runtime.context import (
     mark_turn_started,
     suspend_current_plan,
 )
-from openhachimi_agent.service.agent_runtime.executor import execute_task
+from openhachimi_agent.service.agent_runtime.executor import execute_task, message_with_attachments
 from openhachimi_agent.service.agent_runtime.planner import needs_planning, run_planner
 from openhachimi_agent.service.agent_runtime.router import resolve_task_frame, should_route_message
 from openhachimi_agent.service.agent_runtime.streaming import (
@@ -37,7 +37,7 @@ from openhachimi_agent.memory.capture import capture_turn_memories
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.memory.recall import recall_memories
 from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
-from openhachimi_agent.transport.api_models import AgentState, ChatResponse, CommandResponse, RolesResponse
+from openhachimi_agent.transport.api_models import AgentState, AttachmentRef, ChatResponse, CommandResponse, RolesResponse
 
 
 logger = logging.getLogger(__name__)
@@ -217,20 +217,30 @@ class AgentService:
             session_id=session_id,
         )
 
-    async def _run_with_session(self, message: str, role: str | None, session_id: str | None, stream: bool) -> AsyncIterator[object]:
+    async def _run_with_session(
+        self,
+        message: str,
+        role: str | None,
+        session_id: str | None,
+        stream: bool,
+        attachments: Sequence[AttachmentRef] | None = None,
+    ) -> AsyncIterator[object]:
         start_time = time.perf_counter()
         role = role or self.config.default_role_name
+        attachment_list = list(attachments or [])
+        effective_message = message_with_attachments(message, attachment_list)
 
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
         lock = self._get_session_lock(actual_session_id)
 
         async with lock:
             logger.info(
-                "chat started role=%s session_id=%s message_chars=%d history_messages=%d stream=%s",
+                "chat started role=%s session_id=%s message_chars=%d history_messages=%d attachment_count=%d stream=%s",
                 role,
                 actual_session_id,
                 len(message),
                 len(history),
+                len(attachment_list),
                 str(stream).lower(),
             )
 
@@ -244,7 +254,7 @@ class AgentService:
                 session_id=actual_session_id,
                 channel="cli",
             )
-            memory_context = recall_memories(self.config, memory_scope, message)
+            memory_context = recall_memories(self.config, memory_scope, effective_message)
             session_state["memory_context"] = memory_context
             deps = AgentDeps(
                 config=self.config,
@@ -263,6 +273,7 @@ class AgentService:
                 role=role,
                 session_id=actual_session_id,
                 message=message,
+                attachments=attachment_list,
                 history=history,
                 deps=deps,
                 session_state=session_state,
@@ -448,7 +459,7 @@ class AgentService:
                 capture_args = (
                     self.config,
                     memory_scope,
-                    message,
+                    effective_message,
                     str(result.output),  # type: ignore[attr-defined]
                 )
                 capture_kwargs = {
@@ -516,13 +527,25 @@ class AgentService:
                 if not task.done():
                     task.cancel()
 
-    async def send_message(self, message: str, role: str | None = None, session_id: str | None = None) -> ChatResponse:
-        async for result in self._run_with_session(message, role, session_id, stream=False):
+    async def send_message(
+        self,
+        message: str,
+        role: str | None = None,
+        session_id: str | None = None,
+        attachments: Sequence[AttachmentRef] | None = None,
+    ) -> ChatResponse:
+        async for result in self._run_with_session(message, role, session_id, stream=False, attachments=attachments):
             return result  # type: ignore[return-value]
         raise RuntimeError("No result returned from _run_with_session")
 
-    async def stream_events(self, message: str, role: str | None = None, session_id: str | None = None) -> AsyncIterator[StreamEventItem]:
-        async for event in self._run_with_session(message, role, session_id, stream=True):
+    async def stream_events(
+        self,
+        message: str,
+        role: str | None = None,
+        session_id: str | None = None,
+        attachments: Sequence[AttachmentRef] | None = None,
+    ) -> AsyncIterator[StreamEventItem]:
+        async for event in self._run_with_session(message, role, session_id, stream=True, attachments=attachments):
             if isinstance(event, StreamEventItem):
                 yield event
 
@@ -531,8 +554,9 @@ class AgentService:
         message: str,
         role: str | None = None,
         session_id: str | None = None,
+        attachments: Sequence[AttachmentRef] | None = None,
     ) -> AsyncIterator[str]:
-        async for event in self.stream_events(message, role, session_id):
+        async for event in self.stream_events(message, role, session_id, attachments=attachments):
             if event.type in {"text", "system"}:
                 yield event.text
             elif event.type == "tool":

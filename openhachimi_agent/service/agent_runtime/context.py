@@ -13,6 +13,7 @@ from pydantic_ai.messages import ModelMessage
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.transport.api_models import AttachmentRef
 
 
 @dataclass
@@ -55,6 +56,7 @@ class AgentRunContext:
     role: str
     session_id: str
     message: str
+    attachments: list[AttachmentRef]
     history: list[ModelMessage]
     deps: AgentDeps
     session_state: dict[str, Any]

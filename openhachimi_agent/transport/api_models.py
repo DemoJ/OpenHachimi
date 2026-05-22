@@ -1,5 +1,7 @@
 """本地 HTTP 服务的数据模型。"""
 
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -8,10 +10,22 @@ class AgentState(BaseModel):
     base_url: str | None = None
 
 
+class AttachmentRef(BaseModel):
+    id: str = Field(min_length=1)
+    filename: str | None = None
+    content_type: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    local_path: str = Field(min_length=1)
+    source: Literal["telegram", "http", "local"] = "local"
+    kind: Literal["image", "document", "audio", "video", "unknown"] = "unknown"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1)
+    message: str = Field(default="")
     role: str | None = None
     session_id: str | None = None
+    attachments: list[AttachmentRef] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):

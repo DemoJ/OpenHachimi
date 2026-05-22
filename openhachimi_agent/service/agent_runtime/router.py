@@ -21,6 +21,7 @@ from openhachimi_agent.service.agent_runtime.context import (
     should_route_new_turn,
     suspend_current_plan,
 )
+from openhachimi_agent.service.agent_runtime.executor import message_with_attachments
 
 
 logger = logging.getLogger(__name__)
@@ -111,17 +112,18 @@ async def should_route_message(ctx: AgentRunContext, get_agent: Callable[[str, s
 
 
 async def resolve_task_frame(ctx: AgentRunContext, get_agent: Callable[[str, str], Any]) -> TaskFrame:
+    prompt_message = message_with_attachments(ctx.message, ctx.attachments)
     try:
         router_agent = get_agent(ctx.role, "router")
-        router_result = await router_agent.run(f"指令：{ctx.message}")
+        router_result = await router_agent.run(f"指令：{prompt_message}")
         router_data = getattr(router_result, "data", getattr(router_result, "output", None))
-        task_frame = coerce_task_frame(router_data, ctx.message)
+        task_frame = coerce_task_frame(router_data, prompt_message)
     except Exception as router_e:
-        decision = classify_intent_heuristic(ctx.message)
+        decision = classify_intent_heuristic(prompt_message)
         if not (decision.task_kind == "browser" and decision.target_urls and decision.risk != "high"):
             decision.requires_plan = True
         decision.rationale = f"router failed: {router_e.__class__.__name__}"
-        task_frame = build_task_frame(ctx.message, decision)
+        task_frame = build_task_frame(prompt_message, decision)
         logger.warning("Router failed: %s. Falling back to conservative planning.", router_e)
 
     logger.info(

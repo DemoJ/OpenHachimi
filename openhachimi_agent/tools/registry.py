@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic_ai import FunctionToolset
 
+from openhachimi_agent.tools.attachments import inspect_image
 from openhachimi_agent.tools.browser import (
     browser_click, browser_get_state, browser_navigate, browser_scroll, browser_type,
     browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab
@@ -52,6 +53,7 @@ _FILE_TOOLS = [
     find_files,
     search_text,
     read_file,
+    inspect_image,
 ]
 
 _OTHER_TOOLS = [

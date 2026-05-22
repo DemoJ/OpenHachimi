@@ -1,5 +1,10 @@
 """Agent 构建包。"""
 
-from openhachimi_agent.agent.factory import build_router_agent, build_planner_agent, build_executor_agent
-
 __all__ = ["build_router_agent", "build_planner_agent", "build_executor_agent"]
+
+
+def __getattr__(name: str):
+    if name in __all__:
+        from openhachimi_agent.agent import factory
+        return getattr(factory, name)
+    raise AttributeError(name)
