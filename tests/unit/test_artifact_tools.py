@@ -7,7 +7,7 @@ from openhachimi_agent.tools.artifacts import publish_artifact
 
 
 def make_ctx(tmp_path, max_size=1024):
-    config = SimpleNamespace(base_dir=tmp_path, max_attachment_size_bytes=max_size)
+    config = SimpleNamespace(base_dir=tmp_path, attachments_dir=tmp_path / ".tmp" / "attachments", max_attachment_size_bytes=max_size)
     deps = SimpleNamespace(base_dir=tmp_path, skills_dirs=[], config=config, session_state={})
     return SimpleNamespace(deps=deps)
 
@@ -23,7 +23,9 @@ def test_publish_artifact_records_turn_artifact(tmp_path):
     assert artifact["filename"] == "report.md"
     assert artifact["content_type"] == "text/markdown"
     assert artifact["download_url"].startswith("/artifacts/")
-    assert artifact["local_path"] == "report.md"
+    assert artifact["local_path"].startswith(".tmp/artifacts/art_")
+    assert artifact["local_path"].endswith("/report.md")
+    assert (tmp_path / artifact["local_path"]).read_text(encoding="utf-8") == "hello"
     assert len(ctx.deps.session_state["turn_artifacts"]) == 1
     assert ctx.deps.session_state["turn_artifacts"][0].title == "报告"
 
@@ -46,7 +48,11 @@ def test_publish_artifact_resolves_relative_path_from_cwd(tmp_path):
 
     result = publish_artifact(ctx, "cute_kitten.jpg", cwd="tmp/doubao-seedream")
 
-    assert result["artifact"]["local_path"] == "tmp/doubao-seedream/cute_kitten.jpg"
+    assert result["artifact"]["local_path"].startswith(".tmp/artifacts/art_")
+    assert result["artifact"]["local_path"].endswith("/cute_kitten.jpg")
+    assert (tmp_path / result["artifact"]["local_path"]).read_bytes() == b"jpg"
+    image.unlink()
+    assert (tmp_path / result["artifact"]["local_path"]).read_bytes() == b"jpg"
 
 
 @pytest.mark.parametrize("path", ["missing.txt", ".", "../outside.txt"])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import mimetypes
 import re
+import shutil
 import uuid
 from pathlib import Path
 
@@ -31,6 +32,11 @@ def _reject_sensitive_path(path: Path) -> None:
         raise ModelRetry("该文件名疑似包含密钥或凭据，不能发布为文件附件。")
 
 
+def _artifact_cache_dir(ctx: RunContext[AgentDeps], artifact_id: str) -> Path:
+    attachments_dir = getattr(ctx.deps.config, "attachments_dir", ctx.deps.base_dir / ".tmp" / "attachments")
+    return attachments_dir.parent / "artifacts" / artifact_id
+
+
 def _build_artifact_ref(
     ctx: RunContext[AgentDeps],
     target_file: Path,
@@ -47,12 +53,16 @@ def _build_artifact_ref(
     output_filename = _sanitize_filename(filename or target_file.name)
     content_type = mimetypes.guess_type(output_filename)[0] or mimetypes.guess_type(target_file.name)[0] or "application/octet-stream"
     artifact_id = f"art_{uuid.uuid4().hex[:12]}"
+    artifact_dir = _artifact_cache_dir(ctx, artifact_id)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_file = artifact_dir / output_filename
+    shutil.copy2(target_file, artifact_file)
     return ArtifactRef(
         id=artifact_id,
         filename=output_filename,
         content_type=content_type,
         size_bytes=size_bytes,
-        local_path=normalize_relative_path(ctx.deps.base_dir, target_file),
+        local_path=normalize_relative_path(ctx.deps.base_dir, artifact_file),
         download_url=f"/artifacts/{artifact_id}/download",
         title=title,
         description=description,

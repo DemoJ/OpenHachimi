@@ -13,6 +13,7 @@ import re
 import time
 import asyncio
 import contextlib
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -364,6 +365,10 @@ class TelegramBot:
                 filename=artifact.filename,
                 caption=caption[:1024],
             )
+        artifacts_root = self.config.attachments_dir.parent / "artifacts"
+        with contextlib.suppress(ValueError, OSError):
+            target.relative_to(artifacts_root.resolve())
+            shutil.rmtree(target.parent)
 
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """普通文本消息处理器：流式调用 Agent 并以「编辑消息」实现打字效果。
