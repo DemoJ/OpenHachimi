@@ -31,7 +31,8 @@ from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.storage.attachments import AttachmentError, AttachmentStorage
-from openhachimi_agent.transport.api_models import AttachmentRef
+from openhachimi_agent.tools.utils import resolve_workspace_path
+from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 
 
 logger = logging.getLogger(__name__)
@@ -344,6 +345,25 @@ class TelegramBot:
         logger.info("telegram attachments user_id=%d count=%d", user_id, len(attachments))
         return attachments
 
+    async def _send_artifact(self, update: Update, artifact: ArtifactRef) -> None:
+        target = resolve_workspace_path(self.config.base_dir, artifact.local_path)
+        if not target.exists() or not target.is_file():
+            await update.message.reply_text(f"⚠️ 生成文件不存在：{artifact.filename}")
+            return
+        size = target.stat().st_size
+        if size > self.config.max_attachment_size_bytes:
+            await update.message.reply_text(f"⚠️ 文件过大，无法通过 Telegram 发送：{artifact.filename}")
+            return
+        caption = f"已生成文件：{artifact.filename}"
+        if artifact.description:
+            caption = f"{caption}\n{artifact.description}"
+        with target.open("rb") as file:
+            await update.message.reply_document(
+                document=file,
+                filename=artifact.filename,
+                caption=caption[:1024],
+            )
+
     async def handle_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """普通文本消息处理器：流式调用 Agent 并以「编辑消息」实现打字效果。
 
@@ -500,6 +520,12 @@ class TelegramBot:
                             system_text += action.text
                             if time.monotonic() - last_answer_edit_time >= _EDIT_INTERVAL:
                                 await render_answer_messages(final=False)
+                        elif action.type == "artifact" and action.artifact:
+                            if current_tool_text:
+                                await finalize_tool_segment()
+                            if answer_text.strip() or system_text.strip():
+                                await finalize_answer_segment()
+                            await self._send_artifact(update, action.artifact)
 
                 for action in presenter.finalize():
                     if action.type == "tool":

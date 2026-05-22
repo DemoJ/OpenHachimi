@@ -37,7 +37,7 @@ from openhachimi_agent.memory.capture import capture_turn_memories
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.memory.recall import recall_memories
 from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
-from openhachimi_agent.transport.api_models import AgentState, AttachmentRef, ChatResponse, CommandResponse, RolesResponse
+from openhachimi_agent.transport.api_models import AgentState, ArtifactRef, AttachmentRef, ChatResponse, CommandResponse, RolesResponse
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,7 @@ class AgentService:
         self.browser_manager = BrowserManager(config)
         self.process_manager = ProcessManager()
         self._session_states: BoundedDict[str, dict] = BoundedDict(100)
+        self._artifact_records: BoundedDict[str, ArtifactRef] = BoundedDict(500)
         logger.info(
             "service initialized model=%s",
             self.config.model_name,
@@ -142,6 +143,13 @@ class AgentService:
             self._agents[cache_key] = (agent, current_mtime)
             
         return self._agents[cache_key][0]
+
+    def register_artifacts(self, artifacts: list[ArtifactRef]) -> None:
+        for artifact in artifacts:
+            self._artifact_records[artifact.id] = artifact
+
+    def get_artifact(self, artifact_id: str) -> ArtifactRef | None:
+        return self._artifact_records.get(artifact_id)
 
     def state(self) -> AgentState:
         return AgentState(
@@ -247,6 +255,7 @@ class AgentService:
             if actual_session_id not in self._session_states:
                 self._session_states[actual_session_id] = {}
             session_state = self._session_states[actual_session_id]
+            session_state["turn_artifacts"] = []
             memory_scope = MemoryScope(
                 tenant_id="local",
                 user_id="local",
@@ -433,6 +442,22 @@ class AgentService:
                             "\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
                             f"{json.dumps(final_signal, ensure_ascii=False)}"
                         )
+                    turn_artifacts = [
+                        artifact for artifact in session_state.get("turn_artifacts", [])
+                        if isinstance(artifact, ArtifactRef)
+                    ]
+                    self.register_artifacts(turn_artifacts)
+                    seen_artifacts: set[str] = set()
+                    for artifact in turn_artifacts:
+                        if artifact.id in seen_artifacts:
+                            continue
+                        seen_artifacts.add(artifact.id)
+                        yield StreamEventItem(
+                            type="artifact",
+                            text=f"已生成文件：{artifact.filename}",
+                            artifact=artifact,
+                            counted_as_output=False,
+                        )
                 else:
                     try:
                         await task
@@ -446,6 +471,11 @@ class AgentService:
                         raise error
 
                 result = result_holder["result"]
+                turn_artifacts = [
+                    artifact for artifact in session_state.get("turn_artifacts", [])
+                    if isinstance(artifact, ArtifactRef)
+                ]
+                self.register_artifacts(turn_artifacts)
                 new_history = list(result.all_messages())  # type: ignore[attr-defined]
                 history_json = result.all_messages_json()  # type: ignore[attr-defined]
 
@@ -521,6 +551,7 @@ class AgentService:
                         output=output,
                         role=role,
                         session_id=actual_session_id,
+                        artifacts=turn_artifacts,
                     )
             finally:
                 self._running_tasks.pop(actual_session_id, None)

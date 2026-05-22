@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic_ai import FunctionToolset
 
+from openhachimi_agent.tools.artifacts import publish_artifact
 from openhachimi_agent.tools.attachments import inspect_image
 from openhachimi_agent.tools.browser import (
     browser_click, browser_get_state, browser_navigate, browser_scroll, browser_type,
@@ -54,6 +55,7 @@ _FILE_TOOLS = [
     search_text,
     read_file,
     inspect_image,
+    publish_artifact,
 ]
 
 _OTHER_TOOLS = [
@@ -86,7 +88,7 @@ _UPDATE_TODO_TOOL = [
 
 # 组装横切关注点 (Middlewares) 和 TODO 提醒
 _MUTATION_FUNCS = {
-    write_file, make_directory, replace_in_file, delete_path,
+    write_file, make_directory, replace_in_file, delete_path, publish_artifact,
     run_command, send_command_input,
     browser_navigate, browser_click, browser_type, browser_scroll,
     browser_new_tab, browser_switch_tab, browser_close_tab,

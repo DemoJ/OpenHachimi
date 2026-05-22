@@ -61,7 +61,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             "Executor 拥有以下工具能力：\n"
             "- 浏览器：browser_navigate（打开URL）、browser_get_state（读取页面）、browser_click、browser_type、browser_scroll、browser_new_tab 等\n"
             "- 网络：web_fetch（HTTP抓取）、web_search（搜索引擎）、discover_web_resources\n"
-            "- 文件：read_file、write_file、replace_in_file、list_files、find_files、search_text\n"
+            "- 文件：read_file、write_file、replace_in_file、publish_artifact、list_files、find_files、search_text\n"
             "- 命令行：run_command、send_command_input\n"
             "- Git：git_status、git_diff\n\n"
             "请基于对以上 Executor 工具能力的理解来制定执行计划。\n"
@@ -73,7 +73,10 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             filtered_executor_toolset = FunctionToolset(tools=filtered_tools)
             
         toolsets = [filtered_executor_toolset, dynamic_toolset]
-        extra_prompt = "\n\n[System Role] 你现在是 **Executor Agent (执行者)**。你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作（写代码、运行命令等），并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
+        extra_prompt = (
+            "\n\n[System Role] 你现在是 **Executor Agent (执行者)**。你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作（写代码、运行命令等），并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
+            "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
+        )
 
     agent = Agent(
         OpenAIChatModel(config.model_name, provider=provider),

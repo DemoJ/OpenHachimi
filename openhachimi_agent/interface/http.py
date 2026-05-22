@@ -7,15 +7,17 @@
 import json
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.interface.telegram import telegram_lifespan
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.transport.api_models import ChatRequest, RoleSwitchRequest, StopRequest
+from openhachimi_agent.tools.utils import resolve_workspace_path
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,8 @@ def chat_stream(request: ChatRequest, service: AgentService = Depends(get_servic
                     payload["tool_name"] = event.tool_name
                 if event.tool_icon:
                     payload["tool_icon"] = event.tool_icon
+                if event.artifact:
+                    payload["artifact"] = event.artifact.model_dump(mode="json")
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
         except Exception as exc:
@@ -109,7 +113,26 @@ def chat_stream(request: ChatRequest, service: AgentService = Depends(get_servic
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/new")
+@app.get("/artifacts/{artifact_id}/download")
+def download_artifact(artifact_id: str, service: AgentService = Depends(get_service)):
+    artifact = service.get_artifact(artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="artifact 不存在")
+    try:
+        target = resolve_workspace_path(service.config.base_dir, artifact.local_path)
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="artifact 路径不合法") from exc
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="artifact 文件不存在")
+    size = target.stat().st_size
+    if size > service.config.max_attachment_size_bytes:
+        raise HTTPException(status_code=413, detail="artifact 文件超过大小上限")
+    return FileResponse(
+        target,
+        media_type=artifact.content_type or "application/octet-stream",
+        filename=artifact.filename or Path(target).name,
+    )
+
 def new_session(role: str | None = None, service: AgentService = Depends(get_service)):
     logger.info("http new session request role=%s", role)
     return service.new_session(role)

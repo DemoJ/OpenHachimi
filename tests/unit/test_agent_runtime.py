@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from openhachimi_agent.agent.intent import PlanContinuationDecision
+from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
     has_active_todos,
@@ -14,9 +15,9 @@ from openhachimi_agent.service.agent_runtime.context import (
     should_route_new_turn,
 )
 from openhachimi_agent.service.agent_runtime.executor import _build_executor_message
-from openhachimi_agent.transport.api_models import AttachmentRef
+from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 from openhachimi_agent.service.agent_runtime.router import should_route_message
-from openhachimi_agent.service.agent_runtime.streaming import OperationStalledError, StreamStats, consume_stream_queue
+from openhachimi_agent.service.agent_runtime.streaming import OperationStalledError, StreamEventItem, StreamStats, consume_stream_queue
 
 
 class FakeContinuationAgent:
@@ -155,6 +156,54 @@ def test_executor_message_with_attachments_adds_safe_summary():
     assert "photo.jpg" in message
     assert ".tmp/attachments/telegram/u1/photo.jpg" in message
     assert "不要臆测附件内容" in message
+
+
+def test_presenter_passes_artifact_events():
+    artifact = ArtifactRef(
+        id="art_1",
+        filename="report.md",
+        content_type="text/markdown",
+        size_bytes=5,
+        local_path="report.md",
+    )
+    presenter = ToolProgressPresenter(mode="conversation")
+
+    actions = presenter.handle_event(StreamEventItem(type="artifact", text="已生成文件：report.md", artifact=artifact, counted_as_output=False))
+
+    assert len(actions) == 1
+    assert actions[0].type == "artifact"
+    assert actions[0].artifact == artifact
+
+
+@pytest.mark.asyncio
+async def test_stream_artifact_event_not_counted_as_output(tmp_path):
+    async def done_task():
+        return None
+
+    task = asyncio.create_task(done_task())
+    queue = asyncio.Queue()
+    artifact = ArtifactRef(id="art_1", filename="a.txt", content_type="text/plain", size_bytes=1, local_path="a.txt")
+    await queue.put(StreamEventItem(type="artifact", text="已生成文件：a.txt", artifact=artifact, counted_as_output=False))
+    ctx = _ctx({})
+    config = SimpleNamespace(stream_idle_timeout_seconds=1, agent_timeout_seconds=300)
+    stats = StreamStats()
+    stream = consume_stream_queue(
+        stream_queue=queue,
+        task=task,
+        config=config,
+        role="default",
+        session_id="session-1",
+        start_time=time.perf_counter(),
+        stats=stats,
+        operation_state=ctx.operation_state,
+    )
+
+    item = await stream.__anext__()
+
+    assert item.artifact == artifact
+    assert stats.chunk_count == 0
+    assert stats.output_chars == 0
+    await stream.aclose()
 
 
 @pytest.mark.asyncio

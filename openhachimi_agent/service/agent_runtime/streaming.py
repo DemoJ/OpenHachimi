@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.service.agent_runtime.context import OperationState
+from openhachimi_agent.transport.api_models import ArtifactRef
 
 
 logger = logging.getLogger(__name__)
@@ -50,12 +51,13 @@ SENSITIVE_VALUE_PATTERNS = (
 
 @dataclass
 class StreamEventItem:
-    type: Literal["text", "tool", "system"]
+    type: Literal["text", "tool", "system", "artifact"]
     text: str
     tool_name: str | None = None
     tool_icon: str | None = None
     temporary: bool = False
     counted_as_output: bool = True
+    artifact: ArtifactRef | None = None
 
 
 @dataclass
