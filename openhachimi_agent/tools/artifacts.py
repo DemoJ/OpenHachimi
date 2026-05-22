@@ -65,9 +65,11 @@ def publish_artifact(
     filename: str | None = None,
     title: str | None = None,
     description: str | None = None,
+    cwd: str = ".",
 ) -> dict[str, object]:
     """将工作区内已有文件发布为可发送给用户的文件附件。"""
-    target_file = resolve_workspace_path(ctx.deps.base_dir, path, ctx.deps.skills_dirs)
+    target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
+    target_file = resolve_workspace_path(target_cwd, path, [ctx.deps.base_dir, *ctx.deps.skills_dirs])
     if not target_file.exists():
         raise ModelRetry(f"文件不存在：{path}")
     if not target_file.is_file():

@@ -33,8 +33,15 @@ class AttachmentError(ValueError):
 
 
 class AttachmentStorage:
-    def __init__(self, base_dir: Path, max_size_bytes: int, allowed_mime_types: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        base_dir: Path,
+        max_size_bytes: int,
+        allowed_mime_types: list[str] | None = None,
+        workspace_root: Path | None = None,
+    ) -> None:
         self.base_dir = base_dir
+        self.workspace_root = workspace_root or base_dir
         self.max_size_bytes = max_size_bytes
         self.allowed_mime_types = {mime.lower() for mime in allowed_mime_types or []}
 
@@ -95,9 +102,9 @@ class AttachmentStorage:
             raise AttachmentError(f"附件过大：{actual_size} bytes，当前上限为 {self.max_size_bytes} bytes")
         kind = "image" if content_type and content_type.lower() in IMAGE_MIME_TYPES else "document"
         try:
-            local_path = path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+            local_path = path.resolve().relative_to(self.workspace_root.resolve()).as_posix()
         except ValueError:
-            local_path = path.as_posix()
+            local_path = path.resolve().as_posix()
         return AttachmentRef(
             id=f"att_{uuid.uuid4().hex[:12]}",
             filename=filename or path.name,

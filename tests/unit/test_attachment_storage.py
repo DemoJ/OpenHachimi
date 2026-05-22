@@ -6,6 +6,7 @@ def make_storage(tmp_path):
         tmp_path / ".tmp" / "attachments",
         max_size_bytes=1024,
         allowed_mime_types=[],
+        workspace_root=tmp_path,
     )
 
 
@@ -61,3 +62,4 @@ def test_to_ref_records_safe_metadata(tmp_path):
     assert ref.kind == "document"
     assert ref.filename == "a.txt"
     assert ref.size_bytes == 5
+    assert ref.local_path == ".tmp/attachments/telegram/u1/a.txt"

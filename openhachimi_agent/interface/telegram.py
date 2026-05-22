@@ -161,6 +161,7 @@ class TelegramBot:
             config.attachments_dir,
             config.max_attachment_size_bytes,
             config.allowed_attachment_mime_types,
+            config.base_dir,
         )
         logger.info("telegram bot handler initialized")
 

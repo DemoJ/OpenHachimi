@@ -26,8 +26,17 @@ def test_inspect_image_returns_metadata(tmp_path):
     assert result["size_bytes"] == len(PNG_BYTES)
     assert result["path"] == ".tmp/attachments/telegram/u1/a.png"
 
+def test_inspect_image_resolves_relative_path_from_cwd(tmp_path):
+    image = tmp_path / "tmp" / "doubao-seedream" / "cute_kitten.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(PNG_BYTES)
 
-def test_inspect_image_rejects_non_image(tmp_path):
+    result = inspect_image(make_ctx(tmp_path), "cute_kitten.png", cwd="tmp/doubao-seedream")
+
+    assert result["format"] == "PNG"
+    assert result["path"] == "tmp/doubao-seedream/cute_kitten.png"
+
+
     file_path = tmp_path / "a.txt"
     file_path.write_text("hello", encoding="utf-8")
 

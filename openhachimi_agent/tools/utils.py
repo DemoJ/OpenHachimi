@@ -92,10 +92,12 @@ def resolve_workspace_path(workspace_root: Path, path: str, allowed_roots: list[
 
 def normalize_relative_path(workspace_root: Path, path: Path) -> str:
     """将绝对路径转换为工作区相对路径。"""
+    root = workspace_root.resolve()
+    target = path.resolve()
     try:
-        return path.relative_to(workspace_root).as_posix()
+        return target.relative_to(root).as_posix()
     except ValueError:
-        return path.as_posix()
+        return target.as_posix()
 
 
 def relative_path_from(cwd: Path, target: Path) -> str:

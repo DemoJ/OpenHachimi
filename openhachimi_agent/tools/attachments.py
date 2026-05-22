@@ -19,17 +19,18 @@ IMAGE_SIGNATURES = {
 }
 
 
-def _resolve_image_path(ctx: RunContext[AgentDeps], path: str) -> Path:
-    allowed_roots = list(ctx.deps.skills_dirs)
+def _resolve_image_path(ctx: RunContext[AgentDeps], path: str, cwd: str = ".") -> Path:
+    allowed_roots = [ctx.deps.base_dir, *ctx.deps.skills_dirs]
     attachments_dir = getattr(ctx.deps.config, "attachments_dir", None)
     if attachments_dir is not None:
         allowed_roots.append(attachments_dir)
-    return resolve_workspace_path(ctx.deps.base_dir, path, allowed_roots)
+    target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
+    return resolve_workspace_path(target_cwd, path, allowed_roots)
 
 
-def inspect_image(ctx: RunContext[AgentDeps], path: str) -> dict[str, object]:
+def inspect_image(ctx: RunContext[AgentDeps], path: str, cwd: str = ".") -> dict[str, object]:
     """读取图片文件的基础元数据，不返回图片内容。"""
-    target = _resolve_image_path(ctx, path)
+    target = _resolve_image_path(ctx, path, cwd)
     if not target.exists() or not target.is_file():
         raise ModelRetry(f"图片文件不存在：{path}")
 

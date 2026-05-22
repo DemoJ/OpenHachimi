@@ -23,6 +23,7 @@ def test_publish_artifact_records_turn_artifact(tmp_path):
     assert artifact["filename"] == "report.md"
     assert artifact["content_type"] == "text/markdown"
     assert artifact["download_url"].startswith("/artifacts/")
+    assert artifact["local_path"] == "report.md"
     assert len(ctx.deps.session_state["turn_artifacts"]) == 1
     assert ctx.deps.session_state["turn_artifacts"][0].title == "报告"
 
@@ -36,6 +37,16 @@ def test_publish_artifact_sanitizes_filename_override(tmp_path):
 
     assert result["artifact"]["filename"] == "bad_name_.csv"
     assert result["artifact"]["content_type"] in {"text/csv", "application/vnd.ms-excel"}
+
+def test_publish_artifact_resolves_relative_path_from_cwd(tmp_path):
+    image = tmp_path / "tmp" / "doubao-seedream" / "cute_kitten.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"jpg")
+    ctx = make_ctx(tmp_path)
+
+    result = publish_artifact(ctx, "cute_kitten.jpg", cwd="tmp/doubao-seedream")
+
+    assert result["artifact"]["local_path"] == "tmp/doubao-seedream/cute_kitten.jpg"
 
 
 @pytest.mark.parametrize("path", ["missing.txt", ".", "../outside.txt"])
