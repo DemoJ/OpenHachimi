@@ -20,6 +20,7 @@ TaskKind = Literal[
 Complexity = Literal["simple", "complex"]
 RiskLevel = Literal["low", "medium", "high"]
 AllowedAutonomy = Literal["narrow", "bounded", "broad"]
+ExecutionMode = Literal["direct", "skill_direct", "planned"]
 PlanContinuationAction = Literal["continue_active_plan", "resume_suspended_plan", "start_new_task"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>()\"'，。；、]+", re.IGNORECASE)
 
@@ -42,6 +43,8 @@ class IntentDecision(BaseModel):
     clarifying_question: str | None = None
     target_urls: list[str] = Field(default_factory=list)
     must_preserve_targets: bool = False
+    relevant_skills: list[str] = Field(default_factory=list)
+    execution_mode: ExecutionMode = "direct"
     rationale: str = ""
 
 
@@ -70,6 +73,7 @@ class TaskFrame(BaseModel):
     invariants: list[str] = Field(default_factory=list)
     allowed_autonomy: AllowedAutonomy = "bounded"
     relevant_skills: list[str] = Field(default_factory=list)
+    execution_mode: ExecutionMode = "direct"
     replan_triggers: list[str] = Field(default_factory=list)
     direct_execution_reason: str = ""
     rationale: str = ""
@@ -104,6 +108,11 @@ def build_task_frame(message: str, decision: IntentDecision | None = None) -> Ta
 
     decision = decision or classify_intent_heuristic(message)
     allowed_autonomy: AllowedAutonomy = "broad" if decision.complexity == "complex" else "bounded"
+    execution_mode = decision.execution_mode
+    if decision.requires_plan:
+        execution_mode = "planned"
+    elif decision.relevant_skills:
+        execution_mode = "skill_direct"
 
     replan_triggers = [
         "A tool result contradicts the task frame goal or invariants.",
@@ -132,6 +141,8 @@ def build_task_frame(message: str, decision: IntentDecision | None = None) -> Ta
         target_entities=_target_entities_from_urls(decision.target_urls),
         invariants=invariants,
         allowed_autonomy=allowed_autonomy,
+        relevant_skills=decision.relevant_skills,
+        execution_mode=execution_mode,
         replan_triggers=replan_triggers,
         direct_execution_reason=direct_reason,
         rationale=decision.rationale,
@@ -198,7 +209,9 @@ def coerce_intent_decision(value: object, message: str) -> IntentDecision:
     except Exception:
         decision = classify_intent_heuristic(message)
         decision.confidence = min(decision.confidence, 0.4)
-        decision.requires_plan = True
+        decision.requires_plan = decision.risk == "high"
+        if decision.requires_plan:
+            decision.execution_mode = "planned"
         decision.rationale = "unparseable router output"
         return decision
 
@@ -227,5 +240,9 @@ def coerce_task_frame(value: object, message: str) -> TaskFrame:
         for entity in _target_entities_from_urls(detected_urls):
             if entity.value not in existing_urls:
                 frame.target_entities.append(entity)
+    if frame.requires_plan:
+        frame.execution_mode = "planned"
+    elif frame.relevant_skills and frame.execution_mode == "direct":
+        frame.execution_mode = "skill_direct"
     return frame
 

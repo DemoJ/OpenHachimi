@@ -93,4 +93,11 @@ def publish_artifact(
         turn_artifacts.append(artifact)
     if isinstance(artifacts, list):
         artifacts.append(artifact)
+    known_paths = ctx.deps.session_state.setdefault("known_paths", {})
+    if isinstance(known_paths, dict):
+        known_paths[normalize_relative_path(ctx.deps.base_dir, target_file)] = {
+            "action": "publish_artifact",
+            "artifact_id": artifact.id,
+            "filename": artifact.filename,
+        }
     return {"artifact": artifact.model_dump(mode="json")}

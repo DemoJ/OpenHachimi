@@ -15,6 +15,12 @@ from openhachimi_agent.tools.utils import normalize_relative_path, read_text_fil
 logger = logging.getLogger(__name__)
 
 
+def _record_known_path(ctx: RunContext[AgentDeps], path: str, action: str, **details: object) -> None:
+    known_paths = ctx.deps.session_state.setdefault("known_paths", {})
+    if isinstance(known_paths, dict):
+        known_paths[path] = {"action": action, **details}
+
+
 def write_file(
     ctx: RunContext[AgentDeps],
     path: str,
@@ -33,8 +39,16 @@ def write_file(
     target_file.parent.mkdir(parents=True, exist_ok=True)
     target_file.write_text(content, encoding="utf-8")
 
+    normalized_path = normalize_relative_path(ctx.deps.base_dir, target_file)
+    _record_known_path(
+        ctx,
+        normalized_path,
+        "write_file",
+        bytes_written=len(content.encode("utf-8")),
+        overwritten=existed_before,
+    )
     return {
-        "path": normalize_relative_path(ctx.deps.base_dir, target_file),
+        "path": normalized_path,
         "bytes_written": len(content.encode("utf-8")),
         "overwritten": existed_before,
     }
@@ -55,8 +69,10 @@ def make_directory(
 
     target_dir.mkdir(parents=parents, exist_ok=exist_ok)
 
+    normalized_path = normalize_relative_path(ctx.deps.base_dir, target_dir)
+    _record_known_path(ctx, normalized_path, "make_directory", created=not existed_before)
     return {
-        "path": normalize_relative_path(ctx.deps.base_dir, target_dir),
+        "path": normalized_path,
         "created": not existed_before,
     }
 
@@ -87,8 +103,15 @@ def replace_in_file(
     )
     target_file.write_text(updated_text, encoding="utf-8")
 
+    normalized_path = normalize_relative_path(ctx.deps.base_dir, target_file)
+    _record_known_path(
+        ctx,
+        normalized_path,
+        "replace_in_file",
+        replacements=match_count if replace_all else 1,
+    )
     return {
-        "path": normalize_relative_path(ctx.deps.base_dir, target_file),
+        "path": normalized_path,
         "replacements": match_count if replace_all else 1,
     }
 

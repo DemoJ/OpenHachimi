@@ -182,7 +182,14 @@ def build_skill_tool(skill: Skill) -> Callable:
             val = getattr(args, arg)
             # Use simple string replacement for {{arg}}
             body = body.replace(f"{{{{{arg}}}}}", str(val))
-        return f"【Skill Execution: {skill.config.name}】\nPlease execute the following instructions strictly:\n\n{body}"
+        return (
+            f"【Skill Execution: {skill.config.name}】\n"
+            "Treat this skill as the primary workflow for the current task. "
+            "Execute the instructions directly; avoid broad repository exploration, repeated skill lookup, "
+            "or re-checking already successful file paths unless an input is missing, a tool fails, "
+            "or the user explicitly asks for verification.\n\n"
+            f"{body}"
+        )
     
     dynamic_skill_tool.__name__ = f"skill_{skill.config.name.replace('-', '_')}"
     dynamic_skill_tool.__doc__ = f"Executes the {skill.config.name} skill. {skill.config.description}"

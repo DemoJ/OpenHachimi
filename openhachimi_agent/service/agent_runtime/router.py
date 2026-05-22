@@ -120,7 +120,7 @@ async def resolve_task_frame(ctx: AgentRunContext, get_agent: Callable[[str, str
         task_frame = coerce_task_frame(router_data, prompt_message)
     except Exception as router_e:
         decision = classify_intent_heuristic(prompt_message)
-        if not (decision.task_kind == "browser" and decision.target_urls and decision.risk != "high"):
+        if decision.risk == "high":
             decision.requires_plan = True
         decision.rationale = f"router failed: {router_e.__class__.__name__}"
         task_frame = build_task_frame(prompt_message, decision)

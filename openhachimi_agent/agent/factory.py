@@ -74,7 +74,11 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             
         toolsets = [filtered_executor_toolset, dynamic_toolset]
         extra_prompt = (
-            "\n\n[System Role] 你现在是 **Executor Agent (执行者)**。你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作（写代码、运行命令等），并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
+            "\n\n[System Role] 你现在是 **Executor Agent (执行者)**。"
+            "如果当前有活动 TODO，你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作（写代码、运行命令等），并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
+            "如果 TaskFrame.execution_mode 是 direct 或 skill_direct，优先直接完成用户目标，不要为了低风险任务主动创建 TODO、反复读取已知路径或进行宽泛探索。"
+            "同一轮内，成功的 write_file、replace_in_file、make_directory 或 publish_artifact 返回值可作为对应路径已创建/已修改/已发布的证据；除非后续操作失败或用户要求核验，不要立刻读取或列目录只为确认它存在。"
+            "如果 TaskFrame.execution_mode 是 skill_direct，已匹配的 skill 是当前任务的主流程；除非 skill 缺少必要输入、工具失败或用户目标与 skill 冲突，否则不要再进行宽泛仓库探索。"
             "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
         )
 
@@ -172,15 +176,17 @@ def build_router_agent(config: AppConfig) -> Agent:
 
     system_prompt = (
         "你是一个专业的任务框架分析器。请只做任务理解，不要执行任务。\n"
-        "你需要把用户请求整理成 TaskFrame：目标、目标实体、不可变约束、复杂度、风险和是否需要先规划，并挑选可能匹配的技能。\n"
+        "你需要把用户请求整理成 TaskFrame：目标、目标实体、不可变约束、复杂度、风险、execution_mode 和是否需要先规划，并挑选可能匹配的技能。\n"
         "- task_kind 可选：qa, code_change, file_ops, shell, browser, research, unknown。\n"
         "- simple：1-2 步即可完成，且低风险。\n"
         "- complex：需要跨文件/多工具/多步骤调研、代码修改、复杂网页操作或系统性分析。\n"
         "- high risk：删除、覆盖、部署、发布、涉及密钥、登录态或不可逆操作。\n"
+        "- execution_mode 可选：direct、skill_direct、planned。简单低风险任务用 direct；命中技能且技能流程足以指导执行时用 skill_direct；只有复杂或高风险任务用 planned。\n"
         "- 如果用户明确给出 URL、文件路径、函数名等目标实体，必须放入 target_entities，并在 invariants 中说明不能替换或扩大目标。\n"
         "- 简单的显式 URL 访问/打开/查看任务应为 browser + simple + requires_plan=false + allowed_autonomy=narrow。\n"
         "- relevant_skills: 如果用户的意图与下方列出的技能匹配，请把匹配的技能名（name）填入该列表。最多选3个。\n"
-        "不确定时降低 confidence，并将 requires_plan 设为 true。\n\n"
+        "- 用户给出的明确路径、URL、函数名，以及上一轮或同一轮工具成功返回的文件路径，应视为可信目标，不要因确认焦虑而要求额外规划。\n"
+        "不确定时降低 confidence，但优先保持 direct；只有任务明显需要跨文件、多工具、多阶段验证或存在高风险时，才将 requires_plan 设为 true。\n\n"
         f"{skills_info}"
     )
     

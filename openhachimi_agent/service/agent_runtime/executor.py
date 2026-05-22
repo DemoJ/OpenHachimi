@@ -67,6 +67,8 @@ def _build_executor_message(task_frame_payload: dict[str, Any] | None, message: 
 
     return (
         "请执行以下用户任务。必须遵守 TaskFrame 中的 goal、target_entities、invariants、allowed_autonomy 和 replan_triggers；"
+        "如果 TaskFrame.execution_mode 是 direct 或 skill_direct，请以最少必要工具调用完成目标，避免为简单任务创建 TODO、重复确认刚成功写入/发布的路径，或进行与目标无关的宽泛探索；"
+        "如果 TaskFrame.execution_mode 是 skill_direct，已匹配的 skill 是主流程，除非输入缺失或工具失败，否则按 skill 直接推进；"
         "如果工具观察结果与 TaskFrame 冲突，应停止当前动作并重新校准目标。\n"
         f"TaskFrame：{json.dumps(task_frame_payload, ensure_ascii=False)}\n"
         f"用户原始任务：{user_message}"
@@ -94,7 +96,13 @@ def _build_retry_message(task_frame_payload: dict[str, Any] | None, message: str
 
 def _get_task_frame_payload(session_state: dict[str, Any]) -> dict[str, Any] | None:
     task_frame_payload = session_state.get("task_frame")
-    return task_frame_payload if isinstance(task_frame_payload, dict) else None
+    if not isinstance(task_frame_payload, dict):
+        return None
+    payload = dict(task_frame_payload)
+    known_paths = session_state.get("known_paths")
+    if isinstance(known_paths, dict) and known_paths:
+        payload["known_paths"] = known_paths
+    return payload
 
 
 def _build_executor_agent(config: AppConfig, role: str, task_frame_payload: dict[str, Any] | None, get_agent: Callable[[str, str], Any]):

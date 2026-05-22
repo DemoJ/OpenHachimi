@@ -81,6 +81,34 @@ def test_legacy_router_result_is_coerced():
     assert decision.requires_plan is True
 
 
+def test_unparseable_router_output_does_not_force_plan_for_low_risk_task():
+    decision = coerce_intent_decision(object(), "帮我生成一个简单示例文件")
+
+    assert decision.confidence < 0.5
+    assert decision.requires_plan is False
+    assert decision.execution_mode == "direct"
+
+
+def test_relevant_skill_sets_skill_direct_execution_mode():
+    frame = coerce_task_frame(
+        {
+            "user_request": "用 demo skill 处理",
+            "goal": "用 demo skill 处理",
+            "task_kind": "file_ops",
+            "complexity": "simple",
+            "risk": "low",
+            "confidence": 0.8,
+            "requires_plan": False,
+            "relevant_skills": ["demo"],
+            "target_entities": [],
+            "invariants": [],
+        },
+        "用 demo skill 处理",
+    )
+
+    assert frame.execution_mode == "skill_direct"
+
+
 def test_build_task_frame_no_url_special_handling():
     """所有任务一视同仁，不对含 URL 的任务做特殊 autonomy 设置。"""
     frame = build_task_frame("请访问 https://example.com/a 看一下")

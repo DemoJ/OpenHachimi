@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from openhachimi_agent.agent.intent import PlanContinuationDecision
+from openhachimi_agent.agent.intent import TaskFrame
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
@@ -17,6 +18,7 @@ from openhachimi_agent.service.agent_runtime.context import (
 from openhachimi_agent.service.agent_runtime.executor import _build_executor_message
 from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 from openhachimi_agent.service.agent_runtime.router import should_route_message
+from openhachimi_agent.service.agent_runtime.planner import needs_planning
 from openhachimi_agent.service.agent_runtime.streaming import OperationStalledError, StreamEventItem, StreamStats, consume_stream_queue
 
 
@@ -156,6 +158,18 @@ def test_executor_message_with_attachments_adds_safe_summary():
     assert "photo.jpg" in message
     assert ".tmp/attachments/telegram/u1/photo.jpg" in message
     assert "不要臆测附件内容" in message
+
+
+def test_low_confidence_direct_task_does_not_need_planning():
+    frame = TaskFrame(confidence=0.3, requires_plan=False, execution_mode="direct")
+
+    assert needs_planning(frame) is False
+
+
+def test_planned_execution_mode_needs_planning():
+    frame = TaskFrame(confidence=0.9, requires_plan=False, execution_mode="planned")
+
+    assert needs_planning(frame) is True
 
 
 def test_presenter_passes_artifact_events():
