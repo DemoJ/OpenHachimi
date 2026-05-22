@@ -97,6 +97,12 @@ class MemoryStore:
             conn.close()
             self._local.conn = None
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
@@ -736,7 +742,8 @@ class MemoryStore:
             if existing is None:
                 best_by_id[result.id] = result
             else:
-                if result.source not in existing.source:
+                existing_sources = existing.source.split("+")
+                if result.source not in existing_sources:
                     existing.source = f"{existing.source}+{result.source}"
                 if result.score > existing.score:
                     result.source = existing.source
