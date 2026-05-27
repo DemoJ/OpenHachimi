@@ -88,6 +88,16 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    enabled: bool = True
+    db_path: Path | None = None
+    poll_interval_seconds: int = 60
+    max_concurrency: int = 2
+    default_timeout_seconds: int = 300
+    claim_lock_seconds: int = 600
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """集中管理应用运行时配置。"""
 
@@ -118,6 +128,7 @@ class AppConfig:
     agent_timeout_seconds: int
     stream_idle_timeout_seconds: int
     memory: MemoryConfig
+    scheduler: SchedulerConfig
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -241,6 +252,19 @@ def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: 
     )
 
 
+def _load_scheduler_config(base_dir: Path, raw_config: dict[str, Any]) -> SchedulerConfig:
+    scheduler_config = _as_mapping(raw_config.get("scheduler"), "scheduler")
+    db_path_value = _config_string(scheduler_config, "db_path", ".scheduler/tasks.sqlite3")
+    return SchedulerConfig(
+        enabled=_config_bool(scheduler_config, "enabled", True),
+        db_path=_resolve_config_path(base_dir, db_path_value, base_dir / ".scheduler" / "tasks.sqlite3"),
+        poll_interval_seconds=_config_int(scheduler_config, "poll_interval_seconds", 60),
+        max_concurrency=_config_int(scheduler_config, "max_concurrency", 2),
+        default_timeout_seconds=_config_int(scheduler_config, "default_timeout_seconds", 300),
+        claim_lock_seconds=_config_int(scheduler_config, "claim_lock_seconds", 600),
+    )
+
+
 def load_config() -> AppConfig:
     """从 user/config.yaml 和项目目录加载配置。"""
     base_dir = Path(__file__).resolve().parents[2]
@@ -316,4 +340,5 @@ def load_config() -> AppConfig:
         agent_timeout_seconds=300,
         stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
         memory=_load_memory_config(base_dir, raw_config, llm_config),
+        scheduler=_load_scheduler_config(base_dir, raw_config),
     )

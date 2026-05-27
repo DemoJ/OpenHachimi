@@ -79,6 +79,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             "如果 TaskFrame.execution_mode 是 direct 或 skill_direct，优先直接完成用户目标，不要为了低风险任务主动创建 TODO、反复读取已知路径或进行宽泛探索。"
             "同一轮内，成功的 write_file、replace_in_file、make_directory 或 publish_artifact 返回值可作为对应路径已创建/已修改/已发布的证据；除非后续操作失败或用户要求核验，不要立刻读取或列目录只为确认它存在。"
             "如果 TaskFrame.execution_mode 是 skill_direct，已匹配的 skill 是当前任务的主流程；除非 skill 缺少必要输入、工具失败或用户目标与 skill 冲突，否则不要再进行宽泛仓库探索。"
+            "用户要求稍后提醒、几分钟后回复、每天/每周/cron 定时执行时，必须使用 create_delayed_task 或 create_scheduled_task 创建真实定时任务；不要调用 run_command 执行 sleep、timeout、循环等待或后台脚本。"
             "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
         )
 
@@ -186,6 +187,7 @@ def build_router_agent(config: AppConfig) -> Agent:
         "- 简单的显式 URL 访问/打开/查看任务应为 browser + simple + requires_plan=false + allowed_autonomy=narrow。\n"
         "- relevant_skills: 如果用户的意图与下方列出的技能匹配，请把匹配的技能名（name）填入该列表。最多选3个。\n"
         "- 用户给出的明确路径、URL、函数名，以及上一轮或同一轮工具成功返回的文件路径，应视为可信目标，不要因确认焦虑而要求额外规划。\n"
+        "- 用户要求稍后提醒、几分钟后回复、每天/每周/cron 定时执行时，task_kind 应为 qa 或 unknown，execution_mode=direct，不要归类为 shell；执行阶段会使用定时任务工具而不是 sleep 命令。\n"
         "不确定时降低 confidence，但优先保持 direct；只有任务明显需要跨文件、多工具、多阶段验证或存在高风险时，才将 requires_plan 设为 true。\n\n"
         f"{skills_info}"
     )

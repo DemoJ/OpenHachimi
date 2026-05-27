@@ -30,7 +30,7 @@ from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.core.version import PACKAGE_NAME, get_version
 from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME, deploy_daemon, undeploy_daemon
-from openhachimi_agent.interface.cli import run_embedded_cli
+from openhachimi_agent.interface.cli import get_server_url, request_json, run_embedded_cli
 
 
 logger = logging.getLogger(__name__)
@@ -224,6 +224,93 @@ def cmd_cli(_args: argparse.Namespace) -> None:
     asyncio.run(run_embedded_cli())
 
 
+def _print_schedule(task: dict[str, object]) -> None:
+    status = "启用" if task.get("enabled") else "暂停"
+    running = "，运行中" if task.get("running") else ""
+    print(f"{task['id']}  {task['name']}  [{task['schedule_type']} {task['schedule_expr']}]  {status}{running}")
+    print(f"  下次运行：{task.get('next_run_at') or '-'}")
+    print(f"  角色/会话：{task.get('role') or '-'} / {task.get('session_id') or '-'}")
+    if task.get("last_status"):
+        print(f"  上次状态：{task.get('last_status')} {task.get('last_error') or ''}".rstrip())
+
+
+def cmd_schedule(args: argparse.Namespace) -> None:
+    server_url = get_server_url()
+    try:
+        if args.schedule_command == "add":
+            provided = [args.once is not None, args.interval is not None, args.cron is not None]
+            if sum(provided) != 1:
+                _err("请且仅请指定 --once、--interval、--cron 其中一个。")
+                sys.exit(1)
+            if args.once is not None:
+                schedule_type, schedule_expr = "once", args.once
+            elif args.interval is not None:
+                schedule_type, schedule_expr = "interval", args.interval
+            else:
+                schedule_type, schedule_expr = "cron", args.cron
+            payload = {
+                "name": args.name,
+                "prompt": args.prompt,
+                "schedule_type": schedule_type,
+                "schedule_expr": schedule_expr,
+                "role": args.role,
+                "session_id": args.session_id,
+                "timezone": args.timezone,
+                "enabled": not args.paused,
+                "timeout_seconds": args.timeout,
+            }
+            task = request_json(server_url, "POST", "/schedules", payload)
+            _ok("定时任务已创建。")
+            _print_schedule(task)
+            return
+
+        if args.schedule_command == "list":
+            tasks = request_json(server_url, "GET", "/schedules")
+            if not tasks:
+                _info("暂无定时任务。")
+                return
+            for task in tasks:
+                _print_schedule(task)
+            return
+
+        if args.schedule_command in {"pause", "resume"}:
+            enabled = args.schedule_command == "resume"
+            task = request_json(server_url, "PATCH", f"/schedules/{args.id}", {"enabled": enabled})
+            _ok("定时任务已恢复。" if enabled else "定时任务已暂停。")
+            _print_schedule(task)
+            return
+
+        if args.schedule_command == "remove":
+            request_json(server_url, "DELETE", f"/schedules/{args.id}")
+            _ok("定时任务已删除。")
+            return
+
+        if args.schedule_command == "run":
+            request_json(server_url, "POST", f"/schedules/{args.id}/run")
+            _ok("定时任务已执行。")
+            return
+
+        if args.schedule_command == "logs":
+            runs = request_json(server_url, "GET", f"/schedules/{args.id}/runs?limit={args.limit}")
+            if not runs:
+                _info("暂无运行记录。")
+                return
+            for run in runs:
+                print(f"{run['id']}  {run['status']}  {run['started_at']}  {run.get('duration_ms') or '-'}ms")
+                if run.get("error"):
+                    print(f"  错误：{run['error']}")
+                if run.get("output"):
+                    print(f"  输出：{str(run['output'])[:500]}")
+            return
+    except Exception as exc:
+        _err(f"定时任务命令失败：{exc}")
+        _info(f"请确认后台服务已启动：{server_url}")
+        sys.exit(1)
+
+    _err("请指定 schedule 子命令。")
+    sys.exit(1)
+
+
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -287,6 +374,29 @@ def main() -> None:
 
     sub.add_parser("cli", help="进入 CLI 对话（与默认行为相同）")
 
+    schedule_p = sub.add_parser("schedule", help="管理定时任务")
+    schedule_sub = schedule_p.add_subparsers(dest="schedule_command", metavar="<操作>")
+
+    schedule_add = schedule_sub.add_parser("add", help="创建定时任务")
+    schedule_add.add_argument("--name", required=True, help="任务名称")
+    schedule_add.add_argument("--prompt", required=True, help="到期后提交给 Agent 的提示词")
+    schedule_add.add_argument("--once", help="一次性运行时间，例如 2026-05-27T10:30:00+08:00")
+    schedule_add.add_argument("--interval", help="循环间隔，例如 10m、2h、86400")
+    schedule_add.add_argument("--cron", help="cron 表达式，例如 '0 9 * * *'")
+    schedule_add.add_argument("--timezone", default="UTC", help="时区，默认 UTC")
+    schedule_add.add_argument("--role", default=None, help="使用的角色")
+    schedule_add.add_argument("--session-id", default=None, help="使用的会话 ID")
+    schedule_add.add_argument("--timeout", type=int, default=None, help="单次执行超时时间（秒）")
+    schedule_add.add_argument("--paused", action="store_true", help="创建后先暂停")
+
+    schedule_sub.add_parser("list", help="列出定时任务")
+    for action, help_text in (("pause", "暂停定时任务"), ("resume", "恢复定时任务"), ("remove", "删除定时任务"), ("run", "立即执行定时任务")):
+        action_p = schedule_sub.add_parser(action, help=help_text)
+        action_p.add_argument("id", help="任务 ID")
+    logs_p = schedule_sub.add_parser("logs", help="查看运行记录")
+    logs_p.add_argument("id", help="任务 ID")
+    logs_p.add_argument("--limit", type=int, default=20, help="记录数量")
+
     args = parser.parse_args()
 
     # 命令分发表
@@ -302,6 +412,7 @@ def main() -> None:
         "uninstall": cmd_uninstall,
         "deploy":    cmd_deploy,
         "serve":     cmd_serve,
+        "schedule":  cmd_schedule,
         "cli":       cmd_cli,
     }
 

@@ -11,6 +11,7 @@ __pycache__/
 *.egg-info/
 .claude
 build/
+.scheduler
 
 # Ignore all user skills
 user/skills/*

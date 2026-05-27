@@ -4,6 +4,7 @@
 服务关闭时优雅停止 Bot。所有渠道共享同一 asyncio 事件循环。
 """
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -15,8 +16,19 @@ from fastapi.responses import FileResponse, StreamingResponse
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.interface.telegram import telegram_lifespan
+from openhachimi_agent.scheduler.store import ScheduledTaskStore
+from openhachimi_agent.scheduler.scheduler import TaskScheduler
+from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.service.agent_service import AgentService
-from openhachimi_agent.transport.api_models import ChatRequest, RoleSwitchRequest, StopRequest
+from openhachimi_agent.transport.api_models import (
+    ChatRequest,
+    RoleSwitchRequest,
+    ScheduleCreateRequest,
+    ScheduleResponse,
+    ScheduleRunResponse,
+    ScheduleUpdateRequest,
+    StopRequest,
+)
 from openhachimi_agent.tools.utils import resolve_workspace_path
 
 logger = logging.getLogger(__name__)
@@ -24,6 +36,53 @@ logger = logging.getLogger(__name__)
 
 def get_service(request: Request) -> AgentService:
     return request.app.state.service
+
+
+def get_schedule_store(request: Request) -> ScheduledTaskStore:
+    store = getattr(request.app.state, "schedule_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="定时任务未启用")
+    return store
+
+
+def _dt_text(value) -> str | None:
+    return value.isoformat() if value else None
+
+
+def schedule_response(task: ScheduledTask) -> ScheduleResponse:
+    return ScheduleResponse(
+        id=task.id,
+        name=task.name,
+        prompt=task.prompt,
+        schedule_type=task.schedule_type.value,
+        schedule_expr=task.schedule_expr,
+        role=task.role,
+        session_id=task.session_id,
+        timezone=task.timezone,
+        enabled=task.enabled,
+        next_run_at=_dt_text(task.next_run_at),
+        timeout_seconds=task.timeout_seconds,
+        metadata=task.metadata,
+        created_at=task.created_at.isoformat(),
+        updated_at=task.updated_at.isoformat(),
+        last_run_at=_dt_text(task.last_run_at),
+        last_status=task.last_status,
+        last_error=task.last_error,
+        running=task.running,
+    )
+
+
+def schedule_run_response(run: ScheduledRun) -> ScheduleRunResponse:
+    return ScheduleRunResponse(
+        id=run.id,
+        task_id=run.task_id,
+        status=run.status,
+        started_at=run.started_at.isoformat(),
+        finished_at=_dt_text(run.finished_at),
+        output=run.output,
+        error=run.error,
+        duration_ms=run.duration_ms,
+    )
 
 
 @asynccontextmanager
@@ -36,6 +95,19 @@ async def lifespan(app: FastAPI):
     config = load_config()
     configure_logging(config)
     app.state.service = AgentService(config)
+    app.state.schedule_store = None
+    scheduler = None
+    if config.scheduler.enabled and config.scheduler.db_path is not None:
+        app.state.schedule_store = ScheduledTaskStore(config.scheduler.db_path)
+        scheduler = TaskScheduler(
+            app.state.schedule_store,
+            app.state.service,
+            poll_interval_seconds=config.scheduler.poll_interval_seconds,
+            max_concurrency=config.scheduler.max_concurrency,
+            default_timeout_seconds=config.scheduler.default_timeout_seconds,
+            claim_lock_seconds=config.scheduler.claim_lock_seconds,
+        )
+        await scheduler.start()
     logger.info("server module initialized")
 
     try:
@@ -44,6 +116,8 @@ async def lifespan(app: FastAPI):
             yield
             logger.info("all channels stopping")
     finally:
+        if scheduler is not None:
+            await scheduler.stop()
         try:
             await app.state.service.browser_manager.close()
         except Exception as exc:
@@ -69,6 +143,86 @@ def state(service: AgentService = Depends(get_service)):
 @app.get("/roles")
 def roles(service: AgentService = Depends(get_service)):
     return service.list_roles()
+
+
+@app.get("/schedules")
+def list_schedules(store: ScheduledTaskStore = Depends(get_schedule_store)) -> list[ScheduleResponse]:
+    return [schedule_response(task) for task in store.list_tasks()]
+
+
+@app.post("/schedules")
+def create_schedule(request: ScheduleCreateRequest, store: ScheduledTaskStore = Depends(get_schedule_store)) -> ScheduleResponse:
+    try:
+        task = store.create_task(
+            name=request.name,
+            prompt=request.prompt,
+            schedule_type=request.schedule_type,
+            schedule_expr=request.schedule_expr,
+            role=request.role,
+            session_id=request.session_id,
+            timezone_name=request.timezone,
+            enabled=request.enabled,
+            timeout_seconds=request.timeout_seconds,
+            metadata=request.metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return schedule_response(task)
+
+
+@app.get("/schedules/{task_id}")
+def get_schedule(task_id: str, store: ScheduledTaskStore = Depends(get_schedule_store)) -> ScheduleResponse:
+    task = store.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="定时任务不存在")
+    return schedule_response(task)
+
+
+@app.patch("/schedules/{task_id}")
+def update_schedule(task_id: str, request: ScheduleUpdateRequest, store: ScheduledTaskStore = Depends(get_schedule_store)) -> ScheduleResponse:
+    updates = request.model_dump(exclude_unset=True)
+    try:
+        task = store.update_task(task_id, **updates)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return schedule_response(task)
+
+
+@app.delete("/schedules/{task_id}")
+def delete_schedule(task_id: str, store: ScheduledTaskStore = Depends(get_schedule_store)) -> dict[str, bool]:
+    try:
+        store.delete_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    return {"ok": True}
+
+
+@app.post("/schedules/{task_id}/run")
+async def run_schedule_now(
+    task_id: str,
+    store: ScheduledTaskStore = Depends(get_schedule_store),
+    service: AgentService = Depends(get_service),
+) -> dict[str, bool]:
+    from openhachimi_agent.scheduler.runner import ScheduledTaskRunner
+
+    try:
+        task = await asyncio.to_thread(store.claim_task_now, task_id, service.config.scheduler.claim_lock_seconds)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    runner = ScheduledTaskRunner(store, service, default_timeout_seconds=service.config.scheduler.default_timeout_seconds)
+    await runner.run_task(task, preserve_schedule=True)
+    return {"ok": True}
+
+
+@app.get("/schedules/{task_id}/runs")
+def list_schedule_runs(task_id: str, limit: int = 20, store: ScheduledTaskStore = Depends(get_schedule_store)) -> list[ScheduleRunResponse]:
+    if store.get_task(task_id) is None:
+        raise HTTPException(status_code=404, detail="定时任务不存在")
+    return [schedule_run_response(run) for run in store.list_runs(task_id, limit)]
 
 
 @app.post("/chat")

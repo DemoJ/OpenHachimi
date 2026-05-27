@@ -55,6 +55,64 @@ class StopRequest(BaseModel):
     session_id: str = Field(min_length=1)
 
 
+class ScheduleCreateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    prompt: str = Field(min_length=1)
+    schedule_type: Literal["once", "interval", "cron"]
+    schedule_expr: str = Field(min_length=1)
+    role: str | None = None
+    session_id: str | None = None
+    timezone: str = "UTC"
+    enabled: bool = True
+    timeout_seconds: int | None = Field(default=None, gt=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScheduleUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1)
+    prompt: str | None = Field(default=None, min_length=1)
+    schedule_type: Literal["once", "interval", "cron"] | None = None
+    schedule_expr: str | None = Field(default=None, min_length=1)
+    role: str | None = None
+    session_id: str | None = None
+    timezone: str | None = None
+    enabled: bool | None = None
+    timeout_seconds: int | None = Field(default=None, gt=0)
+    metadata: dict[str, Any] | None = None
+
+
+class ScheduleResponse(BaseModel):
+    id: str
+    name: str
+    prompt: str
+    schedule_type: str
+    schedule_expr: str
+    role: str | None = None
+    session_id: str | None = None
+    timezone: str
+    enabled: bool
+    next_run_at: str | None = None
+    timeout_seconds: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+    last_run_at: str | None = None
+    last_status: str | None = None
+    last_error: str | None = None
+    running: bool = False
+
+
+class ScheduleRunResponse(BaseModel):
+    id: str
+    task_id: str
+    status: str
+    started_at: str
+    finished_at: str | None = None
+    output: str | None = None
+    error: str | None = None
+    duration_ms: int | None = None
+
+
 class CommandResponse(BaseModel):
     message: str
     role: str

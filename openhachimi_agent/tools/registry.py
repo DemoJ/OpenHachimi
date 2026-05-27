@@ -17,6 +17,7 @@ from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills, install_skill
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import web_search
+from openhachimi_agent.tools.scheduler import create_delayed_task, create_scheduled_task
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
 from openhachimi_agent.tools.memory import forget_memory, list_memory, memory_stats, remember, search_memory
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
@@ -77,6 +78,11 @@ _MEMORY_MUTATION_TOOLS = [
     forget_memory,
 ]
 
+_SCHEDULER_TOOLS = [
+    create_delayed_task,
+    create_scheduled_task,
+]
+
 _PLANNING_TOOLS = [
     create_todos,
     get_todos,
@@ -118,6 +124,9 @@ for _tool in _MEMORY_READ_TOOLS:
 
 for _tool in _MEMORY_MUTATION_TOOLS:
     _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_tool))))
+
+for _tool in _SCHEDULER_TOOLS:
+    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(_tool))
 
 # ── Planner 专用工具集 ──
 # Planner 是纯规划者：只需要本地只读工具来理解项目上下文，然后基于对

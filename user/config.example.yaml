@@ -54,6 +54,14 @@ memory:
     allow_secret_memory: false
     raw_turn_retention_days: 180
 
+scheduler:
+  enabled: true
+  db_path: .scheduler/tasks.sqlite3
+  poll_interval_seconds: 60
+  max_concurrency: 2
+  default_timeout_seconds: 300
+  claim_lock_seconds: 600
+
 logging:
   level: INFO
   dir: .logs

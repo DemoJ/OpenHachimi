@@ -14,6 +14,9 @@ from urllib.request import Request, urlopen
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
+from openhachimi_agent.scheduler.store import ScheduledTaskStore
+from openhachimi_agent.scheduler.scheduler import TaskScheduler
+from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.service.agent_service import AgentService
 
@@ -326,10 +329,32 @@ async def run_embedded_cli() -> None:
     logger.info("starting embedded cli")
     service = AgentService(config)
     backend = EmbeddedBackend(service)
+    scheduler = None
+
+    async def on_scheduled_run_complete(task: ScheduledTask, run: ScheduledRun) -> None:
+        if run.status == "succeeded" and run.output:
+            print(f"\n\n哈基米 > [定时任务：{task.name}] {run.output}\n", flush=True)
+        elif run.status in {"failed", "timeout"}:
+            print(f"\n\n哈基米 > [定时任务：{task.name}] 执行失败：{run.error or run.status}\n", flush=True)
+
+    if config.scheduler.enabled and config.scheduler.db_path is not None:
+        schedule_store = ScheduledTaskStore(config.scheduler.db_path)
+        scheduler = TaskScheduler(
+            schedule_store,
+            service,
+            poll_interval_seconds=config.scheduler.poll_interval_seconds,
+            max_concurrency=config.scheduler.max_concurrency,
+            default_timeout_seconds=config.scheduler.default_timeout_seconds,
+            claim_lock_seconds=config.scheduler.claim_lock_seconds,
+            on_run_complete=on_scheduled_run_complete,
+        )
+        await scheduler.start()
+
     try:
         await run_interactive_loop(backend, "embedded", config.default_role_name)
     finally:
-        # 确保退出时清理浏览器进程，防止 Chrome 残留
+        if scheduler is not None:
+            await scheduler.stop()
         try:
             await service.browser_manager.close()
         except Exception as exc:
