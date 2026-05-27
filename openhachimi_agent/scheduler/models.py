@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import StrEnum
+from enum import Enum
 from typing import Any, Literal
 
 
-class ScheduleType(StrEnum):
+class ScheduleType(str, Enum):
     ONCE = "once"
     INTERVAL = "interval"
     CRON = "cron"
