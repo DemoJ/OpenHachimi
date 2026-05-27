@@ -35,6 +35,7 @@ def mock_config(tmp_path: Path):
         browser_idle_timeout=300,
         telegram_bot_token=None,
         telegram_proxy_url=None,
+        show_tool_calls=True,
         attachments_dir=tmp_path / ".tmp" / "attachments",
         max_attachment_size_bytes=50 * 1024 * 1024,
         allowed_attachment_mime_types=[],

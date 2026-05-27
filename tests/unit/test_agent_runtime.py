@@ -20,6 +20,7 @@ from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 from openhachimi_agent.service.agent_runtime.router import should_route_message
 from openhachimi_agent.service.agent_runtime.planner import needs_planning
 from openhachimi_agent.service.agent_runtime.streaming import OperationStalledError, StreamEventItem, StreamStats, consume_stream_queue
+from openhachimi_agent.service.agent_service import AgentService
 
 
 class FakeContinuationAgent:
@@ -187,6 +188,23 @@ def test_presenter_passes_artifact_events():
     assert len(actions) == 1
     assert actions[0].type == "artifact"
     assert actions[0].artifact == artifact
+
+
+@pytest.mark.asyncio
+async def test_stream_events_filters_tool_events_when_disabled():
+    service = AgentService.__new__(AgentService)
+    service.config = SimpleNamespace(show_tool_calls=False)
+
+    async def fake_run_with_session(*_args, **_kwargs):
+        yield StreamEventItem(type="tool", text="🔧 run_command", counted_as_output=False)
+        yield StreamEventItem(type="text", text="完成")
+
+    service._run_with_session = fake_run_with_session
+
+    events = [event async for event in service.stream_events("hi")]
+
+    assert [event.type for event in events] == ["text"]
+    assert events[0].text == "完成"
 
 
 @pytest.mark.asyncio

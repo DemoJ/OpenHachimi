@@ -578,6 +578,8 @@ class AgentService:
     ) -> AsyncIterator[StreamEventItem]:
         async for event in self._run_with_session(message, role, session_id, stream=True, attachments=attachments):
             if isinstance(event, StreamEventItem):
+                if event.type == "tool" and not self.config.show_tool_calls:
+                    continue
                 yield event
 
     async def stream_message(

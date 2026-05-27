@@ -111,6 +111,7 @@ class AppConfig:
     browser_idle_timeout: int
     telegram_bot_token: str | None
     telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
+    show_tool_calls: bool
     attachments_dir: Path
     max_attachment_size_bytes: int
     allowed_attachment_mime_types: list[str]
@@ -300,6 +301,7 @@ def load_config() -> AppConfig:
         browser_idle_timeout=_config_int(app_config, "browser_idle_timeout", 300, minimum=0),
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
+        show_tool_calls=_config_bool(app_config, "show_tool_calls", True),
         attachments_dir=_resolve_config_path(
             base_dir,
             _config_string(paths_config, "attachments_dir", ".tmp/attachments"),
