@@ -102,7 +102,7 @@ class TelegramDeliverySender:
 
     def canonical_key(self, target: dict[str, Any]) -> str:
         chat_id = target.get("chat_id")
-        thread_id = target.get("thread_id")
+        thread_id = target.get("thread_id", target.get("message_thread_id"))
         return f"telegram:{chat_id}:{thread_id}"
 
     async def send(self, target: dict[str, Any], message: DeliveryMessage) -> DeliveryResult:
@@ -114,7 +114,7 @@ class TelegramDeliverySender:
                 status="failed",
                 error="chat_id is required",
             )
-        thread_id = target.get("thread_id")
+        thread_id = target.get("thread_id", target.get("message_thread_id"))
         text = message.format_text()
         try:
             await self._sender(int(chat_id), text, _optional_int(thread_id))

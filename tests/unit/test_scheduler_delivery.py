@@ -67,6 +67,29 @@ async def test_deliver_scheduled_run_to_telegram(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_deliver_scheduled_run_to_telegram_message_thread_id(tmp_path):
+    store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
+    task = store.create_task(
+        name="提醒",
+        prompt="hello",
+        schedule_type="interval",
+        schedule_expr="60",
+        origin={"type": "telegram", "platform": "telegram", "chat_id": 123, "message_thread_id": 456},
+        delivery_mode="origin",
+    )
+    run = _completed_run(store, task)
+    sent = []
+
+    async def sender(chat_id, text, thread_id):
+        sent.append((chat_id, text, thread_id))
+
+    registry = _make_registry(telegram_sender=sender)
+    await deliver_scheduled_run(task, run, store=store, registry=registry, config=_fake_config())
+
+    assert sent == [(123, "[定时任务：提醒]\n\ndone", 456)]
+
+
+@pytest.mark.asyncio
 async def test_deliver_scheduled_run_missing_telegram_sender_fallback_inbox(tmp_path):
     store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
     task = store.create_task(

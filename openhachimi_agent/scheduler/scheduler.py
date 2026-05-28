@@ -74,19 +74,40 @@ class TaskScheduler:
 
     async def _run_loop(self) -> None:
         while self.running:
-            await self.run_once()
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "task scheduler poll failed; will retry in %ss",
+                    self.poll_interval_seconds,
+                )
             await asyncio.sleep(self.poll_interval_seconds)
 
     async def run_once(self) -> dict[str, int]:
         capacity = max(0, self.max_concurrency - len(self._active_tasks))
         if capacity <= 0:
+            logger.info(
+                "task scheduler poll skipped active=%d max_concurrency=%d",
+                len(self._active_tasks),
+                self.max_concurrency,
+            )
             return {"claimed": 0, "started": 0}
         tasks = await asyncio.to_thread(self.store.claim_due_tasks, capacity, self.claim_lock_seconds)
         for task in tasks:
             active = asyncio.create_task(self._run_claimed_task(task))
             self._active_tasks.add(active)
             active.add_done_callback(self._active_tasks.discard)
-        return {"claimed": len(tasks), "started": len(tasks)}
+        stats = {"claimed": len(tasks), "started": len(tasks)}
+        logger.info(
+            "task scheduler poll completed claimed=%d started=%d active=%d capacity=%d",
+            stats["claimed"],
+            stats["started"],
+            len(self._active_tasks),
+            capacity,
+        )
+        return stats
 
     async def run_task_now(self, task: ScheduledTask, *, preserve_schedule: bool = True) -> ScheduledRun | None:
         """立即运行一个任务（手动触发），并触发 on_run_complete 回调。"""
@@ -96,20 +117,33 @@ class TaskScheduler:
             logger.exception("manual scheduled task failed task_id=%s", task.id)
             await asyncio.to_thread(self.store.release_task, task.id, status="failed", error=str(exc))
             return None
-        if self.on_run_complete and run is not None:
-            result = self.on_run_complete(task, run)
-            if inspect.isawaitable(result):
-                await result
+        if run is not None:
+            await self._notify_run_complete(task, run)
         return run
 
     async def _run_claimed_task(self, task: ScheduledTask) -> None:
         async with self._semaphore:
             try:
                 run = await self.runner.run_task(task)
-                if self.on_run_complete and run is not None:
-                    result = self.on_run_complete(task, run)
-                    if inspect.isawaitable(result):
-                        await result
             except Exception as exc:
                 logger.exception("scheduled task failed task_id=%s", task.id)
                 await asyncio.to_thread(self.store.release_task, task.id, status="failed", error=str(exc))
+                return
+            if run is not None:
+                await self._notify_run_complete(task, run)
+
+    async def _notify_run_complete(self, task: ScheduledTask, run: ScheduledRun) -> None:
+        if self.on_run_complete is None:
+            return
+        try:
+            result = self.on_run_complete(task, run)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.exception("scheduled task delivery callback failed task_id=%s run_id=%s", task.id, run.id)
+            await asyncio.to_thread(
+                self.store.update_run_delivery,
+                run.id,
+                delivery_status="failed",
+                delivery_error=str(exc),
+            )

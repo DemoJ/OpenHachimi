@@ -13,6 +13,8 @@ from typing import Any, Iterator
 from openhachimi_agent.scheduler.models import RunStatus, ScheduledRun, ScheduledTask, ScheduleType, utc_now
 from openhachimi_agent.scheduler.time_utils import compute_next_run
 
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+
 
 def _dt_to_text(value: datetime | None) -> str | None:
     if value is None:
@@ -60,8 +62,9 @@ class ScheduledTaskStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SECONDS * 1000}")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         try:
@@ -290,6 +293,7 @@ class ScheduledTaskStore:
         locked_until = now + timedelta(seconds=lock_seconds)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._recover_stale_running_tasks(conn, now)
             rows = conn.execute(
                 """
                 SELECT * FROM scheduled_tasks
@@ -324,6 +328,73 @@ class ScheduledTaskStore:
                 ).fetchall()
         return [self._task_from_row(row) for row in claimed_rows]
 
+    def _recover_stale_running_tasks(self, conn: sqlite3.Connection, now: datetime) -> None:
+        """Recover tasks that were claimed but never completed (process crash).
+
+        - ONCE tasks: mark deleted + skipped (already attempted, don't retry)
+        - Recurring tasks: reset to enabled, recompute next_run_at, mark run skipped
+        """
+        rows = conn.execute(
+            """
+            SELECT t.*
+            FROM scheduled_tasks t
+            WHERE t.running = 1
+              AND t.locked_until IS NOT NULL
+              AND t.locked_until <= ?
+              AND EXISTS (
+                  SELECT 1 FROM scheduled_runs r
+                  WHERE r.task_id = t.id AND r.status = 'running'
+              )
+            """,
+            (_dt_to_text(now),),
+        ).fetchall()
+        for row in rows:
+            task = self._task_from_row(row)
+            if task.schedule_type == ScheduleType.ONCE:
+                # ONCE: already attempted, mark deleted to prevent re-execution
+                conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET status = 'deleted',
+                        running = 0,
+                        locked_until = NULL,
+                        next_run_at = NULL,
+                        last_status = 'skipped',
+                        last_error = 'stale running task lock recovered (once)',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_dt_to_text(now), task.id),
+                )
+            else:
+                next_run_at = task.next_run_at or compute_next_run(
+                    task.schedule_type, task.schedule_expr, after=now, timezone_name=task.timezone
+                )
+                conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET running = 0,
+                        locked_until = NULL,
+                        next_run_at = ?,
+                        last_status = 'skipped',
+                        last_error = 'stale running task lock recovered',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_dt_to_text(next_run_at), _dt_to_text(now), task.id),
+                )
+            conn.execute(
+                """
+                UPDATE scheduled_runs
+                SET status = 'skipped',
+                    finished_at = ?,
+                    error = 'stale running task lock recovered',
+                    duration_ms = 0
+                WHERE task_id = ? AND status = 'running'
+                """,
+                (_dt_to_text(now), task.id),
+            )
+
     def claim_task_now(self, task_id: str, lock_seconds: int) -> ScheduledTask:
         now = utc_now()
         locked_until = now + timedelta(seconds=lock_seconds)
@@ -355,21 +426,27 @@ class ScheduledTaskStore:
 
     def prepare_task_run(self, task: ScheduledTask, *, preserve_schedule: bool = False, execution_context: dict[str, Any] | None = None) -> ScheduledRun:
         now = utc_now()
-        next_run_at = task.next_run_at if preserve_schedule else None
-        status = task.status
-        if task.schedule_type != ScheduleType.ONCE and not preserve_schedule:
+        # 仅推进周期任务的 next_run_at；ONCE 任务保持 next_run_at 不变，
+        # 状态变更延迟到 complete_run，避免 prepare 与 complete 之间崩溃导致
+        # ONCE 任务变成 deleted+running=1 永远无法恢复。
+        if preserve_schedule:
+            next_run_at = task.next_run_at
+        elif task.schedule_type != ScheduleType.ONCE:
             next_run_at = compute_next_run(task.schedule_type, task.schedule_expr, after=now, timezone_name=task.timezone)
-        elif task.schedule_type == ScheduleType.ONCE and not preserve_schedule:
-            status = "deleted"
-        run = ScheduledRun(id=uuid.uuid4().hex, task_id=task.id, status="running", started_at=now, execution_context=execution_context or {})
+        else:
+            next_run_at = task.next_run_at  # ONCE: 不动，等 complete_run 标记 deleted
+        merged_context = dict(execution_context or {})
+        merged_context["_preserve_schedule"] = preserve_schedule
+        merged_context["_schedule_type"] = task.schedule_type.value
+        run = ScheduledRun(id=uuid.uuid4().hex, task_id=task.id, status="running", started_at=now, execution_context=merged_context)
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE scheduled_tasks
-                SET next_run_at = ?, status = ?, last_run_at = ?, last_status = ?, last_error = NULL, updated_at = ?
+                SET next_run_at = ?, last_run_at = ?, last_status = ?, last_error = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (_dt_to_text(next_run_at), status, _dt_to_text(now), "running", _dt_to_text(now), task.id),
+                (_dt_to_text(next_run_at), _dt_to_text(now), "running", _dt_to_text(now), task.id),
             )
             conn.execute(
                 """
@@ -393,10 +470,13 @@ class ScheduledTaskStore:
     ) -> None:
         finished_at = utc_now()
         with self._connect() as conn:
-            row = conn.execute("SELECT task_id FROM scheduled_runs WHERE id = ?", (run_id,)).fetchone()
+            row = conn.execute("SELECT task_id, execution_context FROM scheduled_runs WHERE id = ?", (run_id,)).fetchone()
             if row is None:
                 raise KeyError(run_id)
             task_id = row["task_id"]
+            exec_ctx = _json_dict(row["execution_context"])
+            preserve_schedule = exec_ctx.get("_preserve_schedule", False)
+            schedule_type = exec_ctx.get("_schedule_type")
             conn.execute(
                 """
                 UPDATE scheduled_runs
@@ -405,14 +485,37 @@ class ScheduledTaskStore:
                 """,
                 (status, _dt_to_text(finished_at), output, error, duration_ms, safety_status, safety_error, run_id),
             )
-            conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET running = 0, locked_until = NULL, last_status = ?, last_error = ?, safety_status = ?, safety_error = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (status, error, safety_status, safety_error, _dt_to_text(finished_at), task_id),
+            # ONCE 任务在非 preserve_schedule 模式下完成后标记为 deleted
+            should_delete = (
+                schedule_type == ScheduleType.ONCE.value
+                and not preserve_schedule
             )
+            if should_delete:
+                conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET status = 'deleted',
+                        running = 0,
+                        locked_until = NULL,
+                        next_run_at = NULL,
+                        last_status = ?,
+                        last_error = ?,
+                        safety_status = ?,
+                        safety_error = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, error, safety_status, safety_error, _dt_to_text(finished_at), task_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET running = 0, locked_until = NULL, last_status = ?, last_error = ?, safety_status = ?, safety_error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, error, safety_status, safety_error, _dt_to_text(finished_at), task_id),
+                )
 
     def skip_task_run(self, task: ScheduledTask, *, error: str | None = None) -> ScheduledRun:
         claimed = self.prepare_task_run(task)

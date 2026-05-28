@@ -23,7 +23,7 @@ def _execution_session_id(task: ScheduledTask) -> str:
     session_id = execution_context.get("session_id")
     if isinstance(session_id, str) and session_id:
         return session_id
-    return task.session_id or f"schedule-{task.id}"
+    return f"schedule-{task.id}"
 
 
 def _build_channel_context(task: ScheduledTask) -> dict[str, Any]:

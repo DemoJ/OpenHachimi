@@ -119,7 +119,14 @@ def test_once_task_is_consumed_on_scheduled_run(tmp_path):
     )
     claimed = store.claim_due_tasks(1, lock_seconds=60)[0]
 
-    store.prepare_task_run(claimed)
+    run = store.prepare_task_run(claimed)
+    # After prepare, ONCE task is still enabled (not yet deleted)
+    after_prepare = store.get_task(task.id)
+    assert after_prepare.status == "enabled"
+    assert after_prepare.next_run_at == task.next_run_at
+
+    # After complete, ONCE task should be deleted
+    store.complete_run(run.id, status="succeeded", output="done", duration_ms=100)
     updated = store.get_task(task.id)
 
     assert updated.status == "deleted"
@@ -220,6 +227,32 @@ async def test_runner_prefers_execution_context_session(tmp_path):
     assert service.session_id == "metadata-session"
 
 
+@pytest.mark.asyncio
+async def test_runner_uses_isolated_session_by_default(tmp_path):
+    store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
+    task = store.create_task(
+        name="执行",
+        prompt="hello",
+        schedule_type="interval",
+        schedule_expr="60",
+        session_id="creator-session",
+    )
+    claimed = store.claim_task_now(task.id, lock_seconds=60)
+
+    class Service:
+        _running_tasks = {}
+
+        async def send_message(self, message, role, session_id, **kwargs):
+            self.session_id = session_id
+            return SimpleNamespace(output="ok")
+
+    service = Service()
+    runner = ScheduledTaskRunner(store, service, default_timeout_seconds=10)
+    await runner.run_task(claimed)
+
+    assert service.session_id == f"schedule-{task.id}"
+
+
 def test_store_tracks_delivery_and_inbox(tmp_path):
     store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
     task = store.create_task(
@@ -273,6 +306,44 @@ async def test_scheduler_claims_due_task(tmp_path):
     assert stats == {"claimed": 1, "started": 1}
     await asyncio.gather(*scheduler._active_tasks)
     assert store.list_runs(task.id)[0].status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_survives_poll_exception(tmp_path, caplog):
+    store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
+
+    class Service:
+        _running_tasks = {}
+
+        async def send_message(self, message, role, session_id, **kwargs):
+            return SimpleNamespace(output="ok")
+
+    scheduler = TaskScheduler(
+        store,
+        Service(),
+        poll_interval_seconds=0,
+        max_concurrency=1,
+        default_timeout_seconds=10,
+        claim_lock_seconds=60,
+    )
+    calls = 0
+
+    async def flaky_run_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database is locked")
+        scheduler.running = False
+        return {"claimed": 0, "started": 0}
+
+    scheduler.run_once = flaky_run_once
+    scheduler.running = True
+
+    with caplog.at_level("ERROR"):
+        await asyncio.wait_for(scheduler._run_loop(), timeout=1)
+
+    assert calls == 2
+    assert "task scheduler poll failed" in caplog.text
 
 
 def test_task_status_field(tmp_path):
