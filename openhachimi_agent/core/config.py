@@ -88,6 +88,20 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerDeliveryConfig:
+    default_mode: str = "origin"
+    fallback_to_inbox: bool = True
+    home_targets: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SchedulerSecurityConfig:
+    prompt_scan_enabled: bool = True
+    allow_scheduler_mutation_in_scheduled_runs: bool = False
+    allow_interactive_tools_in_scheduled_runs: bool = False
+
+
+@dataclass(frozen=True)
 class SchedulerConfig:
     enabled: bool = True
     db_path: Path | None = None
@@ -95,6 +109,8 @@ class SchedulerConfig:
     max_concurrency: int = 2
     default_timeout_seconds: int = 300
     claim_lock_seconds: int = 600
+    delivery: SchedulerDeliveryConfig = field(default_factory=SchedulerDeliveryConfig)
+    security: SchedulerSecurityConfig = field(default_factory=SchedulerSecurityConfig)
 
 
 @dataclass(frozen=True)
@@ -255,6 +271,11 @@ def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: 
 def _load_scheduler_config(base_dir: Path, raw_config: dict[str, Any]) -> SchedulerConfig:
     scheduler_config = _as_mapping(raw_config.get("scheduler"), "scheduler")
     db_path_value = _config_string(scheduler_config, "db_path", ".scheduler/tasks.sqlite3")
+    delivery_config = _as_mapping(scheduler_config.get("delivery"), "scheduler.delivery")
+    security_config = _as_mapping(scheduler_config.get("security"), "scheduler.security")
+    home_targets = delivery_config.get("home_targets", [])
+    if not isinstance(home_targets, list):
+        raise ValueError("config.yaml 中的 scheduler.delivery.home_targets 必须是列表。")
     return SchedulerConfig(
         enabled=_config_bool(scheduler_config, "enabled", True),
         db_path=_resolve_config_path(base_dir, db_path_value, base_dir / ".scheduler" / "tasks.sqlite3"),
@@ -262,6 +283,16 @@ def _load_scheduler_config(base_dir: Path, raw_config: dict[str, Any]) -> Schedu
         max_concurrency=_config_int(scheduler_config, "max_concurrency", 2),
         default_timeout_seconds=_config_int(scheduler_config, "default_timeout_seconds", 300),
         claim_lock_seconds=_config_int(scheduler_config, "claim_lock_seconds", 600),
+        delivery=SchedulerDeliveryConfig(
+            default_mode=_config_string(delivery_config, "default_mode", "origin"),
+            fallback_to_inbox=_config_bool(delivery_config, "fallback_to_inbox", True),
+            home_targets=[item for item in home_targets if isinstance(item, dict)],
+        ),
+        security=SchedulerSecurityConfig(
+            prompt_scan_enabled=_config_bool(security_config, "prompt_scan_enabled", True),
+            allow_scheduler_mutation_in_scheduled_runs=_config_bool(security_config, "allow_scheduler_mutation_in_scheduled_runs", False),
+            allow_interactive_tools_in_scheduled_runs=_config_bool(security_config, "allow_interactive_tools_in_scheduled_runs", False),
+        ),
     )
 
 

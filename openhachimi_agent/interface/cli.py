@@ -14,6 +14,12 @@ from urllib.request import Request, urlopen
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
+from openhachimi_agent.scheduler.delivery import (
+    CliDeliverySender,
+    DeliverySenderRegistry,
+    InboxDeliverySender,
+    deliver_scheduled_run,
+)
 from openhachimi_agent.scheduler.store import ScheduledTaskStore
 from openhachimi_agent.scheduler.scheduler import TaskScheduler
 from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
@@ -155,7 +161,8 @@ class EmbeddedBackend:
         return resp.role, resp.session_id, resp.message
 
     async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]:
-        async for event in self.service.stream_events(message, role, session_id):
+        channel_context = {"type": "cli", "platform": "cli", "session_id": session_id, "role": role}
+        async for event in self.service.stream_events(message, role, session_id, channel_context=channel_context):
             yield event
 
 
@@ -319,7 +326,7 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
                     print(event, end="", flush=True)
         except Exception as exc:
             print(f"\n哈基米 > 调用模型时出错：{exc}")
-        
+
         print("\n")
 
 
@@ -331,14 +338,23 @@ async def run_embedded_cli() -> None:
     backend = EmbeddedBackend(service)
     scheduler = None
 
+    delivery_registry = DeliverySenderRegistry()
+    delivery_registry.register(InboxDeliverySender())
+    delivery_registry.register(CliDeliverySender(lambda text: print(text, end="", flush=True)))
+
     async def on_scheduled_run_complete(task: ScheduledTask, run: ScheduledRun) -> None:
-        if run.status == "succeeded" and run.output:
-            print(f"\n\n哈基米 > [定时任务：{task.name}] {run.output}\n", flush=True)
-        elif run.status in {"failed", "timeout"}:
-            print(f"\n\n哈基米 > [定时任务：{task.name}] 执行失败：{run.error or run.status}\n", flush=True)
+        await deliver_scheduled_run(task, run, store=schedule_store, registry=delivery_registry, config=config)
 
     if config.scheduler.enabled and config.scheduler.db_path is not None:
         schedule_store = ScheduledTaskStore(config.scheduler.db_path)
+        inbox_runs = schedule_store.list_inbox_runs(unread_only=True, limit=10)
+        if inbox_runs:
+            print(f"\n哈基米 > 你有 {len(inbox_runs)} 条未读定时任务结果：")
+            for task, run in inbox_runs:
+                output = run.output or run.error or run.status
+                print(f"[定时任务：{task.name}] {str(output)[:500]}")
+                schedule_store.mark_run_read(run.id)
+            print("")
         scheduler = TaskScheduler(
             schedule_store,
             service,
@@ -346,6 +362,8 @@ async def run_embedded_cli() -> None:
             max_concurrency=config.scheduler.max_concurrency,
             default_timeout_seconds=config.scheduler.default_timeout_seconds,
             claim_lock_seconds=config.scheduler.claim_lock_seconds,
+            delivery_registry=delivery_registry,
+            config=config,
             on_run_complete=on_scheduled_run_complete,
         )
         await scheduler.start()
@@ -367,10 +385,10 @@ def run_cli() -> None:
     except Exception:
         logging.basicConfig(level=logging.INFO)
         logger.exception("failed to configure logging from local config")
-        
+
     server_url = get_server_url()
     logger.info("starting cli client server_url=%s", server_url)
-    
+
     try:
         roles_info = request_json(server_url, "GET", "/roles")
         current_role = roles_info["current_role"]

@@ -12,7 +12,7 @@ from openhachimi_agent.tools.registry import WORKSPACE_TOOLSET, PLANNER_TOOLSET,
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import web_search
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos
-from openhachimi_agent.tools.scheduler import create_delayed_task, create_scheduled_task
+from openhachimi_agent.tools.scheduler import create_delayed_task, create_scheduled_task, manage_scheduled_task
 
 __all__ = [
     "WORKSPACE_TOOLSET",
@@ -45,4 +45,5 @@ __all__ = [
     "get_todos",
     "create_delayed_task",
     "create_scheduled_task",
+    "manage_scheduled_task",
 ]

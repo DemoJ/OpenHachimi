@@ -28,6 +28,30 @@ def _dt_from_text(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value).astimezone(timezone.utc)
 
 
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _json_dict(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    loaded = json.loads(value)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _json_list(value: str | None) -> list[dict[str, Any]]:
+    if not value:
+        return []
+    loaded = json.loads(value)
+    if not isinstance(loaded, list):
+        return []
+    return [item for item in loaded if isinstance(item, dict)]
+
+
+def _task_status(status: str | None) -> str:
+    return status if status in {"enabled", "paused", "deleted"} else "enabled"
+
+
 class ScheduledTaskStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -56,18 +80,26 @@ class ScheduledTaskStore:
                     prompt TEXT NOT NULL,
                     schedule_type TEXT NOT NULL,
                     schedule_expr TEXT NOT NULL,
+                    timezone TEXT NOT NULL DEFAULT 'UTC',
+                    status TEXT NOT NULL DEFAULT 'enabled',
                     role TEXT,
                     session_id TEXT,
-                    timezone TEXT NOT NULL DEFAULT 'UTC',
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    next_run_at TEXT,
                     timeout_seconds INTEGER,
-                    metadata TEXT NOT NULL DEFAULT '{}',
+                    origin TEXT NOT NULL DEFAULT '{}',
+                    delivery_mode TEXT NOT NULL DEFAULT 'origin',
+                    delivery_targets TEXT NOT NULL DEFAULT '[]',
+                    delivery_fallback TEXT NOT NULL DEFAULT '{}',
+                    execution_policy TEXT NOT NULL DEFAULT '{}',
+                    safety_status TEXT,
+                    safety_error TEXT,
+                    next_run_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_run_at TEXT,
                     last_status TEXT,
                     last_error TEXT,
+                    last_delivery_status TEXT,
+                    last_delivery_error TEXT,
                     running INTEGER NOT NULL DEFAULT 0,
                     locked_until TEXT
                 );
@@ -81,11 +113,20 @@ class ScheduledTaskStore:
                     output TEXT,
                     error TEXT,
                     duration_ms INTEGER,
+                    delivery_status TEXT,
+                    delivery_targets TEXT NOT NULL DEFAULT '[]',
+                    delivery_results TEXT NOT NULL DEFAULT '[]',
+                    delivery_error TEXT,
+                    delivered_at TEXT,
+                    read_at TEXT,
+                    safety_status TEXT,
+                    safety_error TEXT,
+                    execution_context TEXT NOT NULL DEFAULT '{}',
                     FOREIGN KEY(task_id) REFERENCES scheduled_tasks(id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
-                    ON scheduled_tasks(enabled, next_run_at, running, locked_until);
+                    ON scheduled_tasks(status, next_run_at, running, locked_until);
                 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_task_started
                     ON scheduled_runs(task_id, started_at DESC);
                 """
@@ -98,24 +139,30 @@ class ScheduledTaskStore:
         prompt: str,
         schedule_type: ScheduleType | str,
         schedule_expr: str,
+        timezone_name: str = "UTC",
+        status: str = "enabled",
         role: str | None = None,
         session_id: str | None = None,
-        timezone_name: str = "UTC",
-        enabled: bool = True,
         timeout_seconds: int | None = None,
-        metadata: dict[str, Any] | None = None,
+        origin: dict[str, Any] | None = None,
+        delivery_mode: str = "origin",
+        delivery_targets: list[dict[str, Any]] | None = None,
+        delivery_fallback: dict[str, Any] | None = None,
+        execution_policy: dict[str, Any] | None = None,
     ) -> ScheduledTask:
         now = utc_now()
         kind = ScheduleType(schedule_type)
-        next_run_at = compute_next_run(kind, schedule_expr, after=now, timezone_name=timezone_name) if enabled else None
+        normalized_status = _task_status(status)
+        next_run_at = compute_next_run(kind, schedule_expr, after=now, timezone_name=timezone_name) if normalized_status == "enabled" else None
         task_id = uuid.uuid4().hex
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO scheduled_tasks (
-                    id, name, prompt, schedule_type, schedule_expr, role, session_id, timezone,
-                    enabled, next_run_at, timeout_seconds, metadata, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, name, prompt, schedule_type, schedule_expr, timezone, status,
+                    role, session_id, timeout_seconds, origin, delivery_mode, delivery_targets,
+                    delivery_fallback, execution_policy, next_run_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -123,13 +170,17 @@ class ScheduledTaskStore:
                     prompt,
                     kind.value,
                     schedule_expr.strip(),
+                    timezone_name,
+                    normalized_status,
                     role,
                     session_id,
-                    timezone_name,
-                    1 if enabled else 0,
-                    _dt_to_text(next_run_at),
                     timeout_seconds,
-                    json.dumps(metadata or {}, ensure_ascii=False),
+                    _json_dumps(origin or {}),
+                    delivery_mode,
+                    _json_dumps(delivery_targets or []),
+                    _json_dumps(delivery_fallback or {}),
+                    _json_dumps(execution_policy or {}),
+                    _dt_to_text(next_run_at),
                     _dt_to_text(now),
                     _dt_to_text(now),
                 ),
@@ -139,9 +190,12 @@ class ScheduledTaskStore:
             raise RuntimeError("定时任务创建失败。")
         return task
 
-    def list_tasks(self) -> list[ScheduledTask]:
+    def list_tasks(self, *, include_deleted: bool = False) -> list[ScheduledTask]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM scheduled_tasks ORDER BY created_at DESC").fetchall()
+            if include_deleted:
+                rows = conn.execute("SELECT * FROM scheduled_tasks ORDER BY created_at DESC").fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM scheduled_tasks WHERE status != 'deleted' ORDER BY created_at DESC").fetchall()
         return [self._task_from_row(row) for row in rows]
 
     def get_task(self, task_id: str) -> ScheduledTask | None:
@@ -149,32 +203,65 @@ class ScheduledTaskStore:
             row = conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()
         return self._task_from_row(row) if row else None
 
+    def resolve_task_ref(self, task_id_or_name: str, *, include_deleted: bool = False) -> ScheduledTask | None:
+        task = self.get_task(task_id_or_name)
+        if task is not None and (include_deleted or task.status != "deleted"):
+            return task
+        matches = [task for task in self.list_tasks(include_deleted=include_deleted) if task.name == task_id_or_name]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError(f"找到多个同名定时任务：{task_id_or_name}，请使用任务 ID。")
+        return matches[0]
+
     def update_task(self, task_id: str, **updates: Any) -> ScheduledTask:
-        allowed = {"name", "prompt", "schedule_type", "schedule_expr", "role", "session_id", "timezone", "enabled", "timeout_seconds", "metadata"}
+        allowed = {
+            "name",
+            "prompt",
+            "schedule_type",
+            "schedule_expr",
+            "timezone",
+            "status",
+            "role",
+            "session_id",
+            "timeout_seconds",
+            "origin",
+            "delivery_mode",
+            "delivery_targets",
+            "delivery_fallback",
+            "execution_policy",
+            "safety_status",
+            "safety_error",
+            "last_error",
+            "last_delivery_status",
+            "last_delivery_error",
+        }
         current = self.get_task(task_id)
         if current is None:
             raise KeyError(task_id)
         data = {key: value for key, value in updates.items() if key in allowed}
         if not data:
             return current
+
         schedule_type = ScheduleType(data.get("schedule_type", current.schedule_type))
         schedule_expr = str(data.get("schedule_expr", current.schedule_expr))
         timezone_name = str(data.get("timezone", current.timezone))
-        enabled = bool(data.get("enabled", current.enabled))
-        schedule_changed = any(key in data for key in {"schedule_type", "schedule_expr", "timezone", "enabled"})
+        status = _task_status(str(data.get("status", current.status)))
+        schedule_changed = any(key in data for key in {"schedule_type", "schedule_expr", "timezone", "status"})
         next_run_at = current.next_run_at
         if schedule_changed:
-            next_run_at = compute_next_run(schedule_type, schedule_expr, after=utc_now(), timezone_name=timezone_name) if enabled else None
+            next_run_at = compute_next_run(schedule_type, schedule_expr, after=utc_now(), timezone_name=timezone_name) if status == "enabled" else None
+
         assignments = []
         values: list[Any] = []
         for key, value in data.items():
             column_value = value
             if key == "schedule_type":
                 column_value = ScheduleType(value).value
-            elif key == "enabled":
-                column_value = 1 if value else 0
-            elif key == "metadata":
-                column_value = json.dumps(value or {}, ensure_ascii=False)
+            elif key == "status":
+                column_value = _task_status(str(value))
+            elif key in {"origin", "delivery_targets", "delivery_fallback", "execution_policy"}:
+                column_value = _json_dumps(value or ([] if key == "delivery_targets" else {}))
             assignments.append(f"{key} = ?")
             values.append(column_value)
         assignments.extend(["next_run_at = ?", "updated_at = ?"])
@@ -186,11 +273,17 @@ class ScheduledTaskStore:
             raise KeyError(task_id)
         return updated
 
-    def delete_task(self, task_id: str) -> None:
-        with self._connect() as conn:
-            cur = conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
-        if cur.rowcount == 0:
-            raise KeyError(task_id)
+    def pause_task(self, task_id: str, *, reason: str | None = None) -> ScheduledTask:
+        updates: dict[str, Any] = {"status": "paused"}
+        if reason:
+            updates["last_error"] = reason
+        return self.update_task(task_id, **updates)
+
+    def resume_task(self, task_id: str) -> ScheduledTask:
+        return self.update_task(task_id, status="enabled")
+
+    def delete_task(self, task_id: str) -> ScheduledTask:
+        return self.update_task(task_id, status="deleted")
 
     def claim_due_tasks(self, limit: int, lock_seconds: int) -> list[ScheduledTask]:
         now = utc_now()
@@ -200,7 +293,7 @@ class ScheduledTaskStore:
             rows = conn.execute(
                 """
                 SELECT * FROM scheduled_tasks
-                WHERE enabled = 1
+                WHERE status = 'enabled'
                   AND next_run_at IS NOT NULL
                   AND next_run_at <= ?
                   AND (running = 0 OR locked_until IS NULL OR locked_until <= ?)
@@ -218,7 +311,7 @@ class ScheduledTaskStore:
                     UPDATE scheduled_tasks
                     SET running = 1, locked_until = ?, updated_at = ?
                     WHERE id IN ({placeholders})
-                      AND enabled = 1
+                      AND status = 'enabled'
                       AND next_run_at IS NOT NULL
                       AND next_run_at <= ?
                       AND (running = 0 OR locked_until IS NULL OR locked_until <= ?)
@@ -240,6 +333,8 @@ class ScheduledTaskStore:
             if row is None:
                 raise KeyError(task_id)
             current = self._task_from_row(row)
+            if current.status == "deleted":
+                raise RuntimeError("定时任务已删除")
             if current.running and current.locked_until and current.locked_until > now:
                 raise RuntimeError("定时任务正在运行")
             cur = conn.execute(
@@ -258,30 +353,44 @@ class ScheduledTaskStore:
             raise KeyError(task_id)
         return claimed
 
-    def prepare_task_run(self, task: ScheduledTask, *, preserve_schedule: bool = False) -> ScheduledRun:
+    def prepare_task_run(self, task: ScheduledTask, *, preserve_schedule: bool = False, execution_context: dict[str, Any] | None = None) -> ScheduledRun:
         now = utc_now()
         next_run_at = task.next_run_at if preserve_schedule else None
-        enabled = task.enabled if preserve_schedule else False
+        status = task.status
         if task.schedule_type != ScheduleType.ONCE and not preserve_schedule:
             next_run_at = compute_next_run(task.schedule_type, task.schedule_expr, after=now, timezone_name=task.timezone)
-            enabled = task.enabled
-        run = ScheduledRun(id=uuid.uuid4().hex, task_id=task.id, status="running", started_at=now)
+        elif task.schedule_type == ScheduleType.ONCE and not preserve_schedule:
+            status = "deleted"
+        run = ScheduledRun(id=uuid.uuid4().hex, task_id=task.id, status="running", started_at=now, execution_context=execution_context or {})
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE scheduled_tasks
-                SET next_run_at = ?, enabled = ?, last_run_at = ?, last_status = ?, last_error = NULL, updated_at = ?
+                SET next_run_at = ?, status = ?, last_run_at = ?, last_status = ?, last_error = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (_dt_to_text(next_run_at), 1 if enabled else 0, _dt_to_text(now), "running", _dt_to_text(now), task.id),
+                (_dt_to_text(next_run_at), status, _dt_to_text(now), "running", _dt_to_text(now), task.id),
             )
             conn.execute(
-                "INSERT INTO scheduled_runs (id, task_id, status, started_at) VALUES (?, ?, ?, ?)",
-                (run.id, run.task_id, run.status, _dt_to_text(run.started_at)),
+                """
+                INSERT INTO scheduled_runs (id, task_id, status, started_at, execution_context)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (run.id, run.task_id, run.status, _dt_to_text(run.started_at), _json_dumps(run.execution_context)),
             )
         return run
 
-    def complete_run(self, run_id: str, *, status: RunStatus, output: str | None = None, error: str | None = None, duration_ms: int | None = None) -> None:
+    def complete_run(
+        self,
+        run_id: str,
+        *,
+        status: RunStatus,
+        output: str | None = None,
+        error: str | None = None,
+        duration_ms: int | None = None,
+        safety_status: str | None = None,
+        safety_error: str | None = None,
+    ) -> None:
         finished_at = utc_now()
         with self._connect() as conn:
             row = conn.execute("SELECT task_id FROM scheduled_runs WHERE id = ?", (run_id,)).fetchone()
@@ -291,45 +400,27 @@ class ScheduledTaskStore:
             conn.execute(
                 """
                 UPDATE scheduled_runs
-                SET status = ?, finished_at = ?, output = ?, error = ?, duration_ms = ?
+                SET status = ?, finished_at = ?, output = ?, error = ?, duration_ms = ?, safety_status = ?, safety_error = ?
                 WHERE id = ?
                 """,
-                (status, _dt_to_text(finished_at), output, error, duration_ms, run_id),
+                (status, _dt_to_text(finished_at), output, error, duration_ms, safety_status, safety_error, run_id),
             )
             conn.execute(
                 """
                 UPDATE scheduled_tasks
-                SET running = 0, locked_until = NULL, last_status = ?, last_error = ?, updated_at = ?
+                SET running = 0, locked_until = NULL, last_status = ?, last_error = ?, safety_status = ?, safety_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, error, _dt_to_text(finished_at), task_id),
+                (status, error, safety_status, safety_error, _dt_to_text(finished_at), task_id),
             )
 
     def skip_task_run(self, task: ScheduledTask, *, error: str | None = None) -> ScheduledRun:
-        now = utc_now()
-        next_run_at = None
-        enabled = False
-        if task.schedule_type != ScheduleType.ONCE:
-            next_run_at = compute_next_run(task.schedule_type, task.schedule_expr, after=now, timezone_name=task.timezone)
-            enabled = task.enabled
-        run_id = uuid.uuid4().hex
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET running = 0, locked_until = NULL, next_run_at = ?, enabled = ?, last_run_at = ?, last_status = ?, last_error = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (_dt_to_text(next_run_at), 1 if enabled else 0, _dt_to_text(now), "skipped", error, _dt_to_text(now), task.id),
-            )
-            conn.execute(
-                """
-                INSERT INTO scheduled_runs (id, task_id, status, started_at, finished_at, error, duration_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, task.id, "skipped", _dt_to_text(now), _dt_to_text(now), error, 0),
-            )
-        return ScheduledRun(id=run_id, task_id=task.id, status="skipped", started_at=now, finished_at=now, error=error, duration_ms=0)
+        claimed = self.prepare_task_run(task)
+        self.complete_run(claimed.id, status="skipped", error=error, duration_ms=0)
+        run = self.get_run(claimed.id)
+        if run is None:
+            raise KeyError(claimed.id)
+        return run
 
     def release_task(self, task_id: str, *, status: RunStatus = "skipped", error: str | None = None) -> None:
         now = utc_now()
@@ -342,6 +433,54 @@ class ScheduledTaskStore:
                 """,
                 (status, error, _dt_to_text(now), task_id),
             )
+
+    def update_run_delivery(
+        self,
+        run_id: str,
+        *,
+        delivery_status: str,
+        delivery_targets: list[dict[str, Any]] | None = None,
+        delivery_results: list[dict[str, Any]] | None = None,
+        delivery_error: str | None = None,
+        delivered_at: datetime | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT task_id FROM scheduled_runs WHERE id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            task_id = row["task_id"]
+            conn.execute(
+                """
+                UPDATE scheduled_runs
+                SET delivery_status = ?, delivery_targets = ?, delivery_results = ?, delivery_error = ?, delivered_at = ?
+                WHERE id = ?
+                """,
+                (
+                    delivery_status,
+                    _json_dumps(delivery_targets or []),
+                    _json_dumps(delivery_results or []),
+                    delivery_error,
+                    _dt_to_text(delivered_at),
+                    run_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET last_delivery_status = ?, last_delivery_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (delivery_status, delivery_error, _dt_to_text(utc_now()), task_id),
+            )
+
+    def update_run_safety(self, run_id: str, *, safety_status: str | None, safety_error: str | None) -> None:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE scheduled_runs SET safety_status = ?, safety_error = ? WHERE id = ?",
+                (safety_status, safety_error, run_id),
+            )
+        if cur.rowcount == 0:
+            raise KeyError(run_id)
 
     def get_run(self, run_id: str) -> ScheduledRun | None:
         with self._connect() as conn:
@@ -356,6 +495,39 @@ class ScheduledTaskStore:
             ).fetchall()
         return [self._run_from_row(row) for row in rows]
 
+    def list_inbox_runs(self, *, unread_only: bool = True, limit: int = 20) -> list[tuple[ScheduledTask, ScheduledRun]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM scheduled_runs
+                WHERE finished_at IS NOT NULL
+                  AND (output IS NOT NULL OR error IS NOT NULL)
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (max(limit * 10, 50),),
+            ).fetchall()
+        results: list[tuple[ScheduledTask, ScheduledRun]] = []
+        for row in rows:
+            run = self._run_from_row(row)
+            if unread_only and run.read_at is not None:
+                continue
+            if not _run_has_inbox(run):
+                continue
+            task = self.get_task(run.task_id)
+            if task is None:
+                continue
+            results.append((task, run))
+            if len(results) >= limit:
+                break
+        return results
+
+    def mark_run_read(self, run_id: str) -> None:
+        with self._connect() as conn:
+            cur = conn.execute("UPDATE scheduled_runs SET read_at = ? WHERE id = ?", (_dt_to_text(utc_now()), run_id))
+        if cur.rowcount == 0:
+            raise KeyError(run_id)
+
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
             id=row["id"],
@@ -363,18 +535,26 @@ class ScheduledTaskStore:
             prompt=row["prompt"],
             schedule_type=ScheduleType(row["schedule_type"]),
             schedule_expr=row["schedule_expr"],
+            timezone=row["timezone"],
+            status=_task_status(row["status"]),
             role=row["role"],
             session_id=row["session_id"],
-            timezone=row["timezone"],
-            enabled=bool(row["enabled"]),
-            next_run_at=_dt_from_text(row["next_run_at"]),
             timeout_seconds=row["timeout_seconds"],
-            metadata=json.loads(row["metadata"] or "{}"),
+            origin=_json_dict(row["origin"]),
+            delivery_mode=row["delivery_mode"],
+            delivery_targets=_json_list(row["delivery_targets"]),
+            delivery_fallback=_json_dict(row["delivery_fallback"]),
+            execution_policy=_json_dict(row["execution_policy"]),
+            safety_status=row["safety_status"],
+            safety_error=row["safety_error"],
+            next_run_at=_dt_from_text(row["next_run_at"]),
             created_at=_dt_from_text(row["created_at"]) or utc_now(),
             updated_at=_dt_from_text(row["updated_at"]) or utc_now(),
             last_run_at=_dt_from_text(row["last_run_at"]),
             last_status=row["last_status"],
             last_error=row["last_error"],
+            last_delivery_status=row["last_delivery_status"],
+            last_delivery_error=row["last_delivery_error"],
             running=bool(row["running"]),
             locked_until=_dt_from_text(row["locked_until"]),
         )
@@ -389,4 +569,19 @@ class ScheduledTaskStore:
             output=row["output"],
             error=row["error"],
             duration_ms=row["duration_ms"],
+            delivery_status=row["delivery_status"],
+            delivery_targets=_json_list(row["delivery_targets"]),
+            delivery_results=_json_list(row["delivery_results"]),
+            delivery_error=row["delivery_error"],
+            delivered_at=_dt_from_text(row["delivered_at"]),
+            read_at=_dt_from_text(row["read_at"]),
+            safety_status=row["safety_status"],
+            safety_error=row["safety_error"],
+            execution_context=_json_dict(row["execution_context"]),
         )
+
+
+def _run_has_inbox(run: ScheduledRun) -> bool:
+    targets = run.delivery_targets or []
+    results = run.delivery_results or []
+    return any(target.get("type") == "inbox" for target in targets) or any(result.get("target", {}).get("type") == "inbox" for result in results)

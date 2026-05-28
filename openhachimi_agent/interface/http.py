@@ -16,14 +16,24 @@ from fastapi.responses import FileResponse, StreamingResponse
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.interface.telegram import telegram_lifespan
+from openhachimi_agent.scheduler.delivery import (
+    CliDeliverySender,
+    DeliverySenderRegistry,
+    InboxDeliverySender,
+    TelegramDeliverySender,
+    deliver_scheduled_run,
+)
+from openhachimi_agent.scheduler.service import ScheduledTaskService, run_to_dict, task_to_dict
 from openhachimi_agent.scheduler.store import ScheduledTaskStore
 from openhachimi_agent.scheduler.scheduler import TaskScheduler
 from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.transport.api_models import (
     ChatRequest,
+    DeliveryPreviewResponse,
     RoleSwitchRequest,
     ScheduleCreateRequest,
+    ScheduleDeliveryUpdateRequest,
     ScheduleResponse,
     ScheduleRunResponse,
     ScheduleUpdateRequest,
@@ -38,11 +48,34 @@ def get_service(request: Request) -> AgentService:
     return request.app.state.service
 
 
+def get_config(request: Request):
+    return request.app.state.config
+
+
 def get_schedule_store(request: Request) -> ScheduledTaskStore:
     store = getattr(request.app.state, "schedule_store", None)
     if store is None:
         raise HTTPException(status_code=503, detail="定时任务未启用")
     return store
+
+
+def get_schedule_service(request: Request) -> ScheduledTaskService:
+    store = get_schedule_store(request)
+    return ScheduledTaskService(store)
+
+
+def get_scheduler(request: Request) -> TaskScheduler:
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="定时任务调度器未启动")
+    return scheduler
+
+
+def get_delivery_registry(request: Request) -> DeliverySenderRegistry:
+    registry = getattr(request.app.state, "delivery_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="投递系统未初始化")
+    return registry
 
 
 def _dt_text(value) -> str | None:
@@ -56,18 +89,27 @@ def schedule_response(task: ScheduledTask) -> ScheduleResponse:
         prompt=task.prompt,
         schedule_type=task.schedule_type.value,
         schedule_expr=task.schedule_expr,
+        timezone=task.timezone,
+        status=task.status,
+        enabled=task.enabled,
         role=task.role,
         session_id=task.session_id,
-        timezone=task.timezone,
-        enabled=task.enabled,
-        next_run_at=_dt_text(task.next_run_at),
         timeout_seconds=task.timeout_seconds,
-        metadata=task.metadata,
+        origin=task.origin,
+        delivery_mode=task.delivery_mode,
+        delivery_targets=task.delivery_targets,
+        delivery_fallback=task.delivery_fallback,
+        execution_policy=task.execution_policy,
+        safety_status=task.safety_status,
+        safety_error=task.safety_error,
+        next_run_at=_dt_text(task.next_run_at),
         created_at=task.created_at.isoformat(),
         updated_at=task.updated_at.isoformat(),
         last_run_at=_dt_text(task.last_run_at),
         last_status=task.last_status,
         last_error=task.last_error,
+        last_delivery_status=task.last_delivery_status,
+        last_delivery_error=task.last_delivery_error,
         running=task.running,
     )
 
@@ -82,36 +124,61 @@ def schedule_run_response(run: ScheduledRun) -> ScheduleRunResponse:
         output=run.output,
         error=run.error,
         duration_ms=run.duration_ms,
+        delivery_status=run.delivery_status,
+        delivery_targets=run.delivery_targets,
+        delivery_results=run.delivery_results,
+        delivery_error=run.delivery_error,
+        delivered_at=_dt_text(run.delivered_at),
+        read_at=_dt_text(run.read_at),
+        safety_status=run.safety_status,
+        safety_error=run.safety_error,
+        execution_context=run.execution_context,
     )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """FastAPI 应用生命周期管理器。
-
-    负责在服务启动/停止时，统一管理所有渠道（当前为 Telegram Bot）的生命周期。
-    各渠道以异步上下文管理器的形式嵌套，共享同一 asyncio 事件循环，无需额外线程。
-    """
+    """FastAPI 应用生命周期管理器。"""
     config = load_config()
     configure_logging(config)
     app.state.service = AgentService(config)
+    app.state.config = config
     app.state.schedule_store = None
+    app.state.scheduler = None
+    app.state.delivery_registry = DeliverySenderRegistry()
+    app.state.delivery_registry.register(InboxDeliverySender())
     scheduler = None
-    if config.scheduler.enabled and config.scheduler.db_path is not None:
-        app.state.schedule_store = ScheduledTaskStore(config.scheduler.db_path)
-        scheduler = TaskScheduler(
-            app.state.schedule_store,
-            app.state.service,
-            poll_interval_seconds=config.scheduler.poll_interval_seconds,
-            max_concurrency=config.scheduler.max_concurrency,
-            default_timeout_seconds=config.scheduler.default_timeout_seconds,
-            claim_lock_seconds=config.scheduler.claim_lock_seconds,
-        )
-        await scheduler.start()
-    logger.info("server module initialized")
-
     try:
-        async with telegram_lifespan(config, app.state.service):
+        async with telegram_lifespan(config, app.state.service) as telegram_sender:
+            app.state.telegram_sender = telegram_sender
+            if telegram_sender is not None:
+                app.state.delivery_registry.register(TelegramDeliverySender(telegram_sender))
+            if config.scheduler.enabled and config.scheduler.db_path is not None:
+                app.state.schedule_store = ScheduledTaskStore(config.scheduler.db_path)
+
+                async def on_scheduled_run_complete(task: ScheduledTask, run: ScheduledRun) -> None:
+                    await deliver_scheduled_run(
+                        task,
+                        run,
+                        store=app.state.schedule_store,
+                        registry=app.state.delivery_registry,
+                        config=config,
+                    )
+
+                scheduler = TaskScheduler(
+                    app.state.schedule_store,
+                    app.state.service,
+                    poll_interval_seconds=config.scheduler.poll_interval_seconds,
+                    max_concurrency=config.scheduler.max_concurrency,
+                    default_timeout_seconds=config.scheduler.default_timeout_seconds,
+                    claim_lock_seconds=config.scheduler.claim_lock_seconds,
+                    delivery_registry=app.state.delivery_registry,
+                    config=config,
+                    on_run_complete=on_scheduled_run_complete,
+                )
+                app.state.scheduler = scheduler
+                await scheduler.start()
+            logger.info("server module initialized")
             logger.info("all channels started")
             yield
             logger.info("all channels stopping")
@@ -146,43 +213,78 @@ def roles(service: AgentService = Depends(get_service)):
 
 
 @app.get("/schedules")
-def list_schedules(store: ScheduledTaskStore = Depends(get_schedule_store)) -> list[ScheduleResponse]:
-    return [schedule_response(task) for task in store.list_tasks()]
+def list_schedules(
+    include_deleted: bool = False,
+    svc: ScheduledTaskService = Depends(get_schedule_service),
+) -> list[ScheduleResponse]:
+    return [schedule_response(task) for task in svc.list(include_deleted=include_deleted)]
 
 
 @app.post("/schedules")
-def create_schedule(request: ScheduleCreateRequest, store: ScheduledTaskStore = Depends(get_schedule_store)) -> ScheduleResponse:
+def create_schedule(
+    request: ScheduleCreateRequest,
+    svc: ScheduledTaskService = Depends(get_schedule_service),
+) -> ScheduleResponse:
+    origin = dict(request.origin or {})
+    origin.setdefault("type", "http")
+    origin.setdefault("platform", "http")
     try:
-        task = store.create_task(
+        task = svc.create(
             name=request.name,
             prompt=request.prompt,
             schedule_type=request.schedule_type,
             schedule_expr=request.schedule_expr,
+            timezone=request.timezone,
             role=request.role,
             session_id=request.session_id,
-            timezone_name=request.timezone,
-            enabled=request.enabled,
             timeout_seconds=request.timeout_seconds,
-            metadata=request.metadata,
+            origin=origin,
+            delivery_mode=request.delivery_mode,
+            delivery_targets=request.delivery_targets,
+            delivery_fallback=request.delivery_fallback,
+            execution_policy=request.execution_policy,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return schedule_response(task)
 
 
+@app.get("/schedules/inbox")
+def list_schedule_inbox(
+    unread_only: bool = True,
+    limit: int = 20,
+    mark_read: bool = False,
+    svc: ScheduledTaskService = Depends(get_schedule_service),
+) -> list[ScheduleRunResponse]:
+    items = svc.read_inbox(unread_only=unread_only, limit=limit, mark_read=mark_read)
+    return [schedule_run_response(run) for _task, run in items]
+
+
+@app.post("/schedules/inbox/{run_id}/read")
+def mark_schedule_run_read(run_id: str, svc: ScheduledTaskService = Depends(get_schedule_service)) -> dict[str, bool]:
+    try:
+        svc.mark_read(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="运行记录不存在") from exc
+    return {"ok": True}
+
+
 @app.get("/schedules/{task_id}")
-def get_schedule(task_id: str, store: ScheduledTaskStore = Depends(get_schedule_store)) -> ScheduleResponse:
-    task = store.get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="定时任务不存在")
+def get_schedule(task_id: str, svc: ScheduledTaskService = Depends(get_schedule_service)) -> ScheduleResponse:
+    try:
+        task = svc.get(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
     return schedule_response(task)
 
 
 @app.patch("/schedules/{task_id}")
-def update_schedule(task_id: str, request: ScheduleUpdateRequest, store: ScheduledTaskStore = Depends(get_schedule_store)) -> ScheduleResponse:
+def update_schedule(task_id: str, request: ScheduleUpdateRequest, svc: ScheduledTaskService = Depends(get_schedule_service)) -> ScheduleResponse:
     updates = request.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="没有提供可更新字段")
     try:
-        task = store.update_task(task_id, **updates)
+        task = svc.update(task_id, **updates)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="定时任务不存在") from exc
     except ValueError as exc:
@@ -190,46 +292,108 @@ def update_schedule(task_id: str, request: ScheduleUpdateRequest, store: Schedul
     return schedule_response(task)
 
 
-@app.delete("/schedules/{task_id}")
-def delete_schedule(task_id: str, store: ScheduledTaskStore = Depends(get_schedule_store)) -> dict[str, bool]:
+@app.patch("/schedules/{task_id}/delivery")
+def update_schedule_delivery(
+    task_id: str,
+    request: ScheduleDeliveryUpdateRequest,
+    svc: ScheduledTaskService = Depends(get_schedule_service),
+) -> ScheduleResponse:
     try:
-        store.delete_task(task_id)
+        task = svc.update_delivery(
+            task_id,
+            delivery_mode=request.delivery_mode,
+            delivery_targets=request.delivery_targets,
+            delivery_fallback=request.delivery_fallback,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    return schedule_response(task)
+
+
+@app.delete("/schedules/{task_id}")
+def delete_schedule(task_id: str, svc: ScheduledTaskService = Depends(get_schedule_service)) -> dict[str, bool]:
+    try:
+        svc.remove(task_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="定时任务不存在") from exc
     return {"ok": True}
+
+
+@app.post("/schedules/{task_id}/pause")
+def pause_schedule(task_id: str, svc: ScheduledTaskService = Depends(get_schedule_service)) -> ScheduleResponse:
+    try:
+        task = svc.pause(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    return schedule_response(task)
+
+
+@app.post("/schedules/{task_id}/resume")
+def resume_schedule(task_id: str, svc: ScheduledTaskService = Depends(get_schedule_service)) -> ScheduleResponse:
+    try:
+        task = svc.resume(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    return schedule_response(task)
 
 
 @app.post("/schedules/{task_id}/run")
 async def run_schedule_now(
     task_id: str,
+    scheduler: TaskScheduler = Depends(get_scheduler),
     store: ScheduledTaskStore = Depends(get_schedule_store),
-    service: AgentService = Depends(get_service),
-) -> dict[str, bool]:
-    from openhachimi_agent.scheduler.runner import ScheduledTaskRunner
-
+) -> ScheduleRunResponse:
     try:
-        task = await asyncio.to_thread(store.claim_task_now, task_id, service.config.scheduler.claim_lock_seconds)
+        task = await asyncio.to_thread(store.claim_task_now, task_id, scheduler.claim_lock_seconds)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="定时任务不存在") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    runner = ScheduledTaskRunner(store, service, default_timeout_seconds=service.config.scheduler.default_timeout_seconds)
-    await runner.run_task(task, preserve_schedule=True)
-    return {"ok": True}
+    run = await scheduler.run_task_now(task, preserve_schedule=True)
+    if run is None:
+        raise HTTPException(status_code=500, detail="任务执行失败")
+    return schedule_run_response(run)
 
 
 @app.get("/schedules/{task_id}/runs")
-def list_schedule_runs(task_id: str, limit: int = 20, store: ScheduledTaskStore = Depends(get_schedule_store)) -> list[ScheduleRunResponse]:
-    if store.get_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="定时任务不存在")
-    return [schedule_run_response(run) for run in store.list_runs(task_id, limit)]
+def list_schedule_runs(task_id: str, limit: int = 20, svc: ScheduledTaskService = Depends(get_schedule_service)) -> list[ScheduleRunResponse]:
+    try:
+        runs = svc.list_runs(task_id, limit=limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    return [schedule_run_response(run) for run in runs]
+
+
+@app.get("/schedules/{task_id}/runs/{run_id}")
+def get_schedule_run(run_id: str, svc: ScheduledTaskService = Depends(get_schedule_service)) -> ScheduleRunResponse:
+    try:
+        run = svc.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="运行记录不存在") from exc
+    return schedule_run_response(run)
+
+
+@app.post("/schedules/{task_id}/delivery/preview")
+def preview_schedule_delivery(task_id: str, svc: ScheduledTaskService = Depends(get_schedule_service)) -> DeliveryPreviewResponse:
+    try:
+        preview = svc.preview_delivery(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="定时任务不存在") from exc
+    return DeliveryPreviewResponse(**preview)
 
 
 @app.post("/chat")
 async def chat(request: ChatRequest, service: AgentService = Depends(get_service)):
     logger.info("http chat request message_chars=%d attachment_count=%d stream=false", len(request.message), len(request.attachments))
+    channel_context = {"type": "http", "platform": "http", "session_id": request.session_id, "role": request.role}
     try:
-        return await service.send_message(request.message, request.role, request.session_id, attachments=request.attachments)
+        return await service.send_message(
+            request.message,
+            request.role,
+            request.session_id,
+            attachments=request.attachments,
+            channel_context=channel_context,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -239,8 +403,15 @@ def chat_stream(request: ChatRequest, service: AgentService = Depends(get_servic
     logger.info("http chat request message_chars=%d attachment_count=%d stream=true", len(request.message), len(request.attachments))
 
     async def sse_generator():
+        channel_context = {"type": "http", "platform": "http", "session_id": request.session_id, "role": request.role}
         try:
-            async for event in service.stream_events(request.message, request.role, request.session_id, attachments=request.attachments):
+            async for event in service.stream_events(
+                request.message,
+                request.role,
+                request.session_id,
+                attachments=request.attachments,
+                channel_context=channel_context,
+            ):
                 payload = {
                     "type": event.type,
                     "text": event.text,
@@ -286,6 +457,7 @@ def download_artifact(artifact_id: str, service: AgentService = Depends(get_serv
         media_type=artifact.content_type or "application/octet-stream",
         filename=artifact.filename or Path(target).name,
     )
+
 
 def new_session(role: str | None = None, service: AgentService = Depends(get_service)):
     logger.info("http new session request role=%s", role)

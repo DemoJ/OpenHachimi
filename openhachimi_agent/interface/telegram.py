@@ -14,7 +14,7 @@ import time
 import asyncio
 import contextlib
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Awaitable
 from contextlib import asynccontextmanager
 
 from telegram import Update, constants
@@ -507,7 +507,22 @@ class TelegramBot:
                 presenter.reset_tools()
 
             try:
-                async for event in self.service.stream_events(user_text, role, session_id, attachments=attachments):
+                channel_context = {
+                    "type": "telegram",
+                    "platform": "telegram",
+                    "chat_id": update.effective_chat.id if update.effective_chat else update.message.chat_id,
+                    "user_id": user_id,
+                    "thread_id": getattr(update.message, "message_thread_id", None),
+                    "session_id": session_id,
+                    "role": role,
+                }
+                async for event in self.service.stream_events(
+                    user_text,
+                    role,
+                    session_id,
+                    attachments=attachments,
+                    channel_context=channel_context,
+                ):
                     for action in presenter.handle_event(event):
                         if action.type == "tool":
                             if answer_text.strip() or system_text.strip():
@@ -571,7 +586,7 @@ class TelegramBot:
 
 
 @asynccontextmanager
-async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIterator[None]:
+async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIterator[Callable[[int, str, int | None], Awaitable[None]] | None]:
     """Telegram Bot 生命周期管理器，供 FastAPI lifespan 调用。
 
     若未配置 token，则跳过，不影响 HTTP 服务正常运行。
@@ -579,7 +594,7 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
     token = config.telegram_bot_token
     if not token:
         logger.info("telegram bot token not configured, skipping")
-        yield
+        yield None
         return
 
     bot = TelegramBot(config, service)
@@ -636,10 +651,17 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
             "telegram bot 启动失败（可能是代理不通或 token 无效），"
             "HTTP 服务将继续运行，Telegram 功能不可用"
         )
-        yield  # HTTP 服务照常运行
+        yield None  # HTTP 服务照常运行
         return
 
-    yield  # FastAPI 服务运行期间 Bot 持续工作
+    async def send_scheduled_message(chat_id: int, text: str, thread_id: int | None = None) -> None:
+        for part in _split_long_text(text):
+            kwargs = {"chat_id": chat_id, "text": part}
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+            await app.bot.send_message(**kwargs)
+
+    yield send_scheduled_message  # FastAPI 服务运行期间 Bot 持续工作
 
     # 优雅关闭
     logger.info("telegram bot shutting down")

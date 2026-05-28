@@ -232,11 +232,23 @@ class AgentService:
         session_id: str | None,
         stream: bool,
         attachments: Sequence[AttachmentRef] | None = None,
+        run_mode: str = "interactive",
+        channel_context: dict[str, object] | None = None,
+        scheduler_context: dict[str, object] | None = None,
+        channel: str | None = None,
+        delivery_target: dict[str, object] | None = None,
     ) -> AsyncIterator[object]:
         start_time = time.perf_counter()
         role = role or self.config.default_role_name
         attachment_list = list(attachments or [])
         effective_message = message_with_attachments(message, attachment_list)
+
+        channel_context_data = dict(channel_context or {})
+        if not channel_context_data:
+            channel_context_data = {"type": channel or "local", "platform": channel or "local"}
+            if delivery_target:
+                channel_context_data.update(delivery_target)
+        channel_name = str(channel_context_data.get("type") or channel_context_data.get("platform") or "local")
 
         actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
         lock = self._get_session_lock(actual_session_id)
@@ -261,7 +273,7 @@ class AgentService:
                 user_id="local",
                 role_name=role,
                 session_id=actual_session_id,
-                channel="cli",
+                channel=channel_name,
             )
             memory_context = recall_memories(self.config, memory_scope, effective_message)
             session_state["memory_context"] = memory_context
@@ -273,6 +285,9 @@ class AgentService:
                 session_state=session_state,
                 memory_scope=memory_scope,
                 memory_context=memory_context,
+                run_mode=run_mode,
+                channel_context=channel_context_data,
+                scheduler_context=dict(scheduler_context or {}),
             )
             stream_queue: asyncio.Queue[StreamEventItem | object] = asyncio.Queue()
             stream_stats = StreamStats()
@@ -564,8 +579,24 @@ class AgentService:
         role: str | None = None,
         session_id: str | None = None,
         attachments: Sequence[AttachmentRef] | None = None,
+        run_mode: str = "interactive",
+        channel_context: dict[str, object] | None = None,
+        scheduler_context: dict[str, object] | None = None,
+        channel: str = "local",
+        delivery_target: dict[str, object] | None = None,
     ) -> ChatResponse:
-        async for result in self._run_with_session(message, role, session_id, stream=False, attachments=attachments):
+        async for result in self._run_with_session(
+            message,
+            role,
+            session_id,
+            stream=False,
+            attachments=attachments,
+            run_mode=run_mode,
+            channel_context=channel_context,
+            scheduler_context=scheduler_context,
+            channel=channel,
+            delivery_target=delivery_target,
+        ):
             return result  # type: ignore[return-value]
         raise RuntimeError("No result returned from _run_with_session")
 
@@ -575,8 +606,24 @@ class AgentService:
         role: str | None = None,
         session_id: str | None = None,
         attachments: Sequence[AttachmentRef] | None = None,
+        run_mode: str = "interactive",
+        channel_context: dict[str, object] | None = None,
+        scheduler_context: dict[str, object] | None = None,
+        channel: str = "local",
+        delivery_target: dict[str, object] | None = None,
     ) -> AsyncIterator[StreamEventItem]:
-        async for event in self._run_with_session(message, role, session_id, stream=True, attachments=attachments):
+        async for event in self._run_with_session(
+            message,
+            role,
+            session_id,
+            stream=True,
+            attachments=attachments,
+            run_mode=run_mode,
+            channel_context=channel_context,
+            scheduler_context=scheduler_context,
+            channel=channel,
+            delivery_target=delivery_target,
+        ):
             if isinstance(event, StreamEventItem):
                 if event.type == "tool" and not self.config.show_tool_calls:
                     continue

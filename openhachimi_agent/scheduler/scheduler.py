@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.scheduler.runner import ScheduledTaskRunner
@@ -25,6 +26,8 @@ class TaskScheduler:
         max_concurrency: int,
         default_timeout_seconds: int,
         claim_lock_seconds: int,
+        delivery_registry: Any = None,
+        config: Any = None,
         on_run_complete: Callable[[ScheduledTask, ScheduledRun], Awaitable[None] | None] | None = None,
     ) -> None:
         self.store = store
@@ -32,7 +35,15 @@ class TaskScheduler:
         self.poll_interval_seconds = poll_interval_seconds
         self.max_concurrency = max_concurrency
         self.claim_lock_seconds = claim_lock_seconds
-        self.runner = ScheduledTaskRunner(store, service, default_timeout_seconds=default_timeout_seconds)
+        self.delivery_registry = delivery_registry
+        self.config = config
+        self.runner = ScheduledTaskRunner(
+            store,
+            service,
+            default_timeout_seconds=default_timeout_seconds,
+            delivery_registry=delivery_registry,
+            config=config,
+        )
         self.on_run_complete = on_run_complete
         self.running = False
         self._task: asyncio.Task[None] | None = None
@@ -77,7 +88,21 @@ class TaskScheduler:
             active.add_done_callback(self._active_tasks.discard)
         return {"claimed": len(tasks), "started": len(tasks)}
 
-    async def _run_claimed_task(self, task) -> None:
+    async def run_task_now(self, task: ScheduledTask, *, preserve_schedule: bool = True) -> ScheduledRun | None:
+        """立即运行一个任务（手动触发），并触发 on_run_complete 回调。"""
+        try:
+            run = await self.runner.run_task(task, preserve_schedule=preserve_schedule)
+        except Exception as exc:
+            logger.exception("manual scheduled task failed task_id=%s", task.id)
+            await asyncio.to_thread(self.store.release_task, task.id, status="failed", error=str(exc))
+            return None
+        if self.on_run_complete and run is not None:
+            result = self.on_run_complete(task, run)
+            if inspect.isawaitable(result):
+                await result
+        return run
+
+    async def _run_claimed_task(self, task: ScheduledTask) -> None:
         async with self._semaphore:
             try:
                 run = await self.runner.run_task(task)

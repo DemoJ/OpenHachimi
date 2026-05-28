@@ -12,6 +12,7 @@
   hachimi serve        直接在前台运行 HTTP 服务（调试用）
   hachimi update       更新到最新版本
   hachimi install      安装 Playwright 浏览器驱动
+  hachimi schedule     管理定时任务
 """
 
 import argparse
@@ -225,13 +226,17 @@ def cmd_cli(_args: argparse.Namespace) -> None:
 
 
 def _print_schedule(task: dict[str, object]) -> None:
-    status = "启用" if task.get("enabled") else "暂停"
+    status = task.get("status", "enabled")
+    status_text = "启用" if status == "enabled" else ("暂停" if status == "paused" else "已删除")
     running = "，运行中" if task.get("running") else ""
-    print(f"{task['id']}  {task['name']}  [{task['schedule_type']} {task['schedule_expr']}]  {status}{running}")
+    print(f"{task['id']}  {task['name']}  [{task['schedule_type']} {task['schedule_expr']}]  {status_text}{running}")
     print(f"  下次运行：{task.get('next_run_at') or '-'}")
     print(f"  角色/会话：{task.get('role') or '-'} / {task.get('session_id') or '-'}")
+    print(f"  投递模式：{task.get('delivery_mode', 'origin')}")
     if task.get("last_status"):
         print(f"  上次状态：{task.get('last_status')} {task.get('last_error') or ''}".rstrip())
+    if task.get("last_delivery_status"):
+        print(f"  上次投递：{task.get('last_delivery_status')} {task.get('last_delivery_error') or ''}".rstrip())
 
 
 def cmd_schedule(args: argparse.Namespace) -> None:
@@ -256,16 +261,22 @@ def cmd_schedule(args: argparse.Namespace) -> None:
                 "role": args.role,
                 "session_id": args.session_id,
                 "timezone": args.timezone,
-                "enabled": not args.paused,
                 "timeout_seconds": args.timeout,
+                "delivery_mode": args.delivery_mode,
+                "origin": {
+                    "type": "cli_command",
+                    "platform": "cli",
+                },
             }
+            if args.paused:
+                payload["status"] = "paused"
             task = request_json(server_url, "POST", "/schedules", payload)
             _ok("定时任务已创建。")
             _print_schedule(task)
             return
 
         if args.schedule_command == "list":
-            tasks = request_json(server_url, "GET", "/schedules")
+            tasks = request_json(server_url, "GET", f"/schedules?include_deleted={str(args.all).lower()}")
             if not tasks:
                 _info("暂无定时任务。")
                 return
@@ -273,10 +284,15 @@ def cmd_schedule(args: argparse.Namespace) -> None:
                 _print_schedule(task)
             return
 
-        if args.schedule_command in {"pause", "resume"}:
-            enabled = args.schedule_command == "resume"
-            task = request_json(server_url, "PATCH", f"/schedules/{args.id}", {"enabled": enabled})
-            _ok("定时任务已恢复。" if enabled else "定时任务已暂停。")
+        if args.schedule_command == "pause":
+            task = request_json(server_url, "POST", f"/schedules/{args.id}/pause")
+            _ok("定时任务已暂停。")
+            _print_schedule(task)
+            return
+
+        if args.schedule_command == "resume":
+            task = request_json(server_url, "POST", f"/schedules/{args.id}/resume")
+            _ok("定时任务已恢复。")
             _print_schedule(task)
             return
 
@@ -286,8 +302,27 @@ def cmd_schedule(args: argparse.Namespace) -> None:
             return
 
         if args.schedule_command == "run":
-            request_json(server_url, "POST", f"/schedules/{args.id}/run")
+            run = request_json(server_url, "POST", f"/schedules/{args.id}/run")
             _ok("定时任务已执行。")
+            print(f"运行 ID：{run['id']}")
+            print(f"状态：{run['status']}")
+            if run.get("output"):
+                print(f"输出：{str(run['output'])[:500]}")
+            if run.get("error"):
+                print(f"错误：{run['error']}")
+            return
+
+        if args.schedule_command == "inbox":
+            runs = request_json(server_url, "GET", f"/schedules/inbox?limit={args.limit}&unread_only={str(not args.all).lower()}&mark_read={str(args.mark_read).lower()}")
+            if not runs:
+                _info("暂无定时任务收件箱消息。")
+                return
+            for run in runs:
+                print(f"{run['id']}  {run['status']}  {run['started_at']}  {run.get('delivery_status') or '-'}")
+                if run.get("error"):
+                    print(f"  错误：{run['error']}")
+                if run.get("output"):
+                    print(f"  输出：{str(run['output'])[:500]}")
             return
 
         if args.schedule_command == "logs":
@@ -326,7 +361,8 @@ def main() -> None:
   hachimi log            实时查看服务日志
   hachimi config         编辑配置文件
   hachimi install        安装 Playwright 浏览器驱动
-  hachimi uninstall      卸载后台守护服务""",
+  hachimi uninstall      卸载后台守护服务
+  hachimi schedule       管理定时任务""",
     )
     parser.add_argument(
         "-V",
@@ -388,11 +424,19 @@ def main() -> None:
     schedule_add.add_argument("--session-id", default=None, help="使用的会话 ID")
     schedule_add.add_argument("--timeout", type=int, default=None, help="单次执行超时时间（秒）")
     schedule_add.add_argument("--paused", action="store_true", help="创建后先暂停")
+    schedule_add.add_argument("--delivery-mode", default="origin", help="投递模式：origin/inbox/explicit/none，默认 origin")
 
-    schedule_sub.add_parser("list", help="列出定时任务")
+    schedule_list = schedule_sub.add_parser("list", help="列出定时任务")
+    schedule_list.add_argument("--all", action="store_true", help="包含已删除的任务")
+
     for action, help_text in (("pause", "暂停定时任务"), ("resume", "恢复定时任务"), ("remove", "删除定时任务"), ("run", "立即执行定时任务")):
         action_p = schedule_sub.add_parser(action, help=help_text)
         action_p.add_argument("id", help="任务 ID")
+    inbox_p = schedule_sub.add_parser("inbox", help="查看定时任务收件箱")
+    inbox_p.add_argument("--limit", type=int, default=20, help="记录数量")
+    inbox_p.add_argument("--all", action="store_true", help="包含已读记录")
+    inbox_p.add_argument("--mark-read", action="store_true", help="显示后标记为已读")
+
     logs_p = schedule_sub.add_parser("logs", help="查看运行记录")
     logs_p.add_argument("id", help="任务 ID")
     logs_p.add_argument("--limit", type=int, default=20, help="记录数量")

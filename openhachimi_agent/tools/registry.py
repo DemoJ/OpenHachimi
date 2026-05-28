@@ -17,7 +17,7 @@ from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills, install_skill
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import web_search
-from openhachimi_agent.tools.scheduler import create_delayed_task, create_scheduled_task
+from openhachimi_agent.tools.scheduler import create_delayed_task, create_scheduled_task, manage_scheduled_task
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
 from openhachimi_agent.tools.memory import forget_memory, list_memory, memory_stats, remember, search_memory
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
@@ -79,6 +79,7 @@ _MEMORY_MUTATION_TOOLS = [
 ]
 
 _SCHEDULER_TOOLS = [
+    manage_scheduled_task,
     create_delayed_task,
     create_scheduled_task,
 ]

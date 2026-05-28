@@ -55,6 +55,28 @@ class StopRequest(BaseModel):
     session_id: str = Field(min_length=1)
 
 
+class ScheduleOrigin(BaseModel):
+    type: str = "http"
+    platform: str = "http"
+    session_id: str | None = None
+    role: str | None = None
+
+
+class DeliveryTarget(BaseModel):
+    type: str = "inbox"
+    chat_id: str | int | None = None
+    thread_id: str | int | None = None
+    user_id: str | int | None = None
+    box: str | None = None
+
+
+class DeliveryFallback(BaseModel):
+    enabled: bool = True
+    mode: str = "inbox"
+    targets: list[dict[str, Any]] = Field(default_factory=lambda: [{"type": "inbox", "box": "default"}])
+    on: list[str] = Field(default_factory=lambda: ["resolve_failed", "send_failed"])
+
+
 class ScheduleCreateRequest(BaseModel):
     name: str = Field(min_length=1)
     prompt: str = Field(min_length=1)
@@ -63,9 +85,12 @@ class ScheduleCreateRequest(BaseModel):
     role: str | None = None
     session_id: str | None = None
     timezone: str = "UTC"
-    enabled: bool = True
     timeout_seconds: int | None = Field(default=None, gt=0)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    origin: dict[str, Any] | None = None
+    delivery_mode: str = "origin"
+    delivery_targets: list[dict[str, Any]] | None = None
+    delivery_fallback: dict[str, Any] | None = None
+    execution_policy: dict[str, Any] | None = None
 
 
 class ScheduleUpdateRequest(BaseModel):
@@ -76,9 +101,14 @@ class ScheduleUpdateRequest(BaseModel):
     role: str | None = None
     session_id: str | None = None
     timezone: str | None = None
-    enabled: bool | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
-    metadata: dict[str, Any] | None = None
+    execution_policy: dict[str, Any] | None = None
+
+
+class ScheduleDeliveryUpdateRequest(BaseModel):
+    delivery_mode: str
+    delivery_targets: list[dict[str, Any]] | None = None
+    delivery_fallback: dict[str, Any] | None = None
 
 
 class ScheduleResponse(BaseModel):
@@ -87,18 +117,27 @@ class ScheduleResponse(BaseModel):
     prompt: str
     schedule_type: str
     schedule_expr: str
+    timezone: str
+    status: str
+    enabled: bool
     role: str | None = None
     session_id: str | None = None
-    timezone: str
-    enabled: bool
-    next_run_at: str | None = None
     timeout_seconds: int | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    origin: dict[str, Any] = Field(default_factory=dict)
+    delivery_mode: str = "origin"
+    delivery_targets: list[dict[str, Any]] = Field(default_factory=list)
+    delivery_fallback: dict[str, Any] = Field(default_factory=dict)
+    execution_policy: dict[str, Any] = Field(default_factory=dict)
+    safety_status: str | None = None
+    safety_error: str | None = None
+    next_run_at: str | None = None
     created_at: str
     updated_at: str
     last_run_at: str | None = None
     last_status: str | None = None
     last_error: str | None = None
+    last_delivery_status: str | None = None
+    last_delivery_error: str | None = None
     running: bool = False
 
 
@@ -111,6 +150,22 @@ class ScheduleRunResponse(BaseModel):
     output: str | None = None
     error: str | None = None
     duration_ms: int | None = None
+    delivery_status: str | None = None
+    delivery_targets: list[dict[str, Any]] = Field(default_factory=list)
+    delivery_results: list[dict[str, Any]] = Field(default_factory=list)
+    delivery_error: str | None = None
+    delivered_at: str | None = None
+    read_at: str | None = None
+    safety_status: str | None = None
+    safety_error: str | None = None
+    execution_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class DeliveryPreviewResponse(BaseModel):
+    mode: str
+    targets: list[dict[str, Any]] = Field(default_factory=list)
+    fallback: dict[str, Any] = Field(default_factory=dict)
+    origin: dict[str, Any] = Field(default_factory=dict)
 
 
 class CommandResponse(BaseModel):
