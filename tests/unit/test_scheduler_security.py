@@ -3,8 +3,9 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from openhachimi_agent.scheduler.security import (
-    scan_scheduled_prompt,
     ensure_scheduler_action_allowed,
+    ensure_scheduler_mutation_allowed,
+    scan_scheduled_prompt,
 )
 from openhachimi_agent.scheduler.runner import ScheduledTaskRunner
 from openhachimi_agent.scheduler.store import ScheduledTaskStore
@@ -101,35 +102,37 @@ def test_ensure_scheduler_action_allowed_read_operations():
     ensure_scheduler_action_allowed("scheduled", "get")
     ensure_scheduler_action_allowed("scheduled", "list_runs")
     ensure_scheduler_action_allowed("scheduled", "read_inbox")
+    ensure_scheduler_action_allowed("scheduled", "read_inbox", mutates=False)
     ensure_scheduler_action_allowed("scheduled", "preview_delivery")
 
 
 def test_ensure_scheduler_action_allowed_blocks_mutations():
     """测试 scheduled 模式下阻止修改操作"""
+    for action in ["create", "update", "update_delivery", "pause", "resume", "remove", "delete", "run", "mark_read"]:
+        with pytest.raises(RuntimeError):
+            ensure_scheduler_action_allowed("scheduled", action)
+
+
+def test_ensure_scheduler_action_allowed_blocks_mutating_read_action():
+    """测试只读 action 带写副作用时也会被阻止"""
     with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "create")
+        ensure_scheduler_action_allowed("scheduled", "read_inbox", mutates=True)
+
+
+def test_ensure_scheduler_mutation_allowed():
+    """测试 scheduled 模式下 mutation guard fail closed"""
+    ensure_scheduler_mutation_allowed("interactive")
     with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "update")
-    with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "update_delivery")
-    with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "pause")
-    with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "resume")
-    with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "remove")
-    with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "run")
-    with pytest.raises(RuntimeError):
-        ensure_scheduler_action_allowed("scheduled", "mark_read")
+        ensure_scheduler_mutation_allowed("scheduled")
 
 
 def test_ensure_scheduler_action_allowed_all_in_interactive():
     """测试 interactive 模式下允许所有操作"""
-    actions = ["create", "update", "delete", "run", "pause", "resume", "list"]
+    actions = ["create", "update", "remove", "delete", "run", "pause", "resume", "list"]
     for action in actions:
         # 这些不应该抛出异常
         ensure_scheduler_action_allowed("interactive", action)
+        ensure_scheduler_action_allowed("interactive", action, mutates=True)
 
 
 @pytest.mark.asyncio
@@ -183,11 +186,14 @@ async def test_runner_uses_scheduled_run_mode(tmp_path, mock_config):
     )
 
     captured_kwargs = {}
+    captured_message = ""
 
     class MockService:
         _running_tasks = {}
 
         async def send_message(self, message, role, session_id, **kwargs):
+            nonlocal captured_message
+            captured_message = message
             captured_kwargs.update(kwargs)
             return MagicMock(output="done")
 
@@ -195,6 +201,9 @@ async def test_runner_uses_scheduled_run_mode(tmp_path, mock_config):
     await runner.run_task(task)
 
     assert captured_kwargs.get("run_mode") == "scheduled"
+    assert "已经到期的定时任务" in captured_message
+    assert "不要询问提醒时间" in captured_message
+    assert "安全任务" in captured_message
 
 
 @pytest.mark.asyncio

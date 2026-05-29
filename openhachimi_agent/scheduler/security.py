@@ -31,7 +31,8 @@ _THREAT_PATTERNS = [
 ]
 
 _INVISIBLE_CHARS = {"​", "‌", "‍", "⁠", "﻿", "‪", "‫", "‬", "‭", "‮"}
-_SCHEDULED_MUTATIONS = {"create", "update", "update_delivery", "pause", "resume", "remove", "run", "mark_read"}
+_SCHEDULED_MUTATIONS = {"create", "update", "update_delivery", "pause", "resume", "remove", "delete", "run", "mark_read"}
+_SCHEDULED_MUTATION_ERROR = "定时任务执行期间禁止创建、修改、触发、删除或标记定时任务。"
 
 
 def scan_scheduled_prompt(prompt: str) -> SafetyResult:
@@ -45,7 +46,16 @@ def scan_scheduled_prompt(prompt: str) -> SafetyResult:
     return SafetyResult("allowed")
 
 
-def ensure_scheduler_action_allowed(run_mode: str, action: str) -> None:
+def ensure_scheduler_mutation_allowed(run_mode: str) -> None:
     """定时任务无人值守执行中禁止递归修改调度系统。"""
+    if run_mode == "scheduled":
+        raise RuntimeError(_SCHEDULED_MUTATION_ERROR)
+
+
+def ensure_scheduler_action_allowed(run_mode: str, action: str, *, mutates: bool | None = None) -> None:
+    """兼容旧 action 工具的安全检查；新写工具应直接使用 ensure_scheduler_mutation_allowed。"""
+    if mutates is True:
+        ensure_scheduler_mutation_allowed(run_mode)
+        return
     if run_mode == "scheduled" and action in _SCHEDULED_MUTATIONS:
-        raise RuntimeError("定时任务执行期间禁止创建、修改、触发或删除定时任务。")
+        raise RuntimeError(_SCHEDULED_MUTATION_ERROR)

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from openhachimi_agent.scheduler.models import ScheduleType
-from openhachimi_agent.scheduler.runner import ScheduledTaskRunner
+from openhachimi_agent.scheduler.runner import ScheduledTaskRunner, _build_scheduled_execution_prompt
 from openhachimi_agent.scheduler.scheduler import TaskScheduler
 from openhachimi_agent.scheduler.store import ScheduledTaskStore
 from openhachimi_agent.scheduler.time_utils import compute_next_run, parse_interval_seconds
@@ -194,7 +194,8 @@ async def test_runner_records_success(tmp_path):
     runs = store.list_runs(task.id)
     updated = store.get_task(task.id)
     assert runs[0].status == "succeeded"
-    assert runs[0].output == "done: hello"
+    assert runs[0].output.startswith("done: [IMPORTANT: 你正在执行一个已经到期的定时任务。]")
+    assert "定时任务内容：\nhello" in runs[0].output
     assert service.session_id == f"schedule-{task.id}"
     assert updated.running is False
     assert updated.last_status == "succeeded"
@@ -251,6 +252,55 @@ async def test_runner_uses_isolated_session_by_default(tmp_path):
     await runner.run_task(claimed)
 
     assert service.session_id == f"schedule-{task.id}"
+
+
+def test_build_scheduled_execution_prompt_wraps_reminder_task(tmp_path):
+    store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
+    task = store.create_task(
+        name="更新团测系统提醒",
+        prompt="提醒用户：⏰ 时间到！请记得更新团测系统。",
+        schedule_type="once",
+        schedule_expr=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
+    )
+
+    prompt = _build_scheduled_execution_prompt(task)
+
+    assert "已经到期的定时任务" in prompt
+    assert "不是用户新发来的普通请求" in prompt
+    assert "不要询问提醒时间" in prompt
+    assert "系统会负责按任务投递配置" in prompt
+    assert "请直接输出提醒消息" in prompt
+    assert "更新团测系统提醒" in prompt
+    assert "提醒用户：⏰ 时间到！请记得更新团测系统。" in prompt
+
+
+@pytest.mark.asyncio
+async def test_runner_sends_wrapped_scheduled_prompt(tmp_path):
+    store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
+    task = store.create_task(
+        name="更新团测系统提醒",
+        prompt="提醒用户：⏰ 时间到！请记得更新团测系统。",
+        schedule_type="interval",
+        schedule_expr="60",
+    )
+    claimed = store.claim_task_now(task.id, lock_seconds=60)
+
+    class Service:
+        _running_tasks = {}
+
+        async def send_message(self, message, role, session_id, **kwargs):
+            self.message = message
+            self.kwargs = kwargs
+            return SimpleNamespace(output="ok")
+
+    service = Service()
+    runner = ScheduledTaskRunner(store, service, default_timeout_seconds=10)
+    await runner.run_task(claimed)
+
+    assert service.kwargs["run_mode"] == "scheduled"
+    assert "已经到期的定时任务" in service.message
+    assert "不要询问提醒时间" in service.message
+    assert "提醒用户：⏰ 时间到！请记得更新团测系统。" in service.message
 
 
 def test_store_tracks_delivery_and_inbox(tmp_path):

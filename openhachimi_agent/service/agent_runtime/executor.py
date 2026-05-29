@@ -12,7 +12,7 @@ from typing import Any
 from pydantic_ai.usage import UsageLimits
 
 from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
-from openhachimi_agent.agent.factory import build_executor_agent
+from openhachimi_agent.agent.factory import build_executor_agent, build_scheduled_executor_agent
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -105,8 +105,9 @@ def _get_task_frame_payload(session_state: dict[str, Any]) -> dict[str, Any] | N
     return payload
 
 
-def _build_executor_agent(config: AppConfig, role: str, task_frame_payload: dict[str, Any] | None, get_agent: Callable[[str, str], Any]):
-    executor_agent = get_agent(role, "executor")
+def _build_executor_agent(config: AppConfig, role: str, task_frame_payload: dict[str, Any] | None, get_agent: Callable[[str, str], Any], run_mode: str = "interactive"):
+    scheduled_mode = run_mode == "scheduled"
+    executor_agent = build_scheduled_executor_agent(config, role) if scheduled_mode else get_agent(role, "executor")
     if not task_frame_payload:
         return executor_agent
 
@@ -123,7 +124,9 @@ def _build_executor_agent(config: AppConfig, role: str, task_frame_payload: dict
             allowed_tools_set.update(skill.config.allowed_tools)
 
     if is_restricted:
-        logger.info("sandboxing executor agent for role=%s restricted_tools=%s", role, allowed_tools_set)
+        logger.info("sandboxing executor agent for role=%s run_mode=%s restricted_tools=%s", role, run_mode, allowed_tools_set)
+        if scheduled_mode:
+            return build_scheduled_executor_agent(config, role, allowed_tools=allowed_tools_set)
         return build_executor_agent(config, role, allowed_tools=allowed_tools_set)
     return executor_agent
 
@@ -178,7 +181,7 @@ async def _replan_after_execution_signal(
 async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any]) -> ExecutionOutcome:
     ctx.operation_state.start("model", "executor")
     task_frame_payload = _get_task_frame_payload(ctx.session_state)
-    executor_agent = _build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent)
+    executor_agent = _build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode)
     executor_message = _build_executor_message(task_frame_payload, ctx.message, ctx.attachments)
     ledger_start_seq = get_ledger_length(ctx.session_state)
     ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
@@ -200,7 +203,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             await _replan_after_execution_signal(ctx, signal, get_agent)
             retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments)
             result = await run_executor_once(
-                executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent),
+                executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
                 run_message=retry_message,
                 history=ctx.history,
                 deps=ctx.deps,
@@ -218,7 +221,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n"))
         repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments)
         result = await run_executor_once(
-            executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent),
+            executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
             run_message=repair_message,
             history=ctx.history,
             deps=ctx.deps,

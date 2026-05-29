@@ -17,7 +17,21 @@ from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills, install_skill
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
 from openhachimi_agent.tools.research import web_search
-from openhachimi_agent.tools.scheduler import create_delayed_task, create_scheduled_task, manage_scheduled_task
+from openhachimi_agent.tools.scheduler import (
+    create_delayed_task,
+    create_scheduled_task,
+    get_scheduled_task,
+    list_scheduled_task_runs,
+    list_scheduled_tasks,
+    mark_schedule_run_read,
+    pause_scheduled_task,
+    preview_scheduled_task_delivery,
+    read_schedule_inbox,
+    remove_scheduled_task,
+    resume_scheduled_task,
+    update_scheduled_task,
+    update_scheduled_task_delivery,
+)
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
 from openhachimi_agent.tools.memory import forget_memory, list_memory, memory_stats, remember, search_memory
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
@@ -78,10 +92,23 @@ _MEMORY_MUTATION_TOOLS = [
     forget_memory,
 ]
 
-_SCHEDULER_TOOLS = [
-    manage_scheduled_task,
+_SCHEDULER_READ_TOOLS = [
+    list_scheduled_tasks,
+    get_scheduled_task,
+    list_scheduled_task_runs,
+    read_schedule_inbox,
+    preview_scheduled_task_delivery,
+]
+
+_SCHEDULER_MUTATION_TOOLS = [
     create_delayed_task,
     create_scheduled_task,
+    update_scheduled_task,
+    update_scheduled_task_delivery,
+    pause_scheduled_task,
+    resume_scheduled_task,
+    remove_scheduled_task,
+    mark_schedule_run_read,
 ]
 
 _PLANNING_TOOLS = [
@@ -105,6 +132,7 @@ _MUTATION_FUNCS = {
 
 _READ_ONLY_FINAL_TOOLS = []
 _EXECUTION_FINAL_TOOLS = []
+_SCHEDULED_EXECUTION_FINAL_TOOLS = []
 
 for _orig_tools, _middlewares in [
     (_COMMAND_TOOLS, [with_prompt_injection("commands")]),
@@ -126,8 +154,17 @@ for _tool in _MEMORY_READ_TOOLS:
 for _tool in _MEMORY_MUTATION_TOOLS:
     _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_tool))))
 
-for _tool in _SCHEDULER_TOOLS:
-    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(_tool))
+for _tool in _SCHEDULER_READ_TOOLS:
+    _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_tool))
+
+for _tool in _SCHEDULER_MUTATION_TOOLS:
+    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_tool))))
+
+_SCHEDULED_MUTATION_NAMES = {tool.__name__ for tool in _SCHEDULER_MUTATION_TOOLS}
+_SCHEDULED_EXECUTION_FINAL_TOOLS = [
+    tool for tool in _EXECUTION_FINAL_TOOLS
+    if getattr(tool, "__name__", "") not in _SCHEDULED_MUTATION_NAMES and getattr(tool, "name", "") not in _SCHEDULED_MUTATION_NAMES
+]
 
 # ── Planner 专用工具集 ──
 # Planner 是纯规划者：只需要本地只读工具来理解项目上下文，然后基于对
@@ -154,6 +191,13 @@ PLANNER_TOOLSET = FunctionToolset(
 # Executor 拥有所有执行权限、只读权限和更新 TODO 能力
 EXECUTOR_TOOLSET = FunctionToolset(
     tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)],
+    max_retries=3,
+)
+
+# ── Scheduled Executor 专用工具集 ──
+# 定时任务无人值守执行期间允许普通执行能力和调度只读能力，但不暴露调度写入/触发工具。
+SCHEDULED_EXECUTOR_TOOLSET = FunctionToolset(
+    tools=_READ_ONLY_FINAL_TOOLS + _SCHEDULED_EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)],
     max_retries=3,
 )
 

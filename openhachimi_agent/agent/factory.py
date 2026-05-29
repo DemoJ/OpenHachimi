@@ -12,7 +12,7 @@ from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.memory.recall import build_memory_context_text
-from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET
+from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET, SCHEDULED_EXECUTOR_TOOLSET
 from openhachimi_agent.agent.intent import PlanContinuationDecision, TaskFrame
 
 
@@ -67,21 +67,36 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             "请基于对以上 Executor 工具能力的理解来制定执行计划。\n"
         )
     else:
-        filtered_executor_toolset = EXECUTOR_TOOLSET
+        base_executor_toolset = SCHEDULED_EXECUTOR_TOOLSET if agent_type == "scheduled_executor" else EXECUTOR_TOOLSET
+        filtered_executor_toolset = base_executor_toolset
         if allowed_tools is not None:
-            filtered_tools = [t for t in EXECUTOR_TOOLSET.tools if getattr(t, "__name__", "") in allowed_tools or getattr(t, "name", "") in allowed_tools]
+            filtered_tools = [
+                t for t in base_executor_toolset.tools
+                if getattr(t, "__name__", "") in allowed_tools or getattr(t, "name", "") in allowed_tools
+            ]
             filtered_executor_toolset = FunctionToolset(tools=filtered_tools)
-            
+
         toolsets = [filtered_executor_toolset, dynamic_toolset]
-        extra_prompt = (
-            "\n\n[System Role] 你现在是 **Executor Agent (执行者)**。"
-            "如果当前有活动 TODO，你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作（写代码、运行命令等），并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
-            "如果 TaskFrame.execution_mode 是 direct 或 skill_direct，优先直接完成用户目标，不要为了低风险任务主动创建 TODO、反复读取已知路径或进行宽泛探索。"
-            "同一轮内，成功的 write_file、replace_in_file、make_directory 或 publish_artifact 返回值可作为对应路径已创建/已修改/已发布的证据；除非后续操作失败或用户要求核验，不要立刻读取或列目录只为确认它存在。"
-            "如果 TaskFrame.execution_mode 是 skill_direct，已匹配的 skill 是当前任务的主流程；除非 skill 缺少必要输入、工具失败或用户目标与 skill 冲突，否则不要再进行宽泛仓库探索。"
-            "用户要求稍后提醒、几分钟后回复、每天/每周/cron 定时执行时，必须使用 create_delayed_task 或 create_scheduled_task 创建真实定时任务；不要调用 run_command 执行 sleep、timeout、循环等待或后台脚本。"
-            "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
-        )
+        if agent_type == "scheduled_executor":
+            extra_prompt = (
+                "\n\n[System Role] 你现在是 **Scheduled Executor Agent (定时任务执行者)**。"
+                "当前运行在定时任务无人值守执行模式。你可以完成本次任务本身，但禁止创建、修改、暂停、恢复、删除、立即触发或标记任何定时任务。"
+                "不要尝试安排后续调度；如任务需要后续调度，请在最终结果中说明需要用户在交互模式下确认。"
+                "你只能使用调度只读工具查询定时任务、运行记录、收件箱或投递预览。"
+                "如果当前有活动 TODO，你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作，并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
+                "同一轮内，成功的 write_file、replace_in_file、make_directory 或 publish_artifact 返回值可作为对应路径已创建/已修改/已发布的证据；除非后续操作失败或用户要求核验，不要立刻读取或列目录只为确认它存在。"
+                "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
+            )
+        else:
+            extra_prompt = (
+                "\n\n[System Role] 你现在是 **Executor Agent (执行者)**。"
+                "如果当前有活动 TODO，你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作（写代码、运行命令等），并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
+                "如果 TaskFrame.execution_mode 是 direct 或 skill_direct，优先直接完成用户目标，不要为了低风险任务主动创建 TODO、反复读取已知路径或进行宽泛探索。"
+                "同一轮内，成功的 write_file、replace_in_file、make_directory 或 publish_artifact 返回值可作为对应路径已创建/已修改/已发布的证据；除非后续操作失败或用户要求核验，不要立刻读取或列目录只为确认它存在。"
+                "如果 TaskFrame.execution_mode 是 skill_direct，已匹配的 skill 是当前任务的主流程；除非 skill 缺少必要输入、工具失败或用户目标与 skill 冲突，否则不要再进行宽泛仓库探索。"
+                "用户要求稍后提醒、几分钟后回复、每天/每周/cron 定时执行时，必须使用 create_delayed_task 或 create_scheduled_task 创建真实定时任务；不要调用 run_command 执行 sleep、timeout、循环等待或后台脚本。"
+                "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
+            )
 
     agent = Agent(
         OpenAIChatModel(config.model_name, provider=provider),
@@ -93,7 +108,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         retries=3,  # 允许工具调用失败后最多重试 3 次，避免因单次输出格式问题导致整体失败
     )
 
-    if agent_type == "executor":
+    if agent_type in {"executor", "scheduled_executor"}:
         @agent.output_validator
         def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
             from openhachimi_agent.agent.execution import get_final_verification_signal
@@ -153,6 +168,11 @@ def build_planner_agent(config: AppConfig, role_name: str) -> Agent:
 def build_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None) -> Agent:
     """创建专职执行的 Agent（拥有所有权限）。"""
     return _build_base_agent(config, role_name, "executor", allowed_tools=allowed_tools)
+
+
+def build_scheduled_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None) -> Agent:
+    """创建定时任务执行 Agent（不暴露调度写入工具）。"""
+    return _build_base_agent(config, role_name, "scheduled_executor", allowed_tools=allowed_tools)
 
 
 def _build_router_model(config: AppConfig) -> OpenAIChatModel:

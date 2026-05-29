@@ -1,6 +1,6 @@
 """Agent 构建包。"""
 
-__all__ = ["build_router_agent", "build_planner_agent", "build_executor_agent"]
+__all__ = ["build_router_agent", "build_planner_agent", "build_executor_agent", "build_scheduled_executor_agent"]
 
 
 def __getattr__(name: str):

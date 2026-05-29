@@ -8,7 +8,7 @@ import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
 
-from openhachimi_agent.agent.factory import build_continuation_agent, build_executor_agent, build_planner_agent, build_router_agent
+from openhachimi_agent.agent.factory import build_continuation_agent, build_executor_agent, build_planner_agent, build_router_agent, build_scheduled_executor_agent
 from openhachimi_agent.content.roles import list_role_names
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -137,6 +137,8 @@ class AgentService:
                 agent = build_continuation_agent(self.config)
             elif agent_type == "planner":
                 agent = build_planner_agent(self.config, role_name)
+            elif agent_type == "scheduled_executor":
+                agent = build_scheduled_executor_agent(self.config, role_name)
             else:
                 agent = build_executor_agent(self.config, role_name)
                 
