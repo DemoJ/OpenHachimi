@@ -54,6 +54,17 @@ memory:
     allow_secret_memory: false
     raw_turn_retention_days: 180
 
+research:
+  enabled_backends:
+    - duckduckgo              # 默认无需 API Key；可扩展为 brave / tavily
+  brave_api_key: ""           # Brave Search API Key，留空则不启用
+  tavily_api_key: ""          # Tavily API Key，留空则不启用
+  search_timeout_seconds: 15
+  max_backend_results: 10
+  min_independent_sources: 3
+  require_citations: true
+  browser_fallback_enabled: true
+
 scheduler:
   enabled: true
   db_path: .scheduler/tasks.sqlite3

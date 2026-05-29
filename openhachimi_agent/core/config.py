@@ -114,6 +114,18 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True)
+class ResearchConfig:
+    enabled_backends: list[str] = field(default_factory=lambda: ["duckduckgo"])
+    brave_api_key: str | None = None
+    tavily_api_key: str | None = None
+    search_timeout_seconds: int = 15
+    max_backend_results: int = 10
+    min_independent_sources: int = 3
+    require_citations: bool = True
+    browser_fallback_enabled: bool = True
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """集中管理应用运行时配置。"""
 
@@ -145,6 +157,7 @@ class AppConfig:
     stream_idle_timeout_seconds: int
     memory: MemoryConfig
     scheduler: SchedulerConfig
+    research: ResearchConfig
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -296,6 +309,21 @@ def _load_scheduler_config(base_dir: Path, raw_config: dict[str, Any]) -> Schedu
     )
 
 
+def _load_research_config(raw_config: dict[str, Any]) -> ResearchConfig:
+    research_config = _as_mapping(raw_config.get("research"), "research")
+    enabled_backends = _config_string_list(research_config, "enabled_backends", ["duckduckgo"])
+    return ResearchConfig(
+        enabled_backends=enabled_backends or ["duckduckgo"],
+        brave_api_key=_config_string(research_config, "brave_api_key") or None,
+        tavily_api_key=_config_string(research_config, "tavily_api_key") or None,
+        search_timeout_seconds=min(60, _config_int(research_config, "search_timeout_seconds", 15)),
+        max_backend_results=min(50, _config_int(research_config, "max_backend_results", 10)),
+        min_independent_sources=min(20, _config_int(research_config, "min_independent_sources", 3)),
+        require_citations=_config_bool(research_config, "require_citations", True),
+        browser_fallback_enabled=_config_bool(research_config, "browser_fallback_enabled", True),
+    )
+
+
 def load_config() -> AppConfig:
     """从 user/config.yaml 和项目目录加载配置。"""
     base_dir = Path(__file__).resolve().parents[2]
@@ -372,4 +400,5 @@ def load_config() -> AppConfig:
         stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
         memory=_load_memory_config(base_dir, raw_config, llm_config),
         scheduler=_load_scheduler_config(base_dir, raw_config),
+        research=_load_research_config(raw_config),
     )

@@ -7,7 +7,7 @@ from pydantic_ai import FunctionToolset
 from openhachimi_agent.tools.artifacts import publish_artifact
 from openhachimi_agent.tools.attachments import inspect_image
 from openhachimi_agent.tools.browser import (
-    browser_click, browser_get_state, browser_navigate, browser_scroll, browser_type,
+    browser_click, browser_extract_content, browser_get_state, browser_navigate, browser_scroll, browser_type,
     browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab
 )
 from openhachimi_agent.tools.command import command_status, run_command, send_command_input
@@ -16,7 +16,7 @@ from openhachimi_agent.tools.filesystem import find_files, list_files, read_file
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills, install_skill
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
-from openhachimi_agent.tools.research import web_search
+from openhachimi_agent.tools.research import research_next_queries, research_sources, web_search
 from openhachimi_agent.tools.scheduler import (
     create_delayed_task,
     create_scheduled_task,
@@ -49,6 +49,7 @@ _BROWSER_TOOLS = [
     browser_type,
     browser_scroll,
     browser_get_state,
+    browser_extract_content,
     browser_list_tabs,
     browser_new_tab,
     browser_switch_tab,
@@ -79,6 +80,8 @@ _OTHER_TOOLS = [
     web_fetch,
     discover_web_resources,
     web_search,
+    research_sources,
+    research_next_queries,
 ]
 
 _MEMORY_READ_TOOLS = [

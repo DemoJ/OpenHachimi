@@ -59,8 +59,8 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             "你的唯一职责是：理解用户目标，然后使用 `create_todos` 制定一个可执行的步骤计划。\n"
             "你自己不要去执行任何调研、搜索或网络请求，那是 Executor 的事。\n\n"
             "Executor 拥有以下工具能力：\n"
-            "- 浏览器：browser_navigate（打开URL）、browser_get_state（读取页面）、browser_click、browser_type、browser_scroll、browser_new_tab 等\n"
-            "- 网络：web_fetch（HTTP抓取）、web_search（搜索引擎）、discover_web_resources\n"
+            "- 浏览器：browser_navigate（打开URL）、browser_extract_content（提取当前页正文/metadata/links）、browser_get_state（读取交互元素）、browser_click、browser_type、browser_scroll、browser_new_tab 等\n"
+            "- 网络/研究：research_sources（多源搜索、排序、引用编号）、research_next_queries（证据不足时生成下一轮查询）、web_fetch（HTTP抓取）、web_search（轻量搜索）、discover_web_resources\n"
             "- 文件：read_file、write_file、replace_in_file、publish_artifact、list_files、find_files、search_text\n"
             "- 命令行：run_command、send_command_input\n"
             "- Git：git_status、git_diff\n\n"
@@ -86,6 +86,9 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                 "如果当前有活动 TODO，你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作，并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
                 "同一轮内，成功的 write_file、replace_in_file、make_directory 或 publish_artifact 返回值可作为对应路径已创建/已修改/已发布的证据；除非后续操作失败或用户要求核验，不要立刻读取或列目录只为确认它存在。"
                 "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
+                "\n研究类任务必须优先使用 `research_sources` 获取多来源候选和 [S#] 引用编号，再用 `web_fetch` 或 `browser_navigate` + `browser_extract_content` 读取关键来源正文。"
+                "搜索摘要不是全文证据；外部事实、数据、时间敏感结论必须附带 [S#] 引用。信息不足时继续搜索或明确说明不足。"
+                "遇到 CAPTCHA、人机验证、登录墙或付费墙时不得绕过，应换公开来源或请用户人工处理。"
             )
         else:
             extra_prompt = (
@@ -96,6 +99,9 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                 "如果 TaskFrame.execution_mode 是 skill_direct，已匹配的 skill 是当前任务的主流程；除非 skill 缺少必要输入、工具失败或用户目标与 skill 冲突，否则不要再进行宽泛仓库探索。"
                 "用户要求稍后提醒、几分钟后回复、每天/每周/cron 定时执行时，必须使用 create_delayed_task 或 create_scheduled_task 创建真实定时任务；不要调用 run_command 执行 sleep、timeout、循环等待或后台脚本。"
                 "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
+                "\n研究类任务必须优先使用 `research_sources` 获取多来源候选和 [S#] 引用编号，再用 `web_fetch` 或 `browser_navigate` + `browser_extract_content` 读取关键来源正文。"
+                "搜索摘要不是全文证据；外部事实、数据、时间敏感结论必须附带 [S#] 引用。信息不足时继续搜索或明确说明不足。"
+                "遇到 CAPTCHA、人机验证、登录墙或付费墙时不得绕过，应换公开来源或请用户人工处理。"
             )
 
     agent = Agent(

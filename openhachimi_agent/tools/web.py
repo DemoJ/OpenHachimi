@@ -12,10 +12,11 @@ import ipaddress
 import json
 import logging
 import re
+import socket
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from pydantic_ai import RunContext
 
@@ -38,6 +39,14 @@ class WebFetchError(Exception):
     def __init__(self, message: str, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = build_opener(NoRedirectHandler)
 
 
 class ResourceLinkParser(HTMLParser):
@@ -104,6 +113,46 @@ class ResourceLinkParser(HTMLParser):
             self.title += data.strip()
 
 
+def _is_blocked_ip(address: str) -> bool:
+    ip = ipaddress.ip_address(address)
+    return any(
+        (
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
+def _validate_public_host(hostname: str, resolve_dns: bool = False) -> None:
+    lowered = hostname.strip().lower().rstrip(".")
+    if lowered in {"localhost", "localhost.localdomain"} or lowered.endswith(".localhost") or lowered.endswith(".local"):
+        raise ValueError(f"URL 主机不允许访问本机或局域网地址：{hostname}")
+
+    try:
+        if _is_blocked_ip(lowered.strip("[]")):
+            raise ValueError(f"URL 主机不允许访问非公网地址：{hostname}")
+        return
+    except ValueError as exc:
+        if "不允许" in str(exc):
+            raise
+
+    if not resolve_dns:
+        return
+
+    try:
+        resolved = socket.getaddrinfo(lowered, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"URL 主机名无法解析：{hostname}") from exc
+    for family, _, _, _, sockaddr in resolved:
+        address = sockaddr[0]
+        if _is_blocked_ip(address):
+            raise ValueError(f"URL 主机解析到非公网地址：{hostname} -> {address}")
+
+
 def _quote_url_component(value: str, safe: str) -> str:
     try:
         decoded = unquote(value, errors="strict")
@@ -148,6 +197,7 @@ def _normalize_public_url(url: str) -> str:
         raise ValueError(f"URL 端口无效：{url}") from exc
 
     netloc = _normalize_host(parsed.hostname)
+    _validate_public_host(netloc.strip("[]"), resolve_dns=False)
     if port is not None:
         netloc = f"{netloc}:{port}"
 
@@ -158,15 +208,22 @@ def _normalize_public_url(url: str) -> str:
 
 
 def _request_url(url: str) -> tuple[str, str, str]:
+    parsed = urlsplit(url)
+    if parsed.hostname:
+        _validate_public_host(parsed.hostname, resolve_dns=True)
     request = Request(url, headers={"User-Agent": WEB_USER_AGENT, "Accept": "*/*"})
     try:
-        with urlopen(request, timeout=WEB_TIMEOUT_SECONDS) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=WEB_TIMEOUT_SECONDS) as response:
             content_type = response.headers.get("content-type", "")
-            final_url = response.geturl()
+            final_url = _normalize_public_url(response.geturl())
             raw = response.read(MAX_WEB_RESPONSE_CHARS + 1)
     except HTTPError as exc:
-        body = exc.read(12000).decode("utf-8", errors="replace")
-        raise WebFetchError(f"HTTP {exc.code} {exc.reason}: {body}", status_code=exc.code) from exc
+        if exc.code in {301, 302, 303, 307, 308}:
+            location = exc.headers.get("Location")
+            if location:
+                redirect_url = _normalize_public_url(urljoin(url, location))
+                raise WebFetchError(f"HTTP {exc.code} 重定向到 {redirect_url}；为防止 SSRF，web_fetch 不自动跟随重定向。请确认目标为公开网页后直接访问重定向 URL。", status_code=exc.code) from exc
+        raise WebFetchError(f"HTTP {exc.code} {exc.reason}", status_code=exc.code) from exc
     except URLError as exc:
         raise WebFetchError(f"请求失败：{exc}") from exc
 
@@ -190,11 +247,12 @@ async def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     """通过 HTTP 抓取指定 URL 的公开页面或 API 内容（不启动浏览器）。
 
     适用于公开 HTML 页面、JSON API、RSS、Atom 等文本端点。
-    如果返回 'Fetch failed' + 'Hint'，说明该页面有反爬保护，请改用 browser_navigate。
+    如果返回 'Fetch failed' + 'Hint'，说明该页面可能有反爬保护，请改用 browser_navigate 后再调用 browser_extract_content。
 
     【工具选择建议】：
-    - 先用 web_search 获取相关链接，再用本工具读取页面内容
-    - 若本工具失败（403 / 429 等），升级到 browser_navigate + browser_get_state
+    - 先用 research_sources 获取带引用编号的高质量来源，再用本工具读取页面内容
+    - 轻量查找可先用 web_search 获取相关链接，再用本工具读取页面内容
+    - 若本工具失败（403 / 429 等），升级到 browser_navigate(url) + browser_extract_content()
     """
     del ctx
     target_url = _normalize_public_url(url)
@@ -203,7 +261,7 @@ async def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
         final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
     except WebFetchError as exc:
         if exc.status_code in {401, 403, 429, 503}:
-            return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请改用 browser_navigate 等浏览器相关工具来访问此页面。"
+            return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请先尝试 discover_web_resources(url) 寻找公开 RSS/API/JSON；若仍需渲染公开页面，请调用 browser_navigate(url)，再调用 browser_extract_content() 读取正文。遇到 CAPTCHA/登录墙/付费墙时不要绕过，应换公开来源或说明信息不足。"
         return f"Fetch failed: {exc}"
 
     text = _maybe_pretty_json(text)
@@ -230,7 +288,7 @@ async def discover_web_resources(ctx: RunContext[AgentDeps], url: str) -> str:
         final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
     except WebFetchError as exc:
         if exc.status_code in {401, 403, 429, 503}:
-            return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请改用 browser_navigate 等浏览器相关工具来访问此页面。"
+            return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请先尝试 discover_web_resources(url) 寻找公开 RSS/API/JSON；若仍需渲染公开页面，请调用 browser_navigate(url)，再调用 browser_extract_content() 读取正文。遇到 CAPTCHA/登录墙/付费墙时不要绕过，应换公开来源或说明信息不足。"
         return f"Fetch failed: {exc}"
 
     parser = ResourceLinkParser(final_url)

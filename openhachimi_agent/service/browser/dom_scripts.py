@@ -110,14 +110,19 @@ MUTATION_OBSERVER_SCRIPT = """
 GET_STATE_SCRIPT = """
 (maxElements) => {
     let idCounter = 1;
+    let visitedNodes = 0;
+    const maxVisitedNodes = Math.max(maxElements * 20, 5000);
     const elements = [];
     let isTruncated = false;
-    
+
+    document.querySelectorAll('[data-agent-id]').forEach(el => el.removeAttribute('data-agent-id'));
+
     const winHeight = window.innerHeight;
-    
+
     function traverse(node, isInsideInteractive) {
         if (isTruncated) return;
-        if (elements.length >= maxElements) {
+        visitedNodes += 1;
+        if (visitedNodes >= maxVisitedNodes || elements.length >= maxElements) {
             isTruncated = true;
             return;
         }
@@ -243,6 +248,104 @@ GET_STATE_SCRIPT = """
         scrollY: Math.round(window.scrollY),
         scrollHeight: Math.round(document.body ? document.body.scrollHeight : 0),
         clientHeight: Math.round(window.innerHeight),
+    };
+}
+"""
+
+EXTRACT_CONTENT_SCRIPT = r"""
+(args) => {
+    const maxChars = Math.max(1000, Math.min(args && args.maxChars || 60000, 120000));
+    const includeLinks = !args || args.includeLinks !== false;
+    const maxLinks = Math.max(0, Math.min(args && args.maxLinks || 80, 200));
+
+    function textOf(node, preserveStructure = false) {
+        const raw = node && (node.innerText || node.textContent) || '';
+        if (preserveStructure) {
+            return raw.replace(/[ \t\f\v]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+        }
+        return raw.replace(/\s+/g, ' ').trim();
+    }
+
+    function meta(selector, attr = 'content') {
+        const node = document.querySelector(selector);
+        return node ? (node.getAttribute(attr) || '').trim() : '';
+    }
+
+    function cleanClone(node) {
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('script, style, noscript, svg, canvas, nav, header, footer, aside').forEach(el => el.remove());
+        return clone;
+    }
+
+    const selectors = ['article', 'main', '[role="main"]', '.article', '.post', '.entry-content', '.content', '#content', '.markdown-body', '.document', '.docs-content'];
+    const candidates = [];
+    for (const selector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(selector)).slice(0, 8)) {
+            const cleaned = cleanClone(node);
+            const text = textOf(cleaned, true);
+            if (text.length > 100) {
+                const linkText = Array.from(cleaned.querySelectorAll('a')).map(a => textOf(a)).join(' ');
+                const linkDensity = text.length ? linkText.length / text.length : 0;
+                const paragraphs = cleaned.querySelectorAll('p, li, pre, blockquote').length;
+                candidates.push({selector, text, score: text.length + paragraphs * 80 - linkDensity * 1000});
+            }
+        }
+    }
+    if (document.body) {
+        const cleaned = cleanClone(document.body);
+        const text = textOf(cleaned, true);
+        candidates.push({selector: 'body', text, score: text.length * 0.6});
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0] || {selector: 'none', text: '', score: 0};
+    const fullText = best.text || '';
+    const truncated = fullText.length > maxChars;
+    const contentText = truncated ? fullText.slice(0, maxChars) : fullText;
+
+    const headings = Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 80).map(h => ({
+        level: h.tagName.toLowerCase(),
+        text: textOf(h).slice(0, 300),
+    })).filter(h => h.text);
+
+    let links = [];
+    if (includeLinks) {
+        links = Array.from(document.querySelectorAll('a[href]')).slice(0, 400).map(a => ({
+            text: textOf(a).slice(0, 160),
+            href: a.href,
+            rel: a.getAttribute('rel') || '',
+            target: a.getAttribute('target') || '',
+            isExternal: a.hostname && a.hostname !== location.hostname,
+        })).filter(link => link.href).slice(0, maxLinks);
+    }
+
+    return {
+        url: document.location.href,
+        title: document.title || '',
+        readyState: document.readyState,
+        lang: document.documentElement ? (document.documentElement.lang || '') : '',
+        metadata: {
+            description: meta('meta[name="description"]'),
+            canonical: meta('link[rel="canonical"]', 'href'),
+            author: meta('meta[name="author"]'),
+            publishedTime: meta('meta[property="article:published_time"]') || meta('meta[name="pubdate"]') || meta('time[datetime]', 'datetime'),
+            modifiedTime: meta('meta[property="article:modified_time"]'),
+            ogTitle: meta('meta[property="og:title"]'),
+            ogDescription: meta('meta[property="og:description"]'),
+            ogSiteName: meta('meta[property="og:site_name"]'),
+        },
+        headings,
+        links,
+        content: {
+            sourceSelector: best.selector,
+            text: contentText,
+            textLength: fullText.length,
+            truncated,
+        },
+        pageState: {
+            scrollY: Math.round(window.scrollY),
+            scrollHeight: Math.round(document.body ? document.body.scrollHeight : 0),
+            clientHeight: Math.round(window.innerHeight),
+        },
     };
 }
 """

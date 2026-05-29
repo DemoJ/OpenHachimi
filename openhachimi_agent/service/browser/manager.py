@@ -12,7 +12,7 @@ from playwright.async_api import Browser, BrowserContext, Page, Error as Playwri
 
 from openhachimi_agent.core.config import AppConfig
 from .lifecycle import BrowserLifecycleMixin
-from .dom_scripts import DETECT_HUMAN_VERIFICATION_SCRIPT, GET_STATE_SCRIPT, MUTATION_OBSERVER_SCRIPT
+from .dom_scripts import DETECT_HUMAN_VERIFICATION_SCRIPT, EXTRACT_CONTENT_SCRIPT, GET_STATE_SCRIPT, MUTATION_OBSERVER_SCRIPT
 from .captcha_patterns import CAPTCHA_PATTERNS
 from .utils import _human_verification_message
 
@@ -422,6 +422,70 @@ class BrowserManager(BrowserLifecycleMixin):
         except Exception as e:
             logger.error("Failed to get state: %s", e)
             return f"获取页面状态失败：{e}"
+
+    async def extract_content(self, max_chars: int = 60000, include_links: bool = True) -> str:
+        """提取当前页面正文、metadata、标题和链接，供研究任务读取。"""
+        self._record_activity()
+        await self._update_active_page()
+
+        if not self._page or self._page.is_closed():
+            return "当前没有打开的页面，请先使用 browser_navigate 导航到网页。"
+
+        logger.info("提取当前页面正文内容...")
+        if reason := await self._detect_human_verification():
+            return _human_verification_message(self._page.url, reason)
+
+        try:
+            result = await self._page.evaluate(
+                EXTRACT_CONTENT_SCRIPT,
+                {"maxChars": max_chars, "includeLinks": include_links, "maxLinks": 80},
+            )
+            metadata = result.get("metadata") or {}
+            content = result.get("content") or {}
+            page_state = result.get("pageState") or {}
+
+            output = [
+                f"URL: {result.get('url', '')}",
+                f"Title: {result.get('title', '')}",
+                f"ReadyState: {result.get('readyState', '')}",
+                f"Lang: {result.get('lang', '') or 'unknown'}",
+                f"Source selector: {content.get('sourceSelector', 'unknown')}",
+                f"Text length: {content.get('textLength', 0)}",
+                f"Truncated: {content.get('truncated', False)}",
+                f"Scroll: y={page_state.get('scrollY', 0)} height={page_state.get('scrollHeight', 0)} viewport={page_state.get('clientHeight', 0)}",
+                "-" * 40,
+                "Metadata:",
+            ]
+            for key in ("description", "canonical", "author", "publishedTime", "modifiedTime", "ogTitle", "ogDescription", "ogSiteName"):
+                value = metadata.get(key)
+                if value:
+                    output.append(f"- {key}: {value}")
+
+            headings = result.get("headings") or []
+            if headings:
+                output.append("")
+                output.append("Headings:")
+                for item in headings[:40]:
+                    output.append(f"- {item.get('level', '').upper()}: {item.get('text', '')}")
+
+            links = result.get("links") or []
+            if include_links and links:
+                output.append("")
+                output.append("Links:")
+                for index, link in enumerate(links[:80], start=1):
+                    text = link.get("text") or "（无文本）"
+                    href = link.get("href") or ""
+                    external = " external" if link.get("isExternal") else ""
+                    output.append(f"{index}. {text} - {href}{external}")
+
+            output.append("")
+            output.append("Content:")
+            output.append("-" * 40)
+            output.append(content.get("text") or "（未提取到正文文本）")
+            return "\n".join(output)
+        except Exception as e:
+            logger.error("Failed to extract page content: %s", e)
+            return f"提取页面正文失败：{e}"
 
     async def click(self, element_id: int) -> str:
         """点击指定 ID 的元素。"""
