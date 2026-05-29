@@ -147,10 +147,14 @@ def _validate_public_host(hostname: str, resolve_dns: bool = False) -> None:
         resolved = socket.getaddrinfo(lowered, None, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise ValueError(f"URL 主机名无法解析：{hostname}") from exc
-    for family, _, _, _, sockaddr in resolved:
-        address = sockaddr[0]
-        if _is_blocked_ip(address):
-            raise ValueError(f"URL 主机解析到非公网地址：{hostname} -> {address}")
+
+    # 只要存在任一公网可路由地址即放行；仅当所有解析结果都是非公网地址时才拒绝。
+    # 某些网络环境（启用 Teredo/隧道，或 DNS 被污染）会为合法域名额外返回形如
+    # 2001::/32 的伪 IPv6 地址，但同时仍有可用的公网 IPv4。若“任一地址被阻止即拒绝”，
+    # 会把这类站点（如 www.reuters.com）整体误杀。
+    addresses = [sockaddr[0] for *_unused, sockaddr in resolved]
+    if addresses and all(_is_blocked_ip(address) for address in addresses):
+        raise ValueError(f"URL 主机解析到非公网地址：{hostname} -> {addresses[0]}")
 
 
 def _quote_url_component(value: str, safe: str) -> str:
@@ -255,13 +259,17 @@ async def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     - 若本工具失败（403 / 429 等），升级到 browser_navigate(url) + browser_extract_content()
     """
     del ctx
-    target_url = _normalize_public_url(url)
-    logger.info("tool web_fetch url=%s", target_url)
     try:
+        target_url = _normalize_public_url(url)
+        logger.info("tool web_fetch url=%s", target_url)
         final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
     except WebFetchError as exc:
         if exc.status_code in {401, 403, 429, 503}:
             return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请先尝试 discover_web_resources(url) 寻找公开 RSS/API/JSON；若仍需渲染公开页面，请调用 browser_navigate(url)，再调用 browser_extract_content() 读取正文。遇到 CAPTCHA/登录墙/付费墙时不要绕过，应换公开来源或说明信息不足。"
+        return f"Fetch failed: {exc}"
+    except ValueError as exc:
+        # URL 非法或命中 SSRF 校验（如解析到非公网地址）属于可预期的工具失败，
+        # 应作为结果返回给模型让其改用其它来源，而不是抛异常中断整个 agent 运行。
         return f"Fetch failed: {exc}"
 
     text = _maybe_pretty_json(text)
@@ -282,13 +290,16 @@ async def discover_web_resources(ctx: RunContext[AgentDeps], url: str) -> str:
     browser, unless the user explicitly requests browser automation.
     """
     del ctx
-    target_url = _normalize_public_url(url)
-    logger.info("tool discover_web_resources url=%s", target_url)
     try:
+        target_url = _normalize_public_url(url)
+        logger.info("tool discover_web_resources url=%s", target_url)
         final_url, content_type, text = await asyncio.to_thread(_request_url, target_url)
     except WebFetchError as exc:
         if exc.status_code in {401, 403, 429, 503}:
             return f"Fetch failed: {exc}\n\nHint: 网站可能存在反爬或需要验证（HTTP {exc.status_code}）。请先尝试 discover_web_resources(url) 寻找公开 RSS/API/JSON；若仍需渲染公开页面，请调用 browser_navigate(url)，再调用 browser_extract_content() 读取正文。遇到 CAPTCHA/登录墙/付费墙时不要绕过，应换公开来源或说明信息不足。"
+        return f"Fetch failed: {exc}"
+    except ValueError as exc:
+        # URL 非法或命中 SSRF 校验属于可预期的工具失败，作为结果返回而非中断 agent。
         return f"Fetch failed: {exc}"
 
     parser = ResourceLinkParser(final_url)

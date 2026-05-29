@@ -162,3 +162,51 @@ def test_request_url_does_not_echo_http_error_body(monkeypatch):
 
     assert "HTTP 403 Forbidden" in str(exc_info.value)
     assert "secret-token" not in str(exc_info.value)
+
+
+def test_validate_public_host_allows_host_with_any_public_address(monkeypatch):
+    """域名同时解析出公网 IPv4 和 Teredo 伪 IPv6 时应放行（修复 www.reuters.com 误杀）。"""
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        return [
+            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("174.37.54.20", 0)),
+            (web_module.socket.AF_INET6, web_module.socket.SOCK_STREAM, 6, "", ("2001::a88f:abba", 0, 0, 0)),
+        ]
+
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+
+    # 不应抛出异常
+    web_module._validate_public_host("www.reuters.com", resolve_dns=True)
+
+
+def test_validate_public_host_rejects_host_resolving_only_to_private(monkeypatch):
+    """域名所有解析结果均为非公网地址时仍应拒绝（保留 SSRF 基础防护）。"""
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        return [
+            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0)),
+            (web_module.socket.AF_INET6, web_module.socket.SOCK_STREAM, 6, "", ("fd00::1", 0, 0, 0)),
+        ]
+
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+
+    with pytest.raises(ValueError):
+        web_module._validate_public_host("intranet.example", resolve_dns=True)
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_returns_error_string_for_blocked_host():
+    """SSRF 校验失败应作为结果字符串返回，不应抛异常中断 agent run。"""
+    result = await web_module.web_fetch(SimpleNamespace(), "http://10.0.0.1/")
+
+    assert "Fetch failed" in result
+    assert "非公网" in result
+
+
+@pytest.mark.asyncio
+async def test_discover_web_resources_returns_error_string_for_blocked_host():
+    """discover_web_resources 遇到 SSRF 拦截同样应返回字符串而非抛异常。"""
+    result = await web_module.discover_web_resources(SimpleNamespace(), "http://192.168.1.1/")
+
+    assert "Fetch failed" in result
+    assert "非公网" in result
