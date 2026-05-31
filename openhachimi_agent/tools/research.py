@@ -23,13 +23,15 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Literal
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import Request
 
 from pydantic_ai import RunContext
 
 from openhachimi_agent.core.config import ResearchConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.tools.web import _NO_REDIRECT_OPENER, _normalize_public_url, _validate_public_host
 
 logger = logging.getLogger(__name__)
 
@@ -160,10 +162,33 @@ def _search_duckduckgo(
     return results
 
 
-def _request_json(url: str, headers: dict[str, str], timeout: int) -> dict:
-    request = Request(url, headers=headers)
-    with urlopen(request, timeout=timeout) as response:
-        raw = response.read(2_000_000)
+def _request_json(
+    url: str,
+    headers: dict[str, str],
+    timeout: int,
+    data: bytes | None = None,
+    method: str | None = None,
+) -> dict:
+    safe_url = _normalize_public_url(url)
+    parsed = urlsplit(safe_url)
+    if parsed.hostname:
+        _validate_public_host(parsed.hostname, resolve_dns=True)
+
+    request = Request(safe_url, data=data, headers=headers, method=method)
+    try:
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+            final_url = _normalize_public_url(response.geturl())
+            final_host = urlsplit(final_url).hostname
+            if final_host:
+                _validate_public_host(final_host, resolve_dns=True)
+            raw = response.read(2_000_000)
+    except HTTPError as exc:
+        if exc.code in {301, 302, 303, 307, 308}:
+            location = exc.headers.get("Location")
+            if location:
+                redirect_url = _normalize_public_url(urljoin(safe_url, location))
+                raise ValueError(f"搜索 API 返回 HTTP {exc.code} 重定向到 {redirect_url}；为防止 SSRF，research 不自动跟随重定向。") from exc
+        raise
     return json.loads(raw.decode("utf-8", errors="replace"))
 
 
@@ -201,14 +226,13 @@ def _search_brave(query: str, max_results: int, config: ResearchConfig, source_t
 def _search_tavily(query: str, max_results: int, config: ResearchConfig, source_type: str = "general") -> list[SearchResult]:
     if not config.tavily_api_key:
         raise ValueError("tavily 后端已启用，但 research.tavily_api_key 为空")
-    request = Request(
+    payload = _request_json(
         "https://api.tavily.com/search",
         data=json.dumps({"api_key": config.tavily_api_key, "query": query, "max_results": max_results}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
+        timeout=config.search_timeout_seconds,
     )
-    with urlopen(request, timeout=config.search_timeout_seconds) as response:
-        payload = json.loads(response.read(2_000_000).decode("utf-8", errors="replace"))
     results: list[SearchResult] = []
     for index, item in enumerate(payload.get("results", [])[:max_results], start=1):
         url = item.get("url") or ""

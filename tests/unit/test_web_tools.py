@@ -155,6 +155,7 @@ def test_request_url_does_not_echo_http_error_body(monkeypatch):
     def fake_open(request, timeout):
         raise FakeHTTPError(request.full_url, 403, "Forbidden", {}, None)
 
+    monkeypatch.setattr(web_module, "_validate_public_host", lambda hostname, resolve_dns=False: None)
     monkeypatch.setattr(web_module._NO_REDIRECT_OPENER, "open", fake_open)
 
     with pytest.raises(web_module.WebFetchError) as exc_info:

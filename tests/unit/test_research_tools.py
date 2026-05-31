@@ -111,6 +111,86 @@ def test_enabled_backend_without_api_key_reports_error(tmp_path):
     assert "brave_api_key" in error
 
 
+def test_request_json_rejects_non_public_host():
+    with pytest.raises(ValueError):
+        research_module._request_json("http://127.0.0.1/search", {}, 1)
+
+
+def test_request_json_uses_no_redirect_opener_and_parses_json(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def geturl(self):
+            return "https://api.search.brave.com/res/v1/web/search?q=test"
+
+        def read(self, limit):
+            captured["limit"] = limit
+            return b'{"ok": true}'
+
+    def fake_open(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(research_module, "_validate_public_host", lambda hostname, resolve_dns=False: None)
+    monkeypatch.setattr(research_module._NO_REDIRECT_OPENER, "open", fake_open)
+
+    payload = research_module._request_json(
+        "https://api.search.brave.com/res/v1/web/search?q=test",
+        {"Accept": "application/json"},
+        7,
+    )
+
+    assert payload == {"ok": True}
+    assert captured["url"] == "https://api.search.brave.com/res/v1/web/search?q=test"
+    assert captured["timeout"] == 7
+    assert captured["limit"] == 2_000_000
+
+
+def test_search_tavily_posts_through_safe_json_request(monkeypatch):
+    captured = {}
+
+    def fake_request_json(url, headers, timeout, data=None, method=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        captured["data"] = data
+        captured["method"] = method
+        return {
+            "results": [
+                {
+                    "title": "Result",
+                    "url": "https://example.com/article",
+                    "content": "Snippet",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(research_module, "_request_json", fake_request_json)
+
+    results = research_module._search_tavily(
+        "topic",
+        3,
+        ResearchConfig(tavily_api_key="key", search_timeout_seconds=9),
+    )
+
+    assert captured["url"] == "https://api.tavily.com/search"
+    assert captured["headers"]["Content-Type"] == "application/json"
+    assert captured["timeout"] == 9
+    assert captured["method"] == "POST"
+    assert research_module.json.loads(captured["data"].decode("utf-8"))["query"] == "topic"
+    assert results[0].backend == "tavily"
+    assert results[0].url == "https://example.com/article"
+
+
 def asyncio_run(coro):
     import asyncio
     return asyncio.run(coro)
