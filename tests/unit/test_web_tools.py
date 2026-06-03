@@ -195,6 +195,21 @@ def test_validate_public_host_rejects_host_resolving_only_to_private(monkeypatch
         web_module._validate_public_host("intranet.example", resolve_dns=True)
 
 
+def test_validate_public_host_rejects_mixed_public_and_private_addresses(monkeypatch):
+    """公网地址旁挂私网地址时必须拒绝，避免 DNS rebinding/SSRF 绕过。"""
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        return [
+            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
+            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0)),
+        ]
+
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+
+    with pytest.raises(ValueError):
+        web_module._validate_public_host("mixed.example", resolve_dns=True)
+
+
 @pytest.mark.asyncio
 async def test_web_fetch_returns_error_string_for_blocked_host():
     """SSRF 校验失败应作为结果字符串返回，不应抛异常中断 agent run。"""

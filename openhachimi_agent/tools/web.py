@@ -127,6 +127,14 @@ def _is_blocked_ip(address: str) -> bool:
     )
 
 
+def _is_teredo_ip(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return isinstance(ip, ipaddress.IPv6Address) and ip.teredo is not None
+
+
 def _validate_public_host(hostname: str, resolve_dns: bool = False) -> None:
     lowered = hostname.strip().lower().rstrip(".")
     if lowered in {"localhost", "localhost.localdomain"} or lowered.endswith(".localhost") or lowered.endswith(".local"):
@@ -148,12 +156,14 @@ def _validate_public_host(hostname: str, resolve_dns: bool = False) -> None:
     except socket.gaierror as exc:
         raise ValueError(f"URL 主机名无法解析：{hostname}") from exc
 
-    # 只要存在任一公网可路由地址即放行；仅当所有解析结果都是非公网地址时才拒绝。
-    # 某些网络环境（启用 Teredo/隧道，或 DNS 被污染）会为合法域名额外返回形如
-    # 2001::/32 的伪 IPv6 地址，但同时仍有可用的公网 IPv4。若“任一地址被阻止即拒绝”，
-    # 会把这类站点（如 www.reuters.com）整体误杀。
+    # Teredo 解析结果可作为兼容例外忽略，但私网/回环/link-local 等敏感地址
+    # 只要与公网地址混合出现也必须拒绝，避免 DNS rebinding/SSRF 绕过。
     addresses = [sockaddr[0] for *_unused, sockaddr in resolved]
-    if addresses and all(_is_blocked_ip(address) for address in addresses):
+    blocked_addresses = [address for address in addresses if _is_blocked_ip(address)]
+    dangerous_addresses = [address for address in blocked_addresses if not _is_teredo_ip(address)]
+    if dangerous_addresses:
+        raise ValueError(f"URL 主机解析到非公网地址：{hostname} -> {dangerous_addresses[0]}")
+    if addresses and len(blocked_addresses) == len(addresses):
         raise ValueError(f"URL 主机解析到非公网地址：{hostname} -> {addresses[0]}")
 
 

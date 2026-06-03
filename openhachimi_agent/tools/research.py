@@ -327,7 +327,11 @@ def _canonicalize_result_url(url: str) -> str:
 def _merge_duplicate_results(results: list[SearchResult]) -> list[MergedSource]:
     merged: dict[str, MergedSource] = {}
     for result in results:
-        key = _canonicalize_result_url(result.url)
+        try:
+            key = _canonicalize_result_url(result.url)
+        except ValueError as exc:
+            logger.debug("Skipping malformed search result URL from %s: %s (%s)", result.backend, result.url, exc)
+            continue
         if key not in merged:
             merged[key] = MergedSource(
                 title=result.title,

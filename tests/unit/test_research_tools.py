@@ -95,6 +95,18 @@ def test_canonicalize_result_url_normalizes_www_and_default_port():
     assert research_module._canonicalize_result_url("http://example.com:80/a") == "http://example.com/a"
 
 
+def test_rank_sources_skips_malformed_result_urls():
+    results = [
+        research_module.SearchResult("Bad", "https://example.com:bad/path", "broken", "duckduckgo", 1),
+        research_module.SearchResult("Good", "https://example.com/good", "useful", "duckduckgo", 2),
+    ]
+
+    ranked = research_module._rank_sources("good", results, "general", ResearchConfig())
+
+    assert len(ranked) == 1
+    assert ranked[0].title == "Good"
+
+
 def test_enabled_backend_without_api_key_reports_error(tmp_path):
     backend, results, error = asyncio_run(
         research_module._search_backend(
