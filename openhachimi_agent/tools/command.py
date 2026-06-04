@@ -56,6 +56,7 @@ async def run_command(
         [*shell_command, command],
         cwd=target_cwd,
         shell_name=shell_name,
+        session_id=ctx.deps.session_id,
     )
     
     # 等待一小段时间

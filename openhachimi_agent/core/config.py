@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -126,6 +126,23 @@ class ResearchConfig:
 
 
 @dataclass(frozen=True)
+class VisionConfig:
+    enabled: bool = True
+    fallback_enabled: bool = True
+    model: str = ""
+    base_url: str = ""
+    api_key: str | None = None
+    detail: Literal["auto", "low", "high"] = "auto"
+    prompt: str = (
+        "请详细识别用户发送的图片内容。请包括：图片中的主体、场景、文字、表格、代码、界面或物体；"
+        "如果图片中有文字，请尽量完整 OCR；如果用户问题依赖图片细节，请指出关键信息；"
+        "不要编造看不清的内容，看不清请说明。"
+    )
+    max_images_per_message: int = 4
+    max_image_size_bytes: int = 10 * 1024 * 1024
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """集中管理应用运行时配置。"""
 
@@ -138,6 +155,7 @@ class AppConfig:
     openai_base_url: str
     default_role_name: str
     openai_api_key: str | None
+    llm_supports_vision: Literal["auto", "true", "false"]
     log_dir: Path
     log_level: str
     log_console: bool
@@ -158,6 +176,7 @@ class AppConfig:
     memory: MemoryConfig
     scheduler: SchedulerConfig
     research: ResearchConfig
+    vision: VisionConfig
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -211,6 +230,28 @@ def _config_string_list(section: dict[str, Any], key: str, default: list[str]) -
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     raise ValueError(f"config.yaml 中的 {key} 必须是字符串列表或逗号分隔字符串。")
+
+
+def _config_vision_support(section: dict[str, Any], key: str, default: str = "auto") -> Literal["auto", "true", "false"]:
+    value = section.get(key, default)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    normalized = str(value or default).strip().lower()
+    if normalized in {"auto", "true", "false"}:
+        return normalized  # type: ignore[return-value]
+    if normalized in {"1", "yes", "on"}:
+        return "true"
+    if normalized in {"0", "no", "off"}:
+        return "false"
+    raise ValueError(f"config.yaml 中的 {key} 必须是 auto、true 或 false。")
+
+
+def _config_literal(section: dict[str, Any], key: str, allowed: set[str], default: str) -> str:
+    value = _config_string(section, key, default).lower()
+    if value not in allowed:
+        allowed_text = "、".join(sorted(allowed))
+        raise ValueError(f"config.yaml 中的 {key} 必须是以下值之一：{allowed_text}。")
+    return value
 
 
 def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: dict[str, Any]) -> MemoryConfig:
@@ -324,6 +365,22 @@ def _load_research_config(raw_config: dict[str, Any]) -> ResearchConfig:
     )
 
 
+def _load_vision_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) -> VisionConfig:
+    vision_config = _as_mapping(raw_config.get("vision"), "vision")
+    prompt = _config_string(vision_config, "prompt", VisionConfig.prompt)
+    return VisionConfig(
+        enabled=_config_bool(vision_config, "enabled", True),
+        fallback_enabled=_config_bool(vision_config, "fallback_enabled", True),
+        model=_config_string(vision_config, "model"),
+        base_url=_config_string(vision_config, "base_url") or _config_string(llm_config, "base_url"),
+        api_key=_config_string(vision_config, "api_key") or _config_string(llm_config, "api_key") or None,
+        detail=_config_literal(vision_config, "detail", {"auto", "low", "high"}, "auto"),  # type: ignore[arg-type]
+        prompt=prompt or VisionConfig.prompt,
+        max_images_per_message=_config_int(vision_config, "max_images_per_message", 4),
+        max_image_size_bytes=_config_int(vision_config, "max_image_size_mb", 10) * 1024 * 1024,
+    )
+
+
 def load_config() -> AppConfig:
     """从 user/config.yaml 和项目目录加载配置。"""
     base_dir = Path(__file__).resolve().parents[2]
@@ -369,6 +426,7 @@ def load_config() -> AppConfig:
         openai_base_url=_config_string(llm_config, "base_url"),
         default_role_name=_config_string(app_config, "default_role", "default"),
         openai_api_key=_config_string(llm_config, "api_key") or None,
+        llm_supports_vision=_config_vision_support(llm_config, "supports_vision", "auto"),
         log_dir=_resolve_config_path(
             base_dir,
             _config_string(logging_config, "dir"),
@@ -401,4 +459,5 @@ def load_config() -> AppConfig:
         memory=_load_memory_config(base_dir, raw_config, llm_config),
         scheduler=_load_scheduler_config(base_dir, raw_config),
         research=_load_research_config(raw_config),
+        vision=_load_vision_config(raw_config, llm_config),
     )

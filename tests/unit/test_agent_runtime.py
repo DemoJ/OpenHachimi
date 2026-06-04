@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import BinaryContent
+
 from openhachimi_agent.agent.intent import PlanContinuationDecision
 from openhachimi_agent.agent.intent import TaskFrame
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
@@ -15,7 +18,8 @@ from openhachimi_agent.service.agent_runtime.context import (
     mark_turn_started,
     should_route_new_turn,
 )
-from openhachimi_agent.service.agent_runtime.executor import _build_executor_message
+from openhachimi_agent.service.agent_runtime.executor import _build_executor_message, _run_executor_with_vision_fallback
+from openhachimi_agent.vision.preprocess import VisionPreprocessResult
 from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 from openhachimi_agent.service.agent_runtime.router import should_route_message
 from openhachimi_agent.service.agent_runtime.planner import needs_planning
@@ -159,6 +163,82 @@ def test_executor_message_with_attachments_adds_safe_summary():
     assert "photo.jpg" in message
     assert ".tmp/attachments/telegram/u1/photo.jpg" in message
     assert "不要臆测附件内容" in message
+
+
+def test_executor_message_with_fallback_vision_discourages_image_tools():
+    attachment = AttachmentRef(
+        id="att_1",
+        filename="photo.jpg",
+        content_type="image/jpeg",
+        size_bytes=123,
+        local_path=".tmp/attachments/telegram/u1/photo.jpg",
+        source="telegram",
+        kind="image",
+    )
+    vision_result = VisionPreprocessResult(
+        mode="fallback",
+        text_prefix="[图片附件识别结果]\n图中有一只猫。\n",
+        consumed_attachment_ids=["att_1"],
+    )
+
+    message = _build_executor_message(None, "看看这张图", [attachment], vision_result)
+
+    assert "图中有一只猫" in message
+    assert "图片附件已由辅助视觉模型识别" in message
+    assert "不要再调用 inspect_image、read_file、browser_navigate" in message
+    assert "status: 已处理" in message
+
+
+@pytest.mark.asyncio
+async def test_direct_vision_http_error_retries_without_image_parts():
+    class FailingVisionAgent:
+        def __init__(self):
+            self.messages = []
+
+        async def run(self, message, **_kwargs):
+            self.messages.append(message)
+            if isinstance(message, list):
+                raise ModelHTTPError(status_code=502, model_name="hachimi", body="")
+            return SimpleNamespace(output="已降级回复")
+
+    agent = FailingVisionAgent()
+    attachment = AttachmentRef(
+        id="att_1",
+        filename="photo.jpg",
+        content_type="image/jpeg",
+        size_bytes=123,
+        local_path=".tmp/attachments/telegram/u1/photo.jpg",
+        source="telegram",
+        kind="image",
+    )
+    vision_result = VisionPreprocessResult(
+        mode="direct",
+        direct_parts=[BinaryContent(data=b"image", media_type="image/jpeg", identifier="att_1")],
+        consumed_attachment_ids=["att_1"],
+    )
+    config = SimpleNamespace(model_name="hachimi", openai_base_url="http://test", openai_api_key="key", agent_timeout_seconds=300)
+
+    result, degraded = await _run_executor_with_vision_fallback(
+        executor_agent=agent,
+        task_frame_payload=None,
+        message="看看这张图",
+        attachments=[attachment],
+        vision_result=vision_result,
+        history=[],
+        deps=SimpleNamespace(),
+        config=config,
+        stream=False,
+        handle_stream_events=None,
+    )
+
+    assert result.output == "已降级回复"
+    assert degraded.mode == "unavailable"
+    assert degraded.direct_parts == []
+    assert len(agent.messages) == 2
+    assert isinstance(agent.messages[0], list)
+    assert isinstance(agent.messages[1], str)
+    assert "系统尝试将图片直接发送给主模型识别，但模型服务返回错误" in agent.messages[1]
+    assert "主模型图片输入错误" in agent.messages[1]
 
 
 def test_low_confidence_direct_task_does_not_need_planning():

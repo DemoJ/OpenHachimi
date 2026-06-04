@@ -2,6 +2,7 @@
 
 import asyncio
 import codecs
+import contextlib
 import json
 import logging
 import os
@@ -234,6 +235,36 @@ class HttpBackend:
             yield item
 
 
+async def _read_stdin(input_queue: asyncio.Queue[object]) -> None:
+    while True:
+        try:
+            user_input = await asyncio.to_thread(input, "你 > ")
+            await input_queue.put(user_input.strip())
+        except (EOFError, KeyboardInterrupt) as exc:
+            await input_queue.put(exc)
+            return
+
+
+async def _render_stream_message(backend: CliBackend, message: str, role: str, session_id: str) -> None:
+    print("哈基米 > ", end="", flush=True)
+    presenter = ToolProgressPresenter(mode="cli")
+    async for event in backend.stream_message(message, role, session_id):
+        if isinstance(event, StreamEventItem):
+            for action in presenter.handle_event(event):
+                if action.type == "tool":
+                    print(f"\n[工具] {action.text}", flush=True)
+                elif action.type in {"text", "system"}:
+                    print(action.text, end="", flush=True)
+        else:
+            print(event, end="", flush=True)
+
+
+async def _cancel_task(task: asyncio.Task) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+
+
 async def run_interactive_loop(backend: CliBackend, server_url: str, current_role: str) -> None:
     try:
         current_role, current_session_id = await backend.latest_session(current_role)
@@ -243,91 +274,147 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
         return
 
     print_welcome(state, server_url, current_role, current_session_id)
+    input_queue: asyncio.Queue[object] = asyncio.Queue()
+    stdin_task = asyncio.create_task(_read_stdin(input_queue))
 
-    while True:
-        try:
-            user_input = await asyncio.to_thread(input, "你 > ")
-            user_input = user_input.strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已退出对话。")
-            return
+    try:
+        while True:
+            item = await input_queue.get()
+            if isinstance(item, (EOFError, KeyboardInterrupt)):
+                print("\n已退出对话。")
+                return
+            user_input = str(item).strip()
 
-        if not user_input:
-            continue
-
-        if user_input in EXIT_COMMANDS:
-            print("已退出对话。")
-            return
-
-        if user_input in NEW_SESSION_COMMANDS:
-            try:
-                await backend.stop_session(current_session_id)
-            except Exception:
-                pass
-            try:
-                current_role, current_session_id, msg = await backend.new_session(current_role)
-                print(msg)
-            except Exception as exc:
-                print(f"哈基米 > 新建会话失败：{exc}")
-            continue
-
-        if user_input in STOP_COMMANDS:
-            try:
-                msg = await backend.stop_session(current_session_id)
-                print(msg)
-            except Exception as exc:
-                print(f"哈基米 > 停止任务失败：{exc}")
-            continue
-
-        if user_input in HELP_COMMANDS:
-            print_help()
-            continue
-
-        if user_input in ROLE_LIST_COMMANDS:
-            try:
-                roles = await backend.list_roles()
-                print("可用角色：")
-                for r in roles:
-                    marker = "（当前）" if r == current_role else ""
-                    print(f"  - {r}{marker}")
-                print()
-            except Exception as exc:
-                print(f"哈基米 > 获取角色列表失败：{exc}")
-            continue
-
-        if user_input == "/role" or user_input.startswith("/role "):
-            role_name = user_input[6:].strip()
-            if not role_name:
-                print("请在 /role 后面填写角色名称，例如：/role default\n")
+            if not user_input:
                 continue
+
+            if user_input in EXIT_COMMANDS:
+                print("已退出对话。")
+                return
+
+            if user_input in NEW_SESSION_COMMANDS:
+                try:
+                    await backend.stop_session(current_session_id)
+                except Exception:
+                    pass
+                try:
+                    current_role, current_session_id, msg = await backend.new_session(current_role)
+                    print(msg)
+                except Exception as exc:
+                    print(f"哈基米 > 新建会话失败：{exc}")
+                continue
+
+            if user_input in STOP_COMMANDS:
+                try:
+                    msg = await backend.stop_session(current_session_id)
+                    print(msg)
+                except Exception as exc:
+                    print(f"哈基米 > 停止任务失败：{exc}")
+                continue
+
+            if user_input in HELP_COMMANDS:
+                print_help()
+                continue
+
+            if user_input in ROLE_LIST_COMMANDS:
+                try:
+                    roles = await backend.list_roles()
+                    print("可用角色：")
+                    for r in roles:
+                        marker = "（当前）" if r == current_role else ""
+                        print(f"  - {r}{marker}")
+                    print()
+                except Exception as exc:
+                    print(f"哈基米 > 获取角色列表失败：{exc}")
+                continue
+
+            if user_input == "/role" or user_input.startswith("/role "):
+                role_name = user_input[6:].strip()
+                if not role_name:
+                    print("请在 /role 后面填写角色名称，例如：/role default\n")
+                    continue
+                try:
+                    await backend.stop_session(current_session_id)
+                except Exception:
+                    pass
+                try:
+                    current_role, current_session_id, msg = await backend.switch_role(role_name)
+                    print(msg)
+                except Exception as exc:
+                    print(f"哈基米 > 切换角色失败：{exc}")
+                print()
+                continue
+
+            stream_task = asyncio.create_task(_render_stream_message(backend, user_input, current_role, current_session_id))
+            pending_input_task: asyncio.Task | None = None
             try:
-                await backend.stop_session(current_session_id)
-            except Exception:
-                pass
-            try:
-                current_role, current_session_id, msg = await backend.switch_role(role_name)
-                print(msg)
+                while not stream_task.done():
+                    pending_input_task = asyncio.create_task(input_queue.get())
+                    done, pending = await asyncio.wait(
+                        {stream_task, pending_input_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if stream_task in done:
+                        pending_input_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await pending_input_task
+                        await stream_task
+                        break
+
+                    pending_input_task = None
+                    interrupt_item = next(iter(done)).result()
+                    if isinstance(interrupt_item, (EOFError, KeyboardInterrupt)):
+                        try:
+                            await backend.stop_session(current_session_id)
+                        except Exception:
+                            pass
+                        await _cancel_task(stream_task)
+                        print("\n已退出对话。")
+                        return
+
+                    interrupt_input = str(interrupt_item).strip()
+                    if not interrupt_input:
+                        continue
+                    if interrupt_input in STOP_COMMANDS:
+                        try:
+                            msg = await backend.stop_session(current_session_id)
+                            print(f"\n{msg}")
+                        except Exception as exc:
+                            print(f"\n哈基米 > 停止任务失败：{exc}")
+                        await _cancel_task(stream_task)
+                        break
+                    if interrupt_input in NEW_SESSION_COMMANDS:
+                        try:
+                            await backend.stop_session(current_session_id)
+                        except Exception:
+                            pass
+                        try:
+                            current_role, current_session_id, msg = await backend.new_session(current_role)
+                            print(f"\n{msg}")
+                        except Exception as exc:
+                            print(f"\n哈基米 > 新建会话失败：{exc}")
+                        await _cancel_task(stream_task)
+                        break
+                    if interrupt_input in EXIT_COMMANDS:
+                        try:
+                            await backend.stop_session(current_session_id)
+                        except Exception:
+                            pass
+                        await _cancel_task(stream_task)
+                        print("\n已退出对话。")
+                        return
+                    print("\n哈基米 > 当前任务执行中，可输入 /stop 或 /new 抢占；普通消息请稍后再发。")
             except Exception as exc:
-                print(f"哈基米 > 切换角色失败：{exc}")
-            print()
-            continue
+                print(f"\n哈基米 > 调用模型时出错：{exc}")
+                if not stream_task.done():
+                    await _cancel_task(stream_task)
+            finally:
+                if pending_input_task is not None and not pending_input_task.done():
+                    pending_input_task.cancel()
 
-        try:
-            print("哈基米 > ", end="", flush=True)
-            presenter = ToolProgressPresenter(mode="cli")
-            async for event in backend.stream_message(user_input, current_role, current_session_id):
-                if isinstance(event, StreamEventItem):
-                    for action in presenter.handle_event(event):
-                        if action.type == "tool":
-                            print(f"\n[工具] {action.text}", flush=True)
-                        elif action.type in {"text", "system"}:
-                            print(action.text, end="", flush=True)
-                else:
-                    print(event, end="", flush=True)
-        except Exception as exc:
-            print(f"\n哈基米 > 调用模型时出错：{exc}")
-
-        print("\n")
+            print("\n")
+    finally:
+        stdin_task.cancel()
 
 
 async def run_embedded_cli() -> None:

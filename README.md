@@ -134,6 +134,17 @@ llm:
   api_key: sk-xxxxxxxx           # 必填：你的 API Key
   model: gpt-4o                  # 模型名称
   base_url: https://...          # 可选：兼容 OpenAI 接口的代理/网关
+  supports_vision: auto          # 图片能力：auto / true / false
+
+vision:
+  enabled: true                  # 是否处理 Telegram/HTTP 图片附件
+  fallback_enabled: true         # 主模型不支持图片时，调用辅助视觉模型识别
+  model: ""                    # 辅助视觉模型；可留空。留空且主模型不支持图片时，仅告知主模型无法识别图片
+  base_url: ""
+  api_key: ""
+  detail: auto                   # image_url.detail：auto / low / high
+  max_images_per_message: 4
+  max_image_size_mb: 10
 
 paths:
   roles_dir: user/roles          # 角色配置目录

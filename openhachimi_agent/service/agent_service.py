@@ -42,6 +42,8 @@ from openhachimi_agent.transport.api_models import AgentState, ArtifactRef, Atta
 
 logger = logging.getLogger(__name__)
 AGENT_DEPENDENCY_MTIME_TTL_SECONDS = 2.0
+PRIORITY_STOP_COMMANDS = {"/stop", "停止"}
+PRIORITY_NEW_SESSION_COMMANDS = {"/new", "新对话"}
 
 
 def _error_message(exc: BaseException) -> str:
@@ -73,11 +75,24 @@ class AgentService:
 
     async def stop_session(self, session_id: str) -> CommandResponse:
         logger.info("stop requested for session_id=%s", session_id)
-        if session_id in self._running_tasks:
-            task = self._running_tasks[session_id]
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        task = self._running_tasks.get(session_id)
+        state = self._session_states.setdefault(session_id, {})
+        state["cancel_requested"] = True
+        state["cancel_reason"] = "user_stop"
+        state["last_cancelled_at"] = time.time()
+
+        interrupted_count = await self._interrupt_session_resources(session_id)
+
+        if task is not None:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(self._log_cancelled_task_result)
+            return CommandResponse(
+                message="已成功中断当前任务。",
+                role=self.config.default_role_name,
+                session_id=session_id,
+            )
+        if interrupted_count:
             return CommandResponse(
                 message="已成功中断当前任务。",
                 role=self.config.default_role_name,
@@ -88,6 +103,68 @@ class AgentService:
             role=self.config.default_role_name,
             session_id=session_id,
         )
+
+    def _log_cancelled_task_result(self, task: asyncio.Task) -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            exc = task.exception()
+            if exc is not None:
+                logger.debug("cancelled task finished with error: %s", exc)
+
+    async def _interrupt_session_resources(self, session_id: str) -> int:
+        terminate_session = getattr(self.process_manager, "terminate_session", None)
+        if not callable(terminate_session):
+            return 0
+        try:
+            count = await asyncio.to_thread(terminate_session, session_id)
+        except Exception:
+            logger.exception("failed to interrupt resources for session_id=%s", session_id)
+            return 0
+        logger.info("interrupted session resources session_id=%s process_count=%s", session_id, count)
+        return count if isinstance(count, int) else 0
+
+    def _priority_command(self, message: str) -> str | None:
+        command = message.strip()
+        if command in PRIORITY_STOP_COMMANDS:
+            return "stop"
+        if command in PRIORITY_NEW_SESSION_COMMANDS:
+            return "new"
+        return None
+
+    def _resolve_priority_session(self, role: str | None, session_id: str | None) -> tuple[str, str]:
+        resolved_role = role or self.config.default_role_name
+        if session_id:
+            return resolved_role, session_id
+        latest = self.latest_session(resolved_role)
+        return latest.role, latest.session_id
+
+    async def _handle_priority_command_response(
+        self,
+        message: str,
+        role: str | None,
+        session_id: str | None,
+    ) -> ChatResponse | None:
+        command = self._priority_command(message)
+        if command is None:
+            return None
+        resolved_role, resolved_session_id = self._resolve_priority_session(role, session_id)
+        if command == "stop":
+            resp = await self.stop_session(resolved_session_id)
+            return ChatResponse(output=resp.message, role=resolved_role, session_id=resolved_session_id)
+
+        await self.stop_session(resolved_session_id)
+        resp = self.new_session(resolved_role)
+        return ChatResponse(output=resp.message, role=resp.role, session_id=resp.session_id)
+
+    async def _handle_priority_command_events(
+        self,
+        message: str,
+        role: str | None,
+        session_id: str | None,
+    ) -> list[StreamEventItem] | None:
+        response = await self._handle_priority_command_response(message, role, session_id)
+        if response is None:
+            return None
+        return [StreamEventItem(type="system", text=response.output)]
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_id)
@@ -587,6 +664,10 @@ class AgentService:
         channel: str = "local",
         delivery_target: dict[str, object] | None = None,
     ) -> ChatResponse:
+        priority_response = await self._handle_priority_command_response(message, role, session_id)
+        if priority_response is not None:
+            return priority_response
+
         async for result in self._run_with_session(
             message,
             role,
@@ -614,6 +695,12 @@ class AgentService:
         channel: str = "local",
         delivery_target: dict[str, object] | None = None,
     ) -> AsyncIterator[StreamEventItem]:
+        priority_events = await self._handle_priority_command_events(message, role, session_id)
+        if priority_events is not None:
+            for event in priority_events:
+                yield event
+            return
+
         async for event in self._run_with_session(
             message,
             role,

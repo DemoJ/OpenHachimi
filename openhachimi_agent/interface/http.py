@@ -459,6 +459,7 @@ def download_artifact(artifact_id: str, service: AgentService = Depends(get_serv
     )
 
 
+@app.post("/new")
 def new_session(role: str | None = None, service: AgentService = Depends(get_service)):
     logger.info("http new session request role=%s", role)
     return service.new_session(role)

@@ -3,17 +3,36 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 from pydantic_ai import RunContext
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.tools.vision_guard import raise_if_processed_vision_attachment
 
 logger = logging.getLogger(__name__)
 
 
+def _file_url_to_path(url: str) -> Path | None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "file":
+        return None
+    path_text = url2pathname(unquote(parsed.path))
+    if parsed.netloc and not path_text.startswith(("/", "\\")):
+        path_text = f"//{parsed.netloc}/{path_text}"
+    if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":":
+        path_text = path_text[1:]
+    return Path(path_text)
+
+
 async def browser_navigate(ctx: RunContext[AgentDeps], url: str) -> str:
     """导航浏览器到指定的网址。使用该工具前请确保需要访问网页，完成后使用 browser_get_state 获取页面信息。"""
+    local_path = _file_url_to_path(url)
+    if local_path is not None:
+        raise_if_processed_vision_attachment(ctx, local_path, tool_name="browser_navigate")
     bm = ctx.deps.browser_manager
     result = await bm.navigate(url)
     return result

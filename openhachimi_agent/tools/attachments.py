@@ -9,6 +9,7 @@ from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import normalize_relative_path, resolve_workspace_path
+from openhachimi_agent.tools.vision_guard import raise_if_processed_vision_attachment
 
 IMAGE_SIGNATURES = {
     b"\x89PNG\r\n\x1a\n": "PNG",
@@ -31,6 +32,7 @@ def _resolve_image_path(ctx: RunContext[AgentDeps], path: str, cwd: str = ".") -
 def inspect_image(ctx: RunContext[AgentDeps], path: str, cwd: str = ".") -> dict[str, object]:
     """读取图片文件的基础元数据，不返回图片内容。"""
     target = _resolve_image_path(ctx, path, cwd)
+    raise_if_processed_vision_attachment(ctx, target, tool_name="inspect_image")
     if not target.exists() or not target.is_file():
         raise ModelRetry(f"图片文件不存在：{path}")
 

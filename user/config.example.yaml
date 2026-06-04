@@ -17,6 +17,25 @@ llm:
   api_key: sk-xxxxxxxx
   model: gpt-5.2
   base_url: https://your-openai-compatible-server.example/v1
+  supports_vision: auto       # 主模型是否支持图片输入：auto 自动按模型名判断；true 强制直传图片；false 使用 vision 辅助模型
+
+vision:
+  enabled: true               # 是否处理图片附件
+  fallback_enabled: true      # 主模型不支持图片时，是否调用辅助视觉模型识别后再交给主模型
+  model: ""                   # 辅助视觉模型；可留空。留空且主模型不支持图片时，不识别图片，只把情况告知主模型
+  base_url: ""                # 留空则复用 llm.base_url
+  api_key: ""                 # 留空则复用 llm.api_key
+  detail: auto                # OpenAI image_url.detail：auto / low / high
+  max_images_per_message: 4
+  max_image_size_mb: 10
+  # prompt 可省略或留空；未配置时使用程序内置的默认图片识别提示词。
+  # 如需自定义辅助视觉模型的识别要求，可取消下面注释：
+  # prompt: |
+  #   请详细识别用户发送的图片内容。请包括：
+  #   1. 图片中的主体、场景、文字、表格、代码、界面或物体；
+  #   2. 如果图片中有文字，请尽量完整 OCR；
+  #   3. 如果用户问题依赖图片细节，请指出关键信息；
+  #   4. 不要编造看不清的内容，看不清请说明。
 
 paths:
   roles_dir: user/roles

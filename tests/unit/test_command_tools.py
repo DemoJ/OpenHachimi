@@ -47,8 +47,15 @@ class FakeProcess:
 class FakeProcessManager:
     def __init__(self, process: FakeProcess | None) -> None:
         self.process = process
+        self.started: list[dict[str, object]] = []
 
-    def start_process(self, command, cwd, shell_name):
+    def start_process(self, command, cwd, shell_name, session_id=None):
+        self.started.append({
+            "command": command,
+            "cwd": cwd,
+            "shell_name": shell_name,
+            "session_id": session_id,
+        })
         return self.process
 
     def get_process(self, command_id: str) -> FakeProcess | None:
@@ -56,11 +63,13 @@ class FakeProcessManager:
 
 
 def make_ctx(process: FakeProcess):
+    process_manager = FakeProcessManager(process)
     deps = SimpleNamespace(
         base_dir=Path.cwd(),
-        process_manager=FakeProcessManager(process),
+        process_manager=process_manager,
+        session_id="test_session_123",
     )
-    return SimpleNamespace(deps=deps)
+    return SimpleNamespace(deps=deps, process_manager=process_manager)
 
 
 @pytest.mark.asyncio
@@ -128,6 +137,19 @@ async def test_run_command_clamps_wait_seconds_to_max(monkeypatch):
 
     assert result["is_running"] is True
     assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_run_command_tags_process_with_session_id(monkeypatch):
+    process = FakeProcess("started")
+    ctx = make_ctx(process)
+
+    monkeypatch.setattr(_command_module, "assert_safe_command", lambda command: None)
+    monkeypatch.setattr(_command_module, "get_command_shell", lambda: (["shell", "-c"], "test-shell"))
+
+    await run_command(ctx, "long task", wait_seconds=0)
+
+    assert ctx.process_manager.started[0]["session_id"] == "test_session_123"
 
 
 def test_run_command_max_wait_seconds_is_120():

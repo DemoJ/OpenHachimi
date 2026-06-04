@@ -16,13 +16,14 @@ logger = logging.getLogger(__name__)
 class RunningProcess:
     """包装正在后台运行的子进程。"""
 
-    def __init__(self, command: list[str], cwd: Path, shell_name: str):
+    def __init__(self, command: list[str], cwd: Path, shell_name: str, session_id: str | None = None):
         self.id = str(uuid.uuid4())
         self.command = command
         self.cwd = cwd.as_posix()
         self.shell_name = shell_name
-        
-        logger.info("Starting process %s: %s in %s", self.id, command, cwd)
+        self.session_id = session_id
+
+        logger.info("Starting process %s: %s in %s session_id=%s", self.id, command, cwd, session_id)
         
         self.process = subprocess.Popen(
             command,
@@ -153,9 +154,9 @@ class ProcessManager:
                 if proc:
                     proc.cleanup()
         
-    def start_process(self, command: list[str], cwd: Path, shell_name: str) -> RunningProcess:
+    def start_process(self, command: list[str], cwd: Path, shell_name: str, session_id: str | None = None) -> RunningProcess:
         self._cleanup_old_processes()
-        proc = RunningProcess(command, cwd, shell_name)
+        proc = RunningProcess(command, cwd, shell_name, session_id=session_id)
         self._processes[proc.id] = proc
         return proc
         
@@ -167,4 +168,14 @@ class ProcessManager:
         if proc:
             proc.terminate()
 
+    def terminate_session(self, session_id: str) -> int:
+        """终止指定 session 启动且仍在运行的后台进程。"""
+        count = 0
+        for proc in list(self._processes.values()):
+            if proc.session_id != session_id or not proc.is_running():
+                continue
+            logger.info("Terminating process %s for session %s", getattr(proc, "id", "unknown"), session_id)
+            proc.cleanup()
+            count += 1
+        return count
 

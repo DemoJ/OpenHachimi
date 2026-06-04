@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from openhachimi_agent.core.config import AppConfig, MemoryConfig, ResearchConfig, SchedulerConfig
+from openhachimi_agent.core.config import AppConfig, MemoryConfig, ResearchConfig, SchedulerConfig, VisionConfig
 
 _TOOLS_DIR = Path(__file__).parents[2] / "openhachimi_agent" / "tools"
 _tools_pkg = types.ModuleType("openhachimi_agent.tools")
@@ -35,6 +35,7 @@ def _ctx(tmp_path, research_config=None):
         openai_base_url="http://test",
         default_role_name="default",
         openai_api_key="test-key",
+        llm_supports_vision="auto",
         log_dir=tmp_path / ".logs",
         log_level="INFO",
         log_console=False,
@@ -55,6 +56,7 @@ def _ctx(tmp_path, research_config=None):
         memory=MemoryConfig(db_path=tmp_path / ".memory" / "memory.sqlite3"),
         scheduler=SchedulerConfig(db_path=tmp_path / ".scheduler" / "tasks.sqlite3"),
         research=research_config or ResearchConfig(),
+        vision=VisionConfig(api_key="test-key", base_url="http://test"),
     )
     return SimpleNamespace(deps=SimpleNamespace(config=config))
 

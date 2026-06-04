@@ -6,6 +6,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+from pydantic_ai.exceptions import ModelRetry
+
 _TOOLS_DIR = Path(__file__).parents[2] / "openhachimi_agent" / "tools"
 _tools_pkg = types.ModuleType("openhachimi_agent.tools")
 _tools_pkg.__path__ = [str(_TOOLS_DIR)]
@@ -33,8 +36,9 @@ MAX_READ_LINES = _utils_module.MAX_READ_LINES
 MAX_READ_LINES_PER_CALL = _utils_module.MAX_READ_LINES_PER_CALL
 
 
-def make_ctx(base_dir):
-    return SimpleNamespace(deps=SimpleNamespace(base_dir=base_dir, skills_dirs=[]))
+def make_ctx(base_dir, session_state=None):
+    config = SimpleNamespace(attachments_dir=base_dir / ".tmp" / "attachments")
+    return SimpleNamespace(deps=SimpleNamespace(base_dir=base_dir, skills_dirs=[], config=config, session_state=session_state or {}))
 
 
 def write_lines(path, count: int) -> None:
@@ -74,3 +78,28 @@ def test_read_file_reports_not_truncated_when_range_reaches_end(tmp_path):
     assert result["end_line"] == 20
     assert result["truncated"] is False
     assert result["next_start_line"] is None
+
+
+def test_read_file_blocks_processed_fallback_image(tmp_path):
+    image = tmp_path / ".tmp" / "attachments" / "telegram" / "u1" / "a.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 24)
+    key = str(image.resolve()).casefold()
+    session_state = {
+        "vision_attachments": {
+            "att_1": {
+                "attachment_id": "att_1",
+                "mode": "fallback",
+                "status": "succeeded",
+                "summary": "图中有一只猫。",
+                "size_bytes": image.stat().st_size,
+            }
+        },
+        "vision_attachment_paths": {key: "att_1"},
+    }
+
+    with pytest.raises(ModelRetry) as exc_info:
+        read_file(make_ctx(tmp_path, session_state), ".tmp/attachments/telegram/u1/a.png")
+
+    assert "已由辅助视觉模型成功识别" in str(exc_info.value)
+    assert session_state["vision_tool_blocks"][0]["tool"] == "read_file"

@@ -20,6 +20,7 @@ from openhachimi_agent.tools.utils import (
     read_text_file,
     resolve_workspace_path,
 )
+from openhachimi_agent.tools.vision_guard import raise_if_processed_vision_attachment
 
 
 logger = logging.getLogger(__name__)
@@ -177,7 +178,13 @@ def read_file(
 ) -> dict[str, object]:
     """读取工作区内文件的全部内容或指定行范围。"""
     logger.debug("tool read_file path=%s start_line=%d end_line=%s", path, start_line, end_line)
-    target_file, text = read_text_file(ctx.deps.base_dir, path)
+    allowed_roots = [*ctx.deps.skills_dirs]
+    attachments_dir = getattr(getattr(ctx.deps, "config", None), "attachments_dir", None)
+    if attachments_dir is not None:
+        allowed_roots.append(attachments_dir)
+    target = resolve_workspace_path(ctx.deps.base_dir, path, allowed_roots)
+    raise_if_processed_vision_attachment(ctx, target, tool_name="read_file")
+    target_file, text = read_text_file(ctx.deps.base_dir, path, allowed_roots)
     if start_line < 1:
         raise ModelRetry("start_line 必须大于等于 1")
 
