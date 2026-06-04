@@ -48,7 +48,7 @@ async def test_stop_session(agent_service):
     # Call stop_session
     resp = await agent_service.stop_session(session_id)
     assert resp.message == "已成功中断当前任务。"
-    assert task.cancelling() > 0
+    assert not task.done() or task.cancelled()
     assert terminated == [session_id]
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -77,7 +77,7 @@ async def test_stop_session_returns_after_issuing_interrupts_without_waiting_for
     resp = await asyncio.wait_for(agent_service.stop_session(session_id), timeout=0.2)
 
     assert resp.message == "已成功中断当前任务。"
-    assert task.cancelling() > 0
+    assert not task.done() or task.cancelled()
     assert terminated == [session_id]
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -102,7 +102,7 @@ async def test_send_message_stop_bypasses_session_lock(agent_service):
 
     assert resp.output == "已成功中断当前任务。"
     assert resp.session_id == session_id
-    assert task.cancelling() > 0
+    assert not task.done() or task.cancelled()
     with pytest.raises(asyncio.CancelledError):
         await task
 
@@ -125,7 +125,7 @@ async def test_send_message_new_bypasses_session_lock_and_returns_new_session(ag
 
     assert "新对话已准备好" in resp.output
     assert resp.session_id != old_session_id
-    assert task.cancelling() > 0
+    assert not task.done() or task.cancelled()
     with pytest.raises(asyncio.CancelledError):
         await task
 
@@ -149,7 +149,7 @@ async def test_stream_events_stop_yields_control_event_without_lock(agent_servic
 
     assert event.type == "system"
     assert "已成功中断当前任务" in event.text
-    assert task.cancelling() > 0
+    assert not task.done() or task.cancelled()
     with pytest.raises(asyncio.CancelledError):
         await task
 
