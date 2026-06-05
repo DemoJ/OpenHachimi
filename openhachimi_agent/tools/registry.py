@@ -59,6 +59,7 @@ _BROWSER_TOOLS = [
 _SKILLS_TOOLS = [
     list_skills,
     get_skill_instructions,
+    install_skill,
 ]
 
 _FILE_TOOLS = [

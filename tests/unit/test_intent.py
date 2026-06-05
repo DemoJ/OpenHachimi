@@ -116,3 +116,46 @@ def test_build_task_frame_no_url_special_handling():
     # 不再强制 narrow，由 LLM 判断
     assert frame.allowed_autonomy in ("bounded", "broad")
     assert frame.target_urls == ["https://example.com/a"]
+
+
+def test_coerce_task_frame_adds_install_skill_invariant_for_skill_update_url():
+    url = "https://github.com/DemoJ/product-manager-suite"
+    frame = coerce_task_frame(
+        {
+            "user_request": f"请更新我本地已安装的 product-manager-suite skill 到最新版本，仓库地址是：{url}",
+            "goal": "更新 product-manager-suite skill",
+            "task_kind": "unknown",
+            "complexity": "simple",
+            "risk": "low",
+            "confidence": 0.8,
+            "requires_plan": False,
+            "target_entities": [],
+            "invariants": [],
+        },
+        f"请更新我本地已安装的 product-manager-suite skill 到最新版本，仓库地址是：{url}",
+    )
+
+    invariant_text = "\n".join(frame.invariants)
+    assert frame.target_urls == [url]
+    assert "install_skill" in invariant_text
+    assert url in invariant_text
+    assert "command-based update flow" in invariant_text
+
+
+def test_coerce_task_frame_does_not_add_skill_invariant_for_regular_npx_command():
+    frame = coerce_task_frame(
+        {
+            "user_request": "用 npx vite build 打包项目",
+            "goal": "打包项目",
+            "task_kind": "shell",
+            "complexity": "simple",
+            "risk": "low",
+            "confidence": 0.8,
+            "requires_plan": False,
+            "target_entities": [],
+            "invariants": [],
+        },
+        "用 npx vite build 打包项目",
+    )
+
+    assert not any("install_skill" in invariant for invariant in frame.invariants)

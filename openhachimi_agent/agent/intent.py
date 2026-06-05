@@ -84,6 +84,30 @@ class TaskFrame(BaseModel):
 
 
 _HIGH_RISK_TERMS = ("删除", "覆盖", "发布", "部署", "reset", "clean", "密钥", "token", "登录")
+_SKILL_TERMS = ("skill", "技能")
+_SKILL_INSTALL_UPDATE_TERMS = ("install", "update", "add", "import", "安装", "更新", "添加", "导入", "最新版本")
+
+
+def _is_skill_install_or_update_request(message: str, urls: list[str]) -> bool:
+    """Conservatively detect explicit skill install/update requests with a source URL."""
+
+    if not urls:
+        return False
+    text = message.lower()
+    return any(term in text for term in _SKILL_TERMS) and any(
+        term in text for term in _SKILL_INSTALL_UPDATE_TERMS
+    )
+
+
+def _skill_install_update_invariant(urls: list[str]) -> str:
+    source = urls[0]
+    return (
+        f"Skill install/update requests with the explicit source URL {source} should prefer "
+        f"install_skill(source_path_or_url={source!r}) as the default project-local installer. "
+        "install_skill supports updating an already installed skill with the same name. "
+        "If the user or the skill documentation requires a command-based update flow, explain "
+        "the reason before using command tools."
+    )
 
 
 def extract_urls(message: str) -> list[str]:
@@ -240,6 +264,8 @@ def coerce_task_frame(value: object, message: str) -> TaskFrame:
         for entity in _target_entities_from_urls(detected_urls):
             if entity.value not in existing_urls:
                 frame.target_entities.append(entity)
+    if _is_skill_install_or_update_request(message, detected_urls) and not any("install_skill" in invariant for invariant in frame.invariants):
+        frame.invariants.append(_skill_install_update_invariant(detected_urls))
     if frame.requires_plan:
         frame.execution_mode = "planned"
     elif frame.relevant_skills and frame.execution_mode == "direct":

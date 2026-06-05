@@ -25,15 +25,16 @@ from openhachimi_agent.core.deps import AgentDeps
 def install_skill(ctx: RunContext[AgentDeps], source_path_or_url: str) -> str:
     """Installs or updates a Claude Skill into this OpenHachimi project's user/skills directory.
 
-    Use this tool whenever the user asks to install, add, update, import, or fetch
+    Prefer this tool whenever the user asks to install, add, update, import, or fetch
     a skill from a GitHub/Git URL, a zip/tar download URL, or a local skill directory.
-    This tool is the default and preferred installation path for third-party skills:
+    This tool is the default installation path for third-party skills:
     <current OpenHachimi project>/user/skills/<skill-name>.
 
-    Do not use run_command, git clone, download commands, copy/move commands, or
-    manual file writes to install skills. Do not install into ~/.agents/skills or
-    paths.external_skills_dir unless the user explicitly asks to configure that
-    external directory instead of installing a project skill.
+    Do not install into ~/.agents/skills or paths.external_skills_dir unless the user
+    explicitly asks to configure that external directory instead of installing a
+    project skill. If a particular skill documents a required command-based update
+    flow, use that flow only when the user asks for it or this source-based installer
+    is not suitable.
 
     Args:
         source_path_or_url: The Git repository URL, a zip/tar download URL, or a local directory containing the skill.

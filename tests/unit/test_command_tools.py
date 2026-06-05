@@ -9,7 +9,6 @@ import types
 from pathlib import Path
 
 import pytest
-from pydantic_ai.exceptions import ModelRetry
 
 _TOOLS_DIR = Path(__file__).parents[2] / "openhachimi_agent" / "tools"
 _tools_pkg = types.ModuleType("openhachimi_agent.tools")
@@ -158,47 +157,34 @@ def test_run_command_max_wait_seconds_is_120():
 
 
 @pytest.mark.asyncio
-async def test_run_command_rejects_git_clone_into_user_skills(monkeypatch):
-    process = FakeProcess("started")
-    monkeypatch.setattr(_command_module, "get_command_shell", lambda: (["shell", "-c"], "test-shell"))
-
-    with pytest.raises(ModelRetry, match="install_skill"):
-        await run_command(
-            make_ctx(process),
-            "git clone https://github.com/foo/bar.git user/skills/bar",
-            wait_seconds=0,
-        )
-
-
-@pytest.mark.asyncio
-async def test_run_command_allows_regular_git_clone(monkeypatch):
+async def test_run_command_allows_skill_related_commands(monkeypatch):
     process = FakeProcess("started")
     ctx = make_ctx(process)
     monkeypatch.setattr(_command_module, "get_command_shell", lambda: (["shell", "-c"], "test-shell"))
 
-    result = await run_command(ctx, "git clone https://github.com/foo/bar.git .tmp/bar", wait_seconds=0)
+    await run_command(ctx, "npx skills update product-manager-suite", wait_seconds=0)
+    await run_command(ctx, "git clone https://github.com/foo/bar.git user/skills/bar", wait_seconds=0)
+    await run_command(ctx, r"Copy-Item C:\tmp\skill user\skills\demo -Recurse", wait_seconds=0)
 
-    assert result["command_id"] == "cmd"
-    assert ctx.process_manager.started[0]["command"] == ["shell", "-c", "git clone https://github.com/foo/bar.git .tmp/bar"]
-
-
-@pytest.mark.asyncio
-async def test_run_command_rejects_copy_item_into_user_skills(monkeypatch):
-    process = FakeProcess("started")
-    monkeypatch.setattr(_command_module, "get_command_shell", lambda: (["shell", "-c"], "test-shell"))
-
-    with pytest.raises(ModelRetry, match="install_skill"):
-        await run_command(
-            make_ctx(process),
-            r"Copy-Item C:\tmp\skill user\skills\demo -Recurse",
-            wait_seconds=0,
-        )
+    assert [entry["command"][-1] for entry in ctx.process_manager.started] == [
+        "npx skills update product-manager-suite",
+        "git clone https://github.com/foo/bar.git user/skills/bar",
+        r"Copy-Item C:\tmp\skill user\skills\demo -Recurse",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_run_command_rejects_cp_into_user_skills(monkeypatch):
+async def test_run_command_allows_regular_npx_and_npm_commands(monkeypatch):
     process = FakeProcess("started")
+    ctx = make_ctx(process)
     monkeypatch.setattr(_command_module, "get_command_shell", lambda: (["shell", "-c"], "test-shell"))
 
-    with pytest.raises(ModelRetry, match="install_skill"):
-        await run_command(make_ctx(process), "cp -R /tmp/skill user/skills/demo", wait_seconds=0)
+    await run_command(ctx, "npx eslint .", wait_seconds=0)
+    await run_command(ctx, "npm update", wait_seconds=0)
+    await run_command(ctx, "npm run update-skills-docs", wait_seconds=0)
+
+    assert [entry["command"][-1] for entry in ctx.process_manager.started] == [
+        "npx eslint .",
+        "npm update",
+        "npm run update-skills-docs",
+    ]

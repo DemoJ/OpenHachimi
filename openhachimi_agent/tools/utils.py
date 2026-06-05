@@ -157,35 +157,6 @@ def assert_safe_command(command: str) -> None:
             )
 
 
-def assert_not_skill_install_bypass(command: str) -> None:
-    """阻止通过命令行手动安装 skill，要求使用专用 install_skill 工具。"""
-    normalized = command.lower().replace("\\", "/")
-    skill_dir_markers = (
-        "user/skills",
-        ".agents/skills",
-        "external_skills",
-    )
-    install_actions = (
-        r"\bgit\s+clone\b",
-        r"\bcopy-item\b",
-        r"\bmove-item\b",
-        r"\brobocopy\b",
-        r"\bxcopy\b",
-        r"\bcopy\b",
-        r"\bcp\b",
-        r"\bmv\b",
-    )
-
-    if any(marker in normalized for marker in skill_dir_markers) and any(
-        re.search(pattern, normalized) for pattern in install_actions
-    ):
-        raise ModelRetry(
-            "检测到你可能正在通过命令行安装或更新 skill。安装、更新、添加或导入 skill "
-            "必须使用 `install_skill(source_path_or_url=...)`，该工具会默认安装到当前项目 "
-            "`user/skills`。请不要用 `run_command` 执行 git clone、复制或移动目录来安装 skill。"
-        )
-
-
 def run_subprocess(
     command: list[str],
     cwd: Path,
