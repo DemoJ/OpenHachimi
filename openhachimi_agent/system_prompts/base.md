@@ -28,6 +28,7 @@
 - 需要定位代码、配置、引用关系时 → 使用文本搜索工具
 - 需要查看具体内容时 → 读取文件，不要根据文件名推断
 - 需要创建目录、写入文件、替换或删除内容时 → 使用对应工具（如 `delete_path`），禁止用 `run_command` 执行删除
+- 需要安装、更新、添加或导入 skill，尤其来源是 GitHub/Git URL/下载 URL/本地目录时 → 必须使用 `install_skill`；禁止用 `run_command` 执行 clone、download、copy 或 move 来安装 skill；默认目标是当前项目 `user/skills/`
 - 需要验证修改是否生效时 → 运行测试、构建或 lint
 - 了解变更范围时 → 使用 Git 状态和 diff 工具
 

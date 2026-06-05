@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 
 from openhachimi_agent.content.skills import parse_skill
-from openhachimi_agent.tools.skills import build_skill_tool, format_skill_prompt, get_skill_instructions
+from openhachimi_agent.tools.skills import build_skill_tool, format_skill_prompt, get_skill_instructions, install_skill
 
 
 def _write_skill(skill_dir, frontmatter: str, body: str):
@@ -82,3 +82,42 @@ def test_build_skill_tool_replaces_arguments_and_includes_skill_root(tmp_path):
     assert "{{target}}" not in result
     assert f"skill_root: {skill.path.parent.resolve().as_posix()}" in result
     assert "拼接成绝对路径" in result
+
+
+def test_install_skill_installs_local_skill_into_project_user_skills(tmp_path):
+    source_skill = tmp_path / "source" / "demo-install"
+    _write_skill(source_skill, "name: demo-install\ndescription: Demo install", "初始内容")
+    ctx = SimpleNamespace(deps=SimpleNamespace(base_dir=tmp_path, skills_dirs=[tmp_path / "user" / "skills"]))
+
+    result = install_skill(ctx, str(source_skill))
+
+    dest_skill_file = tmp_path / "user" / "skills" / "demo-install" / "SKILL.md"
+    assert "successfully installed" in result
+    assert dest_skill_file.exists()
+    assert "初始内容" in dest_skill_file.read_text(encoding="utf-8")
+
+
+def test_install_skill_reports_up_to_date_for_same_local_skill(tmp_path):
+    source_skill = tmp_path / "source" / "demo-install"
+    _write_skill(source_skill, "name: demo-install\ndescription: Demo install", "初始内容")
+    ctx = SimpleNamespace(deps=SimpleNamespace(base_dir=tmp_path, skills_dirs=[tmp_path / "user" / "skills"]))
+
+    install_skill(ctx, str(source_skill))
+    result = install_skill(ctx, str(source_skill))
+
+    assert "already installed and is up-to-date" in result
+
+
+def test_install_skill_updates_existing_local_skill(tmp_path):
+    source_skill = tmp_path / "source" / "demo-install"
+    skill_file = source_skill / "SKILL.md"
+    _write_skill(source_skill, "name: demo-install\ndescription: Demo install", "初始内容")
+    ctx = SimpleNamespace(deps=SimpleNamespace(base_dir=tmp_path, skills_dirs=[tmp_path / "user" / "skills"]))
+
+    install_skill(ctx, str(source_skill))
+    skill_file.write_text("---\nname: demo-install\ndescription: Demo install\n---\n\n更新内容", encoding="utf-8")
+    result = install_skill(ctx, str(source_skill))
+
+    dest_skill_file = tmp_path / "user" / "skills" / "demo-install" / "SKILL.md"
+    assert "successfully updated" in result
+    assert "更新内容" in dest_skill_file.read_text(encoding="utf-8")

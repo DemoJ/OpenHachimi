@@ -13,6 +13,7 @@ from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.utils import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    assert_not_skill_install_bypass,
     assert_safe_command,
     get_command_shell,
     normalize_relative_path,
@@ -43,6 +44,7 @@ async def run_command(
 
     logger.info("tool run_command cwd=%s wait_seconds=%.1f command=%s", cwd, wait_seconds, command)
     assert_safe_command(command)
+    assert_not_skill_install_bypass(command)
     target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
     if not target_cwd.exists():
         raise FileNotFoundError(f"工作目录不存在：{cwd}")

@@ -41,7 +41,7 @@ paths:
   roles_dir: user/roles
   memory_dir: .memory
   attachments_dir: .tmp/attachments
-  external_skills_dir: ""    # 可选配置，外部技能目录的绝对路径，例如 C:\Users\xxx\.agents\skills
+  external_skills_dir: ""    # 可选：额外扫描/读取的外部技能目录；install_skill 默认安装到当前项目 user/skills，此项不是默认安装位置
 
 memory:
   enabled: true

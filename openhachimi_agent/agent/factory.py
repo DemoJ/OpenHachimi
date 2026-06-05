@@ -62,8 +62,9 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             "- 浏览器：browser_navigate（打开URL）、browser_extract_content（提取当前页正文/metadata/links）、browser_get_state（读取交互元素）、browser_click、browser_type、browser_scroll、browser_new_tab 等\n"
             "- 网络/研究：research_sources（多源搜索、排序、引用编号）、research_next_queries（证据不足时生成下一轮查询）、web_fetch（HTTP抓取）、web_search（轻量搜索）、discover_web_resources\n"
             "- 文件：read_file、write_file、replace_in_file、publish_artifact、list_files、find_files、search_text\n"
-            "- 命令行：run_command、send_command_input\n"
-            "- Git：git_status、git_diff\n\n"
+            "- 命令行：run_command、send_command_input（但安装/更新 skill 不应规划为 git clone 或 copy，应规划 install_skill）\n"
+            "- Git：git_status、git_diff\n"
+            "- 技能：list_skills、get_skill_instructions、install_skill（从 GitHub/Git URL/下载 URL/本地目录安装或更新 skill，默认写入当前项目 user/skills）\n\n"
             "请基于对以上 Executor 工具能力的理解来制定执行计划。\n"
         )
     else:
@@ -85,6 +86,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                 "你只能使用调度只读工具查询定时任务、运行记录、收件箱或投递预览。"
                 "如果当前有活动 TODO，你的主要目标是严格按照当前的 TODO 列表，一步步执行具体操作，并在每一步完成后调用 `update_todo`。不要偏离原定计划！"
                 "同一轮内，成功的 write_file、replace_in_file、make_directory 或 publish_artifact 返回值可作为对应路径已创建/已修改/已发布的证据；除非后续操作失败或用户要求核验，不要立刻读取或列目录只为确认它存在。"
+                "用户要求从 GitHub/Git URL/下载 URL/本地目录安装、更新、添加或导入 skill 时，必须调用 `install_skill`；不要调用 `run_command` 执行 git clone、下载、复制、移动目录等方式绕过安装工具。`install_skill` 默认安装到当前项目 `user/skills`，不要写入 `~/.agents/skills` 或 external_skills_dir，除非用户明确要求配置外部技能目录。"
                 "\n当用户要求生成、导出、下载或发送文件时，先用 `write_file` 创建文件，再调用 `publish_artifact` 将该文件发布给用户。"
                 "\n研究类任务必须优先使用 `research_sources` 获取多来源候选和 [S#] 引用编号，再用 `web_fetch` 或 `browser_navigate` + `browser_extract_content` 读取关键来源正文。"
                 "搜索摘要不是全文证据；外部事实、数据、时间敏感结论必须附带 [S#] 引用。信息不足时继续搜索或明确说明不足。"
