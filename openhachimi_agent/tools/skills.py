@@ -164,12 +164,35 @@ def get_skill_instructions(ctx: RunContext[AgentDeps], skill_name: str) -> str:
         if skill.config.name == skill_name:
             if skill.config.disable_model_invocation:
                 return f"Skill '{skill_name}' is marked with disable_model_invocation=true. You should not run this skill directly."
-            return skill.body
-            
+            return format_skill_prompt(skill)
+
     return f"Skill '{skill_name}' not found. Please check available skills using list_skills."
 
 from pydantic import create_model
 from typing import Callable
+
+
+def format_skill_prompt(skill: Skill, body: str | None = None, *, execution_intro: str | None = None) -> str:
+    """Format skill instructions with path metadata for reading bundled resources."""
+    skill_path = skill.path.resolve().as_posix()
+    skill_root = skill.path.parent.resolve().as_posix()
+    content = skill.body if body is None else body
+    intro = f"{execution_intro}\n" if execution_intro else ""
+    return (
+        f"<skill name=\"{skill.config.name}\" skill_root=\"{skill_root}\" path=\"{skill_path}\">\n"
+        f"{intro}"
+        "[Skill Metadata]\n"
+        f"- skill_path: {skill_path}\n"
+        f"- skill_root: {skill_root}\n\n"
+        "[Path Note]\n"
+        "read_file、list_files、find_files 和 search_text 的相对路径仍相对于当前项目工作区根目录，"
+        "不会自动相对于本 skill 目录解析。\n"
+        "如果本 skill 需要读取自身附带的参考文件、模板、示例或脚本，请将 skill 文档中的相对路径"
+        "与上方 skill_root 拼接成绝对路径后再调用文件工具。\n\n"
+        f"{content}\n"
+        "</skill>"
+    )
+
 
 def build_skill_tool(skill: Skill) -> Callable:
     """Dynamically builds a pydantic_ai Tool function for a skill with arguments."""
@@ -182,14 +205,14 @@ def build_skill_tool(skill: Skill) -> Callable:
             val = getattr(args, arg)
             # Use simple string replacement for {{arg}}
             body = body.replace(f"{{{{{arg}}}}}", str(val))
-        return (
+        execution_intro = (
             f"【Skill Execution: {skill.config.name}】\n"
             "Treat this skill as the primary workflow for the current task. "
             "Execute the instructions directly; avoid broad repository exploration, repeated skill lookup, "
             "or re-checking already successful file paths unless an input is missing, a tool fails, "
-            "or the user explicitly asks for verification.\n\n"
-            f"{body}"
+            "or the user explicitly asks for verification."
         )
+        return format_skill_prompt(skill, body, execution_intro=execution_intro)
     
     dynamic_skill_tool.__name__ = f"skill_{skill.config.name.replace('-', '_')}"
     dynamic_skill_tool.__doc__ = f"Executes the {skill.config.name} skill. {skill.config.description}"

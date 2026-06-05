@@ -41,7 +41,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     )
     
     from pydantic_ai import FunctionToolset
-    from openhachimi_agent.tools.skills import build_skill_tool
+    from openhachimi_agent.tools.skills import build_skill_tool, format_skill_prompt
     
     # 动态扫描带 arguments 的技能并注册为宏工具
     dynamic_skill_tools = []
@@ -157,8 +157,8 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         injected = []
         for name in relevant_skills:
             if name in skill_map:
-                injected.append(f"<skill name=\"{name}\">\n{skill_map[name].body}\n</skill>")
-                
+                injected.append(format_skill_prompt(skill_map[name]))
+
         if injected:
             return "\n\n[System] 以下是基于当前任务意图自动匹配到的专家技能指令，请在执行时严格遵循：\n" + "\n\n".join(injected)
         return ""

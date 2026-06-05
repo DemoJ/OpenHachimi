@@ -36,9 +36,16 @@ MAX_READ_LINES = _utils_module.MAX_READ_LINES
 MAX_READ_LINES_PER_CALL = _utils_module.MAX_READ_LINES_PER_CALL
 
 
-def make_ctx(base_dir, session_state=None):
+def make_ctx(base_dir, session_state=None, skills_dirs=None):
     config = SimpleNamespace(attachments_dir=base_dir / ".tmp" / "attachments")
-    return SimpleNamespace(deps=SimpleNamespace(base_dir=base_dir, skills_dirs=[], config=config, session_state=session_state or {}))
+    return SimpleNamespace(
+        deps=SimpleNamespace(
+            base_dir=base_dir,
+            skills_dirs=skills_dirs or [],
+            config=config,
+            session_state=session_state or {},
+        )
+    )
 
 
 def write_lines(path, count: int) -> None:
@@ -103,3 +110,33 @@ def test_read_file_blocks_processed_fallback_image(tmp_path):
 
     assert "已由辅助视觉模型成功识别" in str(exc_info.value)
     assert session_state["vision_tool_blocks"][0]["tool"] == "read_file"
+
+
+def test_read_file_relative_path_still_uses_workspace_root(tmp_path):
+    workspace_reference = tmp_path / "references" / "guide.md"
+    workspace_reference.parent.mkdir(parents=True)
+    workspace_reference.write_text("workspace guide", encoding="utf-8")
+    skill_root = tmp_path / "external_skills" / "demo-skill"
+    skill_reference = skill_root / "references" / "guide.md"
+    skill_reference.parent.mkdir(parents=True)
+    skill_reference.write_text("skill guide", encoding="utf-8")
+
+    result = read_file(make_ctx(tmp_path, skills_dirs=[tmp_path / "external_skills"]), "references/guide.md")
+
+    assert "workspace guide" in result["content"]
+    assert "skill guide" not in result["content"]
+    assert result["path"] == "references/guide.md"
+
+
+def test_read_file_allows_absolute_path_under_skills_dir(tmp_path):
+    base_dir = tmp_path / "workspace"
+    base_dir.mkdir()
+    skills_dir = tmp_path / "external_skills"
+    skill_reference = skills_dir / "demo-skill" / "references" / "guide.md"
+    skill_reference.parent.mkdir(parents=True)
+    skill_reference.write_text("skill guide", encoding="utf-8")
+
+    result = read_file(make_ctx(base_dir, skills_dirs=[skills_dir]), str(skill_reference))
+
+    assert "skill guide" in result["content"]
+    assert result["path"] == skill_reference.resolve().as_posix()
