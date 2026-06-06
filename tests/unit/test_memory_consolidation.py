@@ -1,6 +1,7 @@
 from dataclasses import replace
 
-from openhachimi_agent.memory.consolidation import consolidate_due_memories
+from openhachimi_agent.memory.consolidation import _llm_summarize, consolidate_due_memories
+from openhachimi_agent.memory.llm import MemorySummaryOutput
 from openhachimi_agent.memory.models import MemoryAtom, MemoryScope, MemoryStability
 from openhachimi_agent.memory.store import MemoryStore
 
@@ -60,20 +61,45 @@ def test_consolidation_uses_llm_summary_for_large_atom_group(tmp_path, mock_conf
     scope = MemoryScope(role_name="default", session_id="s1")
     for content in ["用户偏好中文回答", "用户要求中文解释代码", "用户希望中文总结"]:
         store.add_atom(MemoryAtom(memory_type="preference", content=content, scope=scope, keywords=["中文"], tags=["回答"], stability=MemoryStability.STABLE))
+    captured = {}
 
-    class FakeResponse:
-        def __enter__(self):
-            return self
+    def fake_run_memory_summary(config_arg, *, system_prompt, payload):
+        captured["config"] = config_arg
+        captured["system_prompt"] = system_prompt
+        captured["payload"] = payload
+        return MemorySummaryOutput(summary="用户稳定偏好使用中文完成代码解释和总结。")
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return '{"choices":[{"message":{"content":"{\\"summary\\":\\"用户稳定偏好使用中文完成代码解释和总结。\\"}"}}]}'.encode("utf-8")
-
-    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: FakeResponse())
+    monkeypatch.setattr("openhachimi_agent.memory.consolidation.run_memory_summary", fake_run_memory_summary)
 
     consolidate_due_memories(store, scope=scope, config=config)
     results = store.search(scope, "中文 总结", limit=10)
 
     assert any("稳定偏好" in item.content for item in results if item.level == "L2")
+    assert captured["config"] is config
+    assert "长期记忆摘要" in captured["system_prompt"]
+    assert captured["payload"]["kind"] == "block"
+    assert set(captured["payload"]["evidence"]["atoms"]) == {"用户偏好中文回答", "用户要求中文解释代码", "用户希望中文总结"}
+
+
+def test_llm_summarize_truncates_summary(mock_config, monkeypatch):
+    config = replace(mock_config, openai_api_key="key", openai_base_url="https://llm.example/v1")
+
+    def fake_run_memory_summary(*args, **kwargs):
+        return MemorySummaryOutput(summary="中" * 900)
+
+    monkeypatch.setattr("openhachimi_agent.memory.consolidation.run_memory_summary", fake_run_memory_summary)
+
+    result = _llm_summarize("block", {"atoms": ["用户偏好中文回答"]}, config)
+
+    assert result == "中" * 800
+
+
+def test_llm_summary_degrades_to_empty_string(mock_config, monkeypatch):
+    config = replace(mock_config, openai_api_key="key", openai_base_url="https://llm.example/v1")
+
+    def fake_run_memory_summary(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("openhachimi_agent.memory.consolidation.run_memory_summary", fake_run_memory_summary)
+
+    assert _llm_summarize("block", {"atoms": ["用户偏好中文回答"]}, config) == ""

@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import math
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from typing import Any
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.memory.llm import run_memory_summary
 from openhachimi_agent.memory.models import MemoryBlock, MemoryProfile, MemoryScope, MemoryStability, utc_now_iso
 from openhachimi_agent.memory.prompts import MEMORY_EXTRACTION_PROMPT
 from openhachimi_agent.memory.store import MemoryStore, _load_json_array
@@ -233,40 +231,22 @@ def _profile_summary(
 
 
 def _llm_summarize(kind: str, payload: dict[str, Any], config: AppConfig | None) -> str:
-    if not config or not config.openai_api_key or not config.openai_base_url:
-        return ""
     instruction = (
         MEMORY_EXTRACTION_PROMPT
         + "\n请基于证据生成长期记忆摘要。只输出 JSON：{\"summary\":\"...\"}。"
         + "block 摘要要去重、归纳共同主题、保留可执行偏好或项目事实；profile 摘要要形成稳定用户画像，不要编造证据。"
     )
-    request = urllib.request.Request(
-        config.openai_base_url.rstrip("/") + "/chat/completions",
-        data=json.dumps(
-            {
-                "model": config.model_name,
-                "messages": [
-                    {"role": "system", "content": instruction},
-                    {"role": "user", "content": json.dumps({"kind": kind, "evidence": payload}, ensure_ascii=False)},
-                ],
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-            },
-            ensure_ascii=False,
-        ).encode("utf-8"),
-        headers={"Authorization": f"Bearer {config.openai_api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=config.memory.capture.extract_timeout_seconds) as response:
-            raw = response.read()
-        data = json.loads(raw.decode("utf-8"))
-        message = data["choices"][0]["message"]["content"]
-        parsed = json.loads(message)
-        summary = str(parsed.get("summary", "")).strip()
-        return summary[:800]
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError, IndexError, json.JSONDecodeError):
+        output = run_memory_summary(
+            config,
+            system_prompt=instruction,
+            payload={"kind": kind, "evidence": payload},
+        )
+        if output is None:
+            return ""
+        return str(output.summary or "").strip()[:800]
+    except Exception:
         return ""
     finally:
         _ = int((time.perf_counter() - started) * 1000)

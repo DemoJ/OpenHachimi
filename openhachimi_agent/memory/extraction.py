@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.capture import _keywords
 from openhachimi_agent.memory.models import ExtractedMemory, MemoryExtractionResult, MemoryScope, MemoryStability
+from openhachimi_agent.memory.llm import run_memory_extraction
 from openhachimi_agent.memory.privacy import PrivacyGuard
 from openhachimi_agent.memory.prompts import MEMORY_EXTRACTION_PROMPT
 
@@ -51,43 +49,19 @@ def extract_memories_from_turn(
 
 
 def _extract_with_llm(user_message: str, assistant_output: str, config: AppConfig | None) -> MemoryExtractionResult:
-    if not config or not config.openai_api_key:
-        return MemoryExtractionResult()
-    base_url = config.openai_base_url.strip()
-    if not base_url:
-        return MemoryExtractionResult()
-    payload = {
-        "model": config.model_name,
-        "messages": [
-            {"role": "system", "content": _llm_extraction_prompt()},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"user_message": user_message, "assistant_output": assistant_output},
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
-    request = urllib.request.Request(
-        base_url.rstrip("/") + "/chat/completions",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": f"Bearer {config.openai_api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=config.memory.capture.extract_timeout_seconds) as response:
-            raw = response.read()
-        data = json.loads(raw.decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-        memories = [_extracted_from_json(item) for item in parsed.get("memories", []) if isinstance(item, dict)]
+        output = run_memory_extraction(
+            config,
+            system_prompt=_llm_extraction_prompt(),
+            payload={"user_message": user_message, "assistant_output": assistant_output},
+        )
+        if output is None:
+            return MemoryExtractionResult()
+        memories = [_extracted_from_json(item.model_dump()) for item in output.memories]
         logger.info("memory llm extraction succeeded memories=%d duration_ms=%d", len(memories), int((time.perf_counter() - started) * 1000))
         return MemoryExtractionResult(memories=[memory for memory in memories if memory is not None])
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
+    except Exception as exc:
         logger.warning("memory llm extraction degraded: %s", exc)
         return MemoryExtractionResult()
 

@@ -10,6 +10,7 @@ import re
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Optional
 
 import yaml
@@ -75,19 +76,20 @@ def parse_skill(path: Path) -> Skill | None:
 
 
 _SKILLS_CACHE: dict[str, tuple[float, list[Skill]]] = {}
+_SKILLS_CACHE_LOCK = RLock()
+
 
 def find_skills(skills_dirs: list[Path]) -> list[Skill]:
     """Scans provided directories for SKILL.md files and parses them with caching."""
-    global _SKILLS_CACHE
     cache_key = ":".join(str(p.resolve()) for p in skills_dirs)
-    
+
     current_mtime = 0.0
     skill_paths: list[Path] = []
-    
+
     for directory in skills_dirs:
         if not directory.exists() or not directory.is_dir():
             continue
-            
+
         for root, _, files in os.walk(directory):
             for file in files:
                 if file.lower() == "skill.md":
@@ -97,17 +99,20 @@ def find_skills(skills_dirs: list[Path]) -> list[Skill]:
                         current_mtime = max(current_mtime, p.stat().st_mtime)
                     except Exception:
                         pass
-                        
-    if cache_key in _SKILLS_CACHE:
-        cached_mtime, cached_skills = _SKILLS_CACHE[cache_key]
-        if current_mtime > 0 and cached_mtime >= current_mtime:
-            return cached_skills
+
+    with _SKILLS_CACHE_LOCK:
+        cached = _SKILLS_CACHE.get(cache_key)
+        if cached:
+            cached_mtime, cached_skills = cached
+            if current_mtime > 0 and cached_mtime >= current_mtime:
+                return list(cached_skills)
 
     skills = []
     for skill_path in skill_paths:
         skill = parse_skill(skill_path)
         if skill:
             skills.append(skill)
-            
-    _SKILLS_CACHE[cache_key] = (current_mtime, skills)
+
+    with _SKILLS_CACHE_LOCK:
+        _SKILLS_CACHE[cache_key] = (current_mtime, list(skills))
     return skills

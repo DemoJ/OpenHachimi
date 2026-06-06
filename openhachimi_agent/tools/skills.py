@@ -12,6 +12,7 @@ import zipfile
 import tarfile
 import subprocess
 import filecmp
+import stat
 from pathlib import Path
 
 from pydantic_ai import RunContext
@@ -20,6 +21,47 @@ from pydantic_ai.exceptions import ModelRetry
 from openhachimi_agent.content.skills import find_skills, parse_skill, Skill
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+
+
+_SKILL_DOWNLOAD_TIMEOUT_SECONDS = 60
+_SKILL_GIT_CLONE_TIMEOUT_SECONDS = 120
+
+
+def _download_url(source_url: str, download_path: Path) -> None:
+    """Download a URL to disk with an explicit timeout."""
+    with urllib.request.urlopen(source_url, timeout=_SKILL_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with download_path.open("wb") as output_file:
+            shutil.copyfileobj(response, output_file)
+
+
+def _resolve_archive_target(base_dir: Path, member_name: str) -> Path:
+    """Return the resolved extraction target, rejecting paths outside base_dir."""
+    target_path = (base_dir / member_name).resolve()
+    if not target_path.is_relative_to(base_dir.resolve()):
+        raise ValueError(f"Unsafe archive member path: {member_name}")
+    return target_path
+
+
+def _safe_extract_zip(zip_ref: zipfile.ZipFile, dest_dir: Path) -> None:
+    """Extract zip entries after validating each destination path."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for member in zip_ref.infolist():
+        _resolve_archive_target(dest_dir, member.filename)
+    zip_ref.extractall(dest_dir)
+
+
+def _safe_extract_tar(tar_ref: tarfile.TarFile, dest_dir: Path) -> None:
+    """Extract regular tar entries after blocking traversal and unsafe link/device types."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for member in tar_ref.getmembers():
+        _resolve_archive_target(dest_dir, member.name)
+        if member.issym() or member.islnk() or member.isdev():
+            raise ValueError(f"Unsafe tar member type: {member.name}")
+        if member.isdir() or member.isfile():
+            continue
+        if not stat.S_ISREG(member.mode) and not stat.S_ISDIR(member.mode):
+            raise ValueError(f"Unsupported tar member type: {member.name}")
+    tar_ref.extractall(dest_dir)
 
 
 def install_skill(ctx: RunContext[AgentDeps], source_path_or_url: str) -> str:
@@ -56,20 +98,23 @@ def install_skill(ctx: RunContext[AgentDeps], source_path_or_url: str) -> str:
                         ["git", "clone", "--depth", "1", source_path_or_url, str(repo_dir)],
                         check=True,
                         capture_output=True,
-                        text=True
+                        text=True,
+                        timeout=_SKILL_GIT_CLONE_TIMEOUT_SECONDS,
                     )
+                except subprocess.TimeoutExpired:
+                    return f"Failed to git clone {source_path_or_url}: operation timed out after {_SKILL_GIT_CLONE_TIMEOUT_SECONDS} seconds"
                 except subprocess.CalledProcessError as e:
                     return f"Failed to git clone {source_path_or_url}: {e.stderr}"
             else:
                 download_path = tmp_dir / "downloaded_archive"
                 try:
-                    urllib.request.urlretrieve(source_path_or_url, download_path)
+                    _download_url(source_path_or_url, download_path)
                     if source_path_or_url.endswith(".zip"):
                         with zipfile.ZipFile(download_path, 'r') as zip_ref:
-                            zip_ref.extractall(repo_dir)
+                            _safe_extract_zip(zip_ref, repo_dir)
                     elif source_path_or_url.endswith((".tar.gz", ".tgz", ".tar")):
                         with tarfile.open(download_path, 'r') as tar_ref:
-                            tar_ref.extractall(repo_dir)
+                            _safe_extract_tar(tar_ref, repo_dir)
                     else:
                         return "Unsupported URL format. Provide a .git URL or a .zip/.tar archive URL."
                 except Exception as e:
