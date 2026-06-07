@@ -8,20 +8,20 @@ tried before opening a browser unless the user explicitly asks for browser use.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import re
 import socket
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from pydantic_ai import RunContext
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.tools.url_security import assert_public_hostname, normalize_public_http_url
 from openhachimi_agent.tools.utils import trim_output
 
 
@@ -30,10 +30,6 @@ logger = logging.getLogger(__name__)
 MAX_WEB_RESPONSE_CHARS = 60000
 WEB_TIMEOUT_SECONDS = 20
 WEB_USER_AGENT = "OpenHachimi-Agent/0.1 (+https://github.com/DemoJ/OpenHachimi)"
-PATH_SAFE_CHARS = "/:@!$&'()*+,;="
-QUERY_SAFE_CHARS = "/?:@!$&'()*+,;="
-CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
-
 
 class WebFetchError(Exception):
     def __init__(self, message: str, status_code: int | None = None):
@@ -113,112 +109,12 @@ class ResourceLinkParser(HTMLParser):
             self.title += data.strip()
 
 
-def _is_blocked_ip(address: str) -> bool:
-    ip = ipaddress.ip_address(address)
-    return any(
-        (
-            ip.is_private,
-            ip.is_loopback,
-            ip.is_link_local,
-            ip.is_multicast,
-            ip.is_reserved,
-            ip.is_unspecified,
-        )
-    )
-
-
-def _is_teredo_ip(address: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(address)
-    except ValueError:
-        return False
-    return isinstance(ip, ipaddress.IPv6Address) and ip.teredo is not None
+def _normalize_public_url(url: str) -> str:
+    return normalize_public_http_url(url, resolve_dns=False)
 
 
 def _validate_public_host(hostname: str, resolve_dns: bool = False) -> None:
-    lowered = hostname.strip().lower().rstrip(".")
-    if lowered in {"localhost", "localhost.localdomain"} or lowered.endswith(".localhost") or lowered.endswith(".local"):
-        raise ValueError(f"URL 主机不允许访问本机或局域网地址：{hostname}")
-
-    try:
-        if _is_blocked_ip(lowered.strip("[]")):
-            raise ValueError(f"URL 主机不允许访问非公网地址：{hostname}")
-        return
-    except ValueError as exc:
-        if "不允许" in str(exc):
-            raise
-
-    if not resolve_dns:
-        return
-
-    try:
-        resolved = socket.getaddrinfo(lowered, None, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise ValueError(f"URL 主机名无法解析：{hostname}") from exc
-
-    # Teredo 解析结果可作为兼容例外忽略，但私网/回环/link-local 等敏感地址
-    # 只要与公网地址混合出现也必须拒绝，避免 DNS rebinding/SSRF 绕过。
-    addresses = [sockaddr[0] for *_unused, sockaddr in resolved]
-    blocked_addresses = [address for address in addresses if _is_blocked_ip(address)]
-    dangerous_addresses = [address for address in blocked_addresses if not _is_teredo_ip(address)]
-    if dangerous_addresses:
-        raise ValueError(f"URL 主机解析到非公网地址：{hostname} -> {dangerous_addresses[0]}")
-    if addresses and len(blocked_addresses) == len(addresses):
-        raise ValueError(f"URL 主机解析到非公网地址：{hostname} -> {addresses[0]}")
-
-
-def _quote_url_component(value: str, safe: str) -> str:
-    try:
-        decoded = unquote(value, errors="strict")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"URL 包含无效的百分号编码：{value}") from exc
-    return quote(decoded, safe=safe)
-
-
-def _normalize_host(hostname: str) -> str:
-    try:
-        ipaddress.IPv6Address(hostname)
-    except ValueError:
-        pass
-    else:
-        return f"[{hostname.lower()}]"
-
-    try:
-        return hostname.encode("idna").decode("ascii").lower()
-    except UnicodeError as exc:
-        raise ValueError(f"URL 主机名无效：{hostname}") from exc
-
-
-def _normalize_public_url(url: str) -> str:
-    url = url.strip()
-    if not url:
-        raise ValueError("url 不能为空")
-    if CONTROL_CHAR_RE.search(url):
-        raise ValueError(f"URL 包含非法控制字符：{url}")
-    if "://" not in url:
-        url = "https://" + url
-
-    parsed = urlsplit(url)
-    scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
-        raise ValueError(f"仅支持 http/https URL：{url}")
-    if parsed.username or parsed.password:
-        raise ValueError("URL 不能包含用户名或密码")
-
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"URL 端口无效：{url}") from exc
-
-    netloc = _normalize_host(parsed.hostname)
-    _validate_public_host(netloc.strip("[]"), resolve_dns=False)
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-
-    path = _quote_url_component(parsed.path, PATH_SAFE_CHARS)
-    query = _quote_url_component(parsed.query, QUERY_SAFE_CHARS)
-    fragment = _quote_url_component(parsed.fragment, QUERY_SAFE_CHARS)
-    return urlunsplit((scheme, netloc, path, query, fragment))
+    assert_public_hostname(hostname, resolve_dns=resolve_dns)
 
 
 def _request_url(url: str) -> tuple[str, str, str]:

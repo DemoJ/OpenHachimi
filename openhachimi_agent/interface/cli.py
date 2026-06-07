@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+from functools import lru_cache
 from typing import AsyncIterator, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -14,6 +15,7 @@ from urllib.request import Request, urlopen
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
+from openhachimi_agent.core.redaction import redact_text
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.scheduler.delivery import (
     CliDeliverySender,
@@ -41,6 +43,29 @@ def get_server_url() -> str:
     return os.getenv("OPENHACHIMI_SERVER_URL", DEFAULT_SERVER_URL).rstrip("/")
 
 
+@lru_cache(maxsize=1)
+def _configured_http_api_token() -> str | None:
+    try:
+        return load_config().http_api_token
+    except Exception as exc:
+        logger.debug("failed to load HTTP API token from config: %s", exc)
+        return None
+
+
+def get_http_api_token() -> str | None:
+    return _configured_http_api_token()
+
+
+def _request_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if extra:
+        headers.update(extra)
+    token = get_http_api_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def request_json(server_url: str, method: str, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
     logger.debug("http request method=%s path=%s server_url=%s", method, path, server_url)
     data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -48,7 +73,7 @@ def request_json(server_url: str, method: str, path: str, payload: dict[str, obj
         f"{server_url}{path}",
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers=_request_headers(),
     )
     with urlopen(request) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -61,7 +86,7 @@ def request_stream(server_url: str, path: str, payload: dict[str, object]):
         f"{server_url}{path}",
         data=data,
         method="POST",
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        headers=_request_headers({"Accept": "text/event-stream"}),
     )
     with urlopen(request) as response:
         for line in response:
@@ -71,7 +96,7 @@ def request_stream(server_url: str, path: str, payload: dict[str, object]):
                 try:
                     data_json = json.loads(data_str)
                     if "error" in data_json:
-                        raise URLError(data_json["error"])
+                        raise URLError(redact_text(data_json["error"]))
                     event_type = data_json.get("type")
                     if event_type in {"text", "tool", "system"}:
                         yield StreamEventItem(
@@ -91,8 +116,8 @@ def error_detail(exc: HTTPError) -> str:
     try:
         payload = json.loads(exc.read().decode("utf-8"))
     except json.JSONDecodeError:
-        return str(exc)
-    return str(payload.get("detail", exc))
+        return redact_text(str(exc))
+    return redact_text(str(payload.get("detail", exc)))
 
 
 def print_welcome(state: dict[str, object], server_url: str, current_role: str, current_session_id: str) -> None:

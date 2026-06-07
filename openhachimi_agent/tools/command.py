@@ -87,10 +87,10 @@ def command_status(ctx: RunContext[AgentDeps], command_id: str) -> dict[str, obj
     proc = ctx.deps.process_manager.get_process(command_id)
     if not proc:
         return {"error": f"找不到命令 ID: {command_id}"}
-        
+
     output, truncated = proc.get_output()
     is_running = proc.is_running()
-    
+
     result = {
         "command_id": command_id,
         "is_running": is_running,

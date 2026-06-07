@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -21,32 +20,13 @@ from pydantic_ai.messages import (
 )
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.redaction import REDACTED, redact_tool_args, summarize_redacted
 from openhachimi_agent.service.agent_runtime.context import OperationState
 from openhachimi_agent.transport.api_models import ArtifactRef
 
 
 logger = logging.getLogger(__name__)
 STREAM_DONE = object()
-REDACTED = "[REDACTED]"
-SENSITIVE_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "cookie",
-    "credential",
-    "passwd",
-    "password",
-    "private_key",
-    "secret",
-    "token",
-)
-SENSITIVE_VALUE_PATTERNS = (
-    re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization|cookie)\s*[:=]\s*([^\s'\";&]+)"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{12,}\b"),
-)
 
 
 @dataclass
@@ -86,55 +66,8 @@ def text_from_stream_event(event: object) -> str:
     return ""
 
 
-def _is_sensitive_key(key: object) -> bool:
-    normalized = str(key).lower().replace("-", "_")
-    return any(part in normalized for part in SENSITIVE_KEY_PARTS)
-
-
-def _redact_string(text: str) -> str:
-    redacted = text
-    for pattern in SENSITIVE_VALUE_PATTERNS:
-        if pattern.pattern.startswith("(?i)\\b(Bearer"):
-            redacted = pattern.sub(r"\1" + REDACTED, redacted)
-        elif "api" in pattern.pattern and "authorization" in pattern.pattern:
-            redacted = pattern.sub(lambda match: f"{match.group(1)}={REDACTED}", redacted)
-        else:
-            redacted = pattern.sub(REDACTED, redacted)
-    return redacted
-
-
-def redact_tool_args(args: object) -> object:
-    if isinstance(args, dict):
-        return {
-            key: REDACTED if _is_sensitive_key(key) else redact_tool_args(value)
-            for key, value in args.items()
-        }
-    if isinstance(args, list):
-        return [redact_tool_args(item) for item in args]
-    if isinstance(args, tuple):
-        return tuple(redact_tool_args(item) for item in args)
-    if isinstance(args, str):
-        return _redact_string(args)
-    return args
-
-
 def summarize_tool_args(args: object, max_chars: int = 160) -> str:
-    args = redact_tool_args(args)
-    if args in (None, "", {}):
-        return ""
-    if isinstance(args, str):
-        text = args
-    else:
-        import json
-
-        try:
-            text = json.dumps(args, ensure_ascii=False)
-        except TypeError:
-            text = str(args)
-    text = " ".join(text.split())
-    if len(text) > max_chars:
-        return text[: max_chars - 3] + "..."
-    return text
+    return summarize_redacted(args, max_chars=max_chars)
 
 
 def tool_icon_for_name(tool_name: str) -> str:

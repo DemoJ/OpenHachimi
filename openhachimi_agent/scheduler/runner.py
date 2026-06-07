@@ -7,6 +7,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from openhachimi_agent.core.identifiers import scope_digest, validate_session_id
+from openhachimi_agent.core.redaction import redact_exception
 from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.scheduler.security import scan_scheduled_prompt
 from openhachimi_agent.scheduler.store import ScheduledTaskStore
@@ -22,8 +24,12 @@ def _execution_session_id(task: ScheduledTask) -> str:
     execution_context = task.execution_policy if isinstance(task.execution_policy, dict) else {}
     session_id = execution_context.get("session_id")
     if isinstance(session_id, str) and session_id:
-        return session_id
-    return f"schedule-{task.id}"
+        return validate_session_id(session_id, allow_legacy=False)
+    legacy_session_id = f"schedule-{task.id}"
+    try:
+        return validate_session_id(legacy_session_id, allow_legacy=False)
+    except ValueError:
+        return validate_session_id(f"schedule-{scope_digest(task.id)}", allow_legacy=False)
 
 
 def _build_channel_context(task: ScheduledTask) -> dict[str, Any]:
@@ -130,6 +136,9 @@ class ScheduledTaskRunner:
             )
             return await asyncio.to_thread(self.store.get_run, run.id)
         except asyncio.TimeoutError:
+            interrupt_resources = getattr(self.service, "interrupt_session_resources", None)
+            if callable(interrupt_resources):
+                await interrupt_resources(session_id, reason="scheduler_timeout")
             duration_ms = int((time.perf_counter() - started) * 1000)
             await asyncio.to_thread(
                 self.store.complete_run,
@@ -141,6 +150,9 @@ class ScheduledTaskRunner:
             )
             return await asyncio.to_thread(self.store.get_run, run.id)
         except asyncio.CancelledError:
+            interrupt_resources = getattr(self.service, "interrupt_session_resources", None)
+            if callable(interrupt_resources):
+                await interrupt_resources(session_id, reason="scheduler_cancelled")
             duration_ms = int((time.perf_counter() - started) * 1000)
             await asyncio.to_thread(
                 self.store.complete_run,
@@ -157,7 +169,7 @@ class ScheduledTaskRunner:
                 self.store.complete_run,
                 run.id,
                 status="failed",
-                error=str(exc),
+                error=redact_exception(exc),
                 duration_ms=duration_ms,
                 safety_status="allowed",
             )

@@ -347,6 +347,7 @@ storage/memory.py (save_message_history)
 ```yaml
 app:
   default_role: default      # 默认角色名称
+  http_api_token: ""        # HTTP API Token；留空时启动/重启会自动生成并写回配置文件
 
 llm:
   api_key: sk-xxxxxxxx       # OpenAI API Key（必填）

@@ -57,6 +57,7 @@ def _ctx(tmp_path, research_config=None):
         scheduler=SchedulerConfig(db_path=tmp_path / ".scheduler" / "tasks.sqlite3"),
         research=research_config or ResearchConfig(),
         vision=VisionConfig(api_key="test-key", base_url="http://test"),
+        http_api_token="test-token",
     )
     return SimpleNamespace(deps=SimpleNamespace(config=config))
 

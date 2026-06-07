@@ -9,6 +9,7 @@ app:
   telegram_proxy_url: ""     # 代理地址（可选），在无法直连 Telegram 的环境下配置。支持 HTTP/SOCKS5，例如：
                              #   socks5://127.0.0.1:1080
                              #   http://192.168.1.1:7890
+  http_api_token: ""        # HTTP API 访问令牌。留空时启动/重启会自动生成并写回配置文件；除 /health 外所有接口必须携带 Authorization: Bearer <token>
   show_tool_calls: true      # 是否在所有消息渠道显示工具调用信息；设为 false 时 CLI/HTTP/Telegram 均不显示工具进度
   stream_idle_timeout_seconds: 60   # 流式队列无新事件时的进展检查/心跳间隔；实际卡住判定会按操作类型使用更长阈值
   max_attachment_size_mb: 50       # Telegram/HTTP 附件大小上限，单位 MB；文件类型不限制，是否可解析由 Agent/LLM 自行判断

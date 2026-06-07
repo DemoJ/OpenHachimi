@@ -46,6 +46,7 @@ def mock_config(tmp_path: Path):
         scheduler=SchedulerConfig(db_path=tmp_path / ".scheduler" / "tasks.sqlite3"),
         research=ResearchConfig(),
         vision=VisionConfig(api_key="test-key", base_url="http://test"),
+        http_api_token="test-token",
     )
     return config
 

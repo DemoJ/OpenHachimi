@@ -130,11 +130,12 @@ CLI 内置命令：
 
 ## 配置说明
 
-配置文件：`user/config.yaml`（从 `user/config.example.yaml` 复制而来）
+配置文件：`user/config.yaml`（从 `user/config.example.yaml` 复制而来）。`app.http_api_token` 为空时，启动/重启 HTTP 服务会自动生成并写回配置文件；除 `/health` 外的 HTTP API 请求都需要携带 `Authorization: Bearer <token>`。
 
 ```yaml
 app:
   default_role: default          # 启动时加载的默认角色
+  http_api_token: ""            # HTTP API Token；留空时启动/重启会自动生成并写回配置文件
 
 llm:
   api_key: sk-xxxxxxxx           # 必填：你的 API Key

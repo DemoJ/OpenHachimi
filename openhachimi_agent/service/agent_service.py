@@ -9,9 +9,11 @@ import weakref
 from collections.abc import AsyncIterator, Sequence
 
 from openhachimi_agent.agent.factory import build_continuation_agent, build_executor_agent, build_planner_agent, build_router_agent, build_scheduled_executor_agent
-from openhachimi_agent.content.roles import list_role_names
+from openhachimi_agent.content.roles import list_role_names, load_role_content
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.core.identifiers import validate_latest_scope, validate_role_name, validate_session_id
+from openhachimi_agent.core.redaction import redact_exception, redact_text
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
     complete_current_plan,
@@ -47,10 +49,7 @@ PRIORITY_NEW_SESSION_COMMANDS = {"/new", "新对话"}
 
 
 def _error_message(exc: BaseException) -> str:
-    text = str(exc).strip()
-    if text:
-        return f"{exc.__class__.__name__}: {text}"
-    return exc.__class__.__name__
+    return redact_exception(exc)
 
 
 
@@ -73,15 +72,33 @@ class AgentService:
             self.config.model_name,
         )
 
-    async def stop_session(self, session_id: str) -> CommandResponse:
-        logger.info("stop requested for session_id=%s", session_id)
-        task = self._running_tasks.get(session_id)
+    def _normalize_role(self, role_name: str | None) -> str:
+        role = validate_role_name(role_name or self.config.default_role_name)
+        return role
+
+    def _normalize_session_id(self, session_id: str | None) -> str | None:
+        if not session_id:
+            return None
+        return validate_session_id(session_id, allow_legacy=False)
+
+    def _validate_role_exists(self, role_name: str) -> None:
+        if role_name == self.config.default_role_name and not list_role_names(self.config.roles_dir):
+            return
+        load_role_content(self.config.roles_dir, role_name)
+
+    async def interrupt_session_resources(self, session_id: str, reason: str = "interrupt") -> int:
+        session_id = validate_session_id(session_id, allow_legacy=False)
         state = self._session_states.setdefault(session_id, {})
         state["cancel_requested"] = True
-        state["cancel_reason"] = "user_stop"
+        state["cancel_reason"] = reason
         state["last_cancelled_at"] = time.time()
+        return await self._interrupt_session_resources(session_id)
 
-        interrupted_count = await self._interrupt_session_resources(session_id)
+    async def stop_session(self, session_id: str) -> CommandResponse:
+        session_id = validate_session_id(session_id, allow_legacy=False)
+        logger.info("stop requested for session_id=%s", session_id)
+        task = self._running_tasks.get(session_id)
+        interrupted_count = await self.interrupt_session_resources(session_id, reason="user_stop")
 
         if task is not None:
             if not task.done():
@@ -130,11 +147,20 @@ class AgentService:
             return "new"
         return None
 
-    def _resolve_priority_session(self, role: str | None, session_id: str | None) -> tuple[str, str]:
-        resolved_role = role or self.config.default_role_name
-        if session_id:
-            return resolved_role, session_id
-        latest = self.latest_session(resolved_role)
+    def _latest_scope_from_context(self, channel_context: dict[str, object] | None) -> str | None:
+        if not channel_context:
+            return None
+        scope = channel_context.get("session_scope_key")
+        if not scope:
+            return None
+        return validate_latest_scope(str(scope))
+
+    def _resolve_priority_session(self, role: str | None, session_id: str | None, latest_scope: str | None = None) -> tuple[str, str]:
+        resolved_role = self._normalize_role(role)
+        resolved_session_id = self._normalize_session_id(session_id)
+        if resolved_session_id:
+            return resolved_role, resolved_session_id
+        latest = self.latest_session(resolved_role, latest_scope=latest_scope)
         return latest.role, latest.session_id
 
     async def _handle_priority_command_response(
@@ -142,17 +168,19 @@ class AgentService:
         message: str,
         role: str | None,
         session_id: str | None,
+        channel_context: dict[str, object] | None = None,
     ) -> ChatResponse | None:
         command = self._priority_command(message)
         if command is None:
             return None
-        resolved_role, resolved_session_id = self._resolve_priority_session(role, session_id)
+        latest_scope = self._latest_scope_from_context(channel_context)
+        resolved_role, resolved_session_id = self._resolve_priority_session(role, session_id, latest_scope)
         if command == "stop":
             resp = await self.stop_session(resolved_session_id)
             return ChatResponse(output=resp.message, role=resolved_role, session_id=resolved_session_id)
 
         await self.stop_session(resolved_session_id)
-        resp = self.new_session(resolved_role)
+        resp = self.new_session(resolved_role, latest_scope=latest_scope)
         return ChatResponse(output=resp.message, role=resp.role, session_id=resp.session_id)
 
     async def _handle_priority_command_events(
@@ -160,8 +188,9 @@ class AgentService:
         message: str,
         role: str | None,
         session_id: str | None,
+        channel_context: dict[str, object] | None = None,
     ) -> list[StreamEventItem] | None:
-        response = await self._handle_priority_command_response(message, role, session_id)
+        response = await self._handle_priority_command_response(message, role, session_id, channel_context)
         if response is None:
             return None
         return [StreamEventItem(type="system", text=response.output)]
@@ -243,16 +272,18 @@ class AgentService:
             current_role=self.config.default_role_name,
         )
 
-    def latest_session(self, role_name: str | None = None) -> CommandResponse:
-        role = role_name or self.config.default_role_name
+    def latest_session(self, role_name: str | None = None, latest_scope: str | None = None) -> CommandResponse:
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        scope = validate_latest_scope(latest_scope)
         from openhachimi_agent.storage.memory import load_latest_session_id, create_session_id, save_latest_session_id
-        session_id = load_latest_session_id(self.config.memory_dir, role)
+        session_id = load_latest_session_id(self.config.memory_dir, role, scope)
         if not session_id or session_id == "legacy":
             session_id = create_session_id()
-            save_latest_session_id(self.config.memory_dir, role, session_id)
-            logger.info("no latest session found, created new session role=%s session_id=%s", role, session_id)
+            save_latest_session_id(self.config.memory_dir, role, session_id, scope)
+            logger.info("no latest session found, created new session role=%s session_id=%s scope=%s", role, session_id, scope)
         else:
-            logger.info("loaded latest session role=%s session_id=%s", role, session_id)
+            logger.info("loaded latest session role=%s session_id=%s scope=%s", role, session_id, scope)
         
         return CommandResponse(
             message="已恢复上一次的对话上下文。",
@@ -260,13 +291,16 @@ class AgentService:
             session_id=session_id,
         )
 
-    def new_session(self, role_name: str | None = None) -> CommandResponse:
-        role = role_name or self.config.default_role_name
-        session_id = start_new_session(self.config.memory_dir, role)
+    def new_session(self, role_name: str | None = None, latest_scope: str | None = None) -> CommandResponse:
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        scope = validate_latest_scope(latest_scope)
+        session_id = start_new_session(self.config.memory_dir, role, scope)
         logger.info(
-            "new session role=%s session_id=%s",
+            "new session role=%s session_id=%s scope=%s",
             role,
             session_id,
+            scope,
         )
         lines = [
             "✨ 新对话已准备好",
@@ -291,16 +325,20 @@ class AgentService:
             session_id=session_id,
         )
 
-    def switch_role(self, role_name: str) -> CommandResponse:
-        session_id = start_new_session(self.config.memory_dir, role_name)
+    def switch_role(self, role_name: str, latest_scope: str | None = None) -> CommandResponse:
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        scope = validate_latest_scope(latest_scope)
+        session_id = start_new_session(self.config.memory_dir, role, scope)
         logger.info(
-            "switched role to role=%s session_id=%s",
-            role_name,
+            "switched role to role=%s session_id=%s scope=%s",
+            role,
             session_id,
+            scope,
         )
         return CommandResponse(
-            message=f"已切换到角色：{role_name}，并新建对话。",
-            role=role_name,
+            message=f"已切换到角色：{role}，并新建对话。",
+            role=role,
             session_id=session_id,
         )
 
@@ -318,7 +356,10 @@ class AgentService:
         delivery_target: dict[str, object] | None = None,
     ) -> AsyncIterator[object]:
         start_time = time.perf_counter()
-        role = role or self.config.default_role_name
+        role = self._normalize_role(role)
+        session_id = self._normalize_session_id(session_id)
+        self._validate_role_exists(role)
+        latest_scope = validate_latest_scope(str(channel_context.get("session_scope_key"))) if channel_context and channel_context.get("session_scope_key") else None
         attachment_list = list(attachments or [])
         effective_message = message_with_attachments(message, attachment_list)
 
@@ -329,7 +370,7 @@ class AgentService:
                 channel_context_data.update(delivery_target)
         channel_name = str(channel_context_data.get("type") or channel_context_data.get("platform") or "local")
 
-        actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id)
+        actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id, latest_scope)
         lock = self._get_session_lock(actual_session_id)
 
         async with lock:
@@ -429,7 +470,7 @@ class AgentService:
                             "Agent 执行超时："
                             f"{self.config.agent_timeout_seconds}s 内没有完成。"
                             f"模型={self.config.model_name}，"
-                            f"base_url={self.config.openai_base_url or '默认'}，"
+                            f"base_url={redact_text(self.config.openai_base_url or '默认')}，"
                             f"role={role}，session_id={actual_session_id}。"
                             "常见原因：模型服务无响应、工具调用卡住、浏览器/网络代理不可用。"
                         )
@@ -467,11 +508,11 @@ class AgentService:
                         suspend_current_plan(
                             session_state,
                             reason="error",
-                            detail=str(exc),
+                            detail=redact_exception(exc),
                             deps=deps,
                         )
                     else:
-                        fail_current_plan(session_state, reason="error", detail=str(exc))
+                        fail_current_plan(session_state, reason="error", detail=redact_exception(exc))
                     result_holder["error"] = exc
                     logger.exception(
                         "chat failed role=%s session_id=%s stream=%s",
@@ -579,6 +620,7 @@ class AgentService:
                     role,
                     actual_session_id,
                     history_json,
+                    latest_scope,
                 )
                 capture_args = (
                     self.config,
@@ -664,7 +706,7 @@ class AgentService:
         channel: str = "local",
         delivery_target: dict[str, object] | None = None,
     ) -> ChatResponse:
-        priority_response = await self._handle_priority_command_response(message, role, session_id)
+        priority_response = await self._handle_priority_command_response(message, role, session_id, channel_context)
         if priority_response is not None:
             return priority_response
 
@@ -695,7 +737,7 @@ class AgentService:
         channel: str = "local",
         delivery_target: dict[str, object] | None = None,
     ) -> AsyncIterator[StreamEventItem]:
-        priority_events = await self._handle_priority_command_events(message, role, session_id)
+        priority_events = await self._handle_priority_command_events(message, role, session_id, channel_context)
         if priority_events is not None:
             for event in priority_events:
                 yield event

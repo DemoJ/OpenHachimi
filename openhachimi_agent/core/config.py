@@ -1,5 +1,6 @@
 """应用配置。"""
 
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -177,6 +178,7 @@ class AppConfig:
     scheduler: SchedulerConfig
     research: ResearchConfig
     vision: VisionConfig
+    http_api_token: str | None = None
 
 
 def _as_mapping(value: object, section_name: str) -> dict[str, Any]:
@@ -252,6 +254,68 @@ def _config_literal(section: dict[str, Any], key: str, allowed: set[str], defaul
         allowed_text = "、".join(sorted(allowed))
         raise ValueError(f"config.yaml 中的 {key} 必须是以下值之一：{allowed_text}。")
     return value
+
+
+def _quote_yaml_string(value: str) -> str:
+    return f'"{value}"'
+
+
+def _replace_or_insert_http_api_token(config_path: Path, token: str, raw_config: dict[str, Any]) -> None:
+    quoted_token = _quote_yaml_string(token)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        app_index = next((idx for idx, line in enumerate(lines) if line.strip() == "app:"), None)
+        if app_index is None:
+            raise ValueError("config.yaml 缺少 app 配置段")
+
+        app_indent = len(lines[app_index]) - len(lines[app_index].lstrip())
+        insert_index = app_index + 1
+        token_index = None
+        for idx in range(app_index + 1, len(lines)):
+            stripped = lines[idx].strip()
+            if stripped and not stripped.startswith("#"):
+                indent = len(lines[idx]) - len(lines[idx].lstrip())
+                if indent <= app_indent:
+                    break
+            if stripped.startswith("http_api_token:"):
+                token_index = idx
+                break
+            insert_index = idx + 1
+
+        token_line = f"{' ' * (app_indent + 2)}http_api_token: {quoted_token}\n"
+        if token_index is not None:
+            line = lines[token_index]
+            line_ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            comment = ""
+            before_comment = line.rstrip("\r\n")
+            if "#" in before_comment:
+                comment = " " + before_comment[before_comment.index("#"):].strip()
+            lines[token_index] = f"{' ' * (app_indent + 2)}http_api_token: {quoted_token}{comment}{line_ending}"
+        else:
+            lines.insert(insert_index, token_line)
+        config_path.write_text("".join(lines), encoding="utf-8")
+    except Exception:
+        raw_config.setdefault("app", {})["http_api_token"] = token
+        config_path.write_text(yaml.safe_dump(raw_config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
+def _ensure_http_api_token(config_path: Path, raw_config: dict[str, Any]) -> str:
+    app_config = _as_mapping(raw_config.get("app"), "app")
+    token = _config_string(app_config, "http_api_token")
+    if token:
+        return token
+
+    token = secrets.token_urlsafe(32)
+    raw_config["app"] = app_config
+    app_config["http_api_token"] = token
+    try:
+        _replace_or_insert_http_api_token(config_path, token, raw_config)
+    except OSError as exc:
+        raise OSError(
+            f"无法写入 HTTP API Token 到配置文件：{config_path}。请修复文件权限或手动添加 app.http_api_token。"
+        ) from exc
+    return token
 
 
 def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: dict[str, Any]) -> MemoryConfig:
@@ -398,6 +462,8 @@ def load_config() -> AppConfig:
     if not isinstance(raw_config, dict):
         raise ValueError("config.yaml 顶层必须是对象。")
 
+    http_api_token = _ensure_http_api_token(config_path, raw_config)
+
     app_config = _as_mapping(raw_config.get("app"), "app")
     llm_config = _as_mapping(raw_config.get("llm"), "llm")
     paths_config = _as_mapping(raw_config.get("paths"), "paths")
@@ -454,6 +520,7 @@ def load_config() -> AppConfig:
             "allowed_attachment_mime_types",
             [],
         ),
+        http_api_token=http_api_token,
         agent_timeout_seconds=300,
         stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
         memory=_load_memory_config(base_dir, raw_config, llm_config),

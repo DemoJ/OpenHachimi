@@ -5,16 +5,18 @@
 """
 
 import asyncio
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
+from openhachimi_agent.core.redaction import safe_error_detail
 from openhachimi_agent.interface.telegram import telegram_lifespan
 from openhachimi_agent.scheduler.delivery import (
     CliDeliverySender,
@@ -194,6 +196,23 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="OpenHachimi Agent", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def require_http_api_token(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    config = getattr(request.app.state, "config", None)
+    token = getattr(config, "http_api_token", None)
+    if not token:
+        return JSONResponse(status_code=503, content={"detail": "HTTP API Token 未初始化"})
+
+    auth = request.headers.get("authorization", "")
+    expected = f"Bearer {token}"
+    if not hmac.compare_digest(auth, expected):
+        return JSONResponse(status_code=401, content={"detail": "未授权"})
+    return await call_next(request)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     from openhachimi_agent.core.version import get_version
@@ -245,7 +264,7 @@ def create_schedule(
             execution_policy=request.execution_policy,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
     return schedule_response(task)
 
 
@@ -288,7 +307,7 @@ def update_schedule(task_id: str, request: ScheduleUpdateRequest, svc: Scheduled
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="定时任务不存在") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
     return schedule_response(task)
 
 
@@ -348,7 +367,7 @@ async def run_schedule_now(
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="定时任务不存在") from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=safe_error_detail(exc)) from exc
     run = await scheduler.run_task_now(task, preserve_schedule=True)
     if run is None:
         raise HTTPException(status_code=500, detail="任务执行失败")
@@ -395,7 +414,7 @@ async def chat(request: ChatRequest, service: AgentService = Depends(get_service
             channel_context=channel_context,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
 
 
 @app.post("/chat/stream")
@@ -427,7 +446,7 @@ def chat_stream(request: ChatRequest, service: AgentService = Depends(get_servic
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
         except Exception as exc:
             logger.exception("stream error")
-            yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'error': safe_error_detail(exc)}, ensure_ascii=False)}\n\n"
 
     try:
         return StreamingResponse(
@@ -435,7 +454,7 @@ def chat_stream(request: ChatRequest, service: AgentService = Depends(get_servic
             media_type="text/event-stream",
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
 
 
 @app.get("/artifacts/{artifact_id}/download")
@@ -477,7 +496,7 @@ def switch_role(request: RoleSwitchRequest, service: AgentService = Depends(get_
     try:
         return service.switch_role(request.role.strip())
     except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
 
 
 @app.post("/stop")

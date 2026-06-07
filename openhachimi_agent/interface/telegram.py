@@ -29,6 +29,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.redaction import redact_exception
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.storage.attachments import AttachmentError, AttachmentStorage
@@ -47,10 +48,7 @@ _TYPING_INTERVAL = 4.0
 
 
 def _exception_text(exc: BaseException) -> str:
-    text = str(exc).strip()
-    if text:
-        return f"{exc.__class__.__name__}: {text}"
-    return exc.__class__.__name__
+    return redact_exception(exc)
 
 
 def _is_message_not_modified(exc: BaseException) -> bool:
@@ -154,10 +152,10 @@ class TelegramBot:
     def __init__(self, config: AppConfig, service: AgentService) -> None:
         self.config = config
         self.service = service
-        # 按 user_id 存储各自的 {role, session_id}
-        self._sessions: dict[int, dict[str, str]] = {}
-        # 按 user_id 存储队列锁，实现每个用户独立的消息排队机制
-        self._user_locks: dict[int, asyncio.Lock] = {}
+        # 按 chat/thread/user scope 存储各自的 {role, session_id, scope}
+        self._sessions: dict[str, dict[str, str]] = {}
+        # 按 scope 存储队列锁，实现每个会话范围独立的消息排队机制
+        self._user_locks: dict[str, asyncio.Lock] = {}
         self.attachment_storage = AttachmentStorage(
             config.attachments_dir,
             config.max_attachment_size_bytes,
@@ -166,34 +164,47 @@ class TelegramBot:
         )
         logger.info("telegram bot handler initialized")
 
-    def _get_session(self, user_id: int) -> dict[str, str]:
-        """获取用户 session，若不存在则尝试恢复上次会话。"""
-        if user_id not in self._sessions:
+    def _session_key(self, update: Update) -> str:
+        chat_id = update.effective_chat.id if update.effective_chat else getattr(update.message, "chat_id", 0)
+        user_id = update.effective_user.id if update.effective_user else 0
+        thread_id = getattr(update.message, "message_thread_id", None) if update.message else None
+        return f"telegram:{chat_id}:{thread_id or 0}:{user_id}"
+
+    def _get_session(self, update: Update) -> dict[str, str]:
+        """获取当前 Telegram scope 的 session，若不存在则恢复该 scope 上次会话。"""
+        key = self._session_key(update)
+        user_id = update.effective_user.id if update.effective_user else 0
+        if key not in self._sessions:
             if len(self._sessions) >= 1000:
-                oldest_user = next(iter(self._sessions))
-                self._sessions.pop(oldest_user, None)
+                oldest_key = next(iter(self._sessions))
+                self._sessions.pop(oldest_key, None)
             role = self.config.default_role_name
-            resp = self.service.latest_session(role)
-            self._sessions[user_id] = {"role": role, "session_id": resp.session_id}
+            resp = self.service.latest_session(role, latest_scope=key)
+            self._sessions[key] = {"role": role, "session_id": resp.session_id, "scope": key}
             logger.info(
-                "telegram restored session user_id=%d role=%s session_id=%s",
-                user_id, role, resp.session_id,
+                "telegram restored session user_id=%d scope=%s role=%s session_id=%s",
+                user_id, key, role, resp.session_id,
             )
         else:
-            session = self._sessions.pop(user_id)
-            self._sessions[user_id] = session
-        return self._sessions[user_id]
+            session = self._sessions.pop(key)
+            self._sessions[key] = session
+        return self._sessions[key]
 
-    def _get_user_lock(self, user_id: int) -> asyncio.Lock:
-        if user_id not in self._user_locks:
+    def _set_session(self, update: Update, role: str, session_id: str) -> None:
+        key = self._session_key(update)
+        self._sessions[key] = {"role": role, "session_id": session_id, "scope": key}
+
+    def _get_user_lock(self, update: Update) -> asyncio.Lock:
+        key = self._session_key(update)
+        if key not in self._user_locks:
             if len(self._user_locks) >= 1000:
-                oldest_user = next(iter(self._user_locks))
-                self._user_locks.pop(oldest_user, None)
-            self._user_locks[user_id] = asyncio.Lock()
+                oldest_key = next(iter(self._user_locks))
+                self._user_locks.pop(oldest_key, None)
+            self._user_locks[key] = asyncio.Lock()
         else:
-            lock = self._user_locks.pop(user_id)
-            self._user_locks[user_id] = lock
-        return self._user_locks[user_id]
+            lock = self._user_locks.pop(key)
+            self._user_locks[key] = lock
+        return self._user_locks[key]
 
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/start 命令：欢迎语 + 新建会话。"""
@@ -201,8 +212,8 @@ class TelegramBot:
         if user is None:
             return
         role = self.config.default_role_name
-        resp = self.service.new_session(role)
-        self._sessions[user.id] = {"role": role, "session_id": resp.session_id}
+        resp = self.service.new_session(role, latest_scope=self._session_key(update))
+        self._set_session(update, role, resp.session_id)
         logger.info("cmd /start user_id=%d role=%s session_id=%s", user.id, role, resp.session_id)
 
         welcome = (
@@ -235,19 +246,19 @@ class TelegramBot:
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/new 命令：新建对话。"""
         user_id = update.effective_user.id
-        session = self._get_session(user_id)
+        session = self._get_session(update)
         role = session["role"]
         old_session_id = session["session_id"]
         await self.service.stop_session(old_session_id)
-        resp = self.service.new_session(role)
-        self._sessions[user_id] = {"role": role, "session_id": resp.session_id}
+        resp = self.service.new_session(role, latest_scope=self._session_key(update))
+        self._set_session(update, role, resp.session_id)
         logger.info("cmd /new user_id=%d role=%s session_id=%s", user_id, role, resp.session_id)
         await update.message.reply_text(f"✅ {resp.message}")
 
     async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/stop 命令：停止当前正在执行的任务。"""
         user_id = update.effective_user.id
-        session = self._get_session(user_id)
+        session = self._get_session(update)
         resp = await self.service.stop_session(session["session_id"])
         logger.info("cmd /stop user_id=%d role=%s session_id=%s", user_id, session["role"], session["session_id"])
         await update.message.reply_text(f"🛑 {resp.message}")
@@ -255,7 +266,7 @@ class TelegramBot:
     async def cmd_roles(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/roles 命令：列出可用角色。"""
         user_id = update.effective_user.id
-        session = self._get_session(user_id)
+        session = self._get_session(update)
         roles_resp = self.service.list_roles()
         lines = ["🎭 <b>可用角色列表：</b>\n"]
         for r in roles_resp.roles:
@@ -274,15 +285,15 @@ class TelegramBot:
             )
             return
         role_name = args[0].strip()
-        old_session_id = self._get_session(user_id)["session_id"]
+        old_session_id = self._get_session(update)["session_id"]
         await self.service.stop_session(old_session_id)
         try:
-            resp = self.service.switch_role(role_name)
-            self._sessions[user_id] = {"role": resp.role, "session_id": resp.session_id}
+            resp = self.service.switch_role(role_name, latest_scope=self._session_key(update))
+            self._set_session(update, resp.role, resp.session_id)
             logger.info("cmd /role user_id=%d role=%s session_id=%s", user_id, resp.role, resp.session_id)
             await update.message.reply_text(f"✅ {resp.message}")
         except (FileNotFoundError, ValueError) as exc:
-            await update.message.reply_text(f"❌ 切换角色失败：{exc}")
+            await update.message.reply_text(f"❌ 切换角色失败：{_exception_text(exc)}")
 
     async def _download_attachments(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[AttachmentRef]:
         message = update.message
@@ -392,13 +403,24 @@ class TelegramBot:
         if not user_text:
             return
 
-        session = self._get_session(user_id)
+        session = self._get_session(update)
         role = session["role"]
         session_id = session["session_id"]
 
-        lock = self._get_user_lock(user_id)
+        lock = self._get_user_lock(update)
 
         async with lock:
+            if user_text in {"停止"}:
+                resp = await self.service.stop_session(session_id)
+                await update.message.reply_text(f"🛑 {resp.message}")
+                return
+            if user_text in {"新对话"}:
+                await self.service.stop_session(session_id)
+                resp = self.service.new_session(role, latest_scope=session.get("scope"))
+                self._set_session(update, resp.role, resp.session_id)
+                await update.message.reply_text(f"✅ {resp.message}")
+                return
+
             logger.info(
                 "telegram message user_id=%d role=%s session_id=%s chars=%d attachment_count=%d",
                 user_id, role, session_id, len(user_text), len(attachments),
@@ -513,6 +535,7 @@ class TelegramBot:
                     "chat_id": update.effective_chat.id if update.effective_chat else update.message.chat_id,
                     "user_id": user_id,
                     "thread_id": getattr(update.message, "message_thread_id", None),
+                    "session_scope_key": session.get("scope"),
                     "session_id": session_id,
                     "role": role,
                 }

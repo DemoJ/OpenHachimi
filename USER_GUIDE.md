@@ -302,6 +302,17 @@ app:
   telegram_proxy_url: ""                        # 如果在国内，可能需要代理
 ```
 
+### 可选项：HTTP API Token
+
+`app.http_api_token` 用于保护本地 HTTP API。你可以留空；哈基米在启动或重启 HTTP 服务时会自动生成一个强随机 Token，并写回 `user/config.yaml`：
+
+```yaml
+app:
+  http_api_token: "自动生成的内容"
+```
+
+除 `/health` 外，HTTP API 请求都需要携带 `Authorization: Bearer <token>`。如果需要轮换 Token，直接编辑 `user/config.yaml` 后重启服务即可。Token 以配置文件为准，不再通过环境变量覆盖。
+
 ### 可选项：浏览器设置
 
 如果要让哈基米帮你操作浏览器：
@@ -776,10 +787,13 @@ hachimi restart                       # 重启服务
 
 ### HTTP API 集成
 
-如果你懂一点编程，可以通过 HTTP API 调用哈基米：
+如果你懂一点编程，可以通过 HTTP API 调用哈基米。HTTP API Token 保存在 `user/config.yaml` 的 `app.http_api_token`，留空时启动/重启会自动生成；除 `/health` 外，请求都需要携带 Bearer Token：
 
-```
+```http
 POST http://localhost:8765/chat
+Authorization: Bearer <user/config.yaml 中的 http_api_token>
+Content-Type: application/json
+
 {
   "message": "你的问题"
 }
