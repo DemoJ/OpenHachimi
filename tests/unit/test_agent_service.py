@@ -8,6 +8,7 @@ from openhachimi_agent.service import agent_service as agent_service_module
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.agent.intent import extract_urls
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.tools import mcp as mcp_module
 import openhachimi_agent.service.browser  # Ensure module is loaded for mock.patch
 
 @pytest.fixture
@@ -197,3 +198,77 @@ def test_agent_dependency_mtime_uses_short_ttl_cache(agent_service, mock_config)
     )
 
     assert agent_service._get_agent_dependency_mtime("default") == 2000.0
+
+
+class FakeMCPConnection:
+    def __init__(self, toolset):
+        self.toolset = toolset
+
+    async def __aenter__(self):
+        if self.toolset.fail:
+            raise RuntimeError(f"failed {self.toolset.name}")
+        self.toolset.entered = True
+        return self.toolset
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.toolset.exited = True
+
+
+class FakeMCPToolset:
+    def __init__(self, name, fail=False):
+        self.name = name
+        self.fail = fail
+        self.entered = False
+        self.exited = False
+
+    def run_connection(self):
+        return FakeMCPConnection(self)
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_toolsets_keeps_only_connected_toolsets(agent_service, mock_config, monkeypatch):
+    mock_config.user_dir.mkdir(parents=True)
+    ok = FakeMCPToolset("ok")
+    failed = FakeMCPToolset("failed", fail=True)
+
+    monkeypatch.setattr(mcp_module, "load_mcp_toolsets", lambda config: [ok, failed])
+
+    await agent_service.start()
+
+    assert agent_service._mcp_toolsets == [ok]
+    assert ok.entered is True
+    assert failed.entered is False
+    assert len(agent_service._mcp_errors) == 1
+    assert "failed failed" in agent_service._mcp_errors[0]
+
+
+@pytest.mark.asyncio
+async def test_maybe_reload_mcp_toolsets_reloads_only_when_mcp_file_changes(agent_service, mock_config, monkeypatch):
+    mock_config.user_dir.mkdir(parents=True)
+    mcp_file = mock_config.user_dir / "mcp-servers.json"
+    mcp_file.write_text('{"mcpServers": {}}', encoding="utf-8")
+    first = FakeMCPToolset("first")
+    second = FakeMCPToolset("second")
+    calls = []
+
+    def fake_load_mcp_toolsets(config):
+        calls.append(config.mcp)
+        return [first] if len(calls) == 1 else [second]
+
+    monkeypatch.setattr(mcp_module, "load_mcp_toolsets", fake_load_mcp_toolsets)
+
+    await agent_service.start()
+    agent_service._agents["default:executor"] = (object(), 0.0)
+    await agent_service._maybe_reload_mcp_toolsets()
+
+    assert len(calls) == 1
+    assert agent_service._mcp_toolsets == [first]
+    assert agent_service._agents
+
+    mcp_file.write_text('{"mcpServers": {"remote": {"url": "https://example.test/mcp"}}}', encoding="utf-8")
+    await agent_service._maybe_reload_mcp_toolsets()
+
+    assert len(calls) == 2
+    assert agent_service._mcp_toolsets == [second]
+    assert first.exited is True
+    assert agent_service._agents == {}

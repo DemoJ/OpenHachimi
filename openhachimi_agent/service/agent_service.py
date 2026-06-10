@@ -7,6 +7,7 @@ import logging
 import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 
 from openhachimi_agent.agent.factory import build_continuation_agent, build_executor_agent, build_planner_agent, build_router_agent, build_scheduled_executor_agent
 from openhachimi_agent.content.roles import list_role_names, load_role_content
@@ -60,6 +61,9 @@ class AgentService:
         self._agent_dependency_mtime_cache: tuple[float, float] | None = None
         self._mcp_toolsets = []
         self._mcp_stack = contextlib.AsyncExitStack()
+        self._mcp_config_signature: tuple[float, int] | None = None
+        self._mcp_reload_lock = asyncio.Lock()
+        self._mcp_errors: list[str] = []
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         from openhachimi_agent.service.browser import BrowserManager
@@ -76,20 +80,74 @@ class AgentService:
 
     async def start(self) -> None:
         """启动后台服务需要长期维护的资源，如 MCP 连接。"""
-        from openhachimi_agent.tools.mcp import load_mcp_toolsets
-        self._mcp_toolsets = load_mcp_toolsets(self.config)
-        for ts in self._mcp_toolsets:
-            try:
-                await self._mcp_stack.enter_async_context(ts.run_connection())
-            except Exception as exc:
-                logger.error("Failed to start MCP toolset connection: %s", exc)
+        await self._reload_mcp_toolsets(force=True)
 
     async def stop(self) -> None:
         """关闭服务资源。"""
         try:
             await self._mcp_stack.aclose()
+        except Exception:
+            logger.exception("Error closing MCP toolsets")
+
+    def _get_mcp_config_signature(self) -> tuple[float, int] | None:
+        mcp_file = self.config.user_dir / "mcp-servers.json"
+        try:
+            if not mcp_file.exists() or not mcp_file.is_file():
+                return None
+            stat = mcp_file.stat()
+            return (stat.st_mtime, stat.st_size)
         except Exception as exc:
-            logger.error("Error closing MCP toolsets: %s", exc)
+            logger.debug("Failed to check mcp-servers.json signature: %s", exc)
+            return self._mcp_config_signature
+
+    async def _maybe_reload_mcp_toolsets(self) -> None:
+        signature = self._get_mcp_config_signature()
+        if signature == self._mcp_config_signature:
+            return
+        await self._reload_mcp_toolsets(force=True)
+
+    async def _reload_mcp_toolsets(self, force: bool = False) -> None:
+        async with self._mcp_reload_lock:
+            signature = self._get_mcp_config_signature()
+            if not force and signature == self._mcp_config_signature:
+                return
+
+            from openhachimi_agent.core.config import load_mcp_config
+            from openhachimi_agent.tools.mcp import load_mcp_toolsets
+
+            logger.info("reloading MCP toolsets signature_changed=%s", signature != self._mcp_config_signature)
+            runtime_config = replace(self.config, mcp=load_mcp_config(self.config.user_dir))
+            new_stack = contextlib.AsyncExitStack()
+            connected_toolsets = []
+            errors: list[str] = []
+
+            try:
+                for ts in load_mcp_toolsets(runtime_config):
+                    try:
+                        await new_stack.enter_async_context(ts.run_connection())
+                    except Exception as exc:
+                        message = _error_message(exc)
+                        errors.append(message)
+                        logger.exception("Failed to start MCP toolset connection")
+                    else:
+                        connected_toolsets.append(ts)
+
+                old_stack = self._mcp_stack
+                self.config = runtime_config
+                self._mcp_stack = new_stack
+                self._mcp_toolsets = connected_toolsets
+                self._mcp_config_signature = signature
+                self._mcp_errors = errors
+                self._agents.clear()
+                await old_stack.aclose()
+                logger.info(
+                    "MCP toolsets reloaded connected=%d errors=%d",
+                    len(connected_toolsets),
+                    len(errors),
+                )
+            except Exception:
+                await new_stack.aclose()
+                raise
 
     def _normalize_role(self, role_name: str | None) -> str:
         role = validate_role_name(role_name or self.config.default_role_name)
@@ -282,6 +340,8 @@ class AgentService:
         return AgentState(
             model=self.config.model_name,
             base_url=self.config.openai_base_url or None,
+            mcp_servers=len(self._mcp_toolsets),
+            mcp_errors=list(self._mcp_errors),
         )
 
     def list_roles(self) -> RolesResponse:
@@ -402,6 +462,7 @@ class AgentService:
                 len(attachment_list),
                 str(stream).lower(),
             )
+            await self._maybe_reload_mcp_toolsets()
 
             if actual_session_id not in self._session_states:
                 self._session_states[actual_session_id] = {}
@@ -444,17 +505,26 @@ class AgentService:
                 stream_queue=stream_queue,
             )
             ctx.stream_event_handler = build_stream_event_handler(stream_queue, ctx.operation_state)
+
+            async def refresh_mcp_config() -> None:
+                await self._maybe_reload_mcp_toolsets()
+                ctx.config = self.config
+                deps.config = self.config
+
             should_route = await should_route_message(ctx, self._get_agent)
 
             async def run_agent() -> None:
                 mark_turn_started(session_state)
                 try:
                     if should_route:
+                        await refresh_mcp_config()
                         task_frame = await resolve_task_frame(ctx, self._get_agent)
                         session_state["task_frame"] = task_frame.model_dump(mode="json")
                         if needs_planning(task_frame):
+                            await refresh_mcp_config()
                             await run_planner(ctx, task_frame, self._get_agent)
 
+                    await refresh_mcp_config()
                     outcome = await execute_task(ctx, self._get_agent)
                     result_holder["result"] = outcome.result
                     if outcome.final_verification_signal:

@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 class AgentState(BaseModel):
     model: str
     base_url: str | None = None
+    mcp_servers: int = 0
+    mcp_errors: list[str] = Field(default_factory=list)
 
 
 class AttachmentRef(BaseModel):

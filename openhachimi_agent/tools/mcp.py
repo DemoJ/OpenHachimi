@@ -1,10 +1,40 @@
 """MCP (Model Context Protocol) 工具集加载器。"""
 
 import logging
-from pydantic_ai.mcp import MCPServerStdio, MCPServerStreamableHTTP
+from typing import Any
+
 from openhachimi_agent.core.config import AppConfig
 
+MCPServerStdio: Any = None
+MCPServerStreamableHTTP: Any = None
+
 logger = logging.getLogger(__name__)
+
+
+def _load_mcp_stdio_class() -> Any:
+    global MCPServerStdio
+    if MCPServerStdio is None:
+        try:
+            from pydantic_ai.mcp import MCPServerStdio as stdio_cls
+        except ImportError as exc:
+            raise ImportError(
+                "请安装 MCP 依赖后再启用 stdio MCP 服务器：pip install \"pydantic-ai-slim[mcp]\""
+            ) from exc
+        MCPServerStdio = stdio_cls
+    return MCPServerStdio
+
+
+def _load_mcp_http_class() -> Any:
+    global MCPServerStreamableHTTP
+    if MCPServerStreamableHTTP is None:
+        try:
+            from pydantic_ai.mcp import MCPServerStreamableHTTP as http_cls
+        except ImportError as exc:
+            raise ImportError(
+                "请安装 MCP 依赖后再启用 HTTP MCP 服务器：pip install \"pydantic-ai-slim[mcp]\""
+            ) from exc
+        MCPServerStreamableHTTP = http_cls
+    return MCPServerStreamableHTTP
 
 
 def load_mcp_toolsets(config: AppConfig) -> list:
@@ -14,7 +44,7 @@ def load_mcp_toolsets(config: AppConfig) -> list:
     即使用 `async with server.run_connection():`。
     """
     servers = []
-    
+
     for name, server_cfg in config.mcp.servers.items():
         try:
             if server_cfg.type == "stdio":
@@ -23,14 +53,21 @@ def load_mcp_toolsets(config: AppConfig) -> list:
                     continue
                 args = server_cfg.args or []
                 logger.info("Loading MCP server '%s' (stdio): %s %s", name, server_cfg.command, " ".join(args))
-                server = MCPServerStdio(command=server_cfg.command, args=args, env=server_cfg.env)
+                stdio_cls = _load_mcp_stdio_class()
+                server = stdio_cls(command=server_cfg.command, args=args, env=server_cfg.env)
                 servers.append(server)
             elif server_cfg.type == "http":
                 if not server_cfg.url:
                     logger.warning("MCP server '%s' 配置为 http/sse 模式，但未指定 url。", name)
                     continue
-                logger.info("Loading MCP server '%s' (http): %s", name, server_cfg.url)
-                server = MCPServerStreamableHTTP(server_cfg.url)
+                logger.info(
+                    "Loading MCP server '%s' (http): %s headers_configured=%s",
+                    name,
+                    server_cfg.url,
+                    bool(server_cfg.headers),
+                )
+                http_cls = _load_mcp_http_class()
+                server = http_cls(server_cfg.url, headers=server_cfg.headers)
                 servers.append(server)
             else:
                 logger.warning("未知的 MCP server '%s' 类型: %s", name, server_cfg.type)

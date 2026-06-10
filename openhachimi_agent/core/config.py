@@ -151,6 +151,7 @@ class MCPServerConfig:
     args: list[str] = field(default_factory=list)
     url: str | None = None
     env: dict[str, str] | None = None
+    headers: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,23 @@ def _config_string_list(section: dict[str, Any], key: str, default: list[str]) -
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     raise ValueError(f"config.yaml 中的 {key} 必须是字符串列表或逗号分隔字符串。")
+
+
+def _string_mapping(value: object, section_name: str) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        logger.warning("%s 必须是对象，已忽略。", section_name)
+        return None
+
+    result = {}
+    for key, item in value.items():
+        normalized_key = str(key).strip()
+        if not normalized_key:
+            logger.warning("%s 包含空键，已忽略。", section_name)
+            continue
+        result[normalized_key] = str(item)
+    return result or None
 
 
 def _config_vision_support(section: dict[str, Any], key: str, default: str = "auto") -> Literal["auto", "true", "false"]:
@@ -461,26 +479,26 @@ def _load_vision_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) 
     )
 
 
-def _load_mcp_config(user_dir: Path) -> MCPConfig:
+def load_mcp_config(user_dir: Path) -> MCPConfig:
     mcp_file = user_dir / "mcp-servers.json"
     servers = {}
     if mcp_file.exists():
         try:
             with open(mcp_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            
+
             servers_config = data.get("mcpServers", {})
             for name, srv_conf in servers_config.items():
                 if not isinstance(srv_conf, dict):
                     continue
-                
+
                 if "command" in srv_conf:
                     servers[name] = MCPServerConfig(
                         type="stdio",
                         command=srv_conf.get("command"),
                         args=srv_conf.get("args", []),
                         url=None,
-                        env=srv_conf.get("env")
+                        env=_string_mapping(srv_conf.get("env"), f"mcpServers.{name}.env")
                     )
                 elif "url" in srv_conf:
                     servers[name] = MCPServerConfig(
@@ -488,12 +506,17 @@ def _load_mcp_config(user_dir: Path) -> MCPConfig:
                         command=None,
                         args=[],
                         url=srv_conf.get("url"),
-                        env=None
+                        env=None,
+                        headers=_string_mapping(srv_conf.get("headers"), f"mcpServers.{name}.headers")
                     )
         except Exception as exc:
             logger.warning("Failed to parse mcp-servers.json: %s", exc)
 
     return MCPConfig(servers=servers)
+
+
+def _load_mcp_config(user_dir: Path) -> MCPConfig:
+    return load_mcp_config(user_dir)
 
 
 def load_config() -> AppConfig:
