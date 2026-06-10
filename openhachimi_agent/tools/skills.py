@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from pydantic import create_model
 from pydantic_ai import RunContext
 
+from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.content.skills import Skill, find_skills, parse_skill
 from openhachimi_agent.core.deps import AgentDeps
 
@@ -482,19 +483,15 @@ def format_skill_prompt(skill: Skill, body: str | None = None, *, execution_intr
     skill_root = skill.path.parent.resolve().as_posix()
     content = skill.body if body is None else body
     intro = f"{execution_intro}\n" if execution_intro else ""
-    return (
-        f"<skill name=\"{skill.config.name}\" skill_root=\"{skill_root}\" path=\"{skill_path}\">\n"
-        f"{intro}"
-        "[Skill Metadata]\n"
-        f"- skill_path: {skill_path}\n"
-        f"- skill_root: {skill_root}\n\n"
-        "[Path Note]\n"
-        "read_file、list_files、find_files 和 search_text 的相对路径仍相对于当前项目工作区根目录，"
-        "不会自动相对于本 skill 目录解析。\n"
-        "如果本 skill 需要读取自身附带的参考文件、模板、示例或脚本，请将 skill 文档中的相对路径"
-        "与上方 skill_root 拼接成绝对路径后再调用文件工具。\n\n"
-        f"{content}\n"
-        "</skill>"
+    return render_system_prompt(
+        "tools/skill_wrapper",
+        {
+            "skill_name": skill.config.name,
+            "skill_root": skill_root,
+            "skill_path": skill_path,
+            "intro": intro,
+            "content": content,
+        },
     )
 
 
@@ -509,13 +506,7 @@ def build_skill_tool(skill: Skill) -> Callable:
             val = getattr(args, arg)
             # Use simple string replacement for {{arg}}
             body = body.replace(f"{{{{{arg}}}}}", str(val))
-        execution_intro = (
-            f"【Skill Execution: {skill.config.name}】\n"
-            "Treat this skill as the primary workflow for the current task. "
-            "Execute the instructions directly; avoid broad repository exploration, repeated skill lookup, "
-            "or re-checking already successful file paths unless an input is missing, a tool fails, "
-            "or the user explicitly asks for verification."
-        )
+        execution_intro = render_system_prompt("tools/skill_execution_intro", {"skill_name": skill.config.name})
         return format_skill_prompt(skill, body, execution_intro=execution_intro)
 
     dynamic_skill_tool.__name__ = f"skill_{skill.config.name.replace('-', '_')}"

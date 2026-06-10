@@ -8,10 +8,10 @@ import time
 from collections import defaultdict
 from typing import Any
 
+from openhachimi_agent.content.prompts import load_system_prompt
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.llm import run_memory_summary
 from openhachimi_agent.memory.models import MemoryBlock, MemoryProfile, MemoryScope, MemoryStability, utc_now_iso
-from openhachimi_agent.memory.prompts import MEMORY_EXTRACTION_PROMPT
 from openhachimi_agent.memory.store import MemoryStore, _load_json_array
 
 
@@ -231,11 +231,7 @@ def _profile_summary(
 
 
 def _llm_summarize(kind: str, payload: dict[str, Any], config: AppConfig | None) -> str:
-    instruction = (
-        MEMORY_EXTRACTION_PROMPT
-        + "\n请基于证据生成长期记忆摘要。只输出 JSON：{\"summary\":\"...\"}。"
-        + "block 摘要要去重、归纳共同主题、保留可执行偏好或项目事实；profile 摘要要形成稳定用户画像，不要编造证据。"
-    )
+    instruction = load_system_prompt("memory/summary")
     started = time.perf_counter()
     try:
         output = run_memory_summary(

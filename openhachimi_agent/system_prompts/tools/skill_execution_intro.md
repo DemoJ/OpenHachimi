@@ -1,0 +1,2 @@
+【Skill Execution: {{ skill_name }}】
+Treat this skill as the primary workflow for the current task. Execute the instructions directly; avoid broad repository exploration, repeated skill lookup, or re-checking already successful file paths unless an input is missing, a tool fails, or the user explicitly asks for verification.

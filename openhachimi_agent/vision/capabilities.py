@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Literal
 
+from openhachimi_agent.content.prompts import load_system_prompt
 from openhachimi_agent.core.config import AppConfig, VisionConfig
 from openhachimi_agent.vision.openai_compatible import VisionImagePayload, request_vision
 
@@ -80,7 +81,7 @@ async def probe_model_supports_vision(config: AppConfig, image: VisionImagePaylo
         await request_vision(
             probe_config,
             image,
-            "这是一次模型视觉能力探测。请只根据图片内容用一句简短中文回答你能看到什么。",
+            load_system_prompt("vision/probe"),
         )
     except Exception as exc:
         logger.info("main model vision probe failed model=%s base_url_configured=%s: %s", config.model_name, bool(config.openai_base_url), exc)

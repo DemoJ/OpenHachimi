@@ -6,6 +6,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from openhachimi_agent.content.prompts import render_system_prompt
+
 from openhachimi_agent.agent.intent import (
     PlanContinuationDecision,
     TaskFrame,
@@ -53,10 +55,9 @@ def _continuation_prompt(ctx: AgentRunContext) -> str:
         "suspended_plan": ctx.session_state.get("suspended_plan"),
         "plan_status": ctx.session_state.get("plan_status"),
     }
-    return (
-        "请判断用户最新消息是否是在继续/恢复旧计划，还是一个新任务。"
-        "只输出结构化 PlanContinuationDecision。\n"
-        f"上下文：{json.dumps(payload, ensure_ascii=False)}"
+    return render_system_prompt(
+        "runtime/continuation_decision",
+        {"context": json.dumps(payload, ensure_ascii=False)},
     )
 
 

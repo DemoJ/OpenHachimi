@@ -7,12 +7,12 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from openhachimi_agent.content.prompts import load_system_prompt
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.capture import _keywords
 from openhachimi_agent.memory.models import ExtractedMemory, MemoryExtractionResult, MemoryScope, MemoryStability
 from openhachimi_agent.memory.llm import run_memory_extraction
 from openhachimi_agent.memory.privacy import PrivacyGuard
-from openhachimi_agent.memory.prompts import MEMORY_EXTRACTION_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -127,15 +127,7 @@ def _contains_any(text: str, lowered: str, markers: tuple[str, ...]) -> bool:
 
 
 def _llm_extraction_prompt() -> str:
-    return (
-        MEMORY_EXTRACTION_PROMPT
-        + "\n请从输入 JSON 中抽取长期记忆，返回严格 JSON："
-        + '{"memories":[{"memory_type":"preference|constraint|project_context|decision|fact|workflow",'
-        + '"content":"...","subject":"user","predicate":"states","object":"...",'
-        + '"keywords":["..."],"entities":["..."],"tags":["..."],'
-        + '"confidence":0.0,"stability":"ephemeral|situational|stable","source_quote":"..."}]}。'
-        + "要识别隐含偏好，例如用户反复要求字体/格式/语言/流程选择，即使没有出现‘偏好’二字。无长期价值时返回空数组。"
-    )
+    return load_system_prompt("memory/extraction")
 
 
 def _extracted_from_json(item: dict[str, Any]) -> ExtractedMemory | None:

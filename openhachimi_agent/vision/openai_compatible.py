@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from openhachimi_agent.content.prompts import load_system_prompt
 from openhachimi_agent.core.config import VisionConfig
 
 
@@ -73,7 +74,7 @@ def _request_vision_sync(config: VisionConfig, image: VisionImagePayload, user_p
     body = {
         "model": config.model,
         "messages": [
-            {"role": "system", "content": "你是一个可靠的图片识别助手。只描述图片中能观察到的内容，不要编造。"},
+            {"role": "system", "content": load_system_prompt("vision/system")},
             {
                 "role": "user",
                 "content": [

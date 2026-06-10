@@ -1,0 +1,3 @@
+只抽取未来对话仍有用的长期记忆；不要保存一次性过程、命令噪声、临时 TODO 或敏感凭据明文。
+请从输入 JSON 中抽取长期记忆，返回严格 JSON：{"memories":[{"memory_type":"preference|constraint|project_context|decision|fact|workflow","content":"...","subject":"user","predicate":"states","object":"...","keywords":["..."],"entities":["..."],"tags":["..."],"confidence":0.0,"stability":"ephemeral|situational|stable","source_quote":"..."}]}。
+要识别隐含偏好，例如用户反复要求字体/格式/语言/流程选择，即使没有出现‘偏好’二字。无长期价值时返回空数组。

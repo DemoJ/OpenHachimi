@@ -16,6 +16,7 @@ from pydantic_ai.usage import UsageLimits
 
 from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
 from openhachimi_agent.agent.factory import build_executor_agent, build_scheduled_executor_agent
+from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -165,14 +166,10 @@ def _with_direct_vision_parts(text: str, vision_result: VisionPreprocessResult |
 def _degrade_direct_vision_result(vision_result: VisionPreprocessResult, error: Exception) -> VisionPreprocessResult:
     """主模型直传图片失败后，降级为纯文本上下文，避免整轮对话崩溃。"""
     error_text = str(error).strip() or error.__class__.__name__
+    text_prefix = render_system_prompt("vision/direct_error_prefix", {"error_text": error_text}) + "\n"
     return VisionPreprocessResult(
         mode="unavailable",
-        text_prefix=(
-            "[图片附件处理状态]\n"
-            "系统尝试将图片直接发送给主模型识别，但模型服务返回错误，图片未成功识别。"
-            "请不要假装已经看到了图片；请结合用户文字和附件元信息自行判断如何回复，必要时说明当前无法读取图片内容。\n"
-            f"- 主模型图片输入错误：{error_text}\n"
-        ),
+        text_prefix=text_prefix,
         consumed_attachment_ids=vision_result.consumed_attachment_ids,
         errors=[*vision_result.errors, error_text],
     )
@@ -194,13 +191,12 @@ def _build_executor_message(
     if not task_frame_payload:
         return _with_direct_vision_parts(user_message, vision_result)
 
-    text = (
-        "请执行以下用户任务。必须遵守 TaskFrame 中的 goal、target_entities、invariants、allowed_autonomy 和 replan_triggers；"
-        "如果 TaskFrame.execution_mode 是 direct 或 skill_direct，请以最少必要工具调用完成目标，避免为简单任务创建 TODO、重复确认刚成功写入/发布的路径，或进行与目标无关的宽泛探索；"
-        "如果 TaskFrame.execution_mode 是 skill_direct，已匹配的 skill 是主流程，除非输入缺失或工具失败，否则按 skill 直接推进；"
-        "如果工具观察结果与 TaskFrame 冲突，应停止当前动作并重新校准目标。\n"
-        f"TaskFrame：{json.dumps(task_frame_payload, ensure_ascii=False)}\n"
-        f"用户原始任务：{user_message}"
+    text = render_system_prompt(
+        "runtime/executor_task",
+        {
+            "task_frame": json.dumps(task_frame_payload, ensure_ascii=False),
+            "user_message": user_message,
+        },
     )
     return _with_direct_vision_parts(text, vision_result)
 
@@ -212,12 +208,13 @@ def _build_repair_message(
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
 ) -> str | list[UserContent]:
-    text = (
-        "最终验证器发现当前执行结果尚不足以宣称完成。请只补齐验证器指出的缺口，"
-        "继续严格遵守 TaskFrame、TODO 和执行记录；完成后必须更新 TODO 或提供足够证据。\n"
-        f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
-        f"Final verification signal：{json.dumps(verification_signal, ensure_ascii=False)}\n"
-        f"用户原始任务：{message_with_attachments(message, attachments or [], vision_result)}"
+    text = render_system_prompt(
+        "runtime/executor_repair",
+        {
+            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
+            "verification_signal": json.dumps(verification_signal, ensure_ascii=False),
+            "user_message": message_with_attachments(message, attachments or [], vision_result),
+        },
     )
     return _with_direct_vision_parts(text, vision_result)
 
@@ -228,11 +225,12 @@ def _build_retry_message(
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
 ) -> str | list[UserContent]:
-    text = (
-        "请根据刚刚修订后的计划继续执行用户任务。必须遵守 TaskFrame 和新的 TODO；"
-        "如果再次遇到同类偏差，请停止并向用户说明阻塞原因。\n"
-        f"TaskFrame：{json.dumps(task_frame_payload or {}, ensure_ascii=False)}\n"
-        f"用户原始任务：{message_with_attachments(message, attachments or [], vision_result)}"
+    text = render_system_prompt(
+        "runtime/executor_retry",
+        {
+            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
+            "user_message": message_with_attachments(message, attachments or [], vision_result),
+        },
     )
     return _with_direct_vision_parts(text, vision_result)
 
@@ -357,12 +355,14 @@ async def _replan_after_execution_signal(
     if ctx.stream and ctx.stream_queue is not None:
         await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n"))
     planner_result = await planner_agent.run(
-        "Executor 在执行时触发了 TaskFrame 偏差或工具失败。请基于 TaskFrame、当前 TODO 和 execution ledger 摘要修订计划。\n"
-        "要求：保持 TaskFrame 的 goal、target_entities、invariants 不变；不要扩大任务目标；"
-        "如果原计划错误，请调用 create_todos 重建一个更窄、更可执行的计划。\n"
-        f"TaskFrame：{json.dumps(_get_task_frame_payload(ctx.session_state) or {}, ensure_ascii=False)}\n"
-        f"Execution ledger replan signal：{json.dumps(signal, ensure_ascii=False)}\n"
-        f"用户原始任务：{ctx.message}",
+        render_system_prompt(
+            "runtime/executor_replan",
+            {
+                "task_frame": json.dumps(_get_task_frame_payload(ctx.session_state) or {}, ensure_ascii=False),
+                "execution_ledger_signal": json.dumps(signal, ensure_ascii=False),
+                "user_message": ctx.message,
+            },
+        ),
         message_history=ctx.history,
         deps=ctx.deps,
         event_stream_handler=ctx.stream_event_handler if ctx.stream else None,

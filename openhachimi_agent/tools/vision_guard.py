@@ -9,6 +9,7 @@ from typing import Any
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 
+from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.core.deps import AgentDeps
 
 
@@ -76,8 +77,11 @@ def raise_if_processed_vision_attachment(ctx: RunContext[AgentDeps], target_path
     )
     summary = str(processed.get("summary") or "").strip()
     raise ModelRetry(
-        "该图片附件已由辅助视觉模型成功识别，当前工具调用被阻止，以避免重复读取同一图片。"
-        "请直接使用已有识别结果继续回答；如果识别摘要不足，请向用户说明需要补充信息，而不是再次读取图片。\n"
-        f"附件 id：{processed.get('attachment_id')}\n"
-        f"识别摘要：{summary}"
+        render_system_prompt(
+            "vision/processed_attachment_guard",
+            {
+                "attachment_id": processed.get("attachment_id"),
+                "summary": summary,
+            },
+        )
     )

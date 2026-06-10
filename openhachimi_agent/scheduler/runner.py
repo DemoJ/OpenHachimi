@@ -7,6 +7,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.core.identifiers import scope_digest, validate_session_id
 from openhachimi_agent.core.redaction import redact_exception
 from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
@@ -46,18 +47,13 @@ def _build_channel_context(task: ScheduledTask) -> dict[str, Any]:
 
 def _build_scheduled_execution_prompt(task: ScheduledTask) -> str:
     """Wrap the stored task prompt so the model treats it as an already-due job."""
-    return (
-        "[IMPORTANT: 你正在执行一个已经到期的定时任务。]\n"
-        "这不是用户新发来的普通请求，也不是让你创建、修改或安排定时任务。\n"
-        "请执行下面的定时任务内容，并把最终结果作为本次任务输出。系统会负责按任务投递配置把最终结果发送给用户；"
-        "不要自行创建新的定时任务，不要修改/暂停/恢复/删除/立即触发定时任务，也不要询问提醒时间。\n"
-        "如果任务内容是提醒用户，请直接输出提醒消息。\n"
-        "如果任务内容是生成早报、报告、摘要或检查结果，请直接完成内容生成。\n"
-        "如果任务确实需要后续调度，请只在最终结果中说明需要用户在交互模式下确认。\n\n"
-        f"定时任务 ID：{task.id}\n"
-        f"定时任务名称：{task.name}\n"
-        "定时任务内容：\n"
-        f"{task.prompt}"
+    return render_system_prompt(
+        "runtime/scheduled_task_execution",
+        {
+            "task_id": task.id,
+            "task_name": task.name,
+            "task_prompt": task.prompt,
+        },
     )
 
 

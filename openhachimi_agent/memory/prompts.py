@@ -1,4 +1,7 @@
 """长期记忆相关提示词。"""
 
-MEMORY_EXTRACTION_PROMPT = """只抽取未来对话仍有用的长期记忆；不要保存一次性过程、命令噪声、临时 TODO 或敏感凭据明文。"""
-MEMORY_RERANK_PROMPT = """判断候选记忆是否与当前请求真正相关、是否过期、是否会误导。"""
+from openhachimi_agent.content.prompts import load_system_prompt
+
+
+MEMORY_EXTRACTION_PROMPT = load_system_prompt("memory/base")
+MEMORY_RERANK_PROMPT = load_system_prompt("memory/rerank")

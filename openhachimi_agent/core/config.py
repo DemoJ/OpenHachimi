@@ -7,9 +7,12 @@ from typing import Any, Literal
 
 import yaml
 
+from openhachimi_agent.content.prompts import load_system_prompt
+
 
 USER_DIR_NAME = "user"
 CONFIG_FILE_NAME = "config.yaml"
+DEFAULT_VISION_PROMPT = load_system_prompt("vision/default_user")
 
 
 @dataclass(frozen=True)
@@ -134,11 +137,7 @@ class VisionConfig:
     base_url: str = ""
     api_key: str | None = None
     detail: Literal["auto", "low", "high"] = "auto"
-    prompt: str = (
-        "请详细识别用户发送的图片内容。请包括：图片中的主体、场景、文字、表格、代码、界面或物体；"
-        "如果图片中有文字，请尽量完整 OCR；如果用户问题依赖图片细节，请指出关键信息；"
-        "不要编造看不清的内容，看不清请说明。"
-    )
+    prompt: str = DEFAULT_VISION_PROMPT
     max_images_per_message: int = 4
     max_image_size_bytes: int = 10 * 1024 * 1024
 
