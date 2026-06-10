@@ -447,6 +447,7 @@ async def run_embedded_cli() -> None:
     configure_logging(config)
     logger.info("starting embedded cli")
     service = AgentService(config)
+    await service.start()
     backend = EmbeddedBackend(service)
     scheduler = None
 
@@ -489,6 +490,10 @@ async def run_embedded_cli() -> None:
             await service.browser_manager.close()
         except Exception as exc:
             logger.debug("browser cleanup on exit failed: %s", exc)
+        try:
+            await service.stop()
+        except Exception as exc:
+            logger.debug("service stop on exit failed: %s", exc)
 
 
 def run_cli() -> None:

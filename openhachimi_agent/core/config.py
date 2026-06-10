@@ -1,5 +1,7 @@
 """应用配置。"""
 
+import json
+import logging
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,6 +145,20 @@ class VisionConfig:
 
 
 @dataclass(frozen=True)
+class MCPServerConfig:
+    type: Literal["stdio", "http"]
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    url: str | None = None
+    env: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class MCPConfig:
+    servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """集中管理应用运行时配置。"""
 
@@ -177,6 +193,7 @@ class AppConfig:
     scheduler: SchedulerConfig
     research: ResearchConfig
     vision: VisionConfig
+    mcp: MCPConfig
     http_api_token: str | None = None
 
 
@@ -444,6 +461,41 @@ def _load_vision_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) 
     )
 
 
+def _load_mcp_config(user_dir: Path) -> MCPConfig:
+    mcp_file = user_dir / "mcp-servers.json"
+    servers = {}
+    if mcp_file.exists():
+        try:
+            with open(mcp_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            servers_config = data.get("mcpServers", {})
+            for name, srv_conf in servers_config.items():
+                if not isinstance(srv_conf, dict):
+                    continue
+                
+                if "command" in srv_conf:
+                    servers[name] = MCPServerConfig(
+                        type="stdio",
+                        command=srv_conf.get("command"),
+                        args=srv_conf.get("args", []),
+                        url=None,
+                        env=srv_conf.get("env")
+                    )
+                elif "url" in srv_conf:
+                    servers[name] = MCPServerConfig(
+                        type="http",
+                        command=None,
+                        args=[],
+                        url=srv_conf.get("url"),
+                        env=None
+                    )
+        except Exception as exc:
+            logger.warning("Failed to parse mcp-servers.json: %s", exc)
+
+    return MCPConfig(servers=servers)
+
+
 def load_config() -> AppConfig:
     """从 user/config.yaml 和项目目录加载配置。"""
     base_dir = Path(__file__).resolve().parents[2]
@@ -526,4 +578,5 @@ def load_config() -> AppConfig:
         scheduler=_load_scheduler_config(base_dir, raw_config),
         research=_load_research_config(raw_config),
         vision=_load_vision_config(raw_config, llm_config),
+        mcp=_load_mcp_config(user_dir),
     )

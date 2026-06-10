@@ -15,6 +15,7 @@ dependencies = [
     "ddgs>=9.14.0",
     "sqlite-vec>=0.1.6",
     "croniter>=3.0.0",
+    "mcp>=1.1.2",
 ]
 
 [project.optional-dependencies]

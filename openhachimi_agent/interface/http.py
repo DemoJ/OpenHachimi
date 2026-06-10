@@ -144,6 +144,7 @@ async def lifespan(app: FastAPI):
     config = load_config()
     configure_logging(config)
     app.state.service = AgentService(config)
+    await app.state.service.start()
     app.state.config = config
     app.state.schedule_store = None
     app.state.scheduler = None
@@ -191,6 +192,10 @@ async def lifespan(app: FastAPI):
             await app.state.service.browser_manager.close()
         except Exception as exc:
             logger.debug("browser cleanup on server shutdown failed: %s", exc)
+        try:
+            await app.state.service.stop()
+        except Exception as exc:
+            logger.debug("service stop failed: %s", exc)
 
 
 app = FastAPI(title="OpenHachimi Agent", lifespan=lifespan)

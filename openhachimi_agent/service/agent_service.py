@@ -58,6 +58,8 @@ class AgentService:
         self.config = config
         self._agents = {}  # 缓存 (Agent 实例, 最后修改时间)，支持热重载
         self._agent_dependency_mtime_cache: tuple[float, float] | None = None
+        self._mcp_toolsets = []
+        self._mcp_stack = contextlib.AsyncExitStack()
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         from openhachimi_agent.service.browser import BrowserManager
@@ -71,6 +73,23 @@ class AgentService:
             "service initialized model=%s",
             self.config.model_name,
         )
+
+    async def start(self) -> None:
+        """启动后台服务需要长期维护的资源，如 MCP 连接。"""
+        from openhachimi_agent.tools.mcp import load_mcp_toolsets
+        self._mcp_toolsets = load_mcp_toolsets(self.config)
+        for ts in self._mcp_toolsets:
+            try:
+                await self._mcp_stack.enter_async_context(ts.run_connection())
+            except Exception as exc:
+                logger.error("Failed to start MCP toolset connection: %s", exc)
+
+    async def stop(self) -> None:
+        """关闭服务资源。"""
+        try:
+            await self._mcp_stack.aclose()
+        except Exception as exc:
+            logger.error("Error closing MCP toolsets: %s", exc)
 
     def _normalize_role(self, role_name: str | None) -> str:
         role = validate_role_name(role_name or self.config.default_role_name)
@@ -242,11 +261,11 @@ class AgentService:
             elif agent_type == "continuation":
                 agent = build_continuation_agent(self.config)
             elif agent_type == "planner":
-                agent = build_planner_agent(self.config, role_name)
+                agent = build_planner_agent(self.config, role_name, mcp_toolsets=self._mcp_toolsets)
             elif agent_type == "scheduled_executor":
-                agent = build_scheduled_executor_agent(self.config, role_name)
+                agent = build_scheduled_executor_agent(self.config, role_name, mcp_toolsets=self._mcp_toolsets)
             else:
-                agent = build_executor_agent(self.config, role_name)
+                agent = build_executor_agent(self.config, role_name, mcp_toolsets=self._mcp_toolsets)
                 
             self._agents[cache_key] = (agent, current_mtime)
             

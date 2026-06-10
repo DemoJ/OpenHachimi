@@ -19,7 +19,7 @@ from openhachimi_agent.agent.intent import PlanContinuationDecision, TaskFrame
 logger = logging.getLogger(__name__)
 
 
-def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None) -> Agent:
+def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None) -> Agent:
     if not config.openai_api_key:
         raise ValueError("未配置 llm.api_key，请先在 user/config.yaml 中填写 API Key。")
 
@@ -52,8 +52,10 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             
     dynamic_toolset = FunctionToolset(tools=dynamic_skill_tools)
 
+    mcp_toolsets = mcp_toolsets or []
+
     if agent_type == "planner":
-        toolsets = [PLANNER_TOOLSET, dynamic_toolset]
+        toolsets = [PLANNER_TOOLSET, dynamic_toolset] + mcp_toolsets
         extra_prompt = load_system_prompt("agents/planner")
     else:
         base_executor_toolset = SCHEDULED_EXECUTOR_TOOLSET if agent_type == "scheduled_executor" else EXECUTOR_TOOLSET
@@ -65,7 +67,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             ]
             filtered_executor_toolset = FunctionToolset(tools=filtered_tools)
 
-        toolsets = [filtered_executor_toolset, dynamic_toolset]
+        toolsets = [filtered_executor_toolset, dynamic_toolset] + mcp_toolsets
         if agent_type == "scheduled_executor":
             extra_prompt = load_system_prompt("agents/scheduled_executor")
         else:
@@ -98,9 +100,14 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             return result
 
     @agent.system_prompt
-    def _inject_time() -> str:
-        current_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    def _time_prompt(ctx: RunContext[AgentDeps]) -> str:
+        # 使用 isoformat() 保证时区信息明确，并且对模型最友好
+        current_time = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
         return render_system_prompt("runtime/time", {"current_time": current_time}) + "\n"
+
+    @agent.system_prompt
+    def _config_prompt(ctx: RunContext[AgentDeps]) -> str:
+        return render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")}) + "\n"
 
     @agent.system_prompt
     def _inject_memory_context(ctx: RunContext[AgentDeps]) -> str:
@@ -133,19 +140,19 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     return agent
 
 
-def build_planner_agent(config: AppConfig, role_name: str) -> Agent:
+def build_planner_agent(config: AppConfig, role_name: str, mcp_toolsets: list | None = None) -> Agent:
     """创建专职规划的 Agent。"""
-    return _build_base_agent(config, role_name, "planner")
+    return _build_base_agent(config, role_name, "planner", mcp_toolsets=mcp_toolsets)
 
 
-def build_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None) -> Agent:
+def build_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None) -> Agent:
     """创建专职执行的 Agent（拥有所有权限）。"""
-    return _build_base_agent(config, role_name, "executor", allowed_tools=allowed_tools)
+    return _build_base_agent(config, role_name, "executor", allowed_tools=allowed_tools, mcp_toolsets=mcp_toolsets)
 
 
-def build_scheduled_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None) -> Agent:
+def build_scheduled_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None) -> Agent:
     """创建定时任务执行 Agent（不暴露调度写入工具）。"""
-    return _build_base_agent(config, role_name, "scheduled_executor", allowed_tools=allowed_tools)
+    return _build_base_agent(config, role_name, "scheduled_executor", allowed_tools=allowed_tools, mcp_toolsets=mcp_toolsets)
 
 
 def _build_router_model(config: AppConfig) -> OpenAIChatModel:
