@@ -109,6 +109,32 @@ hachimi --version  # 查看版本
 hachimi update     # 检查并更新到最新版本
 ```
 
+### 微信渠道接入
+
+OpenHachimi 支持通过微信与 Agent 对话。
+
+**配置步骤**：
+
+1. **登录微信**：
+   ```bash
+   hachimi weixin
+   ```
+   扫描二维码完成登录，凭证自动保存到 `.memory/weixin_account.json`
+
+2. **启动或重启服务**：
+   ```bash
+   hachimi restart
+   ```
+
+3. **使用**：
+   - 给登录的微信号发送消息，Agent 会自动回复
+   - 支持私聊和群聊（群聊中需要 @机器人）
+   - 回复时会显示"正在输入..."状态
+
+**注意事项**：
+- 微信登录凭证会过期，过期后需重新运行 `hachimi weixin`
+- 同一时间只能有一个客户端使用该微信账号
+
 手动分步启动（适用于开发调试）：
 
 ```bash
