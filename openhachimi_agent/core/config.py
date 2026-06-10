@@ -193,7 +193,7 @@ class AppConfig:
     scheduler: SchedulerConfig
     research: ResearchConfig
     vision: VisionConfig
-    mcp: MCPConfig
+    mcp: MCPConfig = field(default_factory=MCPConfig)
     http_api_token: str | None = None
 
 
