@@ -225,6 +225,12 @@ def cmd_cli(_args: argparse.Namespace) -> None:
     asyncio.run(run_embedded_cli())
 
 
+def cmd_weixin(_args: argparse.Namespace) -> None:
+    """运行微信 iLink 独立扫码登录"""
+    from openhachimi_agent.interface.weixin.cli import main as weixin_main
+    weixin_main()
+
+
 def _print_schedule(task: dict[str, object]) -> None:
     status = task.get("status", "enabled")
     status_text = "启用" if status == "enabled" else ("暂停" if status == "paused" else "已删除")
@@ -362,7 +368,8 @@ def main() -> None:
   hachimi config         编辑配置文件
   hachimi install        安装 Playwright 浏览器驱动
   hachimi uninstall      卸载后台守护服务
-  hachimi schedule       管理定时任务""",
+  hachimi schedule       管理定时任务
+  hachimi weixin         微信原生接入独立扫码登录""",
     )
     parser.add_argument(
         "-V",
@@ -409,6 +416,8 @@ def main() -> None:
     serve_p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
 
     sub.add_parser("cli", help="进入 CLI 对话（与默认行为相同）")
+    
+    sub.add_parser("weixin", help="微信原生扫码登录配置")
 
     schedule_p = sub.add_parser("schedule", help="管理定时任务")
     schedule_sub = schedule_p.add_subparsers(dest="schedule_command", metavar="<操作>")
@@ -458,6 +467,7 @@ def main() -> None:
         "serve":     cmd_serve,
         "schedule":  cmd_schedule,
         "cli":       cmd_cli,
+        "weixin":    cmd_weixin,
     }
 
     if args.command in _dispatch:

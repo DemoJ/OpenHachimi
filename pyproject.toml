@@ -16,6 +16,7 @@ dependencies = [
     "sqlite-vec>=0.1.6",
     "croniter>=3.0.0",
     "mcp>=1.1.2",
+    "qrcode>=7.0.0",
 ]
 
 [project.optional-dependencies]

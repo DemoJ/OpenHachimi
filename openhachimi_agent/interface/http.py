@@ -18,6 +18,7 @@ from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.core.redaction import safe_error_detail
 from openhachimi_agent.interface.telegram import telegram_lifespan
+from openhachimi_agent.interface.weixin.channel import weixin_lifespan
 from openhachimi_agent.scheduler.delivery import (
     CliDeliverySender,
     DeliverySenderRegistry,
@@ -156,8 +157,10 @@ async def lifespan(app: FastAPI):
             app.state.telegram_sender = telegram_sender
             if telegram_sender is not None:
                 app.state.delivery_registry.register(TelegramDeliverySender(telegram_sender))
-            if config.scheduler.enabled and config.scheduler.db_path is not None:
-                app.state.schedule_store = ScheduledTaskStore(config.scheduler.db_path)
+
+            async with weixin_lifespan(app):
+                if config.scheduler.enabled and config.scheduler.db_path is not None:
+                    app.state.schedule_store = ScheduledTaskStore(config.scheduler.db_path)
 
                 async def on_scheduled_run_complete(task: ScheduledTask, run: ScheduledRun) -> None:
                     await deliver_scheduled_run(
@@ -181,10 +184,10 @@ async def lifespan(app: FastAPI):
                 )
                 app.state.scheduler = scheduler
                 await scheduler.start()
-            logger.info("server module initialized")
-            logger.info("all channels started")
-            yield
-            logger.info("all channels stopping")
+                logger.info("server module initialized")
+                logger.info("all channels started")
+                yield
+                logger.info("all channels stopping")
     finally:
         if scheduler is not None:
             await scheduler.stop()
