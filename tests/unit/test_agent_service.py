@@ -200,20 +200,6 @@ def test_agent_dependency_mtime_uses_short_ttl_cache(agent_service, mock_config)
     assert agent_service._get_agent_dependency_mtime("default") == 2000.0
 
 
-class FakeMCPConnection:
-    def __init__(self, toolset):
-        self.toolset = toolset
-
-    async def __aenter__(self):
-        if self.toolset.fail:
-            raise RuntimeError(f"failed {self.toolset.name}")
-        self.toolset.entered = True
-        return self.toolset
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self.toolset.exited = True
-
-
 class FakeMCPToolset:
     def __init__(self, name, fail=False):
         self.name = name
@@ -221,8 +207,14 @@ class FakeMCPToolset:
         self.entered = False
         self.exited = False
 
-    def run_connection(self):
-        return FakeMCPConnection(self)
+    async def __aenter__(self):
+        if self.fail:
+            raise RuntimeError(f"failed {self.name}")
+        self.entered = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exited = True
 
 
 @pytest.mark.asyncio

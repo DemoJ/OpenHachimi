@@ -124,7 +124,7 @@ class AgentService:
             try:
                 for ts in load_mcp_toolsets(runtime_config):
                     try:
-                        await new_stack.enter_async_context(ts.run_connection())
+                        await new_stack.enter_async_context(ts)
                     except Exception as exc:
                         message = _error_message(exc)
                         errors.append(message)
