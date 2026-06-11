@@ -17,11 +17,13 @@ from openhachimi_agent.transport.api_models import ArtifactRef
 
 SENSITIVE_DIR_NAMES = {".git", ".memory", ".venv", "__pycache__", ".browser_data"}
 SENSITIVE_NAME_RE = re.compile(r"(?i)(^\.env$|credential|secret|token|private[_-]?key|password|passwd)")
-SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+SAFE_FILENAME_RE = re.compile(r"[^\w. -]+", re.UNICODE)
 
 
 def _sanitize_filename(filename: str) -> str:
-    cleaned = SAFE_FILENAME_RE.sub("_", Path(filename).name).strip(" ._")
+    cleaned = SAFE_FILENAME_RE.sub("_", Path(filename).name).strip()
+    # 再去掉首尾的点号和下划线（避免产生隐藏文件或无扩展名文件）
+    cleaned = cleaned.strip("._")
     return cleaned[:120] or "artifact"
 
 
