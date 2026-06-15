@@ -63,3 +63,15 @@ def test_to_ref_records_safe_metadata(tmp_path):
     assert ref.filename == "a.txt"
     assert ref.size_bytes == 5
     assert ref.local_path == ".tmp/attachments/telegram/u1/a.txt"
+
+
+def test_to_ref_preserves_weixin_source_and_video_kind(tmp_path):
+    storage = make_storage(tmp_path)
+    path = storage.build_path(source="weixin", namespace="u1", filename="clip.mp4", content_type="video/mp4")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"video")
+
+    ref = storage.to_ref(path=path, source="weixin", filename="clip.mp4", content_type="video/mp4", size_bytes=None)
+
+    assert ref.source == "weixin"
+    assert ref.kind == "video"

@@ -18,7 +18,7 @@ class AttachmentRef(BaseModel):
     content_type: str | None = None
     size_bytes: int | None = Field(default=None, ge=0)
     local_path: str = Field(min_length=1)
-    source: Literal["telegram", "http", "local"] = "local"
+    source: Literal["telegram", "weixin", "http", "local"] = "local"
     kind: Literal["image", "document", "audio", "video", "unknown"] = "unknown"
     metadata: dict[str, Any] = Field(default_factory=dict)
 

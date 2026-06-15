@@ -68,7 +68,7 @@ async def run_weixin_login():
                     data = {"token": token, "account_id": account_id}
                     account_file.write_text(json.dumps(data), "utf-8")
                     print(f"凭证已保存至 {account_file}")
-                    print("现在您可以启动或重启 OpenHachimi 服务了。")
+                    print("如果 OpenHachimi 服务正在运行，微信渠道会自动检测并上线；否则请启动服务。")
                     break
                 elif status_str == "scanned":
                     print("二维码已扫描，请在手机上确认授权...")

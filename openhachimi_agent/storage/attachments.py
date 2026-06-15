@@ -22,6 +22,12 @@ MIME_EXTENSIONS = {
     "image/png": ".png",
     "image/webp": ".webp",
     "image/gif": ".gif",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
     "text/plain": ".txt",
     "application/pdf": ".pdf",
 }
@@ -100,7 +106,15 @@ class AttachmentStorage:
         actual_size = path.stat().st_size if path.exists() else size_bytes
         if actual_size is not None and actual_size > self.max_size_bytes:
             raise AttachmentError(f"附件过大：{actual_size} bytes，当前上限为 {self.max_size_bytes} bytes")
-        kind = "image" if content_type and content_type.lower() in IMAGE_MIME_TYPES else "document"
+        normalized_content_type = (content_type or "").lower()
+        if normalized_content_type in IMAGE_MIME_TYPES:
+            kind = "image"
+        elif normalized_content_type.startswith("audio/"):
+            kind = "audio"
+        elif normalized_content_type.startswith("video/"):
+            kind = "video"
+        else:
+            kind = "document"
         try:
             local_path = path.resolve().relative_to(self.workspace_root.resolve()).as_posix()
         except ValueError:
@@ -111,7 +125,7 @@ class AttachmentStorage:
             content_type=content_type,
             size_bytes=actual_size,
             local_path=local_path,
-            source=source if source in {"telegram", "http", "local"} else "local",
+            source=source if source in {"telegram", "weixin", "http", "local"} else "local",
             kind=kind,
             metadata=dict(metadata or {}),
         )
