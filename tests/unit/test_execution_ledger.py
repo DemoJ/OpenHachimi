@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import pytest
+from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.agent.execution import (
     get_execution_ledger,
@@ -9,7 +10,7 @@ from openhachimi_agent.agent.execution import (
     get_replan_signal,
     with_execution_ledger,
 )
-from openhachimi_agent.tools.planning import create_todos, update_todo
+from openhachimi_agent.tools.planning import create_todos, update_todo, with_execution_guard
 
 
 @dataclass
@@ -31,6 +32,22 @@ def test_execution_ledger_records_success(mock_agent_deps):
     assert ledger[0]["tool_name"] == "read_file"
     assert ledger[0]["args"]["path"] == "README.md"
     assert get_ledger_length(mock_agent_deps.session_state) == 2
+
+
+def test_execution_ledger_records_execution_guard_block(mock_agent_deps):
+    def write_file(ctx):
+        return {"ok": True}
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    guarded = with_execution_ledger(with_execution_guard(write_file))
+    create_todos(ctx, ["Task 1"])
+
+    with pytest.raises(ModelRetry):
+        guarded(ctx)
+
+    ledger = get_execution_ledger(ctx)
+    assert [event["status"] for event in ledger] == ["started", "blocked"]
+    assert "计划执行守卫" in ledger[-1]["violation"]
 
 
 

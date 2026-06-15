@@ -3,6 +3,7 @@
 import logging
 import json
 from dataclasses import dataclass, field, asdict
+from collections.abc import Iterable
 from typing import Literal
 from typing_extensions import TypedDict
 from functools import wraps
@@ -15,6 +16,15 @@ from pydantic_ai.exceptions import ModelRetry
 from openhachimi_agent.core.deps import AgentDeps
 
 logger = logging.getLogger(__name__)
+
+_GUARD_TASK_SUMMARY_LIMIT = 8
+
+
+class ExecutionGuardViolation(ModelRetry):
+    """Raised when a mutating tool violates the active TODO execution contract."""
+
+    ledger_status = "blocked"
+
 
 class TodoTaskInput(TypedDict, total=False):
     id: int
@@ -184,6 +194,71 @@ def _refresh_active_flag(state: TodoState) -> None:
         state.is_active = False
 
 
+def _coerce_tool_names(tool_name: str | Iterable[str]) -> tuple[str, ...]:
+    if isinstance(tool_name, str):
+        raw_names = [tool_name]
+    else:
+        raw_names = [str(name) for name in tool_name]
+
+    names = [name.strip() for name in raw_names if name and name.strip()]
+    return tuple(dict.fromkeys(names or ["unknown_tool"]))
+
+
+def _tool_name_candidates(func) -> tuple[str, ...]:
+    names: list[str] = []
+    for attr in ("__name__", "name"):
+        value = getattr(func, attr, None)
+        if isinstance(value, str) and value.strip():
+            names.append(value.strip())
+    return tuple(dict.fromkeys(names or ["unknown_tool"]))
+
+
+def _tool_key(name: str) -> str:
+    return name.strip().lower()
+
+
+def _tool_allowed(task: TodoTask, tool_names: tuple[str, ...]) -> bool:
+    if not task.allowed_tools:
+        return True
+
+    allowed = {_tool_key(name) for name in task.allowed_tools if str(name).strip()}
+    if "*" in allowed or "any" in allowed:
+        return True
+    return bool(allowed.intersection(_tool_key(name) for name in tool_names))
+
+
+def _format_guard_task(task: TodoTask) -> str:
+    parts = [f"{task.id}:{task.status}", task.description]
+    if task.depends_on:
+        parts.append(f"依赖={task.depends_on}")
+    if task.allowed_tools:
+        parts.append(f"允许工具={task.allowed_tools}")
+    return " ".join(parts)
+
+
+def _format_guard_snapshot(state: TodoState) -> str:
+    tasks = sorted(state.tasks.values(), key=lambda task: task.id)
+    rendered = [_format_guard_task(task) for task in tasks[:_GUARD_TASK_SUMMARY_LIMIT]]
+    if len(tasks) > _GUARD_TASK_SUMMARY_LIMIT:
+        rendered.append(f"... 另有 {len(tasks) - _GUARD_TASK_SUMMARY_LIMIT} 项")
+    return "；".join(rendered) if rendered else "空计划"
+
+
+def _raise_guard_violation(
+    *,
+    state: TodoState,
+    tool_name: str,
+    reason: str,
+    next_step: str,
+) -> None:
+    logger.warning("Execution guard blocked %s: %s", tool_name, reason)
+    raise ExecutionGuardViolation(
+        f"[计划执行守卫] 已阻止变更工具 `{tool_name}`：{reason}\n"
+        f"当前计划状态：{_format_guard_snapshot(state)}\n"
+        f"下一步：{next_step}"
+    )
+
+
 def _normalize_invariants(invariants: list[str] | str | None) -> list[str]:
     if invariants is None:
         return []
@@ -330,6 +405,17 @@ def update_todo(
     task = state.tasks.get(task_id)
     if not task:
         return f"错误：未找到 ID 为 {task_id} 的任务。"
+    if status == "in-progress":
+        other_in_progress = [
+            other for other in state.tasks.values()
+            if other.id != task_id and other.status == "in-progress"
+        ]
+        if other_in_progress:
+            active_ids = [other.id for other in other_in_progress]
+            return (
+                f"错误：已有任务正在进行：{active_ids}。"
+                "请先将这些任务标记为 done、pending 或 blocked，再开始新的任务。"
+            )
     if status in {"in-progress", "done"} and not _all_dependencies_done(state, task):
         missing = [dep_id for dep_id in task.depends_on if state.tasks[dep_id].status != "done"]
         return f"错误：任务 {task_id} 的依赖尚未完成：{missing}"
@@ -391,13 +477,16 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
     return "\n".join(lines)
 
 
-def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str) -> TodoTask | None:
-    """检查当前是否有匹配的 in-progress 任务。
+def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str | Iterable[str]) -> TodoTask | None:
+    """Return the authorized in-progress task for a mutating tool.
 
-    采用软提醒策略：即使没有 in-progress 任务也允许执行，
-    避免 LLM 并行调用 update_todo + 其他工具时因竞态条件而失败。
+    No active plan means direct execution is allowed. Once a plan is active,
+    mutating tools fail closed unless exactly one current task authorizes the
+    action and all of that task's dependencies are complete.
     """
 
+    tool_names = _coerce_tool_names(tool_name)
+    display_name = tool_names[0]
     state = _get_state(ctx)
     if not state.is_active or not state.tasks:
         return None
@@ -410,37 +499,51 @@ def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str) -> Tod
 
     in_progress = [task for task in state.tasks.values() if task.status == "in-progress"]
     if len(in_progress) != 1:
-        # 软提醒：不阻塞执行，仅记录日志
-        logger.warning(
-            "执行 %s 时没有恰好一个 in-progress TODO（当前 %d 个），建议使用 update_todo 更新状态。",
-            tool_name, len(in_progress)
+        if not in_progress:
+            next_step = "先调用 `update_todo` 将当前要执行的任务标记为 `in-progress`，然后再调用变更工具。"
+        else:
+            next_step = "先调用 `update_todo`，只保留一个任务为 `in-progress`，其余任务标记为 `pending`、`done` 或 `blocked`。"
+        _raise_guard_violation(
+            state=state,
+            tool_name=display_name,
+            reason=f"活跃计划中必须恰好有一个 in-progress 任务，当前有 {len(in_progress)} 个。",
+            next_step=next_step,
         )
-        return None
 
     task = in_progress[0]
     if not _all_dependencies_done(state, task):
-        logger.warning("任务 %d 的依赖尚未完成，但仍允许执行 %s。", task.id, tool_name)
-        return task
-    if task.allowed_tools and tool_name not in task.allowed_tools:
+        missing = [dep_id for dep_id in task.depends_on if state.tasks[dep_id].status != "done"]
+        _raise_guard_violation(
+            state=state,
+            tool_name=display_name,
+            reason=f"当前任务 {task.id} 的依赖尚未完成：{missing}。",
+            next_step="先完成依赖任务并用 `update_todo(..., 'done')` 记录证据，再继续当前变更操作。",
+        )
+    if not _tool_allowed(task, tool_names):
         allowed = ", ".join(task.allowed_tools)
-        logger.warning("当前任务 %d 未授权工具 %s（允许：%s），但仍允许执行。", task.id, tool_name, allowed)
+        _raise_guard_violation(
+            state=state,
+            tool_name=display_name,
+            reason=f"当前任务 {task.id} 未授权该工具；允许的工具为：{allowed}。",
+            next_step="改用当前任务允许的工具；如果计划本身不正确，请将任务标记为 blocked，让执行记录触发重规划。",
+        )
     return task
 
 
 def with_execution_guard(func):
     """Block mutating tools when an active plan has no valid in-progress task."""
 
-    tool_name = getattr(func, "__name__", "unknown_tool")
+    tool_names = _tool_name_candidates(func)
     if inspect.iscoroutinefunction(func):
         @wraps(func)
         async def async_wrapper(ctx, *args, **kwargs):
-            get_current_task_for_tool(ctx, tool_name)
+            get_current_task_for_tool(ctx, tool_names)
             return await func(ctx, *args, **kwargs)
         return async_wrapper
 
     @wraps(func)
     def sync_wrapper(ctx, *args, **kwargs):
-        get_current_task_for_tool(ctx, tool_name)
+        get_current_task_for_tool(ctx, tool_names)
         return func(ctx, *args, **kwargs)
     return sync_wrapper
 

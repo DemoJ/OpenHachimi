@@ -84,6 +84,12 @@ def _append_ledger_event(
         del ledger[: len(ledger) - _LEDGER_LIMIT]
 
 
+def _exception_ledger_status(exc: Exception) -> str:
+    return "blocked" if getattr(exc, "ledger_status", "") == "blocked" else "failed"
+
+
+def _exception_violation(exc: Exception, status: str) -> str:
+    return str(exc) if status == "blocked" else ""
 
 
 def get_execution_ledger(ctx: object) -> list[dict[str, Any]]:
@@ -218,7 +224,15 @@ def with_execution_ledger(func: Callable) -> Callable:
             try:
                 result = await func(ctx, *args, **kwargs)
             except Exception as exc:
-                _append_ledger_event(session_state, tool_name=tool_name, status="failed", args=bound_args, result=exc)
+                status = _exception_ledger_status(exc)
+                _append_ledger_event(
+                    session_state,
+                    tool_name=tool_name,
+                    status=status,
+                    args=bound_args,
+                    result=exc,
+                    violation=_exception_violation(exc, status),
+                )
                 raise
             _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
             return result
@@ -232,7 +246,15 @@ def with_execution_ledger(func: Callable) -> Callable:
         try:
             result = func(ctx, *args, **kwargs)
         except Exception as exc:
-            _append_ledger_event(session_state, tool_name=tool_name, status="failed", args=bound_args, result=exc)
+            status = _exception_ledger_status(exc)
+            _append_ledger_event(
+                session_state,
+                tool_name=tool_name,
+                status=status,
+                args=bound_args,
+                result=exc,
+                violation=_exception_violation(exc, status),
+            )
             raise
         _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
         return result

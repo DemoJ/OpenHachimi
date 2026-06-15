@@ -2,6 +2,7 @@
 import pytest
 from unittest.mock import MagicMock
 from dataclasses import dataclass
+from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.tools.planning import (
     create_todos,
@@ -88,24 +89,41 @@ def test_all_done_deactivates_plan(mock_ctx):
     assert _get_state(mock_ctx).is_active is False
 
 
-def test_execution_guard_allows_without_in_progress_task(mock_ctx):
-    """execution_guard 采用软提醒策略，即使没有 in-progress 任务也允许执行。"""
+def test_execution_guard_allows_without_active_plan(mock_ctx):
     def mutating_tool(ctx):
+        return {"ok": True}
+
+    guarded = with_execution_guard(mutating_tool)
+
+    assert guarded(mock_ctx) == {"ok": True}
+
+
+def test_execution_guard_blocks_without_in_progress_task(mock_ctx):
+    called = False
+
+    def mutating_tool(ctx):
+        nonlocal called
+        called = True
         return {"ok": True}
 
     guarded = with_execution_guard(mutating_tool)
     create_todos(mock_ctx, ["Task 1"])
 
-    # 不再抛异常，而是正常执行（软提醒通过日志）
-    assert guarded(mock_ctx) == {"ok": True}
+    with pytest.raises(ModelRetry, match="必须恰好有一个 in-progress"):
+        guarded(mock_ctx)
+
+    assert called is False
 
     update_todo(mock_ctx, 1, "in-progress")
     assert guarded(mock_ctx) == {"ok": True}
 
 
-def test_execution_guard_allows_non_authorized_tools(mock_ctx):
-    """allowed_tools 限制改为软提醒，不再硬阻塞。"""
+def test_execution_guard_blocks_non_authorized_tools(mock_ctx):
+    called = False
+
     def write_file(ctx):
+        nonlocal called
+        called = True
         return {"ok": True}
 
     guarded = with_execution_guard(write_file)
@@ -114,5 +132,80 @@ def test_execution_guard_allows_non_authorized_tools(mock_ctx):
     ])
     update_todo(mock_ctx, 1, "in-progress")
 
-    # 不再抛异常，仅记录 warning 日志
+    with pytest.raises(ModelRetry, match="未授权该工具"):
+        guarded(mock_ctx)
+
+    assert called is False
+
+
+def test_execution_guard_allows_authorized_tool(mock_ctx):
+    def write_file(ctx):
+        return {"ok": True}
+
+    guarded = with_execution_guard(write_file)
+    create_todos(mock_ctx, [
+        {"id": 1, "description": "Task 1", "allowed_tools": ["write_file"]},
+    ])
+    update_todo(mock_ctx, 1, "in-progress")
+
     assert guarded(mock_ctx) == {"ok": True}
+
+
+def test_execution_guard_blocks_unfinished_dependencies(mock_ctx):
+    called = False
+
+    def mutating_tool(ctx):
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    guarded = with_execution_guard(mutating_tool)
+    create_todos(mock_ctx, [
+        {"id": 1, "description": "Prepare"},
+        {"id": 2, "description": "Change", "depends_on": [1]},
+    ])
+    state = _get_state(mock_ctx)
+    state.tasks[2].status = "in-progress"
+
+    with pytest.raises(ModelRetry, match="依赖尚未完成"):
+        guarded(mock_ctx)
+
+    assert called is False
+
+
+def test_update_todo_rejects_second_in_progress_task(mock_ctx):
+    create_todos(mock_ctx, ["Task 1", "Task 2"])
+    update_todo(mock_ctx, 1, "in-progress")
+
+    res = update_todo(mock_ctx, 2, "in-progress")
+
+    assert "已有任务正在进行" in res
+    assert _get_state(mock_ctx).tasks[2].status == "pending"
+
+
+def test_execution_guard_blocks_multiple_in_progress_tasks(mock_ctx):
+    def mutating_tool(ctx):
+        return {"ok": True}
+
+    guarded = with_execution_guard(mutating_tool)
+    create_todos(mock_ctx, ["Task 1", "Task 2"])
+    state = _get_state(mock_ctx)
+    state.tasks[1].status = "in-progress"
+    state.tasks[2].status = "in-progress"
+
+    with pytest.raises(ModelRetry, match="当前有 2 个"):
+        guarded(mock_ctx)
+
+
+@pytest.mark.asyncio
+async def test_execution_guard_supports_async_tools(mock_ctx):
+    async def run_command(ctx):
+        return {"ok": True}
+
+    guarded = with_execution_guard(run_command)
+    create_todos(mock_ctx, [
+        {"id": 1, "description": "Task 1", "allowed_tools": ["run_command"]},
+    ])
+    update_todo(mock_ctx, 1, "in-progress")
+
+    assert await guarded(mock_ctx) == {"ok": True}
