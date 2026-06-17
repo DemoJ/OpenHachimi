@@ -239,42 +239,47 @@ class ScheduledTaskStore:
             "last_delivery_status",
             "last_delivery_error",
         }
-        current = self.get_task(task_id)
-        if current is None:
-            raise KeyError(task_id)
         data = {key: value for key, value in updates.items() if key in allowed}
-        if not data:
-            return current
-
-        schedule_type = ScheduleType(data.get("schedule_type", current.schedule_type))
-        schedule_expr = str(data.get("schedule_expr", current.schedule_expr))
-        timezone_name = str(data.get("timezone", current.timezone))
-        status = _task_status(str(data.get("status", current.status)))
-        schedule_changed = any(key in data for key in {"schedule_type", "schedule_expr", "timezone", "status"})
-        next_run_at = current.next_run_at
-        if schedule_changed:
-            next_run_at = compute_next_run(schedule_type, schedule_expr, after=utc_now(), timezone_name=timezone_name) if status == "enabled" else None
-
-        assignments = []
-        values: list[Any] = []
-        for key, value in data.items():
-            column_value = value
-            if key == "schedule_type":
-                column_value = ScheduleType(value).value
-            elif key == "status":
-                column_value = _task_status(str(value))
-            elif key in {"origin", "delivery_targets", "delivery_fallback", "execution_policy"}:
-                column_value = _json_dumps(value or ([] if key == "delivery_targets" else {}))
-            assignments.append(f"{key} = ?")
-            values.append(column_value)
-        assignments.extend(["next_run_at = ?", "updated_at = ?"])
-        values.extend([_dt_to_text(next_run_at), _dt_to_text(utc_now()), task_id])
+        # 在单连接的 IMMEDIATE 事务内完成 读取-计算-写回-回读，避免 TOCTOU：
+        # 否则并发 update_task 之间、或 update_task 与调度器 claim 流程之间，
+        # 可能用基于过期 current 计算出的 next_run_at 覆盖对方刚写入的状态。
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            current = self._task_from_row(row)
+            if not data:
+                return current
+
+            schedule_type = ScheduleType(data.get("schedule_type", current.schedule_type))
+            schedule_expr = str(data.get("schedule_expr", current.schedule_expr))
+            timezone_name = str(data.get("timezone", current.timezone))
+            status = _task_status(str(data.get("status", current.status)))
+            schedule_changed = any(key in data for key in {"schedule_type", "schedule_expr", "timezone", "status"})
+            next_run_at = current.next_run_at
+            if schedule_changed:
+                next_run_at = compute_next_run(schedule_type, schedule_expr, after=utc_now(), timezone_name=timezone_name) if status == "enabled" else None
+
+            assignments = []
+            values: list[Any] = []
+            for key, value in data.items():
+                column_value = value
+                if key == "schedule_type":
+                    column_value = ScheduleType(value).value
+                elif key == "status":
+                    column_value = _task_status(str(value))
+                elif key in {"origin", "delivery_targets", "delivery_fallback", "execution_policy"}:
+                    column_value = _json_dumps(value or ([] if key == "delivery_targets" else {}))
+                assignments.append(f"{key} = ?")
+                values.append(column_value)
+            assignments.extend(["next_run_at = ?", "updated_at = ?"])
+            values.extend([_dt_to_text(next_run_at), _dt_to_text(utc_now()), task_id])
             conn.execute(f"UPDATE scheduled_tasks SET {', '.join(assignments)} WHERE id = ?", values)
-        updated = self.get_task(task_id)
-        if updated is None:
+            updated_row = conn.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()
+        if updated_row is None:
             raise KeyError(task_id)
-        return updated
+        return self._task_from_row(updated_row)
 
     def pause_task(self, task_id: str, *, reason: str | None = None) -> ScheduledTask:
         updates: dict[str, Any] = {"status": "paused"}

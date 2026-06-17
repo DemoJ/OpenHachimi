@@ -199,9 +199,15 @@ def test_search_tavily_posts_through_safe_json_request(monkeypatch):
 
     assert captured["url"] == "https://api.tavily.com/search"
     assert captured["headers"]["Content-Type"] == "application/json"
+    assert captured["headers"]["Authorization"] == "Bearer key"
     assert captured["timeout"] == 9
     assert captured["method"] == "POST"
-    assert research_module.json.loads(captured["data"].decode("utf-8"))["query"] == "topic"
+    body = research_module.json.loads(captured["data"].decode("utf-8"))
+    assert body["query"] == "topic"
+    # 安全：API key 必须走 Authorization header，不得出现在请求体中，
+    # 避免代理/APM 等记录 body 的系统泄露密钥。
+    assert "api_key" not in body
+    assert "key" not in captured["data"].decode("utf-8")
     assert results[0].backend == "tavily"
     assert results[0].url == "https://example.com/article"
 

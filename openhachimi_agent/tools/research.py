@@ -228,8 +228,12 @@ def _search_tavily(query: str, max_results: int, config: ResearchConfig, source_
         raise ValueError("tavily 后端已启用，但 research.tavily_api_key 为空")
     payload = _request_json(
         "https://api.tavily.com/search",
-        data=json.dumps({"api_key": config.tavily_api_key, "query": query, "max_results": max_results}).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        data=json.dumps({"query": query, "max_results": max_results}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {config.tavily_api_key}",
+        },
         method="POST",
         timeout=config.search_timeout_seconds,
     )
