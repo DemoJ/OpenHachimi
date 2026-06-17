@@ -27,6 +27,7 @@ from pydantic_ai import RunContext
 from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.content.skills import Skill, find_skills, parse_skill
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.tools.url_security import assert_public_hostname
 
 
 _SKILL_DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -106,6 +107,12 @@ def _download_url(
 ) -> str:
     """Download a URL to disk with timeout, size limit, and optional SHA-256 verification."""
     expected_digest = _validate_sha256(expected_sha256)
+    # SSRF 防护：仅允许 http/https，且目标主机必须解析到公网地址，
+    # 拒绝 loopback / private / link-local / 云元数据等内网或本机地址。
+    parsed = urlsplit(source_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"仅支持 http/https URL：{source_url}")
+    assert_public_hostname(parsed.hostname, resolve_dns=True)
     hasher = hashlib.sha256()
     total_bytes = 0
 
@@ -356,6 +363,8 @@ def install_skill(
             if _is_git_source(source_path_or_url):
                 if expected_sha256 is not None:
                     return "expected_sha256 is only supported for archive download URLs, not Git sources."
+                # SSRF 防护：git clone 同样会向目标主机发起连接，需校验为公网地址。
+                assert_public_hostname(parsed_source.hostname, resolve_dns=True)
                 try:
                     subprocess.run(
                         ["git", "clone", "--depth", "1", source_path_or_url, str(repo_dir)],

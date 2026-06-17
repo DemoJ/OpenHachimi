@@ -33,6 +33,7 @@ class BrowserLifecycleMixin:
     self._chrome_stderr_file
     self._chrome_cdp_port: int | None  # 记录当前 CDP 端口，用于复用检测
     self._lock: asyncio.Lock
+    self._op_lock: asyncio.Lock
     """
 
     def _ensure_local_proxy_bypass(self) -> None:
@@ -520,53 +521,57 @@ class BrowserLifecycleMixin:
 
     async def close(self) -> None:
         """关闭浏览器实例。"""
-        async with self._lock:
-            if self._page:
-                try:
-                    await self._page.close()
-                except Exception:
-                    pass
-                self._page = None
-            if self._context:
-                try:
-                    await self._context.close()
-                except Exception:
-                    pass
-                self._context = None
-            if self._browser:
-                try:
-                    await self._browser.close()
-                except Exception:
-                    pass
-                self._browser = None
-            if self._playwright:
-                try:
-                    await self._playwright.stop()
-                except Exception:
-                    pass
-                self._playwright = None
-                
-            if self._chrome_process:
-                try:
-                    if self._chrome_process.poll() is None:
-                        logger.info("终止后台 Chrome 原生进程...")
-                        self._chrome_process.terminate()
-                        try:
-                            self._chrome_process.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            self._chrome_process.kill()
-                except Exception as e:
-                    logger.error("关闭 Chrome 进程失败: %s", e)
-                finally:
-                    self._chrome_process = None
-            # 清除 CDP 端口记录，避免下次 _ensure_browser 误用已失效端口
-            self._chrome_cdp_port = None
-            if self._chrome_stderr_file:
-                try:
-                    self._chrome_stderr_file.close()
-                except Exception:
-                    pass
-                self._chrome_stderr_file = None
-                    
-            logger.info("Playwright 浏览器已关闭。")
+        # 先获取 _op_lock 等待所有进行中的操作收尾，
+        # 防止 idle monitor 在 click/get_state 等操作中途把 _page 置 None。
+        # 锁顺序必须是 _op_lock → _lock，与公开操作方法（间接通过 _ensure_browser 拿 _lock）一致，避免死锁。
+        async with self._op_lock:
+            async with self._lock:
+                if self._page:
+                    try:
+                        await self._page.close()
+                    except Exception:
+                        pass
+                    self._page = None
+                if self._context:
+                    try:
+                        await self._context.close()
+                    except Exception:
+                        pass
+                    self._context = None
+                if self._browser:
+                    try:
+                        await self._browser.close()
+                    except Exception:
+                        pass
+                    self._browser = None
+                if self._playwright:
+                    try:
+                        await self._playwright.stop()
+                    except Exception:
+                        pass
+                    self._playwright = None
+
+                if self._chrome_process:
+                    try:
+                        if self._chrome_process.poll() is None:
+                            logger.info("终止后台 Chrome 原生进程...")
+                            self._chrome_process.terminate()
+                            try:
+                                self._chrome_process.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                self._chrome_process.kill()
+                    except Exception as e:
+                        logger.error("关闭 Chrome 进程失败: %s", e)
+                    finally:
+                        self._chrome_process = None
+                # 清除 CDP 端口记录，避免下次 _ensure_browser 误用已失效端口
+                self._chrome_cdp_port = None
+                if self._chrome_stderr_file:
+                    try:
+                        self._chrome_stderr_file.close()
+                    except Exception:
+                        pass
+                    self._chrome_stderr_file = None
+
+                logger.info("Playwright 浏览器已关闭。")
 
