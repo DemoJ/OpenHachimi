@@ -20,6 +20,7 @@ from openhachimi_agent.transport.api_models import AttachmentRef
 class TurnState:
     replan_attempts: int = 0
     final_verification_repair_attempts: int = 0
+    self_critique_repair_attempts: int = 0
 
 
 @dataclass

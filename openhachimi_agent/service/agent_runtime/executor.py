@@ -16,12 +16,13 @@ from pydantic_ai.usage import UsageLimits
 
 from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
 from openhachimi_agent.agent.factory import build_executor_agent, build_scheduled_executor_agent
+from openhachimi_agent.agent.intent import SelfCritiqueDecision
 from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
-from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem, build_stream_event_handler
 from openhachimi_agent.transport.api_models import AttachmentRef
 from openhachimi_agent.vision.capabilities import mark_model_vision_support
 from openhachimi_agent.vision.preprocess import VisionPreprocessResult, image_attachments, preprocess_vision_attachments
@@ -179,6 +180,7 @@ def _degrade_direct_vision_result(vision_result: VisionPreprocessResult, error: 
 class ExecutionOutcome:
     result: Any
     final_verification_signal: dict[str, object] | None = None
+    self_critique_signal: dict[str, object] | None = None
 
 
 def _build_executor_message(
@@ -214,6 +216,111 @@ def _build_repair_message(
             "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
             "verification_signal": json.dumps(verification_signal, ensure_ascii=False),
             "user_message": message_with_attachments(message, attachments or [], vision_result),
+        },
+    )
+    return _with_direct_vision_parts(text, vision_result)
+
+
+def _compact_text(value: object, max_chars: int = 1200) -> str:
+    text = str(value or "")
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        return text[: max_chars - 3] + "..."
+    return text
+
+
+def _summarize_todo_state(session_state: dict[str, Any]) -> list[dict[str, object]]:
+    todo_state = session_state.get("todo_state")
+    tasks = getattr(todo_state, "tasks", None)
+    if not isinstance(tasks, dict):
+        return []
+    return [
+        {
+            "id": getattr(task, "id", task_id),
+            "description": getattr(task, "description", ""),
+            "status": getattr(task, "status", ""),
+            "success_criteria": getattr(task, "success_criteria", ""),
+            "notes": getattr(task, "notes", ""),
+        }
+        for task_id, task in list(tasks.items())[:20]
+    ]
+
+
+def _summarize_execution_evidence(session_state: dict[str, Any], max_events: int = 30) -> dict[str, object]:
+    ledger = session_state.get("execution_ledger", [])
+    turn_start_seq = int(session_state.get("current_turn_ledger_start_seq", 0) or 0)
+    current_turn_events = []
+    if isinstance(ledger, list):
+        current_turn_events = [
+            {
+                "seq": event.get("seq"),
+                "tool_name": event.get("tool_name"),
+                "status": event.get("status"),
+                "task_id": event.get("task_id"),
+                "args": event.get("args", {}),
+                "result_preview": _compact_text(event.get("result_preview", ""), 500),
+                "violation": _compact_text(event.get("violation", ""), 500),
+            }
+            for event in ledger
+            if isinstance(event, dict) and int(event.get("seq", 0)) > turn_start_seq
+        ][-max_events:]
+
+    artifacts = [
+        {
+            "id": getattr(artifact, "id", ""),
+            "filename": getattr(artifact, "filename", ""),
+            "content_type": getattr(artifact, "content_type", ""),
+            "local_path": getattr(artifact, "local_path", ""),
+        }
+        for artifact in session_state.get("turn_artifacts", [])
+    ]
+
+    return {
+        "todos": _summarize_todo_state(session_state),
+        "current_turn_events": current_turn_events,
+        "artifacts": artifacts,
+        "known_paths": session_state.get("known_paths", {}),
+    }
+
+
+def _result_output(result: object) -> str:
+    return str(getattr(result, "output", getattr(result, "data", "")) or "")
+
+
+def _build_self_critique_message(
+    task_frame_payload: dict[str, Any] | None,
+    message: str,
+    candidate_answer: str,
+    execution_evidence: dict[str, object],
+) -> str:
+    return render_system_prompt(
+        "runtime/self_critique_task",
+        {
+            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False, default=str),
+            "user_message": message,
+            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False, default=str),
+            "candidate_answer": candidate_answer,
+        },
+    )
+
+
+def _build_self_critique_repair_message(
+    task_frame_payload: dict[str, Any] | None,
+    message: str,
+    candidate_answer: str,
+    self_critique: SelfCritiqueDecision,
+    execution_evidence: dict[str, object],
+    attachments: list[AttachmentRef] | None = None,
+    vision_result: VisionPreprocessResult | None = None,
+) -> str | list[UserContent]:
+    text = render_system_prompt(
+        "runtime/executor_self_critique_repair",
+        {
+            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False, default=str),
+            "user_message": message_with_attachments(message, attachments or [], vision_result),
+            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False, default=str),
+            "candidate_answer": candidate_answer,
+            "self_critique": self_critique.model_dump_json(ensure_ascii=False),
         },
     )
     return _with_direct_vision_parts(text, vision_result)
@@ -297,6 +404,72 @@ async def run_executor_once(
     )
 
 
+def _executor_stream_handler(ctx: AgentRunContext, text_buffer: list[str]) -> Callable[[object, object], Any] | None:
+    if not ctx.stream or ctx.stream_queue is None:
+        return ctx.stream_event_handler
+    return build_stream_event_handler(ctx.stream_queue, ctx.operation_state, text_buffer=text_buffer)
+
+
+async def _flush_buffered_text(ctx: AgentRunContext, text_buffer: list[str]) -> None:
+    if not text_buffer or not ctx.stream or ctx.stream_queue is None:
+        return
+    for chunk in text_buffer:
+        await ctx.stream_queue.put(StreamEventItem(type="text", text=chunk))
+    text_buffer.clear()
+
+
+def _self_critique_signal(decision: SelfCritiqueDecision) -> dict[str, object]:
+    return {
+        "reason": "self critique requires revision",
+        "issues": [
+            {
+                "type": "self_critique_revision_required",
+                "items": decision.issues,
+                "repair_instructions": decision.repair_instructions,
+                "confidence": decision.confidence,
+                "rationale": decision.rationale,
+            }
+        ],
+    }
+
+
+async def _run_self_critique(
+    ctx: AgentRunContext,
+    get_agent: Callable[[str, str], Any],
+    task_frame_payload: dict[str, Any] | None,
+    result: object,
+) -> SelfCritiqueDecision:
+    candidate_answer = _result_output(result)
+    evidence = _summarize_execution_evidence(ctx.session_state)
+    prompt = _build_self_critique_message(task_frame_payload, ctx.message, candidate_answer, evidence)
+    ctx.operation_state.start("model", "self_critique")
+    critic_agent = get_agent(ctx.role, "self_critique")
+    try:
+        critic_result = await asyncio.wait_for(
+            critic_agent.run(prompt),
+            timeout=min(60, ctx.config.agent_timeout_seconds),
+        )
+        data = getattr(critic_result, "data", getattr(critic_result, "output", None))
+        decision = SelfCritiqueDecision.model_validate(data)
+    except Exception as exc:
+        logger.warning("self critique failed; allowing executor result role=%s session_id=%s error=%s", ctx.role, ctx.session_id, exc)
+        return SelfCritiqueDecision(
+            verdict="pass",
+            confidence=0.0,
+            rationale=f"self critique failed: {exc.__class__.__name__}",
+        )
+
+    logger.info(
+        "self critique verdict=%s confidence=%.2f issues=%d role=%s session_id=%s",
+        decision.verdict,
+        decision.confidence,
+        len(decision.issues),
+        ctx.role,
+        ctx.session_id,
+    )
+    return decision
+
+
 async def _run_executor_with_vision_fallback(
     *,
     executor_agent: Any,
@@ -353,7 +526,7 @@ async def _replan_after_execution_signal(
 ) -> None:
     planner_agent = get_agent(ctx.role, "planner")
     if ctx.stream and ctx.stream_queue is not None:
-        await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n"))
+        await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n", counted_as_output=False))
     planner_result = await planner_agent.run(
         render_system_prompt(
             "runtime/executor_replan",
@@ -392,6 +565,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     executor_agent = _build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode)
     ledger_start_seq = get_ledger_length(ctx.session_state)
     ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
+    text_buffer: list[str] = []
 
     try:
         result, vision_result = await _run_executor_with_vision_fallback(
@@ -404,12 +578,13 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             deps=ctx.deps,
             config=ctx.config,
             stream=ctx.stream,
-            handle_stream_events=ctx.stream_event_handler,
+            handle_stream_events=_executor_stream_handler(ctx, text_buffer),
         )
     except Exception:
         signal = get_replan_signal(ctx.session_state, ledger_start_seq)
         if signal and ctx.turn_state.replan_attempts < 1:
             ctx.turn_state.replan_attempts += 1
+            text_buffer.clear()
             await _replan_after_execution_signal(ctx, signal, get_agent)
             retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result)
             result = await run_executor_once(
@@ -419,7 +594,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
                 deps=ctx.deps,
                 config=ctx.config,
                 stream=ctx.stream,
-                handle_stream_events=ctx.stream_event_handler,
+                handle_stream_events=_executor_stream_handler(ctx, text_buffer),
             )
         else:
             raise
@@ -427,8 +602,9 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     verification_signal = get_final_verification_signal(ctx.session_state)
     if verification_signal and ctx.turn_state.final_verification_repair_attempts < 1:
         ctx.turn_state.final_verification_repair_attempts += 1
+        text_buffer.clear()
         if ctx.stream and ctx.stream_queue is not None:
-            await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n"))
+            await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n", counted_as_output=False))
         repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments, vision_result)
         result = await run_executor_once(
             executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
@@ -437,8 +613,54 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             deps=ctx.deps,
             config=ctx.config,
             stream=ctx.stream,
-            handle_stream_events=ctx.stream_event_handler,
+            handle_stream_events=_executor_stream_handler(ctx, text_buffer),
         )
         verification_signal = get_final_verification_signal(ctx.session_state)
 
-    return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
+    if verification_signal:
+        await _flush_buffered_text(ctx, text_buffer)
+        return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
+
+    critique = await _run_self_critique(ctx, get_agent, task_frame_payload, result)
+    if critique.verdict == "pass":
+        await _flush_buffered_text(ctx, text_buffer)
+        return ExecutionOutcome(result=result)
+
+    if ctx.turn_state.self_critique_repair_attempts < 1:
+        ctx.turn_state.self_critique_repair_attempts += 1
+        text_buffer.clear()
+        if ctx.stream and ctx.stream_queue is not None:
+            await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 自检发现最终回复需要修正，正在补齐...\n", counted_as_output=False))
+
+        evidence = _summarize_execution_evidence(ctx.session_state)
+        repair_message = _build_self_critique_repair_message(
+            task_frame_payload,
+            ctx.message,
+            _result_output(result),
+            critique,
+            evidence,
+            ctx.attachments,
+            vision_result,
+        )
+        ctx.operation_state.start("model", "self_critique_repair")
+        result = await run_executor_once(
+            executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
+            run_message=repair_message,
+            history=ctx.history,
+            deps=ctx.deps,
+            config=ctx.config,
+            stream=ctx.stream,
+            handle_stream_events=_executor_stream_handler(ctx, text_buffer),
+        )
+        verification_signal = get_final_verification_signal(ctx.session_state)
+        if verification_signal:
+            await _flush_buffered_text(ctx, text_buffer)
+            return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
+
+        critique = await _run_self_critique(ctx, get_agent, task_frame_payload, result)
+        if critique.verdict == "pass":
+            await _flush_buffered_text(ctx, text_buffer)
+            return ExecutionOutcome(result=result)
+
+    await _flush_buffered_text(ctx, text_buffer)
+    return ExecutionOutcome(result=result, self_critique_signal=_self_critique_signal(critique))

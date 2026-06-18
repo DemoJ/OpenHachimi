@@ -9,7 +9,14 @@ import weakref
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 
-from openhachimi_agent.agent.factory import build_continuation_agent, build_executor_agent, build_planner_agent, build_router_agent, build_scheduled_executor_agent
+from openhachimi_agent.agent.factory import (
+    build_continuation_agent,
+    build_executor_agent,
+    build_planner_agent,
+    build_router_agent,
+    build_scheduled_executor_agent,
+    build_self_critique_agent,
+)
 from openhachimi_agent.content.roles import list_role_names, load_role_content
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -318,6 +325,8 @@ class AgentService:
                 agent = build_router_agent(self.config)
             elif agent_type == "continuation":
                 agent = build_continuation_agent(self.config)
+            elif agent_type == "self_critique":
+                agent = build_self_critique_agent(self.config)
             elif agent_type == "planner":
                 agent = build_planner_agent(self.config, role_name, mcp_toolsets=self._mcp_toolsets)
             elif agent_type == "scheduled_executor":
@@ -542,6 +551,21 @@ class AgentService:
                                 reason="final_verification_failed",
                                 detail=outcome.final_verification_signal,
                             )
+                    elif outcome.self_critique_signal:
+                        result_holder["self_critique_signal"] = outcome.self_critique_signal
+                        if has_active_todos(session_state):
+                            suspend_current_plan(
+                                session_state,
+                                reason="self_critique_failed",
+                                detail=outcome.self_critique_signal,
+                                deps=deps,
+                            )
+                        else:
+                            fail_current_plan(
+                                session_state,
+                                reason="self_critique_failed",
+                                detail=outcome.self_critique_signal,
+                            )
                     else:
                         complete_current_plan(session_state)
                 except asyncio.TimeoutError as exc:
@@ -666,6 +690,11 @@ class AgentService:
                             "\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
                             f"{json.dumps(final_signal, ensure_ascii=False)}"
                         )
+                    if critique_signal := result_holder.get("self_critique_signal"):
+                        yield system_stream_event(
+                            "\n\n[自检未通过] 当前最终回复可能仍未完全满足用户意图："
+                            f"{json.dumps(critique_signal, ensure_ascii=False)}"
+                        )
                     turn_artifacts = [
                         artifact for artifact in session_state.get("turn_artifacts", [])
                         if isinstance(artifact, ArtifactRef)
@@ -771,6 +800,11 @@ class AgentService:
                         output = (
                             f"{output}\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
                             f"{json.dumps(final_signal, ensure_ascii=False)}"
+                        )
+                    if critique_signal := result_holder.get("self_critique_signal"):
+                        output = (
+                            f"{output}\n\n[自检未通过] 当前最终回复可能仍未完全满足用户意图："
+                            f"{json.dumps(critique_signal, ensure_ascii=False)}"
                         )
                     yield ChatResponse(
                         output=output,

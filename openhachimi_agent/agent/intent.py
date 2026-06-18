@@ -22,12 +22,23 @@ RiskLevel = Literal["low", "medium", "high"]
 AllowedAutonomy = Literal["narrow", "bounded", "broad"]
 ExecutionMode = Literal["direct", "skill_direct", "planned"]
 PlanContinuationAction = Literal["continue_active_plan", "resume_suspended_plan", "start_new_task"]
+SelfCritiqueVerdict = Literal["pass", "revise"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>()\"'，。；、]+", re.IGNORECASE)
 
 
 class PlanContinuationDecision(BaseModel):
     action: PlanContinuationAction = "start_new_task"
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    rationale: str = ""
+
+
+class SelfCritiqueDecision(BaseModel):
+    """Final-answer review result used before returning an executor response."""
+
+    verdict: SelfCritiqueVerdict = "pass"
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    issues: list[str] = Field(default_factory=list)
+    repair_instructions: str = ""
     rationale: str = ""
 
 

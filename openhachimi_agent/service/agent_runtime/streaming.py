@@ -335,11 +335,15 @@ def _update_operation_from_event(operation_state: OperationState, event: object)
 def build_stream_event_handler(
     stream_queue: asyncio.Queue[StreamEventItem | object],
     operation_state: OperationState,
+    text_buffer: list[str] | None = None,
 ) -> Callable[[object, object], Awaitable[None]]:
     async def handle_stream_events(_ctx: object, stream_event: object) -> None:
         async for event in stream_event:  # type: ignore[attr-defined]
             _update_operation_from_event(operation_state, event)
             if item := event_item_from_stream_event(event):
+                if text_buffer is not None and item.type == "text":
+                    text_buffer.append(item.text)
+                    continue
                 await stream_queue.put(item)
 
     return handle_stream_events
@@ -387,7 +391,7 @@ async def _cancel_stalled_task(task: asyncio.Task, exc: OperationStalledError) -
 
 
 def system_stream_event(text: str) -> StreamEventItem:
-    return StreamEventItem(type="system", text=text)
+    return StreamEventItem(type="system", text=text, counted_as_output=False)
 
 
 async def consume_stream_queue(

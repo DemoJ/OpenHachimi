@@ -9,6 +9,7 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent
 
 from openhachimi_agent.agent.intent import PlanContinuationDecision
+from openhachimi_agent.agent.intent import SelfCritiqueDecision
 from openhachimi_agent.agent.intent import TaskFrame
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_runtime.context import (
@@ -18,7 +19,13 @@ from openhachimi_agent.service.agent_runtime.context import (
     mark_turn_started,
     should_route_new_turn,
 )
-from openhachimi_agent.service.agent_runtime.executor import _build_executor_message, _run_executor_with_vision_fallback
+from openhachimi_agent.service.agent_runtime.executor import (
+    _build_executor_message,
+    _build_self_critique_message,
+    _build_self_critique_repair_message,
+    _run_executor_with_vision_fallback,
+    execute_task,
+)
 from openhachimi_agent.vision.preprocess import VisionPreprocessResult
 from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 from openhachimi_agent.service.agent_runtime.router import should_route_message
@@ -43,6 +50,28 @@ def _get_agent_for_action(action):
         return FakeContinuationAgent(action)
 
     return get_agent
+
+
+class FakeRunResult:
+    def __init__(self, output):
+        self.output = output
+
+    def all_messages(self):
+        return []
+
+    def all_messages_json(self):
+        return b"[]"
+
+
+class FakeSequenceAgent:
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.messages = []
+
+    async def run(self, message, **_kwargs):
+        self.messages.append(message)
+        output = self.outputs.pop(0)
+        return FakeRunResult(output)
 
 
 def _ctx(session_state, message="帮我处理任务"):
@@ -239,6 +268,105 @@ async def test_direct_vision_http_error_retries_without_image_parts():
     assert isinstance(agent.messages[1], str)
     assert "系统尝试将图片直接发送给主模型识别，但模型服务返回错误" in agent.messages[1]
     assert "主模型图片输入错误" in agent.messages[1]
+
+
+def test_self_critique_prompt_includes_candidate_and_evidence():
+    message = _build_self_critique_message(
+        {"goal": "修复 a.py"},
+        "请修复 a.py",
+        "已经修好了",
+        {"current_turn_events": [{"tool_name": "replace_in_file", "status": "succeeded"}]},
+    )
+
+    assert "修复 a.py" in message
+    assert "已经修好了" in message
+    assert "replace_in_file" in message
+
+
+def test_self_critique_repair_prompt_includes_repair_instructions():
+    message = _build_self_critique_repair_message(
+        {"goal": "创建 report.md"},
+        "创建报告",
+        "报告已创建",
+        SelfCritiqueDecision(verdict="revise", issues=["缺少发布文件"], repair_instructions="创建并发布 report.md"),
+        {"current_turn_events": []},
+    )
+
+    assert "缺少发布文件" in message
+    assert "创建并发布 report.md" in message
+    assert "报告已创建" in message
+
+
+@pytest.mark.asyncio
+async def test_execute_task_repairs_after_self_critique_revision(mock_config):
+    session_state = {}
+    deps = SimpleNamespace(run_mode="interactive", session_state=session_state)
+    ctx = AgentRunContext(
+        config=mock_config,
+        role="default",
+        session_id="session-1",
+        message="请生成摘要",
+        attachments=[],
+        history=[],
+        deps=deps,
+        session_state=session_state,
+        stream=False,
+    )
+    executor = FakeSequenceAgent(["候选摘要", "修正后的摘要"])
+    critic = FakeSequenceAgent([
+        SelfCritiqueDecision(verdict="revise", issues=["遗漏用户要求"], repair_instructions="补齐摘要重点"),
+        SelfCritiqueDecision(verdict="pass", confidence=0.9),
+    ])
+
+    def get_agent(_role, agent_type):
+        if agent_type == "executor":
+            return executor
+        if agent_type == "self_critique":
+            return critic
+        raise AssertionError(agent_type)
+
+    outcome = await execute_task(ctx, get_agent)
+
+    assert outcome.result.output == "修正后的摘要"
+    assert outcome.self_critique_signal is None
+    assert len(executor.messages) == 2
+    assert "候选摘要" in executor.messages[1]
+    assert len(critic.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_task_returns_signal_when_self_critique_still_fails(mock_config):
+    session_state = {}
+    deps = SimpleNamespace(run_mode="interactive", session_state=session_state)
+    ctx = AgentRunContext(
+        config=mock_config,
+        role="default",
+        session_id="session-1",
+        message="请生成摘要",
+        attachments=[],
+        history=[],
+        deps=deps,
+        session_state=session_state,
+        stream=False,
+    )
+    executor = FakeSequenceAgent(["候选摘要", "仍然不完整"])
+    critic = FakeSequenceAgent([
+        SelfCritiqueDecision(verdict="revise", issues=["缺少结论"], repair_instructions="补结论"),
+        SelfCritiqueDecision(verdict="revise", issues=["仍缺少结论"], repair_instructions="明确结论"),
+    ])
+
+    def get_agent(_role, agent_type):
+        if agent_type == "executor":
+            return executor
+        if agent_type == "self_critique":
+            return critic
+        raise AssertionError(agent_type)
+
+    outcome = await execute_task(ctx, get_agent)
+
+    assert outcome.result.output == "仍然不完整"
+    assert outcome.self_critique_signal is not None
+    assert outcome.self_critique_signal["issues"][0]["type"] == "self_critique_revision_required"
 
 
 def test_low_confidence_direct_task_does_not_need_planning():

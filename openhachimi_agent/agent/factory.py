@@ -13,7 +13,7 @@ from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.memory.recall import build_memory_context_text
 from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET, SCHEDULED_EXECUTOR_TOOLSET
-from openhachimi_agent.agent.intent import PlanContinuationDecision, TaskFrame
+from openhachimi_agent.agent.intent import PlanContinuationDecision, SelfCritiqueDecision, TaskFrame
 
 
 logger = logging.getLogger(__name__)
@@ -191,4 +191,14 @@ def build_continuation_agent(config: AppConfig) -> Agent:
         _build_router_model(config),
         system_prompt=system_prompt,
         output_type=PlanContinuationDecision,
+    )
+
+
+def build_self_critique_agent(config: AppConfig) -> Agent:
+    """创建用于最终答案自检的轻量级 Agent。"""
+    system_prompt = load_system_prompt("agents/self_critique")
+    return Agent(
+        _build_router_model(config),
+        system_prompt=system_prompt,
+        output_type=SelfCritiqueDecision,
     )
