@@ -49,3 +49,34 @@ async def test_download_encrypted_media_decrypts_cdn_bytes():
     assert data == PNG_BYTES
     assert content_type == "application/octet-stream"
     assert "encrypted_query_param=fileid%3Dabc%26token%3D123" in client.urls[0]
+
+
+@pytest.mark.asyncio
+async def test_download_media_rejects_non_allowlisted_host_to_prevent_ssrf():
+    class FakeWeixinClient(WeixinClient):
+        def __init__(self):
+            self.token = None
+            self.urls = []
+
+        async def _download_bytes(self, url, max_size_bytes, headers=None):
+            self.urls.append(url)
+            return PNG_BYTES, "image/png"
+
+    client = FakeWeixinClient()
+
+    # 内网/任意主机不在微信 CDN 白名单内，必须拒绝，且不发起任何请求。
+    with pytest.raises(ValueError):
+        await client.download_media("http://169.254.169.254/latest/meta-data/", 1024)
+    with pytest.raises(ValueError):
+        await client.download_media("http://127.0.0.1:8080/internal", 1024)
+    with pytest.raises(ValueError):
+        await client.download_media("https://evil.example.com/x.png", 1024)
+    assert client.urls == []
+
+    # 白名单内的 host 正常放行。
+    data, content_type = await client.download_media(
+        "https://mmbiz.qpic.cn/photo.png", 1024
+    )
+    assert data == PNG_BYTES
+    assert content_type == "image/png"
+    assert client.urls == ["https://mmbiz.qpic.cn/photo.png"]

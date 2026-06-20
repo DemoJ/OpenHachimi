@@ -188,6 +188,9 @@ class WeixinClient:
 
     async def download_media(self, url: str, max_size_bytes: int) -> Tuple[bytes, Optional[str]]:
         """下载 iLink 消息中的媒体 URL，返回内容与响应 Content-Type。"""
+        # 该 URL 可能来自对整条消息递归扫描出的任意字段（见 _first_url），
+        # 消息结构由远端客户端控制，必须在发起请求前校验 host，避免 SSRF。
+        _assert_weixin_cdn_url(url)
         headers = _headers(self.token, "")
         headers["Accept"] = "*/*"
         return await self._download_bytes(url, max_size_bytes, headers=headers)

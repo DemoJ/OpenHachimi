@@ -55,6 +55,12 @@ AGENT_DEPENDENCY_MTIME_TTL_SECONDS = 2.0
 PRIORITY_STOP_COMMANDS = {"/stop", "停止"}
 PRIORITY_NEW_SESSION_COMMANDS = {"/new", "新对话"}
 
+# result_holder 中的信号键 → 附加到输出的提示文案，流式与非流式路径共用。
+SIGNAL_LABELS: tuple[tuple[str, str], ...] = (
+    ("final_verification_signal", "[最终验证未通过] 当前执行结果仍缺少完成证据："),
+    ("self_critique_signal", "[自检未通过] 当前最终回复可能仍未完全满足用户意图："),
+)
+
 
 def _error_message(exc: BaseException) -> str:
     return redact_exception(exc)
@@ -685,16 +691,11 @@ class AgentService:
 
                     if error := result_holder.get("error"):
                         raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
-                    if final_signal := result_holder.get("final_verification_signal"):
-                        yield system_stream_event(
-                            "\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
-                            f"{json.dumps(final_signal, ensure_ascii=False)}"
-                        )
-                    if critique_signal := result_holder.get("self_critique_signal"):
-                        yield system_stream_event(
-                            "\n\n[自检未通过] 当前最终回复可能仍未完全满足用户意图："
-                            f"{json.dumps(critique_signal, ensure_ascii=False)}"
-                        )
+                    for signal_key, signal_label in SIGNAL_LABELS:
+                        if signal_value := result_holder.get(signal_key):
+                            yield system_stream_event(
+                                f"\n\n{signal_label}{json.dumps(signal_value, ensure_ascii=False)}"
+                            )
                     turn_artifacts = [
                         artifact for artifact in session_state.get("turn_artifacts", [])
                         if isinstance(artifact, ArtifactRef)
@@ -796,16 +797,9 @@ class AgentService:
                         (time.perf_counter() - start_time) * 1000,
                     )
                     output = result.output  # type: ignore[attr-defined]
-                    if final_signal := result_holder.get("final_verification_signal"):
-                        output = (
-                            f"{output}\n\n[最终验证未通过] 当前执行结果仍缺少完成证据："
-                            f"{json.dumps(final_signal, ensure_ascii=False)}"
-                        )
-                    if critique_signal := result_holder.get("self_critique_signal"):
-                        output = (
-                            f"{output}\n\n[自检未通过] 当前最终回复可能仍未完全满足用户意图："
-                            f"{json.dumps(critique_signal, ensure_ascii=False)}"
-                        )
+                    for signal_key, signal_label in SIGNAL_LABELS:
+                        if signal_value := result_holder.get(signal_key):
+                            output = f"{output}\n\n{signal_label}{json.dumps(signal_value, ensure_ascii=False)}"
                     yield ChatResponse(
                         output=output,
                         role=role,
