@@ -224,6 +224,7 @@ class TelegramBot:
             "  /new — 新建对话\n"
             "  /roles — 查看角色列表\n"
             "  /role &lt;名称&gt; — 切换角色\n"
+            "  /compress [主题] — 压缩当前对话上下文\n"
             "  /stop — 中断当前正在执行的任务\n"
             "  /help — 查看帮助"
         )
@@ -237,6 +238,7 @@ class TelegramBot:
             "<code>/new</code> — 保存当前对话，新建一段对话\n"
             "<code>/roles</code> — 列出全部可用角色\n"
             "<code>/role &lt;名称&gt;</code> — 切换到指定角色\n"
+            "<code>/compress [主题]</code> — 压缩当前对话上下文（可加焦点主题）\n"
             "<code>/stop</code> — 中断当前正在执行的任务\n"
             "<code>/help</code> — 查看本帮助\n\n"
             "直接发送文字消息即可与 Agent 对话。"
@@ -294,6 +296,23 @@ class TelegramBot:
             await update.message.reply_text(f"✅ {resp.message}")
         except (FileNotFoundError, ValueError) as exc:
             await update.message.reply_text(f"❌ 切换角色失败：{_exception_text(exc)}")
+
+    async def cmd_compress(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """/compress [主题] 命令：手动压缩当前会话上下文。"""
+        user_id = update.effective_user.id
+        session = self._get_session(update)
+        focus = " ".join(ctx.args).strip() if ctx.args else ""
+        try:
+            resp = await self.service.compress_session(
+                session["role"],
+                session["session_id"],
+                focus,
+                latest_scope=self._session_key(update),
+            )
+            logger.info("cmd /compress user_id=%d role=%s session_id=%s", user_id, session["role"], session["session_id"])
+            await update.message.reply_text(f"🗜️ {resp.output}")
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"❌ 压缩失败：{_exception_text(exc)}")
 
     async def _download_attachments(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[AttachmentRef]:
         message = update.message
@@ -646,6 +665,7 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
     app.add_handler(CommandHandler("stop", bot.cmd_stop))
     app.add_handler(CommandHandler("roles", bot.cmd_roles))
     app.add_handler(CommandHandler("role", bot.cmd_role))
+    app.add_handler(CommandHandler("compress", bot.cmd_compress))
     # 普通消息处理器（非命令），支持文本、图片与文档，设置为 block=False 以免阻塞后续的 /stop 等命令
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, bot.handle_message, block=False))
 
@@ -661,6 +681,7 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
             BotCommand("new",   "💾 保存当前对话，新建一段对话"),
             BotCommand("roles", "🎭 查看可用角色列表"),
             BotCommand("role",  "🔄 切换角色（如：/role default）"),
+            BotCommand("compress", "🗜️ 压缩当前对话上下文（可加主题）"),
             BotCommand("stop",  "🛑 中断当前正在执行的任务"),
             BotCommand("help",  "📖 查看帮助"),
         ])
