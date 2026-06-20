@@ -11,7 +11,6 @@ from openhachimi_agent.content.roles import load_role_content
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
-from openhachimi_agent.memory.recall import build_memory_context_text
 from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET, SCHEDULED_EXECUTOR_TOOLSET
 from openhachimi_agent.agent.intent import PlanContinuationDecision, SelfCritiqueDecision, TaskFrame
 
@@ -30,7 +29,6 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         config.model_name,
         bool(config.openai_base_url),
     )
-    import datetime
 
     system_prompt = load_system_prompt()
     role_content = load_role_content(config.roles_dir, role_name)
@@ -100,42 +98,12 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             return result
 
     @agent.system_prompt
-    def _time_prompt(ctx: RunContext[AgentDeps]) -> str:
-        # 使用 isoformat() 保证时区信息明确，并且对模型最友好
-        current_time = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
-        return render_system_prompt("runtime/time", {"current_time": current_time}) + "\n"
-
-    @agent.system_prompt
     def _config_prompt(ctx: RunContext[AgentDeps]) -> str:
         return render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")}) + "\n"
 
-    @agent.system_prompt
-    def _inject_memory_context(ctx: RunContext[AgentDeps]) -> str:
-        if not ctx.deps.config.memory.enabled:
-            return ""
-        return build_memory_context_text(ctx.deps.config, ctx.deps.memory_context)
-
-    @agent.system_prompt
-    def _inject_matched_skills(ctx: RunContext[AgentDeps]) -> str:
-        task_frame_dict = ctx.deps.session_state.get("task_frame")
-        if not task_frame_dict:
-            return ""
-        
-        relevant_skills = task_frame_dict.get("relevant_skills", [])
-        if not relevant_skills:
-            return ""
-
-        skills = find_skills(ctx.deps.skills_dirs)
-        skill_map = {s.config.name: s for s in skills}
-        
-        injected = []
-        for name in relevant_skills:
-            if name in skill_map:
-                injected.append(format_skill_prompt(skill_map[name]))
-
-        if injected:
-            return render_system_prompt("runtime/matched_skills", {"skills": "\n\n".join(injected)})
-        return ""
+    # 注:时间 / 记忆召回 / 匹配技能等每轮易变内容已从系统提示迁出,
+    # 改由 content.runtime_context.build_volatile_prefix 注入到每轮用户消息前缀,
+    # 使系统提示在会话内保持稳定、可被 provider 缓存。
 
     return agent
 

@@ -142,6 +142,7 @@ def print_help() -> None:
     print("  /role   切换角色，例如 /role default")
     print("  /new    保存当前对话并新建一段对话")
     print("  /stop   中断当前正在执行的任务")
+    print("  /compress [主题]  手动压缩上下文(可选焦点主题,优先保留相关信息)")
     print("  /exit   退出程序")
     print()
 

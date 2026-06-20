@@ -160,6 +160,45 @@ class MCPConfig:
 
 
 @dataclass(frozen=True)
+class ContextSummaryConfig:
+    """摘要压缩用的辅助模型配置;留空时使用主模型。"""
+
+    model: str = ""
+    base_url: str = ""
+    api_key: str | None = None
+    # 摘要输出的 token 上限。结构化摘要通常 1-3K token,4096 留足余量。
+    max_tokens: int = 4096
+    # 摘要失败时:False=插入确定性兜底摘要,True=中止压缩(冻结对话)
+    abort_on_failure: bool = False
+
+
+@dataclass(frozen=True)
+class ContextConfig:
+    """对话历史上下文压缩配置。
+
+    阈值均为相对模型上下文窗口的比例:
+      - threshold_percent: 轮后主压缩触发线(真实 input_tokens 用量)
+      - hard_ceiling_percent: 轮内预检触发线(粗略估计,防单轮内爆窗口)
+      - context_length: 模型上下文窗口大小,单位 K(128=128K tokens)
+    """
+
+    enabled: bool = True
+    engine: str = "compressor"  # 预留可插拔引擎
+    threshold_percent: float = 0.75
+    hard_ceiling_percent: float = 0.90
+    protect_first_n: int = 3
+    protect_last_n: int = 20
+    tail_token_budget: int = 20000
+    anti_thrash: bool = True
+    min_savings_pct: int = 10
+    rescue_to_memory: bool = True  # on_pre_compress 抢救丢弃窗口到记忆库
+    # 模型上下文窗口大小,单位 K(128 表示 128K tokens)。用于计算压缩触发阈值。
+    # 0 表示用内置默认(128K)。非 128K 的模型需手动填写真实窗口。
+    context_length: int = 128
+    summary: ContextSummaryConfig = field(default_factory=ContextSummaryConfig)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """集中管理应用运行时配置。"""
 
@@ -195,6 +234,7 @@ class AppConfig:
     research: ResearchConfig
     vision: VisionConfig
     mcp: MCPConfig = field(default_factory=MCPConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     http_api_token: str | None = None
 
 
@@ -519,6 +559,40 @@ def _load_mcp_config(user_dir: Path) -> MCPConfig:
     return load_mcp_config(user_dir)
 
 
+def _load_context_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) -> ContextConfig:
+    context_config = _as_mapping(raw_config.get("context"), "context")
+    summary_config = _as_mapping(context_config.get("summary"), "context.summary")
+
+    def _config_float(section: dict[str, Any], key: str, default: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
+        value = section.get(key, default)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"config.yaml 中的 {key} 必须是数值。") from exc
+        return max(lo, min(hi, parsed))
+
+    return ContextConfig(
+        enabled=_config_bool(context_config, "enabled", True),
+        engine=_config_string(context_config, "engine", "compressor") or "compressor",
+        threshold_percent=_config_float(context_config, "threshold_percent", 0.75, lo=0.1, hi=0.95),
+        hard_ceiling_percent=_config_float(context_config, "hard_ceiling_percent", 0.90, lo=0.2, hi=0.99),
+        protect_first_n=_config_int(context_config, "protect_first_n", 3, minimum=0),
+        protect_last_n=_config_int(context_config, "protect_last_n", 20, minimum=0),
+        tail_token_budget=_config_int(context_config, "tail_token_budget", 20000, minimum=0),
+        anti_thrash=_config_bool(context_config, "anti_thrash", True),
+        min_savings_pct=_config_int(context_config, "min_savings_pct", 10, minimum=0),
+        rescue_to_memory=_config_bool(context_config, "rescue_to_memory", True),
+        context_length=_config_int(context_config, "context_length", 128, minimum=0),
+        summary=ContextSummaryConfig(
+            model=_config_string(summary_config, "model"),
+            base_url=_config_string(summary_config, "base_url") or _config_string(llm_config, "base_url"),
+            api_key=_config_string(summary_config, "api_key") or _config_string(llm_config, "api_key") or None,
+            max_tokens=_config_int(summary_config, "max_tokens", 4096, minimum=256),
+            abort_on_failure=_config_bool(summary_config, "abort_on_failure", False),
+        ),
+    )
+
+
 def load_config() -> AppConfig:
     """从 user/config.yaml 和项目目录加载配置。"""
     base_dir = Path(__file__).resolve().parents[2]
@@ -602,4 +676,5 @@ def load_config() -> AppConfig:
         research=_load_research_config(raw_config),
         vision=_load_vision_config(raw_config, llm_config),
         mcp=_load_mcp_config(user_dir),
+        context=_load_context_config(raw_config, llm_config),
     )

@@ -191,7 +191,21 @@ logging:
   level: INFO
   dir: .logs
   console: false                 # 改为 true 可在终端同时输出日志
+
+context:                          # 对话历史上下文压缩（防止长会话爆上下文）
+  enabled: true
+  threshold_percent: 0.75        # 真实用量达此比例时自动压缩
+  hard_ceiling_percent: 0.90     # 粗略估计达此比例时轮内预检压缩
+  protect_first_n: 3             # 始终保留的开头消息数
+  protect_last_n: 20             # 尾部最少保留消息数
+  tail_token_budget: 20000       # 尾部 token 预算
+  rescue_to_memory: true         # 压缩丢弃内容抢救到记忆库（可召回找回）
+  summary:                       # 摘要压缩辅助模型；留空则用主模型
+    model: ""
+    abort_on_failure: false      # 摘要失败：false=插兜底摘要，true=中止压缩
 ```
+
+> 上下文压缩默认开启。长会话接近模型上下文上限时自动压缩历史，被压缩丢弃的内容会抢救到记忆库、后续仍可通过长期记忆召回。也可随时用 `/compress [主题]` 手动压缩。详见 [ARCHITECTURE.md](ARCHITECTURE.md#上下文管理)。
 
 ---
 

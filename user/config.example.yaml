@@ -97,3 +97,22 @@ logging:
   level: INFO
   dir: .logs
   console: false
+
+context:                      # 对话历史上下文压缩(防止长会话爆上下文)
+  enabled: true
+  engine: compressor          # 压缩引擎,预留可插拔
+  threshold_percent: 0.75     # 轮后主压缩触发线(真实 input_tokens 占上下文窗口比例)
+  hard_ceiling_percent: 0.90  # 轮内预检触发线(粗略估计,防单轮内 replan/repair 撑爆窗口)
+  protect_first_n: 3          # 始终保留的开头消息数(首轮指令+交流)
+  protect_last_n: 20          # 尾部最少保留消息数
+  tail_token_budget: 20000    # 尾部 token 预算(从末尾向前累计)
+  anti_thrash: true           # 反抖动:连续两次压缩节省不足 min_savings_pct% 则停止
+  min_savings_pct: 10
+  rescue_to_memory: true      # 压缩丢弃的窗口抢救到记忆库(可召回找回)
+  context_length: 128         # 模型上下文窗口大小,单位 K(128 = 128K tokens);非 128K 模型需按实际填写(如 32K 填 32);0 用内置默认
+  summary:                    # 摘要压缩用的辅助模型;留空则用主模型
+    model: ""
+    base_url: ""
+    api_key: ""
+    max_tokens: 4096          # 摘要输出 token 上限(单位 token);结构化摘要通常 1-3K,4096 足够
+    abort_on_failure: false   # 摘要失败:false=插兜底摘要,true=中止压缩冻结对话

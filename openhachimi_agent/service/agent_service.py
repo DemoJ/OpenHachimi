@@ -8,6 +8,7 @@ import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
+from typing import Any
 
 from openhachimi_agent.agent.factory import (
     build_continuation_agent,
@@ -49,6 +50,8 @@ from openhachimi_agent.memory.recall import recall_memories
 from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
 from openhachimi_agent.transport.api_models import AgentState, ArtifactRef, AttachmentRef, ChatResponse, CommandResponse, RolesResponse
 
+from pydantic_ai import ModelMessagesTypeAdapter
+
 
 logger = logging.getLogger(__name__)
 AGENT_DEPENDENCY_MTIME_TTL_SECONDS = 2.0
@@ -86,6 +89,7 @@ class AgentService:
         self.process_manager = ProcessManager()
         self._session_states: BoundedDict[str, dict] = BoundedDict(100)
         self._artifact_records: BoundedDict[str, ArtifactRef] = BoundedDict(500)
+        self._context_compressors: BoundedDict[str, Any] = BoundedDict(100)
         logger.info(
             "service initialized model=%s",
             self.config.model_name,
@@ -260,6 +264,13 @@ class AgentService:
         session_id: str | None,
         channel_context: dict[str, object] | None = None,
     ) -> ChatResponse | None:
+        # /compress [focus] — 手动触发上下文压缩(可带焦点主题)
+        compress_focus = self._compress_command(message)
+        if compress_focus is not None:
+            latest_scope = self._latest_scope_from_context(channel_context)
+            resolved_role, resolved_session_id = self._resolve_priority_session(role, session_id, latest_scope)
+            return await self.compress_session(resolved_role, resolved_session_id, compress_focus, latest_scope)
+
         command = self._priority_command(message)
         if command is None:
             return None
@@ -272,6 +283,76 @@ class AgentService:
         await self.stop_session(resolved_session_id)
         resp = self.new_session(resolved_role, latest_scope=latest_scope)
         return ChatResponse(output=resp.message, role=resp.role, session_id=resp.session_id)
+
+    def _compress_command(self, message: str) -> str | None:
+        """识别 /compress [focus] 命令,返回焦点主题(空串表示无焦点);非该命令返回 None。"""
+        stripped = message.strip()
+        if stripped == "/compress" or stripped == "/压缩":
+            return ""
+        if stripped.startswith("/compress "):
+            return stripped[len("/compress "):].strip()
+        if stripped.startswith("/压缩 "):
+            return stripped[len("/压缩 "):].strip()
+        return None
+
+    async def compress_session(
+        self,
+        role: str,
+        session_id: str,
+        focus_topic: str = "",
+        latest_scope: str | None = None,
+    ) -> ChatResponse:
+        """手动压缩指定会话的上下文历史(可带焦点主题)。"""
+        role = self._normalize_role(role)
+        actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id, latest_scope)
+        if not history:
+            return ChatResponse(output="当前会话无历史可压缩。", role=role, session_id=actual_session_id)
+        memory_scope = MemoryScope(
+            tenant_id="local",
+            user_id="local",
+            role_name=role,
+            session_id=actual_session_id,
+            channel="local",
+        )
+        compressor = self._get_context_compressor(actual_session_id, memory_scope)
+        if compressor is None:
+            return ChatResponse(output="上下文压缩未启用。", role=role, session_id=actual_session_id)
+        if not compressor.has_content_to_compress(history):
+            return ChatResponse(output="当前对话历史较短,暂无需压缩。", role=role, session_id=actual_session_id)
+        focus = focus_topic.strip() or None
+        before = len(history)
+        try:
+            compressed = await asyncio.to_thread(
+                compressor.compress,
+                history,
+                focus_topic=focus,
+                force=True,
+            )
+        except Exception as exc:
+            logger.warning("manual compress failed role=%s session_id=%s: %s", role, actual_session_id, exc)
+            return ChatResponse(output=f"压缩失败:{exc.__class__.__name__}", role=role, session_id=actual_session_id)
+        if len(compressed) >= before:
+            return ChatResponse(
+                output=f"未产生压缩(可能已无可压缩的中间窗口)。历史共 {before} 条消息。",
+                role=role,
+                session_id=actual_session_id,
+            )
+        history_json = ModelMessagesTypeAdapter.dump_json(compressed)
+        await asyncio.to_thread(
+            save_message_history,
+            self.config.memory_dir,
+            role,
+            actual_session_id,
+            history_json,
+            latest_scope,
+        )
+        savings = compressor._last_compression_savings_pct  # noqa: SLF001
+        focus_hint = f"(焦点:{focus})" if focus else ""
+        return ChatResponse(
+            output=f"已压缩上下文{focus_hint}:{before}→{len(compressed)} 条消息(第 {compressor.compression_count} 次压缩,约省 {savings:.0f}%)。",
+            role=role,
+            session_id=actual_session_id,
+        )
 
     async def _handle_priority_command_events(
         self,
@@ -350,6 +431,40 @@ class AgentService:
 
     def get_artifact(self, artifact_id: str) -> ArtifactRef | None:
         return self._artifact_records.get(artifact_id)
+
+    def _get_context_compressor(self, session_id: str, memory_scope: MemoryScope) -> Any:
+        """获取或构建会话级上下文压缩器(含 LLM 摘要器与记忆抢救钩子)。"""
+        cached = self._context_compressors.get(session_id)
+        if cached is not None:
+            return cached
+        cfg = self.config.context
+        if not cfg.enabled:
+            return None
+        from openhachimi_agent.context.compressor import ContextCompressor
+        from openhachimi_agent.context.summary import build_summarizer
+        from openhachimi_agent.memory.capture import capture_compressed_window
+
+        summarizer = build_summarizer(self.config)
+
+        def _rescue(full_messages: list, window: list) -> None:
+            capture_compressed_window(self.config, memory_scope, full_messages, window)
+
+        compressor = ContextCompressor(
+            threshold_percent=cfg.threshold_percent,
+            hard_ceiling_percent=cfg.hard_ceiling_percent,
+            protect_first_n=cfg.protect_first_n,
+            protect_last_n=cfg.protect_last_n,
+            tail_token_budget=cfg.tail_token_budget,
+            anti_thrash=cfg.anti_thrash,
+            min_savings_pct=cfg.min_savings_pct,
+            # context_length 配置单位为 K,这里换算成 token(128K = 128000)传给压缩引擎
+            context_length=cfg.context_length * 1000 if cfg.context_length else 0,
+            abort_on_summary_failure=cfg.summary.abort_on_failure,
+            summarizer=summarizer,
+            pre_compress_callback=_rescue,
+        )
+        self._context_compressors[session_id] = compressor
+        return compressor
 
     def state(self) -> AgentState:
         return AgentState(
@@ -520,6 +635,7 @@ class AgentService:
                 stream_queue=stream_queue,
             )
             ctx.stream_event_handler = build_stream_event_handler(stream_queue, ctx.operation_state)
+            ctx.context_compressor = self._get_context_compressor(actual_session_id, memory_scope)
 
             async def refresh_mcp_config() -> None:
                 await self._maybe_reload_mcp_toolsets()
@@ -731,7 +847,35 @@ class AgentService:
                 ]
                 self.register_artifacts(turn_artifacts)
                 new_history = list(result.all_messages())  # type: ignore[attr-defined]
-                history_json = result.all_messages_json()  # type: ignore[attr-defined]
+                # 上下文压缩:用本轮真实用量判定,触发则压缩(含 LLM 摘要,经 to_thread 避免阻塞事件循环)
+                compressor = ctx.context_compressor
+                if compressor is not None:
+                    try:
+                        compressor.update_from_response(result.usage())  # type: ignore[attr-defined]
+                    except Exception:
+                        logger.debug("context usage update failed", exc_info=True)
+                    if compressor.should_compress():
+                        try:
+                            new_history = await asyncio.to_thread(
+                                compressor.compress,
+                                new_history,
+                                current_tokens=compressor.last_prompt_tokens,
+                            )
+                            logger.info(
+                                "context compressed post-turn role=%s session_id=%s messages=%d compression_count=%d",
+                                role,
+                                actual_session_id,
+                                len(new_history),
+                                compressor.compression_count,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "context compression failed role=%s session_id=%s",
+                                role,
+                                actual_session_id,
+                                exc_info=True,
+                            )
+                history_json = ModelMessagesTypeAdapter.dump_json(new_history)
 
                 await asyncio.to_thread(
                     save_message_history,

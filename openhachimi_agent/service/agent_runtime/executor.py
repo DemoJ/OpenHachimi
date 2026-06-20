@@ -183,13 +183,21 @@ class ExecutionOutcome:
     self_critique_signal: dict[str, object] | None = None
 
 
+def _prepend_volatile(text: str, prefix: str) -> str:
+    if not prefix:
+        return text
+    return f"{prefix}\n\n{text}"
+
+
 def _build_executor_message(
     task_frame_payload: dict[str, Any] | None,
     message: str,
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
+    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
     user_message = message_with_attachments(message, attachments or [], vision_result)
+    user_message = _prepend_volatile(user_message, volatile_prefix)
     if not task_frame_payload:
         return _with_direct_vision_parts(user_message, vision_result)
 
@@ -209,13 +217,14 @@ def _build_repair_message(
     verification_signal: dict[str, object],
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
+    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
     text = render_system_prompt(
         "runtime/executor_repair",
         {
             "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
             "verification_signal": json.dumps(verification_signal, ensure_ascii=False),
-            "user_message": message_with_attachments(message, attachments or [], vision_result),
+            "user_message": _prepend_volatile(message_with_attachments(message, attachments or [], vision_result), volatile_prefix),
         },
     )
     return _with_direct_vision_parts(text, vision_result)
@@ -312,12 +321,13 @@ def _build_self_critique_repair_message(
     execution_evidence: dict[str, object],
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
+    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
     text = render_system_prompt(
         "runtime/executor_self_critique_repair",
         {
             "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False, default=str),
-            "user_message": message_with_attachments(message, attachments or [], vision_result),
+            "user_message": _prepend_volatile(message_with_attachments(message, attachments or [], vision_result), volatile_prefix),
             "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False, default=str),
             "candidate_answer": candidate_answer,
             "self_critique": self_critique.model_dump_json(ensure_ascii=False),
@@ -331,12 +341,13 @@ def _build_retry_message(
     message: str,
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
+    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
     text = render_system_prompt(
         "runtime/executor_retry",
         {
             "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
-            "user_message": message_with_attachments(message, attachments or [], vision_result),
+            "user_message": _prepend_volatile(message_with_attachments(message, attachments or [], vision_result), volatile_prefix),
         },
     )
     return _with_direct_vision_parts(text, vision_result)
@@ -402,6 +413,38 @@ async def run_executor_once(
         executor_agent.run(run_message, **run_kwargs),
         timeout=config.agent_timeout_seconds,
     )
+
+
+def preflight_compress_history(ctx: AgentRunContext) -> None:
+    """轮内预检:history 粗略估计达硬上限时,做廉价压缩(无 LLM)防止 API 超限。
+
+    针对单轮内 replan/repair/critique 多次 extend history 导致的膨胀。
+    使用 allow_llm_summary=False 走确定性兜底,避免中途中断去调 LLM。
+    """
+    compressor = ctx.context_compressor
+    if compressor is None:
+        return
+    try:
+        if not compressor.should_compress_preflight(ctx.history):
+            return
+        before = len(ctx.history)
+        compressed = compressor.compress(ctx.history, allow_llm_summary=False)
+        if len(compressed) < before:
+            ctx.history[:] = compressed
+            logger.info(
+                "context pre-flight compressed role=%s session_id=%s %d->%d",
+                ctx.role,
+                ctx.session_id,
+                before,
+                len(compressed),
+            )
+    except Exception:
+        logger.warning(
+            "pre-flight compress failed role=%s session_id=%s",
+            ctx.role,
+            ctx.session_id,
+            exc_info=True,
+        )
 
 
 def _executor_stream_handler(ctx: AgentRunContext, text_buffer: list[str]) -> Callable[[object, object], Any] | None:
@@ -482,8 +525,9 @@ async def _run_executor_with_vision_fallback(
     config: AppConfig,
     stream: bool,
     handle_stream_events: Callable[[object, object], Any] | None,
+    volatile_prefix: str = "",
 ) -> tuple[object, VisionPreprocessResult]:
-    run_message = _build_executor_message(task_frame_payload, message, attachments, vision_result)
+    run_message = _build_executor_message(task_frame_payload, message, attachments, vision_result, volatile_prefix=volatile_prefix)
     try:
         result = await run_executor_once(
             executor_agent=executor_agent,
@@ -506,7 +550,7 @@ async def _run_executor_with_vision_fallback(
         )
         mark_model_vision_support(config, False)
         degraded_vision_result = _degrade_direct_vision_result(vision_result, exc)
-        degraded_message = _build_executor_message(task_frame_payload, message, attachments, degraded_vision_result)
+        degraded_message = _build_executor_message(task_frame_payload, message, attachments, degraded_vision_result, volatile_prefix=volatile_prefix)
         result = await run_executor_once(
             executor_agent=executor_agent,
             run_message=degraded_message,
@@ -545,6 +589,10 @@ async def _replan_after_execution_signal(
 
 async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any]) -> ExecutionOutcome:
     task_frame_payload = _get_task_frame_payload(ctx.session_state)
+    # 每轮易变上下文(时间/记忆/技能)注入用户消息前缀,保持系统提示稳定可缓存
+    from openhachimi_agent.content.runtime_context import build_volatile_prefix
+
+    volatile_prefix = build_volatile_prefix(ctx.deps)
     if image_attachments(ctx.attachments):
         ctx.operation_state.start("vision", "preprocess")
         _mark_vision_processing(ctx.session_state, ctx.config, ctx.attachments)
@@ -566,6 +614,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     ledger_start_seq = get_ledger_length(ctx.session_state)
     ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
     text_buffer: list[str] = []
+    preflight_compress_history(ctx)
 
     try:
         result, vision_result = await _run_executor_with_vision_fallback(
@@ -579,6 +628,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             config=ctx.config,
             stream=ctx.stream,
             handle_stream_events=_executor_stream_handler(ctx, text_buffer),
+            volatile_prefix=volatile_prefix,
         )
     except Exception:
         signal = get_replan_signal(ctx.session_state, ledger_start_seq)
@@ -586,7 +636,8 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             ctx.turn_state.replan_attempts += 1
             text_buffer.clear()
             await _replan_after_execution_signal(ctx, signal, get_agent)
-            retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result)
+            preflight_compress_history(ctx)
+            retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result, volatile_prefix=volatile_prefix)
             result = await run_executor_once(
                 executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
                 run_message=retry_message,
@@ -605,7 +656,8 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
         text_buffer.clear()
         if ctx.stream and ctx.stream_queue is not None:
             await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n", counted_as_output=False))
-        repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments, vision_result)
+        repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments, vision_result, volatile_prefix=volatile_prefix)
+        preflight_compress_history(ctx)
         result = await run_executor_once(
             executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
             run_message=repair_message,
@@ -641,8 +693,10 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             evidence,
             ctx.attachments,
             vision_result,
+            volatile_prefix=volatile_prefix,
         )
         ctx.operation_state.start("model", "self_critique_repair")
+        preflight_compress_history(ctx)
         result = await run_executor_once(
             executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
             run_message=repair_message,

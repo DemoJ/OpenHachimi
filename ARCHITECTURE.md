@@ -12,16 +12,30 @@ openhachimi_agent/
 │
 ├── agent/                   # Agent 构建
 │   ├── __init__.py
-│   └── factory.py           # Agent 实例工厂
+│   ├── factory.py           # Agent 实例工厂（planner/executor/router/self_critique）
+│   ├── execution.py         # 执行账本与重规划/验证信号
+│   └── intent.py            # 任务意图分类与 TaskFrame
 │
 ├── content/                 # 内容管理
 │   ├── __init__.py
-│   ├── prompts.py           # 系统提示词加载
-│   └── roles.py             # 角色配置加载
+│   ├── prompts.py           # 系统提示词加载与渲染
+│   ├── roles.py             # 角色配置加载
+│   ├── skills.py            # 技能发现与加载
+│   └── runtime_context.py   # 每轮易变上下文前缀（时间/记忆/技能）
+│
+├── context/                 # 上下文管理：对话历史压缩引擎
+│   ├── __init__.py
+│   ├── engine.py            # ContextEngine 抽象基类（可插拔）
+│   ├── compressor.py        # 默认四阶段压缩实现
+│   ├── pruning.py           # 工具结果剪枝 + 去重（无 LLM）
+│   ├── token_estimate.py    # CJK 感知的粗略 token 估计
+│   └── summary.py           # 结构化 LLM 摘要生成
 │
 ├── core/                    # 核心基础设施
 │   ├── __init__.py
-│   └── config.py            # 应用配置加载与验证
+│   ├── config.py            # 应用配置加载与验证
+│   ├── deps.py              # AgentDeps 依赖容器
+│   └── redaction.py         # 脱敏辅助（密钥/凭证）
 │
 ├── daemon/                  # 守护进程管理
 │   ├── __init__.py
@@ -30,15 +44,31 @@ openhachimi_agent/
 ├── interface/               # 用户接口层
 │   ├── __init__.py
 │   ├── cli.py               # 命令行交互逻辑
-│   └── http.py              # FastAPI HTTP 服务
+│   ├── http.py              # FastAPI HTTP 服务
+│   ├── telegram.py          # Telegram 渠道
+│   └── weixin/              # 微信渠道
+│
+├── memory/                  # 长期记忆系统
+│   ├── __init__.py
+│   ├── recall.py            # BM25+向量+RRF 召回
+│   ├── capture.py           # 记忆捕获 + 压缩窗口抢救
+│   ├── consolidation.py     # 原子→块→profile 固化
+│   ├── store.py             # SQLite 存储与向量索引
+│   └── embeddings.py        # 嵌入服务
 │
 ├── service/                 # 业务服务层
 │   ├── __init__.py
-│   └── agent_service.py     # Agent 会话管理、消息处理
+│   ├── agent_service.py     # Agent 会话管理、消息处理、上下文压缩集成
+│   └── agent_runtime/       # 单轮执行编排
+│       ├── context.py       # AgentRunContext 运行上下文
+│       ├── executor.py      # 执行器（含轮内预检压缩）
+│       ├── planner.py       # 规划器
+│       ├── router.py        # 任务路由与计划续接
+│       └── streaming.py     # 流式事件处理
 │
 ├── storage/                 # 存储层
 │   ├── __init__.py
-│   └── memory.py            # 消息历史持久化
+│   └── memory.py            # 消息历史持久化（JSON）
 │
 ├── tools/                   # 工具集
 │   ├── __init__.py          # 工具导出汇总
@@ -46,17 +76,27 @@ openhachimi_agent/
 │   ├── filesystem.py        # 文件发现、搜索、读取
 │   ├── editing.py           # 文件写入、替换、目录创建
 │   ├── command.py           # 命令执行
-│   ├── git.py               # Git 状态与 diff 查询
-│   └── utils.py             # 工具共享辅助函数
+│   └── git.py               # Git 状态与 diff 查询
 │
 ├── transport/               # 传输层
 │   ├── __init__.py
 │   └── api_models.py        # HTTP API 数据模型
 │
+├── vision/                  # 视觉/图片附件处理
+│   ├── __init__.py
+│   ├── preprocess.py        # 图片预处理与降级
+│   └── capabilities.py      # 模型视觉能力探测
+│
 └── system_prompts/          # 内置系统提示词
     ├── __init__.py
-    └── base.md              # 基础系统提示词
+    ├── base.md              # 基础系统提示词
+    ├── agents/              # 各 Agent 专职提示词
+    ├── runtime/             # 运行时动态提示词（时间/配置/任务模板）
+    └── context/
+        └── summary.md       # 上下文压缩摘要模板
 ```
+
+> 注：上表为当前主要结构。`scheduler/`（定时任务）、`daemon/`、`core/identifiers.py` 等辅助模块未逐一列出。
 
 顶层文件：
 
@@ -402,6 +442,60 @@ logging:
 
 - ...
 ```
+
+---
+
+## 上下文管理
+
+对话历史是长会话的主要上下文消耗源。OpenHachimi 采用**可插拔压缩引擎 + 双触发 + 召回解耦**的方案，借鉴 Hermes Agent 的四阶段压缩与 Claude Code 的 focus 引导压缩，并利用自身已有的强记忆系统形成"压缩丢旧 + 召回找旧"闭环。
+
+### 架构分层
+
+| 层 | 模块 | 职责 |
+|------|------|------|
+| 引擎抽象 | `context/engine.py` | `ContextEngine` ABC：`should_compress`/`compress`/`update_from_response`/`on_pre_compress`，可插拔第三方引擎 |
+| 默认实现 | `context/compressor.py` | `ContextCompressor` 四阶段压缩，操作原生 `ModelMessage` |
+| 廉价剪枝 | `context/pruning.py` | 旧工具结果换一行摘要 + 去重（无 LLM） |
+| token 估计 | `context/token_estimate.py` | CJK 感知的粗略 char→token 估计（预检用） |
+| LLM 摘要 | `context/summary.py` + `system_prompts/context/summary.md` | 辅助模型结构化摘要（时态锚定 + 程序化脱敏） |
+
+### 四阶段压缩算法
+
+1. **触发判定 + 反抖动**：真实 `input_tokens` 达 `threshold_percent`（默认 0.75）触发；连续两次压缩节省不足 `min_savings_pct`（10%）则跳过，避免抖动死循环。
+2. **廉价预剪枝（无 LLM）**：受保护尾部之外的旧 `ToolReturnPart` 换成一行摘要（如 `[read_file] config.py (共 120 行)`），同内容多次出现只留最新、其余换回引。
+3. **头尾边界保护**：开头 `protect_first_n`（3）条始终保留；尾部按 `tail_token_budget`（~20K token）从末尾向前累计保护；仅对中间窗口摘要。
+4. **结构化 LLM 摘要 + 组装**：辅助模型按模板生成（目标/已完成动作/当前状态/关键决策/相关文件/待办/关键上下文）；迭代更新上次摘要而非从零重写；清理孤儿工具配对；剥离历史图片；摘要末尾加边界标记防误读。
+
+摘要用普通 `UserPromptPart` 作载体（provider 无关），不依赖服务端 compaction。
+
+### 双触发集成（多轮编排安全）
+
+单轮内 planner→executor→replan/repair→self_critique 会多次 `extend` 同一份 history，膨胀速度远快于对话轮数，故需双触发：
+
+- **轮后主压缩**（`agent_service.py`）：用本轮真实 `result.usage()` 判定，触发则在 `save_message_history` 前压缩并保存。轮边界最安全，不打断工具序列。
+- **轮内预检安全网**（`executor.py: preflight_compress_history`）：每次 `agent.run` 前粗略估计达 `hard_ceiling_percent`（0.90）时，对内存 history 先做廉价压缩（`allow_llm_summary=False` 走确定性兜底，避免中途中断调 LLM），防止单轮内撑爆模型窗口。
+
+### 召回解耦闭环
+
+OpenHachimi 的记忆系统（BM25+向量+RRF+三级分层）独立于 live context，且 turn store 与消息历史 JSON 解耦。因此压缩时**不是纯丢弃**：
+
+- `on_pre_compress` 钩子调用 `memory/capture.py: capture_compressed_window`，把待丢弃的中间窗口序列化为可向量检索的 L1 atom（带 embedding）。
+- 丢弃的工具调用细节仍可通过 `recall_memories` 召回找回——"压缩丢旧 + 召回找旧"闭环，无需 Hermes 的 DAG/LCM 或服务端 compaction。
+
+### prompt 缓存稳定性
+
+`agent/factory.py` 的系统提示分为稳定层与易变层：
+
+- **稳定层**（进 `Agent(system_prompt=)` 静态参数）：base 提示词 + 角色指令 + executor/planner 提示词。会话内不变，可被 provider 缓存。
+- **易变层**（迁出系统提示）：时间 / 记忆召回 / 匹配技能 / task_frame —— 由 `content/runtime_context.py: build_volatile_prefix` 注入每轮用户消息前缀，使系统前缀不再因时间每秒变化而击穿缓存。
+
+### 手动压缩
+
+`/compress [焦点主题]` 斜杠命令（CLI/HTTP/渠道通用）立即压缩当前会话，可带焦点主题引导压缩优先保留相关信息。无需等待自动触发。
+
+### 配置
+
+见 `user/config.example.yaml` 的 `context:` 段：`threshold_percent` / `hard_ceiling_percent` / `protect_first_n` / `protect_last_n` / `tail_token_budget` / `anti_thrash` / `rescue_to_memory` / `context_length` / `summary.*`（辅助摘要模型，留空用主模型）。
 
 ---
 

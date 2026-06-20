@@ -47,13 +47,21 @@ async def run_planner(ctx: AgentRunContext, task_frame: TaskFrame, get_agent: Ca
     if ctx.stream and ctx.stream_queue is not None:
         await ctx.stream_queue.put(PLANNING_NOTICE)
 
+    # 易变上下文(时间/记忆/技能)注入用户消息前缀,保持系统提示稳定可缓存
+    from openhachimi_agent.content.runtime_context import build_volatile_prefix
+
+    volatile_prefix = build_volatile_prefix(ctx.deps)
+    user_content = message_with_attachments(ctx.message, ctx.attachments)
+    if volatile_prefix:
+        user_content = f"{volatile_prefix}\n\n{user_content}"
+
     heartbeat_task: asyncio.Task | None = None
     if ctx.stream:
         heartbeat_task = asyncio.create_task(_planner_heartbeat(ctx))
 
     try:
         planner_result = await planner_agent.run(
-            build_planner_prompt(task_frame, message_with_attachments(ctx.message, ctx.attachments)),
+            build_planner_prompt(task_frame, user_content),
             message_history=ctx.history,
             deps=ctx.deps,
             event_stream_handler=ctx.stream_event_handler if ctx.stream else None,
