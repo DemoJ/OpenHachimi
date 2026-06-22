@@ -97,11 +97,15 @@ def build_webui(project_root: Path) -> None:
     try:
         _run_shell(install_cmd, cwd=webui_dir, timeout=600)
     except subprocess.CalledProcessError:
+        # 常见原因：上次安装被中断导致 npm 缓存残留损坏（如 esbuild 平台二进制
+        # 包「cache hit 但 no local data」）。清缓存后重装一次以自愈。
+        print("[WARN] 前端依赖安装失败，清理 npm 缓存后重试...")
+        _run_shell(["npm", "cache", "clean", "--force"], cwd=webui_dir, timeout=120)
         if install_cmd[1] == "ci":
-            print("[WARN] npm ci 失败，改用 npm install...")
-            _run_shell(["npm", "install", "--prefer-offline", *NPM_INSTALL_FLAGS], cwd=webui_dir, timeout=600)
+            print("[WARN] 改用 npm install 重试...")
+            _run_shell(["npm", "install", *NPM_INSTALL_FLAGS], cwd=webui_dir, timeout=600)
         else:
-            raise
+            _run_shell(install_cmd, cwd=webui_dir, timeout=600)
 
     print("[INFO] 构建前端（npm run build）...")
     _run_shell(["npm", "run", "build"], cwd=webui_dir, timeout=600)
