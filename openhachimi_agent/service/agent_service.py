@@ -2,80 +2,56 @@
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import replace
 from typing import Any
-
-from openhachimi_agent.agent.factory import (
-    build_continuation_agent,
-    build_executor_agent,
-    build_planner_agent,
-    build_router_agent,
-    build_scheduled_executor_agent,
-    build_self_critique_agent,
-)
-from openhachimi_agent.content.roles import list_role_names, load_role_content
-from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.core.deps import AgentDeps
-from openhachimi_agent.core.identifiers import validate_latest_scope, validate_role_name, validate_session_id
-from openhachimi_agent.core.redaction import redact_exception, redact_text
-from openhachimi_agent.service.agent_runtime.context import (
-    AgentRunContext,
-    complete_current_plan,
-    fail_current_plan,
-    has_active_todos,
-    mark_turn_finished,
-    mark_turn_started,
-    suspend_current_plan,
-)
-from openhachimi_agent.service.agent_runtime.executor import execute_task, message_with_attachments
-from openhachimi_agent.service.agent_runtime.planner import needs_planning, run_planner
-from openhachimi_agent.service.agent_runtime.router import resolve_task_frame, should_route_message
-from openhachimi_agent.service.agent_runtime.streaming import (
-    STREAM_DONE,
-    OperationStalledError,
-    StreamEventItem,
-    StreamStats,
-    build_stream_event_handler,
-    consume_stream_queue,
-    system_stream_event,
-)
-from openhachimi_agent.memory.capture import capture_turn_memories
-from openhachimi_agent.memory.models import MemoryScope
-from openhachimi_agent.memory.recall import recall_memories
-from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
-from openhachimi_agent.transport.api_models import AgentState, ArtifactRef, AttachmentRef, ChatResponse, CommandResponse, RolesResponse
 
 from pydantic_ai import ModelMessagesTypeAdapter
 
-
-logger = logging.getLogger(__name__)
-AGENT_DEPENDENCY_MTIME_TTL_SECONDS = 2.0
-PRIORITY_STOP_COMMANDS = {"/stop", "停止"}
-PRIORITY_NEW_SESSION_COMMANDS = {"/new", "新对话"}
-
-# result_holder 中的信号键 → 附加到输出的提示文案，流式与非流式路径共用。
-SIGNAL_LABELS: tuple[tuple[str, str], ...] = (
-    ("final_verification_signal", "[最终验证未通过] 当前执行结果仍缺少完成证据："),
-    ("self_critique_signal", "[自检未通过] 当前最终回复可能仍未完全满足用户意图："),
+from openhachimi_agent.content.roles import list_role_names, load_role_content
+from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.identifiers import validate_latest_scope, validate_role_name, validate_session_id
+from openhachimi_agent.memory.models import MemoryScope
+from openhachimi_agent.service.agent_runtime.agent_cache import (
+    AGENT_DEPENDENCY_MTIME_TTL_SECONDS,
+    compute_dependency_mtime,
+    get_or_build_agent,
+)
+from openhachimi_agent.service.agent_runtime.command_registry import (
+    CommandOutcome,
+    parse_command,
+)
+from openhachimi_agent.service.agent_runtime.commands import (
+    latest_scope_from_context,
+)
+from openhachimi_agent.service.agent_runtime.mcp_manager import (
+    get_mcp_config_signature,
+    load_new_mcp_stack,
+)
+from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+from openhachimi_agent.service.agent_runtime.turn import run_turn
+from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
+from openhachimi_agent.transport.api_models import (
+    AgentState,
+    ArtifactRef,
+    AttachmentRef,
+    ChatResponse,
+    CommandResponse,
+    RolesResponse,
 )
 
 
-def _error_message(exc: BaseException) -> str:
-    return redact_exception(exc)
-
+logger = logging.getLogger(__name__)
 
 
 class AgentService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self._agents = {}  # 缓存 (Agent 实例, 最后修改时间)，支持热重载
+        self._agents: dict[str, tuple[Any, float]] = {}  # 缓存 (Agent 实例, 最后修改时间),支持热重载
         self._agent_dependency_mtime_cache: tuple[float, float] | None = None
-        self._mcp_toolsets = []
+        self._mcp_toolsets: list = []
         self._mcp_stack = contextlib.AsyncExitStack()
         self._mcp_config_signature: tuple[float, int] | None = None
         self._mcp_reload_lock = asyncio.Lock()
@@ -95,8 +71,10 @@ class AgentService:
             self.config.model_name,
         )
 
+    # ------------------------------------------------------------------ 生命周期
+
     async def start(self) -> None:
-        """启动后台服务需要长期维护的资源，如 MCP 连接。"""
+        """启动后台服务需要长期维护的资源,如 MCP 连接。"""
         await self._reload_mcp_toolsets(force=True)
 
     async def stop(self) -> None:
@@ -106,16 +84,10 @@ class AgentService:
         except Exception:
             logger.exception("Error closing MCP toolsets")
 
+    # ------------------------------------------------------------------ MCP 管理
+
     def _get_mcp_config_signature(self) -> tuple[float, int] | None:
-        mcp_file = self.config.user_dir / "mcp-servers.json"
-        try:
-            if not mcp_file.exists() or not mcp_file.is_file():
-                return None
-            stat = mcp_file.stat()
-            return (stat.st_mtime, stat.st_size)
-        except Exception as exc:
-            logger.debug("Failed to check mcp-servers.json signature: %s", exc)
-            return self._mcp_config_signature
+        return get_mcp_config_signature(self.config.user_dir, self._mcp_config_signature)
 
     async def _maybe_reload_mcp_toolsets(self) -> None:
         signature = self._get_mcp_config_signature()
@@ -129,46 +101,27 @@ class AgentService:
             if not force and signature == self._mcp_config_signature:
                 return
 
-            from openhachimi_agent.core.config import load_mcp_config
-            from openhachimi_agent.tools.mcp import load_mcp_toolsets
-
             logger.info("reloading MCP toolsets signature_changed=%s", signature != self._mcp_config_signature)
-            runtime_config = replace(self.config, mcp=load_mcp_config(self.config.user_dir))
-            new_stack = contextlib.AsyncExitStack()
-            connected_toolsets = []
-            errors: list[str] = []
+            result = await load_new_mcp_stack(self.config, signature)
 
-            try:
-                for ts in load_mcp_toolsets(runtime_config):
-                    try:
-                        await new_stack.enter_async_context(ts)
-                    except Exception as exc:
-                        message = _error_message(exc)
-                        errors.append(message)
-                        logger.exception("Failed to start MCP toolset connection")
-                    else:
-                        connected_toolsets.append(ts)
+            old_stack = self._mcp_stack
+            self.config = result.new_config
+            self._mcp_stack = result.new_stack
+            self._mcp_toolsets = result.new_toolsets
+            self._mcp_config_signature = result.new_signature
+            self._mcp_errors = result.errors
+            self._agents.clear()
+            await old_stack.aclose()
+            logger.info(
+                "MCP toolsets reloaded connected=%d errors=%d",
+                len(result.new_toolsets),
+                len(result.errors),
+            )
 
-                old_stack = self._mcp_stack
-                self.config = runtime_config
-                self._mcp_stack = new_stack
-                self._mcp_toolsets = connected_toolsets
-                self._mcp_config_signature = signature
-                self._mcp_errors = errors
-                self._agents.clear()
-                await old_stack.aclose()
-                logger.info(
-                    "MCP toolsets reloaded connected=%d errors=%d",
-                    len(connected_toolsets),
-                    len(errors),
-                )
-            except Exception:
-                await new_stack.aclose()
-                raise
+    # ------------------------------------------------------------------ 角色与会话身份
 
     def _normalize_role(self, role_name: str | None) -> str:
-        role = validate_role_name(role_name or self.config.default_role_name)
-        return role
+        return validate_role_name(role_name or self.config.default_role_name)
 
     def _normalize_session_id(self, session_id: str | None) -> str | None:
         if not session_id:
@@ -179,6 +132,97 @@ class AgentService:
         if role_name == self.config.default_role_name and not list_role_names(self.config.roles_dir):
             return
         load_role_content(self.config.roles_dir, role_name)
+
+    def state(self) -> AgentState:
+        return AgentState(
+            model=self.config.model_name,
+            base_url=self.config.openai_base_url or None,
+            mcp_servers=len(self._mcp_toolsets),
+            mcp_errors=list(self._mcp_errors),
+        )
+
+    def list_roles(self) -> RolesResponse:
+        logger.debug("listing roles roles_dir=%s", self.config.roles_dir)
+        return RolesResponse(
+            roles=list_role_names(self.config.roles_dir),
+            current_role=self.config.default_role_name,
+        )
+
+    def latest_session(self, role_name: str | None = None, latest_scope: str | None = None) -> CommandResponse:
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        scope = validate_latest_scope(latest_scope)
+        from openhachimi_agent.storage.memory import (
+            create_session_id,
+            load_latest_session_id,
+            save_latest_session_id,
+        )
+        session_id = load_latest_session_id(self.config.memory_dir, role, scope)
+        if not session_id or session_id == "legacy":
+            session_id = create_session_id()
+            save_latest_session_id(self.config.memory_dir, role, session_id, scope)
+            logger.info("no latest session found, created new session role=%s session_id=%s scope=%s", role, session_id, scope)
+        else:
+            logger.info("loaded latest session role=%s session_id=%s scope=%s", role, session_id, scope)
+
+        return CommandResponse(
+            message="已恢复上一次的对话上下文。",
+            role=role,
+            session_id=session_id,
+        )
+
+    def new_session(self, role_name: str | None = None, latest_scope: str | None = None) -> CommandResponse:
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        scope = validate_latest_scope(latest_scope)
+        session_id = start_new_session(self.config.memory_dir, role, scope)
+        logger.info(
+            "new session role=%s session_id=%s scope=%s",
+            role,
+            session_id,
+            scope,
+        )
+        lines = [
+            "✨ 新对话已准备好",
+            "",
+            "✅ 上一段对话已保存",
+            "📝 已为你开启一段全新的上下文",
+            "",
+            "━━ 当前配置 ━━",
+            f"🤖 模型:{self.config.model_name}",
+        ]
+        if self.config.openai_base_url:
+            lines.append(f"🌐 模型服务:{self.config.openai_base_url}")
+        lines.extend([
+            f"🎭 角色:{role}",
+            f"🧩 会话:{session_id}",
+            "",
+            "💬 直接输入内容并回车,即可继续对话。",
+        ])
+        return CommandResponse(
+            message="\n".join(lines),
+            role=role,
+            session_id=session_id,
+        )
+
+    def switch_role(self, role_name: str, latest_scope: str | None = None) -> CommandResponse:
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        scope = validate_latest_scope(latest_scope)
+        session_id = start_new_session(self.config.memory_dir, role, scope)
+        logger.info(
+            "switched role to role=%s session_id=%s scope=%s",
+            role,
+            session_id,
+            scope,
+        )
+        return CommandResponse(
+            message=f"已切换到角色:{role},并新建对话。",
+            role=role,
+            session_id=session_id,
+        )
+
+    # ------------------------------------------------------------------ 中断与停止
 
     async def interrupt_session_resources(self, session_id: str, reason: str = "interrupt") -> int:
         session_id = validate_session_id(session_id, allow_legacy=False)
@@ -233,23 +277,21 @@ class AgentService:
         logger.info("interrupted session resources session_id=%s process_count=%s", session_id, count)
         return count if isinstance(count, int) else 0
 
-    def _priority_command(self, message: str) -> str | None:
-        command = message.strip()
-        if command in PRIORITY_STOP_COMMANDS:
-            return "stop"
-        if command in PRIORITY_NEW_SESSION_COMMANDS:
-            return "new"
-        return None
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
 
-    def _latest_scope_from_context(self, channel_context: dict[str, object] | None) -> str | None:
-        if not channel_context:
-            return None
-        scope = channel_context.get("session_scope_key")
-        if not scope:
-            return None
-        return validate_latest_scope(str(scope))
+    # ------------------------------------------------------------------ 优先命令分发
 
-    def _resolve_priority_session(self, role: str | None, session_id: str | None, latest_scope: str | None = None) -> tuple[str, str]:
+    def _resolve_priority_session(
+        self,
+        role: str | None,
+        session_id: str | None,
+        latest_scope: str | None = None,
+    ) -> tuple[str, str]:
         resolved_role = self._normalize_role(role)
         resolved_session_id = self._normalize_session_id(session_id)
         if resolved_session_id:
@@ -257,43 +299,67 @@ class AgentService:
         latest = self.latest_session(resolved_role, latest_scope=latest_scope)
         return latest.role, latest.session_id
 
+    async def dispatch_command(
+        self,
+        message: str,
+        *,
+        role: str | None = None,
+        session_id: str | None = None,
+        channel_context: dict[str, object] | None = None,
+        channel: str = "local",
+    ) -> CommandOutcome | None:
+        """统一命令分派入口:命中注册表则执行,未命中或不可用于该渠道返回 None。"""
+        parsed = parse_command(message)
+        if parsed is None:
+            return None
+        spec, args = parsed
+        if spec.channels and channel not in spec.channels:
+            return None
+        return await spec.handler(self, args, role, session_id, channel_context, channel)
+
     async def _handle_priority_command_response(
         self,
         message: str,
         role: str | None,
         session_id: str | None,
         channel_context: dict[str, object] | None = None,
+        channel: str = "local",
     ) -> ChatResponse | None:
-        # /compress [focus] — 手动触发上下文压缩(可带焦点主题)
-        compress_focus = self._compress_command(message)
-        if compress_focus is not None:
-            latest_scope = self._latest_scope_from_context(channel_context)
-            resolved_role, resolved_session_id = self._resolve_priority_session(role, session_id, latest_scope)
-            return await self.compress_session(resolved_role, resolved_session_id, compress_focus, latest_scope)
-
-        command = self._priority_command(message)
-        if command is None:
+        outcome = await self.dispatch_command(
+            message,
+            role=role,
+            session_id=session_id,
+            channel_context=channel_context,
+            channel=channel,
+        )
+        if outcome is None:
             return None
-        latest_scope = self._latest_scope_from_context(channel_context)
+        # send_message/stream_events 这条路径只需把命令结果包装为 ChatResponse
+        # (kind=exit 等不会从这里进:HTTP/微信 渠道在更外层已经拦截)
+        latest_scope = latest_scope_from_context(channel_context)
         resolved_role, resolved_session_id = self._resolve_priority_session(role, session_id, latest_scope)
-        if command == "stop":
-            resp = await self.stop_session(resolved_session_id)
-            return ChatResponse(output=resp.message, role=resolved_role, session_id=resolved_session_id)
+        return ChatResponse(
+            output=outcome.message,
+            role=outcome.role or resolved_role,
+            session_id=outcome.session_id or resolved_session_id,
+        )
 
-        await self.stop_session(resolved_session_id)
-        resp = self.new_session(resolved_role, latest_scope=latest_scope)
-        return ChatResponse(output=resp.message, role=resp.role, session_id=resp.session_id)
+    async def _handle_priority_command_events(
+        self,
+        message: str,
+        role: str | None,
+        session_id: str | None,
+        channel_context: dict[str, object] | None = None,
+        channel: str = "local",
+    ) -> list[StreamEventItem] | None:
+        response = await self._handle_priority_command_response(
+            message, role, session_id, channel_context, channel=channel,
+        )
+        if response is None:
+            return None
+        return [StreamEventItem(type="system", text=response.output)]
 
-    def _compress_command(self, message: str) -> str | None:
-        """识别 /compress [focus] 命令,返回焦点主题(空串表示无焦点);非该命令返回 None。"""
-        stripped = message.strip()
-        if stripped == "/compress" or stripped == "/压缩":
-            return ""
-        if stripped.startswith("/compress "):
-            return stripped[len("/compress "):].strip()
-        if stripped.startswith("/压缩 "):
-            return stripped[len("/压缩 "):].strip()
-        return None
+    # ------------------------------------------------------------------ 上下文压缩
 
     async def compress_session(
         self,
@@ -354,84 +420,6 @@ class AgentService:
             session_id=actual_session_id,
         )
 
-    async def _handle_priority_command_events(
-        self,
-        message: str,
-        role: str | None,
-        session_id: str | None,
-        channel_context: dict[str, object] | None = None,
-    ) -> list[StreamEventItem] | None:
-        response = await self._handle_priority_command_response(message, role, session_id, channel_context)
-        if response is None:
-            return None
-        return [StreamEventItem(type="system", text=response.output)]
-
-    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
-        lock = self._session_locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._session_locks[session_id] = lock
-        return lock
-
-    def _get_agent_dependency_mtime(self, role_name: str) -> float:
-        now = time.monotonic()
-        if self._agent_dependency_mtime_cache is not None:
-            checked_at, cached_mtime = self._agent_dependency_mtime_cache
-            if now - checked_at < AGENT_DEPENDENCY_MTIME_TTL_SECONDS:
-                return cached_mtime
-
-        current_mtime = 0.0
-        paths_to_check = [self.config.roles_dir / f"{role_name}.md"]
-        try:
-            for path in paths_to_check:
-                if path.exists() and path.is_file():
-                    current_mtime = max(current_mtime, path.stat().st_mtime)
-
-            for skills_dir in self.config.skills_dirs:
-                if not skills_dir.exists() or not skills_dir.is_dir():
-                    continue
-                for skill_file in skills_dir.rglob("SKILL.md"):
-                    if skill_file.is_file():
-                        current_mtime = max(current_mtime, skill_file.stat().st_mtime)
-        except Exception as exc:
-            logger.debug("Failed to check mtime for agent dependencies: %s", exc)
-
-        self._agent_dependency_mtime_cache = (now, current_mtime)
-        return current_mtime
-
-    def _get_agent(self, role_name: str, agent_type: str = "executor"):
-        cache_key = f"{role_name}:{agent_type}"
-        current_mtime = self._get_agent_dependency_mtime(role_name)
-
-        cached = self._agents.get(cache_key)
-        if cached is None or cached[1] < current_mtime:
-            if cached is not None:
-                logger.info("rebuilding %s agent due to dependency updates role=%s", agent_type, role_name)
-                
-            if agent_type == "router":
-                agent = build_router_agent(self.config)
-            elif agent_type == "continuation":
-                agent = build_continuation_agent(self.config)
-            elif agent_type == "self_critique":
-                agent = build_self_critique_agent(self.config)
-            elif agent_type == "planner":
-                agent = build_planner_agent(self.config, role_name, mcp_toolsets=self._mcp_toolsets)
-            elif agent_type == "scheduled_executor":
-                agent = build_scheduled_executor_agent(self.config, role_name, mcp_toolsets=self._mcp_toolsets)
-            else:
-                agent = build_executor_agent(self.config, role_name, mcp_toolsets=self._mcp_toolsets)
-                
-            self._agents[cache_key] = (agent, current_mtime)
-            
-        return self._agents[cache_key][0]
-
-    def register_artifacts(self, artifacts: list[ArtifactRef]) -> None:
-        for artifact in artifacts:
-            self._artifact_records[artifact.id] = artifact
-
-    def get_artifact(self, artifact_id: str) -> ArtifactRef | None:
-        return self._artifact_records.get(artifact_id)
-
     def _get_context_compressor(self, session_id: str, memory_scope: MemoryScope) -> Any:
         """获取或构建会话级上下文压缩器(含 LLM 摘要器与记忆抢救钩子)。"""
         cached = self._context_compressors.get(session_id)
@@ -466,96 +454,39 @@ class AgentService:
         self._context_compressors[session_id] = compressor
         return compressor
 
-    def state(self) -> AgentState:
-        return AgentState(
-            model=self.config.model_name,
-            base_url=self.config.openai_base_url or None,
-            mcp_servers=len(self._mcp_toolsets),
-            mcp_errors=list(self._mcp_errors),
+    # ------------------------------------------------------------------ Agent 构建与工件
+
+    def _get_agent_dependency_mtime(self, role_name: str) -> float:
+        mtime, new_cache = compute_dependency_mtime(self.config, role_name, self._agent_dependency_mtime_cache)
+        self._agent_dependency_mtime_cache = new_cache
+        return mtime
+
+    def _get_agent(self, role_name: str, agent_type: str = "executor"):
+        current_mtime = self._get_agent_dependency_mtime(role_name)
+        return get_or_build_agent(
+            self._agents,
+            self.config,
+            role_name,
+            agent_type,
+            self._mcp_toolsets,
+            current_mtime,
         )
 
-    def list_roles(self) -> RolesResponse:
-        logger.debug("listing roles roles_dir=%s", self.config.roles_dir)
-        return RolesResponse(
-            roles=list_role_names(self.config.roles_dir),
-            current_role=self.config.default_role_name,
-        )
+    def register_artifacts(self, artifacts: list[ArtifactRef]) -> None:
+        for artifact in artifacts:
+            self._artifact_records[artifact.id] = artifact
 
-    def latest_session(self, role_name: str | None = None, latest_scope: str | None = None) -> CommandResponse:
-        role = self._normalize_role(role_name)
-        self._validate_role_exists(role)
-        scope = validate_latest_scope(latest_scope)
-        from openhachimi_agent.storage.memory import load_latest_session_id, create_session_id, save_latest_session_id
-        session_id = load_latest_session_id(self.config.memory_dir, role, scope)
-        if not session_id or session_id == "legacy":
-            session_id = create_session_id()
-            save_latest_session_id(self.config.memory_dir, role, session_id, scope)
-            logger.info("no latest session found, created new session role=%s session_id=%s scope=%s", role, session_id, scope)
-        else:
-            logger.info("loaded latest session role=%s session_id=%s scope=%s", role, session_id, scope)
-        
-        return CommandResponse(
-            message="已恢复上一次的对话上下文。",
-            role=role,
-            session_id=session_id,
-        )
+    def get_artifact(self, artifact_id: str) -> ArtifactRef | None:
+        return self._artifact_records.get(artifact_id)
 
-    def new_session(self, role_name: str | None = None, latest_scope: str | None = None) -> CommandResponse:
-        role = self._normalize_role(role_name)
-        self._validate_role_exists(role)
-        scope = validate_latest_scope(latest_scope)
-        session_id = start_new_session(self.config.memory_dir, role, scope)
-        logger.info(
-            "new session role=%s session_id=%s scope=%s",
-            role,
-            session_id,
-            scope,
-        )
-        lines = [
-            "✨ 新对话已准备好",
-            "",
-            "✅ 上一段对话已保存",
-            "📝 已为你开启一段全新的上下文",
-            "",
-            "━━ 当前配置 ━━",
-            f"🤖 模型：{self.config.model_name}",
-        ]
-        if self.config.openai_base_url:
-            lines.append(f"🌐 模型服务：{self.config.openai_base_url}")
-        lines.extend([
-            f"🎭 角色：{role}",
-            f"🧩 会话：{session_id}",
-            "",
-            "💬 直接输入内容并回车，即可继续对话。",
-        ])
-        return CommandResponse(
-            message="\n".join(lines),
-            role=role,
-            session_id=session_id,
-        )
+    # ------------------------------------------------------------------ 对外消息入口
 
-    def switch_role(self, role_name: str, latest_scope: str | None = None) -> CommandResponse:
-        role = self._normalize_role(role_name)
-        self._validate_role_exists(role)
-        scope = validate_latest_scope(latest_scope)
-        session_id = start_new_session(self.config.memory_dir, role, scope)
-        logger.info(
-            "switched role to role=%s session_id=%s scope=%s",
-            role,
-            session_id,
-            scope,
-        )
-        return CommandResponse(
-            message=f"已切换到角色：{role}，并新建对话。",
-            role=role,
-            session_id=session_id,
-        )
-
-    async def _run_with_session(
+    def _run_with_session(
         self,
         message: str,
         role: str | None,
         session_id: str | None,
+        *,
         stream: bool,
         attachments: Sequence[AttachmentRef] | None = None,
         run_mode: str = "interactive",
@@ -564,396 +495,23 @@ class AgentService:
         channel: str | None = None,
         delivery_target: dict[str, object] | None = None,
     ) -> AsyncIterator[object]:
-        start_time = time.perf_counter()
-        role = self._normalize_role(role)
-        session_id = self._normalize_session_id(session_id)
-        self._validate_role_exists(role)
-        latest_scope = validate_latest_scope(str(channel_context.get("session_scope_key"))) if channel_context and channel_context.get("session_scope_key") else None
-        attachment_list = list(attachments or [])
-        effective_message = message_with_attachments(message, attachment_list)
+        """委托到 `agent_runtime.turn.run_turn`。
 
-        channel_context_data = dict(channel_context or {})
-        if not channel_context_data:
-            channel_context_data = {"type": channel or "local", "platform": channel or "local"}
-            if delivery_target:
-                channel_context_data.update(delivery_target)
-        channel_name = str(channel_context_data.get("type") or channel_context_data.get("platform") or "local")
-
-        actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id, latest_scope)
-        lock = self._get_session_lock(actual_session_id)
-
-        async with lock:
-            logger.info(
-                "chat started role=%s session_id=%s message_chars=%d history_messages=%d attachment_count=%d stream=%s",
-                role,
-                actual_session_id,
-                len(message),
-                len(history),
-                len(attachment_list),
-                str(stream).lower(),
-            )
-            await self._maybe_reload_mcp_toolsets()
-
-            if actual_session_id not in self._session_states:
-                self._session_states[actual_session_id] = {}
-            session_state = self._session_states[actual_session_id]
-            session_state["turn_artifacts"] = []
-            memory_scope = MemoryScope(
-                tenant_id="local",
-                user_id="local",
-                role_name=role,
-                session_id=actual_session_id,
-                channel=channel_name,
-            )
-            memory_context = recall_memories(self.config, memory_scope, effective_message)
-            session_state["memory_context"] = memory_context
-            deps = AgentDeps(
-                config=self.config,
-                session_id=actual_session_id,
-                browser_manager=self.browser_manager,
-                process_manager=self.process_manager,
-                session_state=session_state,
-                memory_scope=memory_scope,
-                memory_context=memory_context,
-                run_mode=run_mode,
-                channel_context=channel_context_data,
-                scheduler_context=dict(scheduler_context or {}),
-            )
-            stream_queue: asyncio.Queue[StreamEventItem | object] = asyncio.Queue()
-            stream_stats = StreamStats()
-            result_holder: dict[str, object] = {}
-            ctx = AgentRunContext(
-                config=self.config,
-                role=role,
-                session_id=actual_session_id,
-                message=message,
-                attachments=attachment_list,
-                history=history,
-                deps=deps,
-                session_state=session_state,
-                stream=stream,
-                stream_queue=stream_queue,
-            )
-            ctx.stream_event_handler = build_stream_event_handler(stream_queue, ctx.operation_state)
-            ctx.context_compressor = self._get_context_compressor(actual_session_id, memory_scope)
-
-            async def refresh_mcp_config() -> None:
-                await self._maybe_reload_mcp_toolsets()
-                ctx.config = self.config
-                deps.config = self.config
-
-            should_route = await should_route_message(ctx, self._get_agent)
-
-            async def run_agent() -> None:
-                mark_turn_started(session_state)
-                try:
-                    if should_route:
-                        await refresh_mcp_config()
-                        task_frame = await resolve_task_frame(ctx, self._get_agent)
-                        session_state["task_frame"] = task_frame.model_dump(mode="json")
-                        if needs_planning(task_frame):
-                            await refresh_mcp_config()
-                            await run_planner(ctx, task_frame, self._get_agent)
-
-                    await refresh_mcp_config()
-                    outcome = await execute_task(ctx, self._get_agent)
-                    result_holder["result"] = outcome.result
-                    if outcome.final_verification_signal:
-                        result_holder["final_verification_signal"] = outcome.final_verification_signal
-                        if has_active_todos(session_state):
-                            suspend_current_plan(
-                                session_state,
-                                reason="final_verification_failed",
-                                detail=outcome.final_verification_signal,
-                                deps=deps,
-                            )
-                        else:
-                            fail_current_plan(
-                                session_state,
-                                reason="final_verification_failed",
-                                detail=outcome.final_verification_signal,
-                            )
-                    elif outcome.self_critique_signal:
-                        result_holder["self_critique_signal"] = outcome.self_critique_signal
-                        if has_active_todos(session_state):
-                            suspend_current_plan(
-                                session_state,
-                                reason="self_critique_failed",
-                                detail=outcome.self_critique_signal,
-                                deps=deps,
-                            )
-                        else:
-                            fail_current_plan(
-                                session_state,
-                                reason="self_critique_failed",
-                                detail=outcome.self_critique_signal,
-                            )
-                    else:
-                        complete_current_plan(session_state)
-                except asyncio.TimeoutError as exc:
-                    if has_active_todos(session_state):
-                        suspend_current_plan(
-                            session_state,
-                            reason="operation_timeout",
-                            detail=str(exc),
-                            deps=deps,
-                        )
-                    else:
-                        fail_current_plan(session_state, reason="operation_timeout", detail=str(exc))
-                    if stream:
-                        result_holder["error"] = TimeoutError(
-                            "Agent 执行超时："
-                            f"{self.config.agent_timeout_seconds}s 内没有完成。"
-                            f"模型={self.config.model_name}，"
-                            f"base_url={redact_text(self.config.openai_base_url or '默认')}，"
-                            f"role={role}，session_id={actual_session_id}。"
-                            "常见原因：模型服务无响应、工具调用卡住、浏览器/网络代理不可用。"
-                        )
-                        logger.exception(
-                            "chat timed out role=%s session_id=%s timeout_seconds=%d stream=true",
-                            role,
-                            actual_session_id,
-                            self.config.agent_timeout_seconds,
-                        )
-                    else:
-                        result_holder["error"] = exc
-                        logger.exception(
-                            "chat timed out role=%s session_id=%s stream=false",
-                            role,
-                            actual_session_id,
-                        )
-                except asyncio.CancelledError:
-                    if has_active_todos(session_state):
-                        suspend_current_plan(
-                            session_state,
-                            reason="cancelled",
-                            detail="agent task cancelled",
-                            deps=deps,
-                        )
-                    else:
-                        fail_current_plan(session_state, reason="cancelled", detail="agent task cancelled")
-                    logger.info(
-                        "chat stream cancelled role=%s session_id=%s" if stream else "chat cancelled role=%s session_id=%s stream=false",
-                        role,
-                        actual_session_id,
-                    )
-                    raise
-                except Exception as exc:
-                    if has_active_todos(session_state):
-                        suspend_current_plan(
-                            session_state,
-                            reason="error",
-                            detail=redact_exception(exc),
-                            deps=deps,
-                        )
-                    else:
-                        fail_current_plan(session_state, reason="error", detail=redact_exception(exc))
-                    result_holder["error"] = exc
-                    logger.exception(
-                        "chat failed role=%s session_id=%s stream=%s",
-                        role,
-                        actual_session_id,
-                        str(stream).lower(),
-                    )
-                finally:
-                    mark_turn_finished(session_state)
-                    if stream:
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await stream_queue.put(STREAM_DONE)
-
-            task = asyncio.create_task(run_agent())
-            self._running_tasks[actual_session_id] = task
-
-            try:
-                if stream:
-                    try:
-                        async for event in consume_stream_queue(
-                            stream_queue=stream_queue,
-                            task=task,
-                            config=self.config,
-                            role=role,
-                            session_id=actual_session_id,
-                            start_time=start_time,
-                            stats=stream_stats,
-                            operation_state=ctx.operation_state,
-                        ):
-                            yield event
-                    except OperationStalledError as exc:
-                        stalled_detail = {"operation": exc.operation, "stalled_for": exc.stalled_for, "timeout": exc.timeout}
-                        if has_active_todos(session_state):
-                            suspend_current_plan(
-                                session_state,
-                                reason="operation_stalled",
-                                detail=stalled_detail,
-                                deps=deps,
-                            )
-                            yield system_stream_event(
-                                "\n\n[System] 当前任务已暂停："
-                                f"{exc} 旧计划已挂起，不会影响下一轮对话；"
-                                "如需恢复，请明确说明“继续刚才的任务”。"
-                            )
-                        else:
-                            fail_current_plan(session_state, reason="operation_stalled", detail=stalled_detail)
-                            yield system_stream_event(f"\n\n[System] 当前任务已失败：{exc} 未生成可恢复计划，下一轮将重新理解用户请求。")
-                        return
-
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        if task.cancelled():
-                            yield system_stream_event("\n\n【任务已被手动中断】")
-                            return
-                        raise
-
-                    if error := result_holder.get("error"):
-                        raise RuntimeError(f"Agent 调用失败：{_error_message(error)}") from error
-                    for signal_key, signal_label in SIGNAL_LABELS:
-                        if signal_value := result_holder.get(signal_key):
-                            yield system_stream_event(
-                                f"\n\n{signal_label}{json.dumps(signal_value, ensure_ascii=False)}"
-                            )
-                    turn_artifacts = [
-                        artifact for artifact in session_state.get("turn_artifacts", [])
-                        if isinstance(artifact, ArtifactRef)
-                    ]
-                    self.register_artifacts(turn_artifacts)
-                    seen_artifacts: set[str] = set()
-                    for artifact in turn_artifacts:
-                        if artifact.id in seen_artifacts:
-                            continue
-                        seen_artifacts.add(artifact.id)
-                        yield StreamEventItem(
-                            type="artifact",
-                            text=f"已生成文件：{artifact.filename}",
-                            artifact=artifact,
-                            counted_as_output=False,
-                        )
-                else:
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        if task.cancelled():
-                            yield ChatResponse(output="【任务已被手动中断】", role=role, session_id=actual_session_id)
-                            return
-                        raise
-
-                    if error := result_holder.get("error"):
-                        raise error
-
-                result = result_holder["result"]
-                turn_artifacts = [
-                    artifact for artifact in session_state.get("turn_artifacts", [])
-                    if isinstance(artifact, ArtifactRef)
-                ]
-                self.register_artifacts(turn_artifacts)
-                new_history = list(result.all_messages())  # type: ignore[attr-defined]
-                # 上下文压缩:用本轮真实用量判定,触发则压缩(含 LLM 摘要,经 to_thread 避免阻塞事件循环)
-                compressor = ctx.context_compressor
-                if compressor is not None:
-                    try:
-                        compressor.update_from_response(result.usage())  # type: ignore[attr-defined]
-                    except Exception:
-                        logger.debug("context usage update failed", exc_info=True)
-                    if compressor.should_compress():
-                        try:
-                            new_history = await asyncio.to_thread(
-                                compressor.compress,
-                                new_history,
-                                current_tokens=compressor.last_prompt_tokens,
-                            )
-                            logger.info(
-                                "context compressed post-turn role=%s session_id=%s messages=%d compression_count=%d",
-                                role,
-                                actual_session_id,
-                                len(new_history),
-                                compressor.compression_count,
-                            )
-                        except Exception:
-                            logger.warning(
-                                "context compression failed role=%s session_id=%s",
-                                role,
-                                actual_session_id,
-                                exc_info=True,
-                            )
-                history_json = ModelMessagesTypeAdapter.dump_json(new_history)
-
-                await asyncio.to_thread(
-                    save_message_history,
-                    self.config.memory_dir,
-                    role,
-                    actual_session_id,
-                    history_json,
-                    latest_scope,
-                )
-                capture_args = (
-                    self.config,
-                    memory_scope,
-                    effective_message,
-                    str(result.output),  # type: ignore[attr-defined]
-                )
-                capture_kwargs = {
-                    "task_frame": session_state.get("task_frame") if isinstance(session_state.get("task_frame"), dict) else None,
-                    "memory_context_ids": memory_context.ids,
-                    "duration_ms": int((time.perf_counter() - start_time) * 1000),
-                }
-                if self.config.memory.capture.async_enabled:
-                    async def _capture_memory_background() -> None:
-                        try:
-                            await asyncio.to_thread(capture_turn_memories, *capture_args, **capture_kwargs)
-                        except Exception:
-                            logger.exception("memory capture failed role=%s session_id=%s", role, actual_session_id)
-
-                    asyncio.create_task(_capture_memory_background())
-                else:
-                    await asyncio.to_thread(capture_turn_memories, *capture_args, **capture_kwargs)
-
-                if stream:
-                    if not stream_stats.chunk_count:
-                        output = str(result.output)  # type: ignore[attr-defined]
-                        if output:
-                            stream_stats.output_chars = len(output)
-                            stream_stats.chunk_count = 1
-                            logger.info(
-                                "chat produced non-streamed output role=%s session_id=%s output_chars=%d",
-                                role,
-                                actual_session_id,
-                                stream_stats.output_chars,
-                            )
-                            yield StreamEventItem(type="text", text=output)
-
-                    logger.info(
-                        "chat finished role=%s session_id=%s output_chars=%d chunks=%d first_chunk_ms=%s history_messages=%d duration_ms=%.0f stream=true",
-                        role,
-                        actual_session_id,
-                        stream_stats.output_chars,
-                        stream_stats.chunk_count,
-                        f"{stream_stats.first_chunk_ms:.0f}" if stream_stats.first_chunk_ms is not None else None,
-                        len(new_history),
-                        (time.perf_counter() - start_time) * 1000,
-                    )
-                else:
-                    logger.info(
-                        "chat finished role=%s session_id=%s output_chars=%d history_messages=%d duration_ms=%.0f stream=false",
-                        role,
-                        actual_session_id,
-                        len(str(result.output)),  # type: ignore[attr-defined]
-                        len(new_history),
-                        (time.perf_counter() - start_time) * 1000,
-                    )
-                    output = result.output  # type: ignore[attr-defined]
-                    for signal_key, signal_label in SIGNAL_LABELS:
-                        if signal_value := result_holder.get(signal_key):
-                            output = f"{output}\n\n{signal_label}{json.dumps(signal_value, ensure_ascii=False)}"
-                    yield ChatResponse(
-                        output=output,
-                        role=role,
-                        session_id=actual_session_id,
-                        artifacts=turn_artifacts,
-                    )
-            finally:
-                self._running_tasks.pop(actual_session_id, None)
-                if not task.done():
-                    task.cancel()
+        保留此薄壳是为了让测试可以通过 `service._run_with_session = ...` 打桩。
+        """
+        return run_turn(
+            self,
+            message,
+            role,
+            session_id,
+            stream=stream,
+            attachments=attachments,
+            run_mode=run_mode,
+            channel_context=channel_context,
+            scheduler_context=scheduler_context,
+            channel=channel,
+            delivery_target=delivery_target,
+        )
 
     async def send_message(
         self,
@@ -967,7 +525,9 @@ class AgentService:
         channel: str = "local",
         delivery_target: dict[str, object] | None = None,
     ) -> ChatResponse:
-        priority_response = await self._handle_priority_command_response(message, role, session_id, channel_context)
+        priority_response = await self._handle_priority_command_response(
+            message, role, session_id, channel_context, channel=channel,
+        )
         if priority_response is not None:
             return priority_response
 
@@ -984,7 +544,7 @@ class AgentService:
             delivery_target=delivery_target,
         ):
             return result  # type: ignore[return-value]
-        raise RuntimeError("No result returned from _run_with_session")
+        raise RuntimeError("No result returned from run_turn")
 
     async def stream_events(
         self,
@@ -998,7 +558,9 @@ class AgentService:
         channel: str = "local",
         delivery_target: dict[str, object] | None = None,
     ) -> AsyncIterator[StreamEventItem]:
-        priority_events = await self._handle_priority_command_events(message, role, session_id, channel_context)
+        priority_events = await self._handle_priority_command_events(
+            message, role, session_id, channel_context, channel=channel,
+        )
         if priority_events is not None:
             for event in priority_events:
                 yield event

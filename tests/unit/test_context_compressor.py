@@ -151,6 +151,15 @@ def test_sanitize_replaces_orphan_tool_call():
     sanitized = comp._sanitize_tool_pairs(msgs)  # noqa: SLF001
     calls = [p for m in sanitized for p in getattr(m, "parts", []) if isinstance(p, ToolCallPart)]
     assert all(p.tool_call_id != "ghost" for p in calls)
+    # 关键回归:孤儿 call 位于 ModelResponse,替换为的 part 必须是 ModelResponse 合法的
+    # TextPart——若改成 UserPromptPart,pydantic-ai 在 _map_model_response 会 assert_never。
+    response_with_note = next(
+        m for m in sanitized
+        if isinstance(m, ModelResponse)
+        and any(isinstance(p, TextPart) and "已折叠的工具调用" in str(p.content) for p in m.parts)
+    )
+    for part in response_with_note.parts:
+        assert not isinstance(part, UserPromptPart), "ModelResponse 内不允许 UserPromptPart"
 
 
 # ── 反抖动 ─────────────────────────────────────────────────────────────────
@@ -158,13 +167,32 @@ def test_anti_thrash_skips_after_two_ineffective_compressions():
     comp = ContextCompressor(
         context_length=100000,
         threshold_percent=0.75,
+        hard_ceiling_percent=0.90,
         anti_thrash=True,
         min_savings_pct=10,
     )
-    comp.update_from_response(SimpleNamespace(input_tokens=90000, output_tokens=10, details={}))
+    # 80000 高于阈值 75000、低于 ceiling 90000:在非紧急区,anti-thrash 应生效
+    comp.update_from_response(SimpleNamespace(input_tokens=80000, output_tokens=10, details={}))
     # 模拟两次无效压缩(节省 < 10%)
     comp._ineffective_compression_count = 2  # noqa: SLF001
     assert comp.should_compress() is False
+
+
+def test_anti_thrash_self_heals_when_real_usage_breaches_ceiling():
+    """P2:真实用量突破 hard_ceiling 时,anti-thrash 锁定应被强制解除以避免轮内紧急压缩。"""
+    comp = ContextCompressor(
+        context_length=100000,
+        threshold_percent=0.75,
+        hard_ceiling_percent=0.90,
+        anti_thrash=True,
+        min_savings_pct=10,
+    )
+    # 95000 已突破 ceiling 90000:紧急区,即便 ineffective 计数 ≥ 2 也必须重试
+    comp.update_from_response(SimpleNamespace(input_tokens=95000, output_tokens=10, details={}))
+    comp._ineffective_compression_count = 2  # noqa: SLF001
+    assert comp.should_compress() is True
+    # 自愈后计数应清零,避免下一轮又锁住
+    assert comp._ineffective_compression_count == 0  # noqa: SLF001
 
 
 # ── 兜底摘要 ───────────────────────────────────────────────────────────────

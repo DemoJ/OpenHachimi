@@ -31,6 +31,10 @@ from telegram.request import HTTPXRequest
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.redaction import redact_exception
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
+from openhachimi_agent.service.agent_runtime.command_registry import (
+    CommandOutcome,
+    iter_for_tg_menu,
+)
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.storage.attachments import AttachmentError, AttachmentStorage
 from openhachimi_agent.tools.utils import resolve_workspace_path
@@ -206,113 +210,94 @@ class TelegramBot:
             self._user_locks[key] = lock
         return self._user_locks[key]
 
+    async def _dispatch_via_registry(
+        self,
+        update: Update,
+        message_text: str,
+    ) -> CommandOutcome | None:
+        """统一命令分派:命中即把 outcome 渲染回 Telegram 并同步本地会话。"""
+        if not message_text:
+            return None
+        session = self._get_session(update)
+        scope_key = self._session_key(update)
+        channel_context = {
+            "type": "telegram",
+            "platform": "telegram",
+            "chat_id": update.effective_chat.id if update.effective_chat else update.message.chat_id,
+            "user_id": update.effective_user.id if update.effective_user else 0,
+            "thread_id": getattr(update.message, "message_thread_id", None),
+            "session_scope_key": scope_key,
+            "session_id": session["session_id"],
+            "role": session["role"],
+        }
+        try:
+            outcome = await self.service.dispatch_command(
+                message_text,
+                role=session["role"],
+                session_id=session["session_id"],
+                channel_context=channel_context,
+                channel="telegram",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("telegram dispatch_command failed user_id=%s", channel_context["user_id"])
+            await update.message.reply_text(f"❌ 命令执行失败：{_exception_text(exc)}")
+            return None
+        if outcome is None:
+            return None
+        if outcome.role or outcome.session_id:
+            new_role = outcome.role or session["role"]
+            new_session_id = outcome.session_id or session["session_id"]
+            self._set_session(update, new_role, new_session_id)
+        await self._reply_outcome(update, outcome)
+        return outcome
+
+    async def _reply_outcome(self, update: Update, outcome: CommandOutcome) -> None:
+        """按 outcome.kind 选合适的 emoji 前缀并发送。"""
+        if not outcome.message:
+            return
+        prefix_map = {
+            "stop": "🛑 ",
+            "new_session": "✅ ",
+            "switch_role": "✅ ",
+            "compress": "🗜️ ",
+            "info": "",
+            "help": "📖 ",
+            "start": "",
+            "exit": "",
+        }
+        prefix = prefix_map.get(outcome.kind, "")
+        await update.message.reply_text(f"{prefix}{outcome.message}")
+
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/start 命令：欢迎语 + 新建会话。"""
+        """/start 命令：欢迎语 + 新建会话(通过 registry 分派以保持单一来源)。"""
         user = update.effective_user
         if user is None:
             return
-        role = self.config.default_role_name
-        resp = self.service.new_session(role, latest_scope=self._session_key(update))
-        self._set_session(update, role, resp.session_id)
-        logger.info("cmd /start user_id=%d role=%s session_id=%s", user.id, role, resp.session_id)
-
+        outcome = await self._dispatch_via_registry(update, "/start")
+        if outcome is None:
+            return
+        # 在 outcome 之上再附一段 Telegram 专属欢迎语;命令清单由 registry 动态生成
+        commands_summary = "\n".join(
+            f"  <code>{html.escape(spec.aliases[0])}</code>"
+            f"{(' <code>' + html.escape(spec.args_hint) + '</code>') if spec.args_hint else ''}"
+            f" — {html.escape(spec.summary)}"
+            for spec in iter_for_tg_menu()
+        )
+        role_text = outcome.role or self.config.default_role_name
         welcome = (
-            f"👋 你好，<b>{html.escape(user.first_name)}</b>！\n\n"
-            f"我是 OpenHachimi Agent，当前角色：<b>{html.escape(role)}</b>\n\n"
+            f"\n👋 你好,<b>{html.escape(user.first_name)}</b>!\n\n"
+            f"我是 OpenHachimi Agent,当前角色:<b>{html.escape(role_text)}</b>\n\n"
             "直接发送消息即可开始对话。\n"
-            "可用命令：\n"
-            "  /new — 新建对话\n"
-            "  /roles — 查看角色列表\n"
-            "  /role &lt;名称&gt; — 切换角色\n"
-            "  /compress [主题] — 压缩当前对话上下文\n"
-            "  /stop — 中断当前正在执行的任务\n"
-            "  /help — 查看帮助"
+            f"常用命令:\n{commands_summary}"
         )
         await update.message.reply_text(welcome, parse_mode=constants.ParseMode.HTML)
 
-    async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/help 命令：帮助说明。"""
-        text = (
-            "📖 <b>帮助</b>\n\n"
-            "<code>/start</code> — 重新开始，新建对话\n"
-            "<code>/new</code> — 保存当前对话，新建一段对话\n"
-            "<code>/roles</code> — 列出全部可用角色\n"
-            "<code>/role &lt;名称&gt;</code> — 切换到指定角色\n"
-            "<code>/compress [主题]</code> — 压缩当前对话上下文（可加焦点主题）\n"
-            "<code>/stop</code> — 中断当前正在执行的任务\n"
-            "<code>/help</code> — 查看本帮助\n\n"
-            "直接发送文字消息即可与 Agent 对话。"
-        )
-        await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
-
-    async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/new 命令：新建对话。"""
-        user_id = update.effective_user.id
-        session = self._get_session(update)
-        role = session["role"]
-        old_session_id = session["session_id"]
-        await self.service.stop_session(old_session_id)
-        resp = self.service.new_session(role, latest_scope=self._session_key(update))
-        self._set_session(update, role, resp.session_id)
-        logger.info("cmd /new user_id=%d role=%s session_id=%s", user_id, role, resp.session_id)
-        await update.message.reply_text(f"✅ {resp.message}")
-
-    async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/stop 命令：停止当前正在执行的任务。"""
-        user_id = update.effective_user.id
-        session = self._get_session(update)
-        resp = await self.service.stop_session(session["session_id"])
-        logger.info("cmd /stop user_id=%d role=%s session_id=%s", user_id, session["role"], session["session_id"])
-        await update.message.reply_text(f"🛑 {resp.message}")
-
-    async def cmd_roles(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/roles 命令：列出可用角色。"""
-        user_id = update.effective_user.id
-        session = self._get_session(update)
-        roles_resp = self.service.list_roles()
-        lines = ["🎭 <b>可用角色列表：</b>\n"]
-        for r in roles_resp.roles:
-            marker = " ✅（当前）" if r == session["role"] else ""
-            lines.append(f"• <code>{html.escape(r)}</code>{marker}")
-        await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
-
-    async def cmd_role(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/role <名称> 命令：切换角色。"""
-        user_id = update.effective_user.id
-        args = ctx.args
-        if not args:
-            await update.message.reply_text(
-                "❌ 请在命令后面跟上角色名，例如：<code>/role default</code>",
-                parse_mode=constants.ParseMode.HTML,
-            )
+    async def cmd_dispatch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """所有 `/xxx`(除 /start)的统一入口:把原始命令文本交给 registry。"""
+        if update.message is None:
             return
-        role_name = args[0].strip()
-        old_session_id = self._get_session(update)["session_id"]
-        await self.service.stop_session(old_session_id)
-        try:
-            resp = self.service.switch_role(role_name, latest_scope=self._session_key(update))
-            self._set_session(update, resp.role, resp.session_id)
-            logger.info("cmd /role user_id=%d role=%s session_id=%s", user_id, resp.role, resp.session_id)
-            await update.message.reply_text(f"✅ {resp.message}")
-        except (FileNotFoundError, ValueError) as exc:
-            await update.message.reply_text(f"❌ 切换角色失败：{_exception_text(exc)}")
-
-    async def cmd_compress(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/compress [主题] 命令：手动压缩当前会话上下文。"""
-        user_id = update.effective_user.id
-        session = self._get_session(update)
-        focus = " ".join(ctx.args).strip() if ctx.args else ""
-        try:
-            resp = await self.service.compress_session(
-                session["role"],
-                session["session_id"],
-                focus,
-                latest_scope=self._session_key(update),
-            )
-            logger.info("cmd /compress user_id=%d role=%s session_id=%s", user_id, session["role"], session["session_id"])
-            await update.message.reply_text(f"🗜️ {resp.output}")
-        except Exception as exc:  # noqa: BLE001
-            await update.message.reply_text(f"❌ 压缩失败：{_exception_text(exc)}")
+        message_text = update.message.text or ""
+        await self._dispatch_via_registry(update, message_text)
 
     async def _download_attachments(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[AttachmentRef]:
         message = update.message
@@ -429,16 +414,11 @@ class TelegramBot:
         lock = self._get_user_lock(update)
 
         async with lock:
-            if user_text in {"停止"}:
-                resp = await self.service.stop_session(session_id)
-                await update.message.reply_text(f"🛑 {resp.message}")
-                return
-            if user_text in {"新对话"}:
-                await self.service.stop_session(session_id)
-                resp = self.service.new_session(role, latest_scope=session.get("scope"))
-                self._set_session(update, resp.role, resp.session_id)
-                await update.message.reply_text(f"✅ {resp.message}")
-                return
+            # 先尝试命令分派(覆盖中文别名 `/压缩` `停止` `新对话` 等);命中则不走 LLM
+            if user_text and not attachments:
+                outcome = await self._dispatch_via_registry(update, user_text)
+                if outcome is not None:
+                    return
 
             logger.info(
                 "telegram message user_id=%d role=%s session_id=%s chars=%d attachment_count=%d",
@@ -658,34 +638,31 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
         # 使用默认配置构建 Application（含内置 Updater），由 asyncio 事件循环统一调度
         app = Application.builder().token(token).build()
 
-    # 注册命令处理器
+    # 注册命令处理器:/start 保留独立 handler 以匹配 Telegram 习惯,
+    # 其它 `/xxx` 统一由 cmd_dispatch 接管,真正的执行委托给 registry。
     app.add_handler(CommandHandler("start", bot.cmd_start))
-    app.add_handler(CommandHandler("help", bot.cmd_help))
-    app.add_handler(CommandHandler("new", bot.cmd_new))
-    app.add_handler(CommandHandler("stop", bot.cmd_stop))
-    app.add_handler(CommandHandler("roles", bot.cmd_roles))
-    app.add_handler(CommandHandler("role", bot.cmd_role))
-    app.add_handler(CommandHandler("compress", bot.cmd_compress))
-    # 普通消息处理器（非命令），支持文本、图片与文档，设置为 block=False 以免阻塞后续的 /stop 等命令
+    app.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(r"^/start(\s|$)"), bot.cmd_dispatch))
+    # 普通消息处理器(非命令),支持文本、图片与文档,设置为 block=False 以免阻塞后续的 /stop 等命令
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, bot.handle_message, block=False))
 
-    # 启动 Bot（连接失败时不阻断 HTTP 服务，仅记录错误）
+    # 启动 Bot(连接失败时不阻断 HTTP 服务,仅记录错误)
     try:
         await app.initialize()
         await app.start()
 
-        # 向 Telegram 服务器注册命令菜单（用户输入 / 时显示的命令列表）
-        # 注意：此调用会持久化到 Telegram 服务器，重启服务无需重复设置，但保持同步是最佳实践
+        # 向 Telegram 服务器注册命令菜单:从 registry 自动构建
         from telegram import BotCommand
-        await app.bot.set_my_commands([
-            BotCommand("new",   "💾 保存当前对话，新建一段对话"),
-            BotCommand("roles", "🎭 查看可用角色列表"),
-            BotCommand("role",  "🔄 切换角色（如：/role default）"),
-            BotCommand("compress", "🗜️ 压缩当前对话上下文（可加主题）"),
-            BotCommand("stop",  "🛑 中断当前正在执行的任务"),
-            BotCommand("help",  "📖 查看帮助"),
-        ])
-        logger.info("telegram bot commands menu registered")
+        menu_specs = iter_for_tg_menu()
+        bot_commands = [
+            BotCommand(
+                spec.aliases[0].lstrip("/"),
+                (spec.tg_menu_label or spec.summary)[:256],
+            )
+            for spec in menu_specs
+            if spec.aliases and spec.aliases[0].startswith("/")
+        ]
+        await app.bot.set_my_commands(bot_commands)
+        logger.info("telegram bot commands menu registered count=%d", len(bot_commands))
 
         # 在同一 asyncio 事件循环中启动 Polling，不阻塞
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)

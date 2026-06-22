@@ -33,6 +33,8 @@ from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.transport.api_models import (
     ChatRequest,
+    CommandDispatchRequest,
+    CommandDispatchResponse,
     DeliveryPreviewResponse,
     RoleSwitchRequest,
     ScheduleCreateRequest,
@@ -511,3 +513,37 @@ def switch_role(request: RoleSwitchRequest, service: AgentService = Depends(get_
 async def stop_session(request: StopRequest, service: AgentService = Depends(get_service)):
     logger.info("http stop session request session_id=%s", request.session_id)
     return await service.stop_session(request.session_id)
+
+
+@app.post("/commands")
+async def dispatch_command(
+    request: CommandDispatchRequest,
+    service: AgentService = Depends(get_service),
+) -> CommandDispatchResponse:
+    """统一的命令分派接口:解析 message,命中即执行并返回结构化结果。
+
+    未命中返回 handled=False,调用方应继续走 /chat 或 /chat/stream。
+    """
+    logger.info("http command dispatch request message_chars=%d", len(request.message))
+    channel_context = {
+        "type": "http",
+        "platform": "http",
+        "session_id": request.session_id,
+        "role": request.role,
+    }
+    outcome = await service.dispatch_command(
+        request.message,
+        role=request.role,
+        session_id=request.session_id,
+        channel_context=channel_context,
+        channel="http",
+    )
+    if outcome is None:
+        return CommandDispatchResponse(handled=False)
+    return CommandDispatchResponse(
+        handled=True,
+        message=outcome.message,
+        kind=outcome.kind,
+        role=outcome.role,
+        session_id=outcome.session_id,
+    )

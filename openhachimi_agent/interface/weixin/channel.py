@@ -570,6 +570,34 @@ class WeixinChannel:
             "session_scope_key": prepared.scope_key,
         }
 
+        # 优先命令分派:命中即直接回复并返回,不进 LLM、不写入对话历史。
+        # 微信只在用户消息没有附件时尝试,避免媒体场景下误识别。
+        if not prepared.attachments:
+            dispatch = getattr(self.service, "dispatch_command", None)
+            outcome = None
+            if dispatch is not None:
+                outcome = await dispatch(
+                    prepared.text_content,
+                    channel_context=channel_context,
+                    channel="weixin",
+                )
+            if outcome is not None:
+                reply = outcome.message or "已完成。"
+                client_id = f"openhachimi-{uuid.uuid4().hex[:8]}"
+                await self.client.send_message(
+                    to_user_id=prepared.to_user,
+                    text=reply,
+                    context_token=prepared.context_token,
+                    client_id=client_id,
+                )
+                logger.info(
+                    "微信命令已分派 来自 %s kind=%s text=%s",
+                    prepared.from_user,
+                    outcome.kind,
+                    prepared.text_content[:30],
+                )
+                return
+
         logger.info(
             "收到微信消息 来自 %s: %s attachment_count=%d",
             prepared.from_user,

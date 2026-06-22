@@ -77,8 +77,8 @@ def _headers(token: Optional[str], body: str) -> Dict[str, str]:
     return headers
 
 
-def _cdn_download_url(cdn_base_url: str, encrypted_query_param: str) -> str:
-    return f"{cdn_base_url.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
+def _cdn_download_url(encrypted_query_param: str) -> str:
+    return f"{WEIXIN_CDN_BASE_URL.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
 
 
 def _assert_weixin_cdn_url(url: str) -> None:
@@ -202,13 +202,12 @@ class WeixinClient:
         aes_key: Optional[str],
         full_url: Optional[str],
         max_size_bytes: int,
-        cdn_base_url: str = WEIXIN_CDN_BASE_URL,
     ) -> Tuple[bytes, Optional[str]]:
         """下载并解密 iLink CDN 媒体。"""
         content_type: Optional[str] = None
         if encrypted_query_param:
             data, content_type = await self._download_bytes(
-                _cdn_download_url(cdn_base_url, encrypted_query_param),
+                _cdn_download_url(encrypted_query_param),
                 max_size_bytes,
             )
         elif full_url:

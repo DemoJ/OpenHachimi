@@ -176,6 +176,20 @@ class CommandResponse(BaseModel):
     session_id: str
 
 
+class CommandDispatchRequest(BaseModel):
+    message: str = Field(min_length=1)
+    role: str | None = None
+    session_id: str | None = None
+
+
+class CommandDispatchResponse(BaseModel):
+    handled: bool                       # 是否命中命令(False 时其它字段无意义)
+    message: str = ""
+    kind: str = "info"                  # 与 CommandOutcome.kind 对齐
+    role: str | None = None
+    session_id: str | None = None
+
+
 class RolesResponse(BaseModel):
     roles: list[str]
     current_role: str

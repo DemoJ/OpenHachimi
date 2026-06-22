@@ -28,6 +28,13 @@ from openhachimi_agent.transport.api_models import ArtifactRef
 logger = logging.getLogger(__name__)
 STREAM_DONE = object()
 
+# 流式输出时的信号标签:在最终回复后追加的提示文案。
+# 与命令机制无关,仅用于流式事件渲染。
+SIGNAL_LABELS: tuple[tuple[str, str], ...] = (
+    ("final_verification_signal", "[最终验证未通过] 当前执行结果仍缺少完成证据:"),
+    ("self_critique_signal", "[自检未通过] 当前最终回复可能仍未完全满足用户意图:"),
+)
+
 
 @dataclass
 class StreamEventItem:

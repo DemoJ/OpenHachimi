@@ -18,12 +18,20 @@ from openhachimi_agent.memory.recall import build_memory_context_text
 from openhachimi_agent.tools.skills import format_skill_prompt
 
 
+_WEEKDAY_ZH = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+
 def _time_block() -> str:
     try:
-        current_time = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        current_time = now.isoformat()
+        weekday = _WEEKDAY_ZH[now.weekday()]
     except Exception:  # noqa: BLE001
         return ""
-    return render_system_prompt("runtime/time", {"current_time": current_time})
+    return render_system_prompt(
+        "runtime/time",
+        {"current_time": current_time, "weekday": weekday},
+    )
 
 
 def _memory_block(deps: AgentDeps) -> str:

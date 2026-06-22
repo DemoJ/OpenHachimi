@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -93,6 +94,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_fallback_used: bool = False
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
+        self._consecutive_ceiling_breaches: int = 0
         self._summary_failure_cooldown_until: float = 0.0
         self.last_compression_rough_tokens: int = 0
 
@@ -108,6 +110,7 @@ class ContextCompressor(ContextEngine):
         self._last_compress_aborted = False
         self._last_summary_fallback_used = False
         self._ineffective_compression_count = 0
+        self._consecutive_ceiling_breaches = 0
         self._summary_failure_cooldown_until = 0.0
         self._last_compression_savings_pct = 100.0
         self.last_compression_rough_tokens = 0
@@ -135,8 +138,29 @@ class ContextCompressor(ContextEngine):
         """轮后主压缩:真实用量达阈值且未触发反抖动。"""
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
+            # 真实用量回落到阈值下,顺便清空 ceiling 连击计数(不再处于紧急区)
+            self._consecutive_ceiling_breaches = 0
             return False
+
+        # P2 自愈:真实用量已突破 hard_ceiling 即视为紧急。anti-thrash 在紧急区累积一次后
+        # 强制解锁——说明此前判定的"低效压缩"其实没把局面救下来,情况已恶化到必须再试,
+        # 此时继续拒绝压缩只会被 preflight 在轮内打断,体验更差。
+        in_ceiling_breach = tokens >= self.hard_ceiling_tokens
+        if in_ceiling_breach:
+            self._consecutive_ceiling_breaches += 1
+        else:
+            self._consecutive_ceiling_breaches = 0
+
         if self.anti_thrash and self._ineffective_compression_count >= 2:
+            if self._consecutive_ceiling_breaches >= 1:
+                logger.warning(
+                    "anti-thrash 自愈:真实用量 %d 已突破 hard_ceiling=%d,强制重置 ineffective 计数(原值 %d)并重试压缩",
+                    tokens,
+                    self.hard_ceiling_tokens,
+                    self._ineffective_compression_count,
+                )
+                self._ineffective_compression_count = 0
+                return True
             logger.warning(
                 "跳过压缩:最近 %d 次压缩各节省不足 %d%%。建议 /new 开新会话或 /compress <topic> 聚焦压缩。",
                 self._ineffective_compression_count,
@@ -221,7 +245,12 @@ class ContextCompressor(ContextEngine):
             return original_messages
 
         if not summary:
-            logger.warning("摘要失败,插入确定性兜底摘要")
+            # preflight 路径(allow_llm_summary=False)主动跳过 LLM,是设计行为而非异常;
+            # 真正的 LLM 摘要失败已在 _generate_summary 里以 WARNING 记录过了。
+            if not allow_llm_summary:
+                logger.info("preflight 跳过 LLM 摘要,使用确定性兜底(窗口 %d 条)", len(window))
+            else:
+                logger.warning("摘要失败,插入确定性兜底摘要")
             self._last_summary_fallback_used = True
             summary = self._build_static_fallback_summary(window)
 
@@ -237,18 +266,37 @@ class ContextCompressor(ContextEngine):
         saved = display_tokens - new_estimate
         savings_pct = (saved / display_tokens * 100) if display_tokens > 0 else 0
         self._last_compression_savings_pct = savings_pct
-        if savings_pct < self.min_savings_pct:
+
+        # ineffective 判定单独用 estimator-vs-estimator,避免 display_tokens(可能来自
+        # provider 真实值或 current_tokens)与 new_estimate(始终走 estimator)的尺度不一致,
+        # 否则 estimator 系统性偏差会把 _ineffective_compression_count 推到 anti-thrash
+        # 锁死阈值,导致后续压缩被永久拒绝直至会话重置。对外 log 与 _last_compression_savings_pct
+        # 仍沿用真实口径,保持展示一致。
+        estimator_before = estimate_messages_tokens(original_messages)
+        estimator_saved = estimator_before - new_estimate
+        estimator_savings_pct = (estimator_saved / estimator_before * 100) if estimator_before > 0 else 0.0
+
+        # P1 兜底:消息数明显减少(≥20%)说明压缩实质生效,即使 estimator 算出 savings 偏低
+        # 也不累积 ineffective。覆盖 estimator 对剪枝后短工具结果摘要、图片占位等场景估算不准
+        # 但实际节省可观的情况,防止误锁。
+        original_count = len(original_messages)
+        msg_reduction_pct = (1 - len(compressed) / original_count) * 100 if original_count > 0 else 0.0
+        effective_by_msg_count = msg_reduction_pct >= 20.0
+
+        if estimator_savings_pct < self.min_savings_pct and not effective_by_msg_count:
             self._ineffective_compression_count += 1
         else:
             self._ineffective_compression_count = 0
 
         logger.info(
-            "压缩完成 #%d:%d→%d 条消息(约省 %d token,%.0f%%)",
+            "压缩完成 #%d:%d→%d 条消息(约省 %d token,%.0f%%;estimator 视角 %.0f%%,消息数 -%.0f%%)",
             self.compression_count,
             len(messages),
             len(compressed),
             saved,
             savings_pct,
+            estimator_savings_pct,
+            msg_reduction_pct,
         )
         return compressed
 
@@ -503,10 +551,15 @@ def _is_image_part(part: Any) -> bool:
 
 
 def _orphan_call_note(part: ToolCallPart) -> Any:
-    """把孤儿 ToolCallPart 换成文本说明(保留调用意图)。"""
+    """把孤儿 ToolCallPart 换成文本说明(保留调用意图)。
+
+    孤儿 call 只出现在 ModelResponse 里(assistant 消息),所以必须替换为同样合法的
+    TextPart——若改成 UserPromptPart,会导致 pydantic-ai 在把消息映射给 OpenAI
+    时(_map_model_response → assert_never)炸成 AssertionError。
+    """
     args = part.args
     args_text = args if isinstance(args, str) else _safe_str(args)
-    return UserPromptPart(content=f"[已折叠的工具调用:{part.tool_name} {args_text[:120]}]")
+    return TextPart(content=f"[已折叠的工具调用:{part.tool_name} {args_text[:120]}]")
 
 
 __all__ = ["ContextCompressor", "SummaryFn", "PreCompressFn"]

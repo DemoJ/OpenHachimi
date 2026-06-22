@@ -26,16 +26,12 @@ from openhachimi_agent.scheduler.delivery import (
 from openhachimi_agent.scheduler.store import ScheduledTaskStore
 from openhachimi_agent.scheduler.scheduler import TaskScheduler
 from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
+from openhachimi_agent.service.agent_runtime.command_registry import CommandOutcome
 from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.service.agent_service import AgentService
 
 logger = logging.getLogger(__name__)
 
-EXIT_COMMANDS = {"/exit", "/quit", "退出", "q"}
-NEW_SESSION_COMMANDS = {"/new", "新对话"}
-HELP_COMMANDS = {"/help", "帮助"}
-ROLE_LIST_COMMANDS = {"/roles", "/list-roles"}
-STOP_COMMANDS = {"/stop", "停止"}
 DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
 
 
@@ -124,26 +120,14 @@ def print_welcome(state: dict[str, object], server_url: str, current_role: str, 
     from openhachimi_agent.core.version import get_version
 
     print(f"OpenHachimi CLI Agent  v{get_version()}")
-    print(f"服务地址：{server_url}")
-    print(f"当前模型：{state['model']}")
+    print(f"服务地址:{server_url}")
+    print(f"当前模型:{state['model']}")
     if state.get("base_url"):
-        print(f"模型服务：{state['base_url']}")
-    print(f"当前角色：{current_role}")
-    print(f"当前会话：{current_session_id}")
+        print(f"模型服务:{state['base_url']}")
+    print(f"当前角色:{current_role}")
+    print(f"当前会话:{current_session_id}")
     print("输入内容后回车即可对话。")
-    print("可用命令：/help 查看帮助，/roles 查看角色，/role <名称> 切换角色，/new 新建对话，/exit 退出程序。")
-    print()
-
-
-def print_help() -> None:
-    print("命令说明：")
-    print("  /help   查看帮助信息")
-    print("  /roles  查看可用角色列表")
-    print("  /role   切换角色，例如 /role default")
-    print("  /new    保存当前对话并新建一段对话")
-    print("  /stop   中断当前正在执行的任务")
-    print("  /compress [主题]  手动压缩上下文(可选焦点主题,优先保留相关信息)")
-    print("  /exit   退出程序")
+    print("可用命令:/help 查看帮助,/roles 查看角色,/role <名称> 切换角色,/new 新建对话,/exit 退出程序。")
     print()
 
 
@@ -151,9 +135,12 @@ class CliBackend(Protocol):
     async def get_state(self) -> dict[str, object]: ...
     async def list_roles(self) -> list[str]: ...
     async def latest_session(self, role: str) -> tuple[str, str]: ...
-    async def new_session(self, role: str) -> tuple[str, str, str]: ...
-    async def stop_session(self, session_id: str) -> str: ...
-    async def switch_role(self, role: str) -> tuple[str, str, str]: ...
+    async def dispatch_command(
+        self,
+        message: str,
+        role: str,
+        session_id: str,
+    ) -> CommandOutcome | None: ...
     async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]: ...
 
 
@@ -175,17 +162,20 @@ class EmbeddedBackend:
         resp = self.service.latest_session(role)
         return resp.role, resp.session_id
 
-    async def new_session(self, role: str) -> tuple[str, str, str]:
-        resp = self.service.new_session(role)
-        return resp.role, resp.session_id, resp.message
-
-    async def stop_session(self, session_id: str) -> str:
-        resp = await self.service.stop_session(session_id)
-        return resp.message
-
-    async def switch_role(self, role: str) -> tuple[str, str, str]:
-        resp = self.service.switch_role(role)
-        return resp.role, resp.session_id, resp.message
+    async def dispatch_command(
+        self,
+        message: str,
+        role: str,
+        session_id: str,
+    ) -> CommandOutcome | None:
+        channel_context = {"type": "cli", "platform": "cli", "session_id": session_id, "role": role}
+        return await self.service.dispatch_command(
+            message,
+            role=role,
+            session_id=session_id,
+            channel_context=channel_context,
+            channel="cli",
+        )
 
     async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]:
         channel_context = {"type": "cli", "platform": "cli", "session_id": session_id, "role": role}
@@ -209,28 +199,32 @@ class HttpBackend:
         resp = await asyncio.to_thread(request_json, self.server_url, "GET", f"/session/latest?{qs}")
         return resp["role"], resp["session_id"]
 
-    async def new_session(self, role: str) -> tuple[str, str, str]:
-        qs = urlencode({'role': role})
-        resp = await asyncio.to_thread(request_json, self.server_url, "POST", f"/new?{qs}")
-        return resp["role"], resp["session_id"], resp["message"]
-
-    async def stop_session(self, session_id: str) -> str:
+    async def dispatch_command(
+        self,
+        message: str,
+        role: str,
+        session_id: str,
+    ) -> CommandOutcome | None:
         try:
-            resp = await asyncio.to_thread(request_json, self.server_url, "POST", "/stop", {"session_id": session_id})
-            return resp.get("message", "")
+            resp = await asyncio.to_thread(
+                request_json,
+                self.server_url,
+                "POST",
+                "/commands",
+                {"message": message, "role": role, "session_id": session_id},
+            )
         except HTTPError as exc:
             raise RuntimeError(error_detail(exc)) from exc
         except Exception as exc:
             raise RuntimeError(str(exc)) from exc
-
-    async def switch_role(self, role: str) -> tuple[str, str, str]:
-        try:
-            resp = await asyncio.to_thread(request_json, self.server_url, "POST", "/role", {"role": role})
-            return resp["role"], resp["session_id"], resp["message"]
-        except HTTPError as exc:
-            raise RuntimeError(error_detail(exc)) from exc
-        except Exception as exc:
-            raise RuntimeError(str(exc)) from exc
+        if not resp.get("handled"):
+            return None
+        return CommandOutcome(
+            message=str(resp.get("message", "")),
+            kind=str(resp.get("kind", "info")),  # type: ignore[arg-type]
+            role=resp.get("role"),
+            session_id=resp.get("session_id"),
+        )
 
     async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]:
         q: asyncio.Queue[str | Exception | None] = asyncio.Queue()
@@ -296,12 +290,23 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
         current_role, current_session_id = await backend.latest_session(current_role)
         state = await backend.get_state()
     except Exception as exc:
-        print(f"初始化失败：{exc}")
+        print(f"初始化失败:{exc}")
         return
 
     print_welcome(state, server_url, current_role, current_session_id)
     input_queue: asyncio.Queue[object] = asyncio.Queue()
     stdin_task = asyncio.create_task(_read_stdin(input_queue))
+
+    def _apply_outcome(outcome: CommandOutcome, *, prefix: str = "") -> tuple[str, str]:
+        """打印 outcome 文案并更新本地会话状态;返回 (role, session_id)。"""
+        nonlocal current_role, current_session_id
+        if outcome.role:
+            current_role = outcome.role
+        if outcome.session_id:
+            current_session_id = outcome.session_id
+        if outcome.message:
+            print(f"{prefix}{outcome.message}")
+        return current_role, current_session_id
 
     try:
         while True:
@@ -314,60 +319,16 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
             if not user_input:
                 continue
 
-            if user_input in EXIT_COMMANDS:
-                print("已退出对话。")
-                return
-
-            if user_input in NEW_SESSION_COMMANDS:
-                try:
-                    await backend.stop_session(current_session_id)
-                except Exception:
-                    pass
-                try:
-                    current_role, current_session_id, msg = await backend.new_session(current_role)
-                    print(msg)
-                except Exception as exc:
-                    print(f"哈基米 > 新建会话失败：{exc}")
+            # 命令统一交给后端分派
+            try:
+                outcome = await backend.dispatch_command(user_input, current_role, current_session_id)
+            except Exception as exc:
+                print(f"哈基米 > 命令执行失败:{exc}")
                 continue
-
-            if user_input in STOP_COMMANDS:
-                try:
-                    msg = await backend.stop_session(current_session_id)
-                    print(msg)
-                except Exception as exc:
-                    print(f"哈基米 > 停止任务失败：{exc}")
-                continue
-
-            if user_input in HELP_COMMANDS:
-                print_help()
-                continue
-
-            if user_input in ROLE_LIST_COMMANDS:
-                try:
-                    roles = await backend.list_roles()
-                    print("可用角色：")
-                    for r in roles:
-                        marker = "（当前）" if r == current_role else ""
-                        print(f"  - {r}{marker}")
-                    print()
-                except Exception as exc:
-                    print(f"哈基米 > 获取角色列表失败：{exc}")
-                continue
-
-            if user_input == "/role" or user_input.startswith("/role "):
-                role_name = user_input[6:].strip()
-                if not role_name:
-                    print("请在 /role 后面填写角色名称，例如：/role default\n")
-                    continue
-                try:
-                    await backend.stop_session(current_session_id)
-                except Exception:
-                    pass
-                try:
-                    current_role, current_session_id, msg = await backend.switch_role(role_name)
-                    print(msg)
-                except Exception as exc:
-                    print(f"哈基米 > 切换角色失败：{exc}")
+            if outcome is not None:
+                _apply_outcome(outcome)
+                if outcome.kind == "exit":
+                    return
                 print()
                 continue
 
@@ -391,7 +352,7 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
                     interrupt_item = next(iter(done)).result()
                     if isinstance(interrupt_item, (EOFError, KeyboardInterrupt)):
                         try:
-                            await backend.stop_session(current_session_id)
+                            await backend.dispatch_command("/stop", current_role, current_session_id)
                         except Exception:
                             pass
                         await _cancel_task(stream_task)
@@ -401,37 +362,25 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
                     interrupt_input = str(interrupt_item).strip()
                     if not interrupt_input:
                         continue
-                    if interrupt_input in STOP_COMMANDS:
-                        try:
-                            msg = await backend.stop_session(current_session_id)
-                            print(f"\n{msg}")
-                        except Exception as exc:
-                            print(f"\n哈基米 > 停止任务失败：{exc}")
+                    # 流式执行中,只接受可抢占类命令(stop / new / exit);其它命令延迟到任务结束
+                    try:
+                        outcome = await backend.dispatch_command(interrupt_input, current_role, current_session_id)
+                    except Exception as exc:
+                        print(f"\n哈基米 > 命令执行失败:{exc}")
+                        continue
+                    if outcome is None:
+                        print("\n哈基米 > 当前任务执行中,可输入 /stop 或 /new 抢占;普通消息请稍后再发。")
+                        continue
+                    if outcome.kind in {"stop", "new_session", "exit"}:
+                        _apply_outcome(outcome, prefix="\n")
                         await _cancel_task(stream_task)
+                        if outcome.kind == "exit":
+                            return
                         break
-                    if interrupt_input in NEW_SESSION_COMMANDS:
-                        try:
-                            await backend.stop_session(current_session_id)
-                        except Exception:
-                            pass
-                        try:
-                            current_role, current_session_id, msg = await backend.new_session(current_role)
-                            print(f"\n{msg}")
-                        except Exception as exc:
-                            print(f"\n哈基米 > 新建会话失败：{exc}")
-                        await _cancel_task(stream_task)
-                        break
-                    if interrupt_input in EXIT_COMMANDS:
-                        try:
-                            await backend.stop_session(current_session_id)
-                        except Exception:
-                            pass
-                        await _cancel_task(stream_task)
-                        print("\n已退出对话。")
-                        return
-                    print("\n哈基米 > 当前任务执行中，可输入 /stop 或 /new 抢占；普通消息请稍后再发。")
+                    # 其它命令(/help、/roles 等)在抢占态下不打断流,仅提示
+                    print(f"\n哈基米 > 当前任务执行中,{outcome.message}")
             except Exception as exc:
-                print(f"\n哈基米 > 调用模型时出错：{exc}")
+                print(f"\n哈基米 > 调用模型时出错:{exc}")
                 if not stream_task.done():
                     await _cancel_task(stream_task)
             finally:
@@ -463,10 +412,10 @@ async def run_embedded_cli() -> None:
         schedule_store = ScheduledTaskStore(config.scheduler.db_path)
         inbox_runs = schedule_store.list_inbox_runs(unread_only=True, limit=10)
         if inbox_runs:
-            print(f"\n哈基米 > 你有 {len(inbox_runs)} 条未读定时任务结果：")
+            print(f"\n哈基米 > 你有 {len(inbox_runs)} 条未读定时任务结果:")
             for task, run in inbox_runs:
                 output = run.output or run.error or run.status
-                print(f"[定时任务：{task.name}] {str(output)[:500]}")
+                print(f"[定时任务:{task.name}] {str(output)[:500]}")
                 schedule_store.mark_run_read(run.id)
             print("")
         scheduler = TaskScheduler(
@@ -511,7 +460,7 @@ def run_cli() -> None:
         roles_info = request_json(server_url, "GET", "/roles")
         current_role = roles_info["current_role"]
     except URLError as exc:
-        raise SystemExit(f"无法连接 OpenHachimi 后台服务：{server_url}，请先运行 python main.py serve") from exc
+        raise SystemExit(f"无法连接 OpenHachimi 后台服务:{server_url},请先运行 python main.py serve") from exc
 
     backend = HttpBackend(server_url)
     try:
