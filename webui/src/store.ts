@@ -12,6 +12,9 @@ interface ChatStoreState {
   sessions: SessionSummary[]
   messages: MessageItem[]
   isGenerating: boolean
+  // Agent 当前正在执行的动作文案（来自 SSE 的 temporary 工具调用事件）。
+  // 首 chunk 到达前用它驱动"思考中"指示器；流式中调工具时作为底部状态条。
+  activity: string | null
 }
 
 export const useChatStore = defineStore('chat', {
@@ -24,6 +27,7 @@ export const useChatStore = defineStore('chat', {
     sessions: [],
     messages: [],
     isGenerating: false,
+    activity: null,
   }),
   getters: {
     authenticated: (state) => !!state.token,
@@ -48,6 +52,7 @@ export const useChatStore = defineStore('chat', {
       this.sessions = []
       this.messages = []
       this.isGenerating = false
+      this.activity = null
       clearToken()
     },
     async loadInit(role?: string) {
@@ -85,8 +90,13 @@ export const useChatStore = defineStore('chat', {
         this.messages.push({ role: 'assistant', content: text, prefix: '', timestamp: null })
       }
     },
+    setActivity(text: string | null) {
+      this.activity = text
+    },
     setGenerating(v: boolean) {
       this.isGenerating = v
+      // 流结束时清掉活动状态，避免上一轮的工具文案残留到下次"思考中"指示器
+      if (!v) this.activity = null
     },
   },
 })

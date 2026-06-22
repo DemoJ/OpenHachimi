@@ -299,7 +299,7 @@ def test_self_critique_repair_prompt_includes_repair_instructions():
 
 @pytest.mark.asyncio
 async def test_execute_task_repairs_after_self_critique_revision(mock_config):
-    session_state = {}
+    session_state = {"task_frame": {"complexity": "complex", "requires_plan": True, "execution_mode": "planned"}}
     deps = SimpleNamespace(run_mode="interactive", session_state=session_state)
     ctx = AgentRunContext(
         config=mock_config,
@@ -336,7 +336,7 @@ async def test_execute_task_repairs_after_self_critique_revision(mock_config):
 
 @pytest.mark.asyncio
 async def test_execute_task_returns_signal_when_self_critique_still_fails(mock_config):
-    session_state = {}
+    session_state = {"task_frame": {"complexity": "complex", "requires_plan": True, "execution_mode": "planned"}}
     deps = SimpleNamespace(run_mode="interactive", session_state=session_state)
     ctx = AgentRunContext(
         config=mock_config,

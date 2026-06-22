@@ -12,6 +12,7 @@ OpenHachimi 一键部署脚本（跨平台，支持自举）
   --host HOST       后台服务监听地址（默认 127.0.0.1）
   --port PORT       后台服务监听端口（默认 8765）
   --skip-daemon     只安装依赖，不部署后台守护服务
+  --skip-webui      跳过 WebUI 前端构建（/ui 页面将不可用）
   --repo URL        自定义 Git 仓库地址
   --dir DIR         指定克隆目标目录（默认 ./OpenHachimi）
 """
@@ -178,6 +179,7 @@ def main() -> None:
     parser.add_argument("--host", default=DEFAULT_HOST, help="后台服务监听地址")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="后台服务监听端口")
     parser.add_argument("--skip-daemon", action="store_true", help="只安装，不部署后台守护")
+    parser.add_argument("--skip-webui", action="store_true", help="跳过 WebUI 前端构建")
     parser.add_argument("--repo", default=REPO_URL, help="自定义 Git 仓库地址")
     parser.add_argument("--dir", default="./OpenHachimi", help="克隆目标目录")
     args = parser.parse_args()
@@ -194,7 +196,9 @@ def main() -> None:
     # 步骤 3：创建虚拟环境
     ensure_venv(project_root)
 
-    # 步骤 4：安装依赖
+    # 步骤 4：安装依赖并构建 WebUI 前端
+    if args.skip_webui:
+        os.environ["OPENHACHIMI_SKIP_WEBUI"] = "1"
     install_project(project_root)
 
     # 步骤 5：初始化配置文件

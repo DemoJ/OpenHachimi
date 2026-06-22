@@ -14,6 +14,8 @@ const md: MarkdownIt = new MarkdownIt({
     return `<pre class="hljs"><code>${md.utils.escapeHtml(str)}</code></pre>`
   },
 })
+// 显式启用表格规则（markdown-it 默认已启用，这里确保不被意外禁用）。
+md.enable(['table'])
 
 export function renderMarkdown(text: string): string {
   return md.render(text)

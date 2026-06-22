@@ -130,7 +130,16 @@ async function onSend(text: string) {
   try {
     await chatStream(text, store.currentRole, {
       onChunk(t, temporary) {
-        if (temporary) return // 临时事件（如工具调用提示）M1 不展示
+        if (temporary) {
+          // 临时事件是工具调用提示（如"🖥️ 执行命令：npm test"），
+          // 不计入消息正文，但用它驱动"思考中/活动中"指示器，
+          // 让 Agent 在首句产出前的规划与工具调用对用户可见。
+          store.setActivity(t)
+          return
+        }
+        // 收到首个正文 chunk 后清掉活动状态条，
+        // 让打字机光标接管"生成中"的视觉反馈。
+        if (store.activity) store.setActivity(null)
         store.appendAssistantChunk(t)
       },
       onDone() {

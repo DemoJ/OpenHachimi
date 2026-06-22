@@ -12,6 +12,7 @@
 #   -H, --host HOST       监听地址（默认 127.0.0.1）
 #   -p, --port PORT       监听端口（默认 8765）
 #   --skip-daemon         只安装依赖，不部署后台守护服务
+#   --skip-webui          跳过 WebUI 前端构建（/ui 页面将不可用）
 #   --repo URL            自定义 Git 仓库地址
 #   --dir DIR             指定克隆目标目录（默认 ./OpenHachimi）
 #   -h, --help            显示帮助
@@ -36,6 +37,7 @@ error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 HOST="127.0.0.1"
 PORT=8765
 SKIP_DAEMON=false
+SKIP_WEBUI=false
 REPO_URL="https://github.com/DemoJ/OpenHachimi.git"
 CLONE_DIR="./OpenHachimi"
 
@@ -51,6 +53,7 @@ ${BOLD}OpenHachimi 一键部署脚本${RESET}
   -H, --host HOST       后台服务监听地址（默认：127.0.0.1）
   -p, --port PORT       后台服务监听端口（默认：8765）
   --skip-daemon         只安装依赖，不部署后台守护服务
+  --skip-webui          跳过 WebUI 前端构建（/ui 页面将不可用）
   --repo URL            自定义 Git 仓库地址
   --dir DIR             指定克隆目标目录（默认：./OpenHachimi）
   -h, --help            显示此帮助并退出
@@ -73,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         -H|--host)      HOST="$2"; shift 2 ;;
         -p|--port)      PORT="$2"; shift 2 ;;
         --skip-daemon)  SKIP_DAEMON=true; shift ;;
+        --skip-webui)   SKIP_WEBUI=true; shift ;;
         --repo)         REPO_URL="$2"; shift 2 ;;
         --dir)          CLONE_DIR="$2"; shift 2 ;;
         -h|--help)      usage ;;
@@ -85,7 +89,7 @@ echo -e "${BOLD}=== OpenHachimi 部署 ===${RESET}"
 echo ""
 
 # ── 步骤 1：检查 Python 版本 ──────────────────────────────────────────────────
-info "步骤 1/4：检查 Python 环境..."
+info "步骤 1/5：检查 Python 环境..."
 
 PYTHON=""
 for cmd in python3 python; do
@@ -167,8 +171,59 @@ create_venv() {
     fi
 }
 
+# ── 辅助函数：构建 WebUI 前端 ─────────────────────────────────────────────────
+# 产物输出到 openhachimi_agent/webui_dist/（见 webui/vite.config.ts），
+# 后端 http.py 会从该目录挂载 /ui。由于 webui_dist 被 .gitignore 排除，
+# 线上 git clone/pull 后不会自带产物，必须在部署时构建。
+# 返回 0 构建成功，返回 1 跳过（Node/npm 缺失等非致命情况）。
+build_webui() {
+    local webui_dir="$PROJECT_ROOT/webui"
+    if [[ ! -d "$webui_dir" ]]; then
+        warn "未找到 webui 目录（$webui_dir），跳过前端构建。"
+        return 1
+    fi
+
+    # 检测 Node.js / npm
+    if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
+        warn "未检测到 Node.js / npm，跳过前端构建。/ui 网页将不可用（API 不受影响）。"
+        warn "安装 Node.js 18+ 后重新运行本脚本即可："
+        warn "  Ubuntu/Debian：curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs"
+        warn "  macOS：        brew install node"
+        return 1
+    fi
+
+    local node_ver node_major
+    node_ver="$(node -p 'process.versions.node')"
+    node_major="${node_ver%%.*}"
+    if [[ "$node_major" -lt 18 ]]; then
+        warn "Node.js 版本过低（v${node_ver}），Vite 5 需要 18+，跳过前端构建。"
+        return 1
+    fi
+    success "检测到 Node.js v${node_ver}。"
+
+    info "安装前端依赖..."
+    if [[ -f "$webui_dir/package-lock.json" ]]; then
+        (cd "$webui_dir" && npm ci --no-audit --no-fund) || {
+            warn "npm ci 失败，尝试 npm install..."
+            (cd "$webui_dir" && npm install --no-audit --no-fund) || {
+                error "前端依赖安装失败，请查看上方错误信息。"
+            }
+        }
+    else
+        (cd "$webui_dir" && npm install --no-audit --no-fund) || \
+            error "前端依赖安装失败，请查看上方错误信息。"
+    fi
+
+    info "构建前端（npm run build）..."
+    (cd "$webui_dir" && npm run build) || \
+        error "前端构建失败，请查看上方错误信息。\n可使用 --skip-webui 跳过构建以先部署后端 API。"
+
+    success "前端构建完成，产物位于 openhachimi_agent/webui_dist/。"
+    return 0
+}
+
 # ── 步骤 3：准备虚拟环境 ────────────────────────────────────────────────────
-info "步骤 2/4：准备虚拟环境..."
+info "步骤 2/5：准备虚拟环境..."
 
 if venv_is_healthy; then
     success "虚拟环境健全，复用：$VENV_DIR"
@@ -191,7 +246,7 @@ VENV_PYTHON="$VENV_DIR/bin/python"
 VENV_HACHIMI="$VENV_DIR/bin/hachimi"
 
 # ── 步骤 4：安装依赖 ─────────────────────────────────────────────────────────
-info "步骤 3/4：安装项目依赖（pip install -e .）..."
+info "步骤 3/5：安装项目依赖（pip install -e .）..."
 
 if ! "$VENV_PYTHON" -m pip install -U pip --quiet 2>/tmp/_oh_pip_err; then
     cat /tmp/_oh_pip_err >&2
@@ -204,6 +259,18 @@ if ! "$VENV_PYTHON" -m pip install -e "$PROJECT_ROOT" --quiet 2>/tmp/_oh_pip_err
 fi
 
 success "依赖安装完成。"
+
+# ── 步骤 4/5：构建 WebUI 前端 ────────────────────────────────────────────────
+info "步骤 4/5：构建 WebUI 前端..."
+if [[ "$SKIP_WEBUI" == true ]]; then
+    warn "已跳过前端构建（--skip-webui）。/ui 网页将不可用，API 不受影响。"
+else
+    if build_webui; then
+        :
+    else
+        warn "前端构建已跳过，后台 API 仍可正常使用，但 /ui 网页不可访问。"
+    fi
+fi
 
 # ── 初始化配置文件（步骤 4.5，嵌入步骤 4 和 5 之间）────────────────────────
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -222,9 +289,9 @@ fi
 
 # ── 步骤 5：部署后台守护服务 ─────────────────────────────────────────────────
 if [[ "$SKIP_DAEMON" == true ]]; then
-    info "步骤 4/4：已跳过后台守护部署（--skip-daemon）。"
+    info "步骤 5/5：已跳过后台守护部署（--skip-daemon）。"
 else
-    info "步骤 4/4：部署后台守护服务（host=$HOST port=$PORT）..."
+    info "步骤 5/5：部署后台守护服务（host=$HOST port=$PORT）..."
     "$VENV_HACHIMI" deploy --host "$HOST" --port "$PORT"
 fi
 

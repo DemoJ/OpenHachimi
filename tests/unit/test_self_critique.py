@@ -68,6 +68,12 @@ class FakeErrorAgent:
 def _make_ctx(config, message="测试任务", session_state=None):
     if session_state is None:
         session_state = {}
+    # 自检功能测试默认构造「复杂规划」任务，满足 _should_run_self_critique 门槛。
+    # 简单任务跳过自检的行为由专门的测试覆盖。
+    session_state.setdefault(
+        "task_frame",
+        {"complexity": "complex", "requires_plan": True, "execution_mode": "planned"},
+    )
     deps = SimpleNamespace(run_mode="interactive", session_state=session_state)
     return AgentRunContext(
         config=config,
@@ -340,6 +346,41 @@ async def test_only_one_repair_attempt(mock_config):
     # executor 只运行了 2 次（初始 + 1次修复），不会无限循环
     assert executor._call_count == 2
     assert critic._call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_simple_task_skips_self_critique(mock_config):
+    """场景: 简单 direct 任务（问候、信息查询）跳过自检，不发起额外 LLM 调用。"""
+    # 简单任务：无活动 TODO，task_frame 为 direct/simple，不满足自检门槛
+    session_state = {
+        "task_frame": {
+            "complexity": "simple",
+            "requires_plan": False,
+            "execution_mode": "direct",
+        }
+    }
+    ctx = _make_ctx(mock_config, "你好", session_state)
+
+    executor = FakeSequenceAgent(["你好！很高兴见到你。"])
+    critic = FakeSequenceAgent([
+        SelfCritiqueDecision(verdict="pass", confidence=0.9),  # 不应被调用
+    ])
+
+    def get_agent(_role, agent_type):
+        if agent_type == "executor":
+            return executor
+        if agent_type == "self_critique":
+            return critic
+        raise AssertionError(f"unexpected agent_type: {agent_type}")
+
+    outcome = await execute_task(ctx, get_agent)
+
+    # 直接返回 executor 结果，未触发自检
+    assert outcome.result.output == "你好！很高兴见到你。"
+    assert outcome.self_critique_signal is None
+    assert outcome.final_verification_signal is None
+    assert executor._call_count == 1
+    assert critic._call_count == 0
 
 
 # ---------------------------------------------------------------------------

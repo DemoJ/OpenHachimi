@@ -16,8 +16,8 @@
       v-html="renderedPrefix"
     ></div>
 
-    <!-- 主消息体：始终展示 -->
-    <div class="message-content" v-html="renderedContent"></div>
+    <!-- 主消息体：始终展示。streaming 时在末尾追加打字机光标。 -->
+    <div class="message-content" :class="{ streaming }" v-html="renderedContent"></div>
   </div>
 </template>
 
@@ -29,6 +29,7 @@ const props = defineProps<{
   role: 'user' | 'assistant'
   content: string
   prefix?: string
+  streaming?: boolean
 }>()
 
 // prefix 由后端拆好（按哨兵分隔符），无前缀就是空串。无需任何启发式。
@@ -81,5 +82,19 @@ const renderedPrefix = computed(() => renderMarkdown(props.prefix || ''))
   padding: 1px 4px;
   border-radius: 3px;
   font-size: 12px;
+}
+
+/* 打字机光标：作为最后一个子元素的内联伪元素，跟在正文末尾闪烁。 */
+.message-content.streaming > :last-child::after {
+  content: '▋';
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent);
+  font-weight: bold;
+  animation: cursor-blink 1s steps(2, start) infinite;
+}
+@keyframes cursor-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
 }
 </style>

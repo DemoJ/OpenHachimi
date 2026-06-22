@@ -21,8 +21,8 @@ from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
-from openhachimi_agent.service.agent_runtime.context import AgentRunContext
-from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem, build_stream_event_handler
+from openhachimi_agent.service.agent_runtime.context import AgentRunContext, has_active_todos
+from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.transport.api_models import AttachmentRef
 from openhachimi_agent.vision.capabilities import mark_model_vision_support
 from openhachimi_agent.vision.preprocess import VisionPreprocessResult, image_attachments, preprocess_vision_attachments
@@ -448,12 +448,25 @@ def preflight_compress_history(ctx: AgentRunContext) -> None:
 
 
 def _executor_stream_handler(ctx: AgentRunContext, text_buffer: list[str]) -> Callable[[object, object], Any] | None:
+    # 正文实时流式：直接复用 turn.py 里构建的无缓冲 handler（ctx.stream_event_handler），
+    # 不再传 text_buffer。原来传 text_buffer 会把所有正文 chunk 缓冲到 list 里，
+    # 直到 self_critique 跑完才在 _flush_buffered_text 一次性 flush，导致 WebUI
+    # 看不到逐字打字机效果、整段回复在最后才一口气出现。
+    #
+    # 取消缓冲的代价：self_critique / final_verification 要求重写时，首版正文已经
+    # 流式显示给用户了，repair 的输出会作为续写追加在同一条 assistant 消息后，
+    # 中间有 [System] 提示分隔。这与 ChatGPT/Claude 等主流产品的行为一致，
+    # 优于"长时间静默后一次性吐出"。
+    #
+    # text_buffer 参数仅为兼容调用处保留，不再使用（_flush_buffered_text 退化为 no-op）。
     if not ctx.stream or ctx.stream_queue is None:
         return ctx.stream_event_handler
-    return build_stream_event_handler(ctx.stream_queue, ctx.operation_state, text_buffer=text_buffer)
+    return ctx.stream_event_handler
 
 
 async def _flush_buffered_text(ctx: AgentRunContext, text_buffer: list[str]) -> None:
+    # 正文已改为实时流式（见 _executor_stream_handler），此处保留为 no-op 兜底，
+    # 不破坏 execute_task 既有的 repair/critique 分支结构。
     if not text_buffer or not ctx.stream or ctx.stream_queue is None:
         return
     for chunk in text_buffer:
@@ -474,6 +487,29 @@ def _self_critique_signal(decision: SelfCritiqueDecision) -> dict[str, object]:
             }
         ],
     }
+
+
+def _should_run_self_critique(ctx: AgentRunContext, task_frame_payload: dict[str, Any] | None) -> bool:
+    """是否对本轮最终回复执行自检。
+
+    自检会额外发起一次 LLM 调用并阻塞回复返回，对简单任务（问候、信息查询等）
+    收益小、延迟代价大。因此只有「经历了复杂规划」的任务才自检：
+
+    - 本轮有活动 TODO（实际创建并执行了多步计划）—— 最强信号；
+    - TaskFrame 标记 requires_plan / execution_mode=planned / complexity=complex。
+
+    简单 direct / skill_direct 任务直接返回，跳过自检。
+    """
+    if has_active_todos(ctx.session_state):
+        return True
+    if task_frame_payload:
+        if task_frame_payload.get("requires_plan"):
+            return True
+        if task_frame_payload.get("execution_mode") == "planned":
+            return True
+        if task_frame_payload.get("complexity") == "complex":
+            return True
+    return False
 
 
 async def _run_self_critique(
@@ -672,6 +708,18 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     if verification_signal:
         await _flush_buffered_text(ctx, text_buffer)
         return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
+
+    # 简单任务（问候、信息查询等 direct/skill_direct）跳过自检，
+    # 避免对低风险任务做额外 LLM 调用造成无谓延迟。只有经历了复杂规划
+    # （活动 TODO / requires_plan / planned / complex）的任务才自检。
+    if not _should_run_self_critique(ctx, task_frame_payload):
+        await _flush_buffered_text(ctx, text_buffer)
+        logger.info(
+            "self critique skipped (simple task) role=%s session_id=%s",
+            ctx.role,
+            ctx.session_id,
+        )
+        return ExecutionOutcome(result=result)
 
     critique = await _run_self_critique(ctx, get_agent, task_frame_payload, result)
     if critique.verdict == "pass":
