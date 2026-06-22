@@ -472,7 +472,7 @@ logging:
 
 单轮内 planner→executor→replan/repair→self_critique 会多次 `extend` 同一份 history，膨胀速度远快于对话轮数，故需双触发：
 
-- **轮后主压缩**（`agent_service.py`）：用本轮真实 `result.usage()` 判定，触发则在 `save_message_history` 前压缩并保存。轮边界最安全，不打断工具序列。
+- **轮后主压缩**（`agent_service.py`）：用本轮真实 `result.usage` 判定，触发则在 `save_message_history` 前压缩并保存。轮边界最安全，不打断工具序列。
 - **轮内预检安全网**（`executor.py: preflight_compress_history`）：每次 `agent.run` 前粗略估计达 `hard_ceiling_percent`（0.90）时，对内存 history 先做廉价压缩（`allow_llm_summary=False` 走确定性兜底，避免中途中断调 LLM），防止单轮内撑爆模型窗口。
 
 ### 召回解耦闭环

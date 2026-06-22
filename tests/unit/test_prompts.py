@@ -12,9 +12,12 @@ def test_load_system_prompt_supports_nested_prompt():
 
 
 def test_render_system_prompt_replaces_variables():
-    rendered = render_system_prompt("runtime/time", {"current_time": "2026-01-02 03:04:05"})
+    rendered = render_system_prompt(
+        "runtime/time",
+        {"current_time": "2026-01-02 03:04:05", "weekday": "星期五"},
+    )
 
-    assert rendered == "[系统环境] 当前真实时间: 2026-01-02 03:04:05"
+    assert rendered.startswith("[系统环境] 当前真实时间: 2026-01-02 03:04:05(星期五)")
 
 
 def test_render_system_prompt_requires_all_variables():

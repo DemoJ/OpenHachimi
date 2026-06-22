@@ -4,7 +4,7 @@
   - CJK 字符按 ~1 token/字 估计(中日韩一个字通常 1-2 token)
   - 其余字符按 ~4 字符/token 估计(英文/代码的常见比例)
 
-仅供预检与边界决策,真实用量以 ``result.usage().input_tokens`` 为准。
+仅供预检与边界决策,真实用量以 ``result.usage.input_tokens`` 为准。
 """
 
 from __future__ import annotations

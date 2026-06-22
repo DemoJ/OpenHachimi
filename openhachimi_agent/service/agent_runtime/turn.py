@@ -369,7 +369,7 @@ async def run_turn(
             compressor = ctx.context_compressor
             if compressor is not None:
                 try:
-                    compressor.update_from_response(result.usage())  # type: ignore[attr-defined]
+                    compressor.update_from_response(result.usage)  # type: ignore[attr-defined]
                 except Exception:
                     logger.debug("context usage update failed", exc_info=True)
                 if compressor.should_compress():
