@@ -23,6 +23,28 @@ def _command_exists(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+def webui_dist_path() -> Path:
+    """前端构建产物目录（与 interface/http.py 的挂载判断保持一致）。"""
+    return Path(__file__).resolve().parent.parent / "webui_dist"
+
+
+def webui_url(host: str, port: int) -> str | None:
+    """返回 WebUI 访问地址；前端未构建（webui_dist 不存在）时返回 None。"""
+    if webui_dist_path().exists():
+        return f"http://{host}:{port}/ui/"
+    return None
+
+
+def print_endpoints(host: str, port: int) -> None:
+    """打印 API 与 WebUI 访问地址。前端未构建时给出构建提示。"""
+    print(f"  API   地址：http://{host}:{port}")
+    url = webui_url(host, port)
+    if url:
+        print(f"  WebUI 地址：{url}")
+    else:
+        print("  WebUI 地址：（前端未构建，运行 `cd webui && npm run build` 后重启服务）")
+
+
 def deploy_daemon(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     system_name = platform.system().lower()
     if system_name == "linux" and _command_exists("systemctl"):
@@ -57,7 +79,8 @@ def deploy_systemd_user_service(host: str, port: int) -> None:
     subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=True)
 
     print(f"已部署并启动 systemd user service：{service_path}")
-    print(f"服务地址：http://{host}:{port}")
+    print("服务访问地址：")
+    print_endpoints(host, port)
     print("以后直接运行 hachimi 即可进入 CLI。")
 
 
@@ -84,7 +107,8 @@ def deploy_local_script(host: str, port: int) -> None:
         script_path.chmod(script_path.stat().st_mode | 0o111)
 
     print(f"当前系统未检测到可用 systemd，已生成本地启动脚本：{script_path}")
-    print(f"运行该脚本即可启动后台服务：http://{host}:{port}")
+    print("运行该脚本即可启动后台服务：")
+    print_endpoints(host, port)
     print("服务启动后，直接运行 hachimi 即可进入 CLI。")
 
 

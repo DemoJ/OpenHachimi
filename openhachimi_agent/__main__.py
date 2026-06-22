@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +31,7 @@ import uvicorn
 from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import load_config
 from openhachimi_agent.core.version import PACKAGE_NAME, get_version
-from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME, deploy_daemon, undeploy_daemon
+from openhachimi_agent.daemon.deploy import DEFAULT_HOST, DEFAULT_PORT, SERVICE_NAME, deploy_daemon, undeploy_daemon, webui_url
 from openhachimi_agent.interface.cli import get_server_url, request_json, run_embedded_cli
 
 
@@ -79,6 +80,43 @@ def _require_systemd() -> None:
         sys.exit(1)
 
 
+def _deployed_endpoint() -> tuple[str, int]:
+    """从已部署的 systemd service 文件解析监听地址；失败回退默认值。
+
+    cmd_start/cmd_restart 不接收 host/port 参数，需从 deploy 写入的 service
+    文件的 ExecStart 行中解析，以显示正确的访问地址。
+    """
+    host, port = DEFAULT_HOST, DEFAULT_PORT
+    service_path = Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service"
+    try:
+        text = service_path.read_text(encoding="utf-8")
+    except OSError:
+        return host, port
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("ExecStart="):
+            m_host = re.search(r"--host\s+(\S+)", line)
+            m_port = re.search(r"--port\s+(\d+)", line)
+            if m_host:
+                host = m_host.group(1)
+            if m_port:
+                port = int(m_port.group(1))
+            break
+    return host, port
+
+
+def _print_access_info(host: str, port: int) -> None:
+    """打印服务访问地址（API + WebUI）。前端未构建时给出构建提示。"""
+    print()
+    _ok(f"API   地址：http://{host}:{port}")
+    url = webui_url(host, port)
+    if url:
+        _ok(f"WebUI 地址：{url}")
+    else:
+        _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
+    print()
+
+
 # ── 子命令实现 ────────────────────────────────────────────────────────────────
 
 def cmd_status(_args: argparse.Namespace) -> None:
@@ -92,7 +130,10 @@ def cmd_start(_args: argparse.Namespace) -> None:
     _require_systemd()
     _info(f"正在启动 {SERVICE_NAME} 服务...")
     _systemctl("start", SERVICE_NAME, check=True)
-    _ok("服务已启动。使用 `hachimi status` 确认运行状态。")
+    _ok("服务已启动。")
+    host, port = _deployed_endpoint()
+    _print_access_info(host, port)
+    _info("使用 `hachimi status` 确认运行状态。")
 
 
 def cmd_stop(_args: argparse.Namespace) -> None:
@@ -108,7 +149,10 @@ def cmd_restart(_args: argparse.Namespace) -> None:
     _require_systemd()
     _info(f"正在重启 {SERVICE_NAME} 服务...")
     _systemctl("restart", SERVICE_NAME, check=True)
-    _ok("服务已重启。使用 `hachimi status` 确认运行状态。")
+    _ok("服务已重启。")
+    host, port = _deployed_endpoint()
+    _print_access_info(host, port)
+    _info("使用 `hachimi status` 确认运行状态。")
 
 
 def cmd_log(args: argparse.Namespace) -> None:
@@ -211,6 +255,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
     config = load_config()
     configure_logging(config)
     logger.info("serve command host=%s port=%s", args.host, args.port)
+    # uvicorn.run 会阻塞并在启动时自行打印 API 地址，这里先打印 WebUI 提示。
+    url = webui_url(args.host, args.port)
+    if url:
+        _ok(f"WebUI 地址：{url}")
+    else:
+        _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
     uvicorn.run("openhachimi_agent.interface.http:app", host=args.host, port=args.port)
 
 
