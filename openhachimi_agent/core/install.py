@@ -15,17 +15,26 @@ def run(command: list[str], *, cwd: Path | None = None) -> None:
     subprocess.run(command, cwd=cwd, check=True)
 
 
-def _run_shell(command: list[str], *, cwd: Path) -> None:
+def _run_shell(command: list[str], *, cwd: Path, timeout: float | None = None) -> None:
     """运行命令，Windows 下通过 cmd /c 以支持 .cmd/.bat（如 npm）。
 
     CreateProcess 无法直接执行 .cmd/.bat，必须经由 cmd.exe；POSIX 上 npm 是
-    真二进制，直接执行即可。
+    真二进制，直接执行即可。timeout 超时会抛 SystemExit 并给出网络排错提示。
     """
     print("$ " + " ".join(str(item) for item in command))
-    if sys.platform == "win32":
-        subprocess.run(["cmd", "/c", *command], cwd=cwd, check=True)
-    else:
-        subprocess.run(command, cwd=cwd, check=True)
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["cmd", "/c", *command], cwd=cwd, check=True, timeout=timeout)
+        else:
+            subprocess.run(command, cwd=cwd, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(
+            f"[x] 命令超时（{timeout}秒）：{' '.join(command)}\n"
+            "    通常是网络问题。可尝试：\n"
+            "      1. 配置镜像源：设置环境变量 NPM_CONFIG_REGISTRY=https://registry.npmmirror.com/\n"
+            "      2. 跳过前端构建：设置环境变量 OPENHACHIMI_SKIP_WEBUI=1 后重试\n"
+            "      3. 手动在 webui/ 目录执行 npm install 排查"
+        ) from exc
 
 
 def build_webui(project_root: Path) -> None:
@@ -70,17 +79,32 @@ def build_webui(project_root: Path) -> None:
     print(f"[OK] 检测到 Node.js v{node_ver}")
 
     print("[INFO] 安装前端依赖...")
-    if (webui_dir / "package-lock.json").exists():
-        try:
-            _run_shell(["npm", "ci", "--no-audit", "--no-fund"], cwd=webui_dir)
-        except subprocess.CalledProcessError:
-            print("[WARN] npm ci 失败，改用 npm install...")
-            _run_shell(["npm", "install", "--no-audit", "--no-fund"], cwd=webui_dir)
+    # npm ci 会删除 node_modules 全量重装，更新场景下太慢且费流量。
+    # 策略：node_modules 已存在时走 npm install（增量、--prefer-offline 优先用本地缓存），
+    #       仅首次（无 node_modules）才用 npm ci 干净安装。
+    # --foreground-scripts 让 esbuild 等 postinstall 输出实时可见，避免「卡住」错觉。
+    NPM_INSTALL_FLAGS = ["--no-audit", "--no-fund", "--foreground-scripts"]
+    has_lock = (webui_dir / "package-lock.json").exists()
+    has_modules = (webui_dir / "node_modules").is_dir()
+
+    if has_modules:
+        install_cmd = ["npm", "install", "--prefer-offline", *NPM_INSTALL_FLAGS]
+    elif has_lock:
+        install_cmd = ["npm", "ci", *NPM_INSTALL_FLAGS]
     else:
-        _run_shell(["npm", "install", "--no-audit", "--no-fund"], cwd=webui_dir)
+        install_cmd = ["npm", "install", *NPM_INSTALL_FLAGS]
+
+    try:
+        _run_shell(install_cmd, cwd=webui_dir, timeout=600)
+    except subprocess.CalledProcessError:
+        if install_cmd[1] == "ci":
+            print("[WARN] npm ci 失败，改用 npm install...")
+            _run_shell(["npm", "install", "--prefer-offline", *NPM_INSTALL_FLAGS], cwd=webui_dir, timeout=600)
+        else:
+            raise
 
     print("[INFO] 构建前端（npm run build）...")
-    _run_shell(["npm", "run", "build"], cwd=webui_dir)
+    _run_shell(["npm", "run", "build"], cwd=webui_dir, timeout=600)
     print("[OK] 前端构建完成，产物位于 openhachimi_agent/webui_dist/。")
 
 

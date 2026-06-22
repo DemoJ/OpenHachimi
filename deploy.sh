@@ -201,16 +201,23 @@ build_webui() {
     fi
     success "检测到 Node.js v${node_ver}。"
 
+    # npm ci 会删 node_modules 全量重装，更新场景太慢。
+    # 有 node_modules 走 npm install --prefer-offline（优先本地缓存），首次才 npm ci。
+    # --foreground-scripts 让 postinstall 输出可见，避免「卡住」错觉。
+    local npm_flags=(--no-audit --no-fund --foreground-scripts)
     info "安装前端依赖..."
-    if [[ -f "$webui_dir/package-lock.json" ]]; then
-        (cd "$webui_dir" && npm ci --no-audit --no-fund) || {
-            warn "npm ci 失败，尝试 npm install..."
-            (cd "$webui_dir" && npm install --no-audit --no-fund) || {
+    if [[ -d "$webui_dir/node_modules" ]]; then
+        if ! (cd "$webui_dir" && npm install --prefer-offline "${npm_flags[@]}"); then
+            error "前端依赖安装失败，请查看上方错误信息。"
+        fi
+    elif [[ -f "$webui_dir/package-lock.json" ]]; then
+        if ! (cd "$webui_dir" && npm ci "${npm_flags[@]}"); then
+            warn "npm ci 失败，改用 npm install..."
+            (cd "$webui_dir" && npm install --prefer-offline "${npm_flags[@]}") || \
                 error "前端依赖安装失败，请查看上方错误信息。"
-            }
-        }
+        fi
     else
-        (cd "$webui_dir" && npm install --no-audit --no-fund) || \
+        (cd "$webui_dir" && npm install --prefer-offline "${npm_flags[@]}") || \
             error "前端依赖安装失败，请查看上方错误信息。"
     fi
 
