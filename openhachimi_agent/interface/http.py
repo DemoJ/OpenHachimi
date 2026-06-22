@@ -36,12 +36,17 @@ from openhachimi_agent.transport.api_models import (
     CommandDispatchRequest,
     CommandDispatchResponse,
     DeliveryPreviewResponse,
+    MessageItem,
     RoleSwitchRequest,
     ScheduleCreateRequest,
     ScheduleDeliveryUpdateRequest,
     ScheduleResponse,
     ScheduleRunResponse,
     ScheduleUpdateRequest,
+    SessionListResponse,
+    SessionLoadRequest,
+    SessionMessagesResponse,
+    SessionSummary,
     StopRequest,
 )
 from openhachimi_agent.tools.utils import resolve_workspace_path
@@ -208,7 +213,7 @@ app = FastAPI(title="OpenHachimi Agent", lifespan=lifespan)
 
 @app.middleware("http")
 async def require_http_api_token(request: Request, call_next):
-    if request.url.path == "/health":
+    if request.url.path == "/health" or request.url.path.startswith("/ui"):
         return await call_next(request)
 
     config = getattr(request.app.state, "config", None)
@@ -428,19 +433,51 @@ async def chat(request: ChatRequest, service: AgentService = Depends(get_service
 
 
 @app.post("/chat/stream")
-def chat_stream(request: ChatRequest, service: AgentService = Depends(get_service)):
-    logger.info("http chat request message_chars=%d attachment_count=%d stream=true", len(request.message), len(request.attachments))
+def chat_stream(
+    api_request: ChatRequest,
+    http_request: Request,
+    service: AgentService = Depends(get_service),
+):
+    logger.info(
+        "http chat request message_chars=%d attachment_count=%d stream=true",
+        len(api_request.message),
+        len(api_request.attachments),
+    )
 
     async def sse_generator():
-        channel_context = {"type": "http", "platform": "http", "session_id": request.session_id, "role": request.role}
+        event_count = 0
+        channel_context = {
+            "type": "http",
+            "platform": "http",
+            "session_id": api_request.session_id,
+            "role": api_request.role,
+        }
+        logger.info(
+            "sse stream opened role=%s session_id=%s message_chars=%d",
+            api_request.role,
+            api_request.session_id,
+            len(api_request.message),
+        )
         try:
             async for event in service.stream_events(
-                request.message,
-                request.role,
-                request.session_id,
-                attachments=request.attachments,
+                api_request.message,
+                api_request.role,
+                api_request.session_id,
+                attachments=api_request.attachments,
                 channel_context=channel_context,
             ):
+                # 每发出一个事件前检查客户端是否已断开，
+                # 避免后端在无人消费的 stream 上继续运行。
+                if await http_request.is_disconnected():
+                    logger.warning(
+                        "sse stream closing reason=client_disconnected "
+                        "event_count=%d role=%s session_id=%s",
+                        event_count,
+                        api_request.role,
+                        api_request.session_id,
+                    )
+                    return
+
                 payload = {
                     "type": event.type,
                     "text": event.text,
@@ -453,9 +490,22 @@ def chat_stream(request: ChatRequest, service: AgentService = Depends(get_servic
                 if event.artifact:
                     payload["artifact"] = event.artifact.model_dump(mode="json")
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                event_count += 1
+
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+            logger.info(
+                "sse stream closing reason=done event_count=%d role=%s session_id=%s",
+                event_count,
+                api_request.role,
+                api_request.session_id,
+            )
         except Exception as exc:
-            logger.exception("stream error")
+            logger.exception(
+                "sse stream closing reason=error event_count=%d role=%s session_id=%s",
+                event_count,
+                api_request.role,
+                api_request.session_id,
+            )
             yield f"data: {json.dumps({'error': safe_error_detail(exc)}, ensure_ascii=False)}\n\n"
 
     try:
@@ -498,6 +548,30 @@ def new_session(role: str | None = None, service: AgentService = Depends(get_ser
 def latest_session(role: str | None = None, service: AgentService = Depends(get_service)):
     logger.info("http latest session request role=%s", role)
     return service.latest_session(role)
+
+
+@app.get("/sessions")
+def list_sessions(role: str | None = None, service: AgentService = Depends(get_service)) -> SessionListResponse:
+    logger.info("http list sessions request role=%s", role)
+    return SessionListResponse(**service.list_sessions(role))
+
+
+@app.post("/sessions/load")
+def load_session(request: SessionLoadRequest, service: AgentService = Depends(get_service)):
+    logger.info("http load session request session_id=%s role=%s", request.session_id, request.role)
+    try:
+        return service.load_session(request.role, request.session_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+
+
+@app.get("/sessions/{session_id}/messages")
+def get_session_messages(session_id: str, role: str | None = None, service: AgentService = Depends(get_service)) -> SessionMessagesResponse:
+    logger.info("http get session messages request session_id=%s role=%s", session_id, role)
+    try:
+        return SessionMessagesResponse(**service.get_session_messages(role, session_id))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
 
 
 @app.post("/role")
@@ -547,3 +621,20 @@ async def dispatch_command(
         role=outcome.role,
         session_id=outcome.session_id,
     )
+
+
+# ------------------------------------------------------------------ WebUI 静态托管
+# 构建产物位于 openhachimi_agent/webui_dist/（见 webui/vite.config.ts）
+# 用户 pip install 后会随 wheel 一起发布。若产物不存在（如未跑过 npm build），
+# 跳过挂载，访问 /ui/ 会得到 404，不影响其它 API 使用。
+
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_webui_dist = Path(__file__).resolve().parent.parent / "webui_dist"
+if _webui_dist.exists():
+    # html=True 让 SPA 在路径未命中时回落到 index.html。
+    # 配合 vue-router 的 hash 模式（/ui/#/login），刷新不会 404。
+    app.mount("/ui", StaticFiles(directory=str(_webui_dist), html=True), name="webui")
+    logger.info("webui static dir mounted path=%s", _webui_dist)
+else:
+    logger.info("webui static dir not found, /ui disabled path=%s", _webui_dist)

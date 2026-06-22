@@ -36,7 +36,11 @@ Hachimi = "openhachimi_agent.__main__:main"
 include = ["openhachimi_agent*"]
 
 [tool.setuptools.package-data]
-openhachimi_agent = ["system_prompts/*.md", "system_prompts/**/*.md"]
+openhachimi_agent = [
+    "system_prompts/*.md",
+    "system_prompts/**/*.md",
+    "webui_dist/**/*",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

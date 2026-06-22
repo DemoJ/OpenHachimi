@@ -141,6 +141,44 @@ def save_message_history(
     )
 
 
+def list_sessions(memory_dir: Path, role_name: str) -> list[dict]:
+    """列举指定角色目录下所有持久化会话文件。
+
+    返回按 mtime 倒序排列的 ``{session_id, mtime, size_bytes}`` 列表，
+    跳过 ``latest`` 文件、``latest_by_scope`` 子目录以及无法通过
+    ``validate_session_id`` 校验的文件。
+    """
+    role = _role_name(role_name)
+    role_dir = get_role_memory_dir(memory_dir, role)
+    if not role_dir.exists():
+        return []
+
+    items: list[dict] = []
+    for entry in role_dir.iterdir():
+        if entry.is_dir():
+            continue
+        if entry.suffix != ".json":
+            continue
+        session_id = entry.stem
+        try:
+            validate_session_id(session_id, allow_legacy=False)
+        except ValueError:
+            continue
+        try:
+            stat = entry.stat()
+        except OSError as exc:
+            logger.warning("skip session due to stat error role=%s path=%s error=%s", role, entry, exc)
+            continue
+        items.append({
+            "session_id": session_id,
+            "mtime": stat.st_mtime,
+            "size_bytes": stat.st_size,
+        })
+
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return items
+
+
 def start_new_session(memory_dir: Path, role_name: str, latest_scope: str | None = None) -> str:
     """为指定角色创建新会话，并把它设为当前会话。"""
     role = _role_name(role_name)

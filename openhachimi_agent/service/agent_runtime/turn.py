@@ -60,6 +60,40 @@ def _error_message(exc: BaseException) -> str:
     return redact_exception(exc)
 
 
+# WebUI 展示历史会话时需要"用户原始输入"，而 UserPromptPart 里实际拼了 volatile 前缀
+# （时间/记忆/技能/任务模板渲染等），无法可靠反向拆出。pydantic-ai 的 ModelRequest
+# 提供 metadata: dict 字段，序列化为 JSON 时完整保留，是稳妥的旁路存储。
+_USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
+
+
+def _stamp_user_message_metadata(new_history: list, prev_len: int, user_message: str) -> None:
+    """给本轮新增的、首个含 ``UserPromptPart`` 的 ``ModelRequest`` 打用户原始输入。
+
+    Multi-step 单轮中可能多次往 history 追加 ``ModelRequest``（planner、executor_repair
+    等都会 extend），但首个 user 消息就是本轮入口。
+    """
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    if not user_message:
+        return
+    for idx in range(prev_len, len(new_history)):
+        msg = new_history[idx]
+        if not isinstance(msg, ModelRequest):
+            continue
+        if not any(isinstance(part, UserPromptPart) for part in getattr(msg, "parts", ())):
+            continue
+        meta = getattr(msg, "metadata", None)
+        if meta is None:
+            try:
+                msg.metadata = {_USER_MESSAGE_METADATA_KEY: user_message}
+            except Exception:  # noqa: BLE001  # 极端情况 dataclass 被冻结时静默放弃
+                logger.debug("failed to stamp user_message metadata on ModelRequest idx=%d", idx)
+            return
+        if _USER_MESSAGE_METADATA_KEY not in meta:
+            meta[_USER_MESSAGE_METADATA_KEY] = user_message
+        return
+
+
 async def run_turn(
     service: "AgentService",
     message: str,
@@ -365,6 +399,13 @@ async def run_turn(
             ]
             service.register_artifacts(turn_artifacts)
             new_history = list(result.all_messages())  # type: ignore[attr-defined]
+
+            # 把"用户原始输入"持久化到本轮 ModelRequest 的 metadata 里。
+            # 这样 WebUI 等下游展示历史会话时可以精确取到用户那句话，无需启发式
+            # 拆分被注入的 volatile 前缀（时间/记忆/技能等）。
+            # 找的是本轮新增（idx >= len(history)）且含 UserPromptPart 的第一个 ModelRequest，
+            # 通常就是承载本轮用户消息的那条。
+            _stamp_user_message_metadata(new_history, len(history), message)
             # 上下文压缩:用本轮真实用量判定,触发则压缩(含 LLM 摘要,经 to_thread 避免阻塞事件循环)
             compressor = ctx.context_compressor
             if compressor is not None:

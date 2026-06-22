@@ -253,3 +253,33 @@ Agent 内置以下工具，均限制在当前工作区内：
 | `make_directory` | 创建目录 |
 | `run_command` | 执行非交互式系统命令（自动选择平台 shell） |
 | `git_status` / `git_diff` | 查看 Git 状态和变更 |
+
+---
+
+## WebUI（浏览器端，M1 实验性）
+
+OpenHachimi 内置一个最小可用 WebUI（Vue 3 + Vite），用于在浏览器里登录、切换角色、流式对话、查看历史会话。
+
+### 用户使用（已随包发布时）
+
+启动后台服务后，浏览器访问 `http://127.0.0.1:8765/ui/`，输入 `app.http_api_token` 即可登录。配置文件中 token 留空时，第一次 `hachimi serve` 会自动生成并写回 `user/config.yaml`。
+
+### 开发者构建（从源码起步）
+
+前端代码在 `webui/`，构建产物输出到 `openhachimi_agent/webui_dist/`，会随 wheel 一起发布。
+
+```bash
+# 一次性安装前端依赖
+cd webui
+npm install
+
+# 生产构建（产物自动落到 ../openhachimi_agent/webui_dist/）
+npm run build
+
+# 开发模式（hot reload，API 自动代理到 127.0.0.1:8765）
+npm run dev    # 然后浏览器打开 http://localhost:5173/ui/
+```
+
+构建产物不入库（`.gitignore` 已忽略 `openhachimi_agent/webui_dist/`），发布前请先 `npm run build` 再 `python -m build`。`pyproject.toml` 的 `package-data` 已配置好把 `webui_dist/**/*` 打入 wheel。
+
+> 当前 M1 仅包含「登录 + 流式对话 + 角色切换 + 历史会话浏览」四个功能。定时任务、记忆库、配置中心等页面在后续阶段提供。

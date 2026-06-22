@@ -24,3 +24,8 @@ user/skills/*
 .coverage
 coverage.xml
 temp_test
+
+# WebUI 前端构建产物（由 npm run build 生成，发布前再构建）
+webui/node_modules/
+webui/dist/
+openhachimi_agent/webui_dist/

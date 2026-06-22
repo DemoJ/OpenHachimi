@@ -1,0 +1,422 @@
+/* ================================================================
+   OpenHachimi WebUI — 简洁暗色主题
+   ================================================================ */
+
+:root {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-surface: #0f3460;
+  --bg-input: #1e2a4a;
+  --bg-hover: #233554;
+  --text-primary: #e0e6ed;
+  --text-secondary: #8892b0;
+  --text-muted: #5a6785;
+  --accent: #64ffda;
+  --accent-dim: #45b7aa;
+  --danger: #ff6b6b;
+  --border: #233554;
+  --radius: 8px;
+  --sidebar-width: 280px;
+  --header-height: 56px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ================================================================ 登录页 */
+.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+.login-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 40px;
+  width: 380px;
+  max-width: 90vw;
+}
+
+.login-card h1 {
+  font-size: 24px;
+  margin-bottom: 8px;
+}
+
+.login-card p {
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin-bottom: 24px;
+}
+
+.login-card label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.login-card input {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.login-card input:focus {
+  border-color: var(--accent);
+}
+
+.login-card .error {
+  color: var(--danger);
+  font-size: 13px;
+  margin-top: 8px;
+}
+
+/* ================================================================ 布局 */
+.chat-layout {
+  display: flex;
+  height: 100%;
+}
+
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* ================================================================ 顶栏 */
+.header {
+  height: var(--header-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.header .brand {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.header .model-badge {
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  padding: 4px 10px;
+  border-radius: 12px;
+}
+
+/* ================================================================ 侧栏 */
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-header h2 {
+  font-size: 16px;
+  margin-bottom: 12px;
+}
+
+.btn-new {
+  width: 100%;
+  padding: 8px;
+  background: var(--bg-surface);
+  color: var(--accent);
+  border: 1px dashed var(--accent-dim);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+  transition: background 0.2s;
+}
+
+.btn-new:hover {
+  background: var(--bg-hover);
+}
+
+.sidebar-section {
+  padding: 8px 16px;
+}
+
+.sidebar-section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  letter-spacing: 0.5px;
+}
+
+.sidebar-list {
+  list-style: none;
+}
+
+.sidebar-list li {
+  padding: 6px 10px;
+  font-size: 13px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.15s;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-list li:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sidebar-list li.active {
+  background: var(--bg-surface);
+  color: var(--accent);
+}
+
+.sidebar-sessions {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.session-item {
+  padding: 8px 16px;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 1px solid transparent;
+  transition: background 0.15s;
+}
+
+.session-item:hover {
+  background: var(--bg-hover);
+}
+
+.session-item .preview {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-item .time {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* ================================================================ 消息区 */
+.messages-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 0;
+}
+
+.messages-list {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+.message {
+  margin-bottom: 20px;
+}
+
+.message-header {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+}
+
+.message.user .message-header {
+  color: var(--accent);
+}
+
+.message-content {
+  font-size: 15px;
+  line-height: 1.7;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.message.user .message-content {
+  background: var(--bg-surface);
+  border-color: transparent;
+}
+
+.message-content img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+
+/* markdown 内样式 */
+.message-content p { margin-bottom: 8px; }
+.message-content p:last-child { margin-bottom: 0; }
+.message-content code {
+  background: var(--bg-hover);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'Fira Code', 'Consolas', monospace;
+}
+.message-content pre {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  overflow-x: auto;
+  margin: 12px 0;
+}
+.message-content pre code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+}
+.message-content ul, .message-content ol {
+  padding-left: 20px;
+  margin-bottom: 8px;
+}
+.message-content li { margin-bottom: 4px; }
+.message-content blockquote {
+  border-left: 3px solid var(--accent-dim);
+  padding-left: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+/* ================================================================ 输入区 */
+.input-area {
+  padding: 16px 20px;
+  border-top: 1px solid var(--border);
+}
+
+.input-row {
+  max-width: 800px;
+  margin: 0 auto;
+  display: flex;
+  gap: 8px;
+}
+
+.input-row textarea {
+  flex: 1;
+  padding: 10px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 14px;
+  font-family: inherit;
+  resize: none;
+  outline: none;
+  min-height: 44px;
+  max-height: 120px;
+  line-height: 1.5;
+  transition: border-color 0.2s;
+}
+
+.input-row textarea:focus {
+  border-color: var(--accent);
+}
+
+.input-row textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.btn-send, .btn-stop {
+  padding: 0 20px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.2s;
+  height: 44px;
+}
+
+.btn-send {
+  background: var(--accent);
+  color: var(--bg-primary);
+  font-weight: 600;
+}
+
+.btn-send:hover {
+  background: var(--accent-dim);
+}
+
+.btn-send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-stop {
+  background: var(--danger);
+  color: white;
+}
+
+.btn-stop:hover {
+  opacity: 0.85;
+}
+
+/* ================================================================ 通用按钮 */
+.btn {
+  padding: 8px 20px;
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--bg-primary);
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  background: var(--accent-dim);
+}
+
+/* ================================================================ hljs 覆盖 */
+.hljs {
+  background: transparent !important;
+  color: inherit !important;
+}

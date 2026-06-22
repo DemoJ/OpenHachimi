@@ -6,9 +6,11 @@ import logging
 import time
 import weakref
 from collections.abc import AsyncIterator, Sequence
+from datetime import datetime
 from typing import Any
 
 from pydantic_ai import ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
 
 from openhachimi_agent.content.roles import list_role_names, load_role_content
 from openhachimi_agent.core.config import AppConfig
@@ -221,6 +223,163 @@ class AgentService:
             role=role,
             session_id=session_id,
         )
+
+    # ------------------------------------------------------------------ 会话管理（WebUI）
+
+    # WebUI 显示历史会话时需要"用户原始输入"。UserPromptPart 里实际拼了 volatile
+    # 前缀（时间/记忆/技能/任务模板等），无法靠分隔符可靠反向拆分。
+    # turn.run_turn 在保存前会把原话写入 ModelRequest.metadata，这里优先读 metadata；
+    # 没有 metadata 的旧会话回退为整段显示，不折叠。
+    _USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
+
+    def _extract_text_parts(
+        self, messages: list[ModelMessage],
+    ) -> list[dict]:
+        """将 ``pydantic_ai.messages.ModelMessage`` 列表转为简单的 ``{role, content, prefix}`` 结构。
+
+        遍历 ``ModelRequest``（用户消息）中的 ``UserPromptPart``，
+        以及 ``ModelResponse``（Agent 回复）中的 ``TextPart``，
+        忽略工具调用、工具返回等中间环节。
+
+        user 消息额外返回 ``prefix`` 字段（运行时注入的可折叠上下文）：
+          * 当 ``ModelRequest.metadata`` 含 ``openhachimi_user_message`` 键时，
+            ``content`` 直接取这个原话，``prefix`` 为全文里去掉原话剩下的部分；
+          * 否则 ``content`` 是全文、``prefix`` 为空（不折叠，完整显示）。
+        """
+        from pydantic_ai.messages import TextPart, UserPromptPart
+
+        result: list[dict] = []
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                metadata = getattr(msg, "metadata", None) or {}
+                user_message_meta = metadata.get(self._USER_MESSAGE_METADATA_KEY) if isinstance(metadata, dict) else None
+
+                for part in getattr(msg, "parts", ()):
+                    if isinstance(part, UserPromptPart):
+                        raw = part.content
+                        if isinstance(raw, str):
+                            text = raw
+                        else:
+                            # content 可能是 Sequence[UserContent]，取所有文本片段
+                            text = " ".join(str(x) for x in raw if isinstance(x, str))
+                        if not text.strip():
+                            continue
+
+                        if isinstance(user_message_meta, str) and user_message_meta:
+                            # metadata 还原：content = 用户原话，prefix = 注入的上下文
+                            user_msg = user_message_meta
+                            stripped = text.rstrip()
+                            if stripped.endswith(user_msg):
+                                prefix = stripped[: -len(user_msg)].rstrip("\n").rstrip()
+                            else:
+                                # 用户输入被进一步包裹（如 self_critique_repair /
+                                # final_verification_repair 模板渲染），UserPromptPart 全文
+                                # 是系统注入的修复指令而非用户原话。仍以 metadata 为准，
+                                # content 始终是用户原话；prefix 留空（无法可靠抽取）。
+                                logger.debug(
+                                    "user_msg not at end of UserPromptPart; using metadata only "
+                                    "user_msg_chars=%d prompt_chars=%d prompt_preview=%r",
+                                    len(user_msg),
+                                    len(stripped),
+                                    stripped[:120],
+                                )
+                                prefix = ""
+                            result.append({"role": "user", "content": user_msg, "prefix": prefix})
+                        else:
+                            # 旧会话无 metadata：整段显示，不折叠
+                            result.append({"role": "user", "content": text.strip(), "prefix": ""})
+                        # 一个 ModelRequest 只对应一次用户输入
+                        break
+            elif isinstance(msg, ModelResponse):
+                for part in getattr(msg, "parts", ()):
+                    if isinstance(part, TextPart):
+                        text = str(part.content).strip()
+                        if text:
+                            result.append({"role": "assistant", "content": text, "prefix": ""})
+        return result
+
+    def list_sessions(self, role_name: str | None = None, *, with_preview: bool = True) -> dict:
+        """列出指定角色的所有历史会话。
+
+        返回 ``{"role": str, "sessions": [SessionSummary, ...]}``。
+        """
+        from openhachimi_agent.storage.memory import list_sessions as _list_sessions
+
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        raw = _list_sessions(self.config.memory_dir, role)
+
+        sessions: list[dict] = []
+        for s in raw:
+            created_at: str | None = None
+            sid = s["session_id"]
+            # 解析 session_id 前缀 "YYYYMMDD-HHMMSS-..."
+            if "-" in sid:
+                try:
+                    dt = datetime.strptime(sid[:15], "%Y%m%d-%H%M%S")
+                    created_at = dt.isoformat()
+                except (ValueError, IndexError):
+                    pass
+
+            preview = ""
+            msg_count = 0
+            if with_preview:
+                try:
+                    _, msgs = load_message_history(self.config.memory_dir, role, sid)
+                except Exception:
+                    msgs = []
+                msg_count = len(msgs)
+                parts = self._extract_text_parts(msgs)
+                user_msgs = [p["content"] for p in parts if p["role"] == "user"]
+                if user_msgs:
+                    preview = user_msgs[0][:80]
+
+            sessions.append({
+                "session_id": sid,
+                "role": role,
+                "created_at": created_at,
+                "mtime": s["mtime"],
+                "preview": preview,
+                "message_count": msg_count,
+            })
+
+        return {"role": role, "sessions": sessions}
+
+    def load_session(self, role_name: str | None = None, session_id: str | None = None, latest_scope: str | None = None) -> CommandResponse:
+        from openhachimi_agent.storage.memory import save_latest_session_id
+
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        resolved_session_id = self._normalize_session_id(session_id)
+        if not resolved_session_id:
+            raise ValueError("session_id 不能为空，请指定要加载的会话")
+
+        scope = validate_latest_scope(latest_scope)
+        save_latest_session_id(self.config.memory_dir, role, resolved_session_id, scope)
+        logger.info("loaded session role=%s session_id=%s scope=%s", role, resolved_session_id, scope)
+        return CommandResponse(
+            message="已切换到指定会话。",
+            role=role,
+            session_id=resolved_session_id,
+        )
+
+    def get_session_messages(self, role_name: str | None = None, session_id: str | None = None) -> dict:
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        resolved_session_id = self._normalize_session_id(session_id)
+        if not resolved_session_id:
+            raise ValueError("session_id 不能为空")
+
+        _, msgs = load_message_history(self.config.memory_dir, role, resolved_session_id)
+        parts = self._extract_text_parts(msgs)
+
+        from openhachimi_agent.transport.api_models import MessageItem
+
+        return {
+            "role": role,
+            "session_id": resolved_session_id,
+            "messages": [MessageItem(**p) for p in parts],
+        }
 
     # ------------------------------------------------------------------ 中断与停止
 

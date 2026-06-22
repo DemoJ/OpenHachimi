@@ -193,3 +193,35 @@ class CommandDispatchResponse(BaseModel):
 class RolesResponse(BaseModel):
     roles: list[str]
     current_role: str
+
+
+class SessionSummary(BaseModel):
+    session_id: str
+    role: str
+    created_at: str | None = None       # 由 session_id 前缀解析得到的 ISO 时间，无法解析时为 None
+    mtime: float                         # 文件 mtime 秒级时间戳
+    preview: str = ""                    # 首条用户消息截断片段
+    message_count: int = 0
+
+
+class SessionListResponse(BaseModel):
+    role: str
+    sessions: list[SessionSummary] = Field(default_factory=list)
+
+
+class SessionLoadRequest(BaseModel):
+    role: str | None = None
+    session_id: str = Field(min_length=1)
+
+
+class MessageItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str                          # 用户实际输入（user）或 Agent 回复（assistant）
+    prefix: str = ""                      # 仅 user 消息：运行时注入的上下文前缀（时间/记忆/技能等），可折叠显示
+    timestamp: str | None = None
+
+
+class SessionMessagesResponse(BaseModel):
+    role: str
+    session_id: str
+    messages: list[MessageItem] = Field(default_factory=list)
