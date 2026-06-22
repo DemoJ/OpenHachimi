@@ -10,6 +10,8 @@ app:
                              #   socks5://127.0.0.1:1080
                              #   http://192.168.1.1:7890
   http_api_token: ""        # HTTP API 访问令牌。留空时启动/重启会自动生成并写回配置文件；除 /health 外所有接口必须携带 Authorization: Bearer <token>
+  server_host: 127.0.0.1    # HTTP 服务监听地址。127.0.0.1 = 仅本机可访问（默认，最安全）；0.0.0.0 = 监听所有网卡，局域网/公网均可访问（务必配合 http_api_token 与防火墙使用）。也可填具体网卡 IP（如 192.168.1.10）仅暴露该网卡
+  server_port: 8765         # HTTP 服务监听端口
   show_tool_calls: true      # 是否在所有消息渠道显示工具调用信息；设为 false 时 CLI/HTTP/Telegram 均不显示工具进度
   stream_idle_timeout_seconds: 60   # 流式队列无新事件时的进展检查/心跳间隔；实际卡住判定会按操作类型使用更长阈值
   max_attachment_size_mb: 50       # Telegram/HTTP 附件大小上限，单位 MB；文件类型不限制，是否可解析由 Agent/LLM 自行判断

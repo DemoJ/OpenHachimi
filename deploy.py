@@ -27,8 +27,6 @@ from pathlib import Path
 
 
 REPO_URL = "https://github.com/DemoJ/OpenHachimi.git"
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
 
 
 def run(command: list[str], *, cwd: Path | None = None) -> None:
@@ -166,9 +164,15 @@ def write_config_if_missing(project_root: Path) -> None:
     print("[WARN] ⚠  请在启动服务前填写 llm.api_key 等配置！")
 
 
-def deploy_daemon(project_root: Path, host: str, port: int) -> None:
+def deploy_daemon(project_root: Path, host: str | None, port: int | None) -> None:
+    # host/port 为 None 时不传参，由 hachimi deploy 读取配置文件 app.server_host/server_port。
     hachimi = venv_hachimi(project_root)
-    run([str(hachimi), "deploy", "--host", host, "--port", str(port)], cwd=project_root)
+    cmd = [str(hachimi), "deploy"]
+    if host is not None:
+        cmd += ["--host", host]
+    if port is not None:
+        cmd += ["--port", str(port)]
+    run(cmd, cwd=project_root)
 
 
 def main() -> None:
@@ -176,8 +180,8 @@ def main() -> None:
         description="OpenHachimi 一键部署脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", default=DEFAULT_HOST, help="后台服务监听地址")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="后台服务监听端口")
+    parser.add_argument("--host", default=None, help="监听地址，覆盖配置文件 app.server_host（留空则用配置文件，默认 127.0.0.1）")
+    parser.add_argument("--port", type=int, default=None, help="监听端口，覆盖配置文件 app.server_port（留空则用配置文件，默认 8765）")
     parser.add_argument("--skip-daemon", action="store_true", help="只安装，不部署后台守护")
     parser.add_argument("--skip-webui", action="store_true", help="跳过 WebUI 前端构建")
     parser.add_argument("--repo", default=REPO_URL, help="自定义 Git 仓库地址")

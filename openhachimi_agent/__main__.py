@@ -20,7 +20,6 @@ import asyncio
 import logging
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -81,28 +80,16 @@ def _require_systemd() -> None:
 
 
 def _deployed_endpoint() -> tuple[str, int]:
-    """从已部署的 systemd service 文件解析监听地址；失败回退默认值。
+    """读取配置文件的监听地址，供 cmd_start/cmd_restart 显示访问地址。
 
-    cmd_start/cmd_restart 不接收 host/port 参数，需从 deploy 写入的 service
-    文件的 ExecStart 行中解析，以显示正确的访问地址。
+    service 文件只运行 `hachimi serve`（不写死 host/port），serve 启动时读配置文件，
+    故此处也读配置文件，与实际监听地址保持一致。
     """
-    host, port = DEFAULT_HOST, DEFAULT_PORT
-    service_path = Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service"
     try:
-        text = service_path.read_text(encoding="utf-8")
-    except OSError:
-        return host, port
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("ExecStart="):
-            m_host = re.search(r"--host\s+(\S+)", line)
-            m_port = re.search(r"--port\s+(\d+)", line)
-            if m_host:
-                host = m_host.group(1)
-            if m_port:
-                port = int(m_port.group(1))
-            break
-    return host, port
+        config = load_config()
+        return config.server_host, config.server_port
+    except Exception:
+        return DEFAULT_HOST, DEFAULT_PORT
 
 
 def _print_access_info(host: str, port: int) -> None:
@@ -246,22 +233,35 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     """部署并注册后台守护服务。"""
     config = load_config()
     configure_logging(config)
-    logger.info("deploy command host=%s port=%s", args.host, args.port)
-    deploy_daemon(args.host, args.port)
+    # 命令行 --host/--port 显式指定时写回配置文件，使参数持久化。
+    # service 文件只运行 `hachimi serve`，serve 启动时读配置 → 改配置后 restart 即生效。
+    if args.host is not None or args.port is not None:
+        import yaml
+        from openhachimi_agent.core.config import persist_server_endpoint
+        host = args.host if args.host is not None else config.server_host
+        port = args.port if args.port is not None else config.server_port
+        with config.config_path.open("r", encoding="utf-8") as f:
+            raw_config = yaml.safe_load(f) or {}
+        persist_server_endpoint(config.config_path, raw_config, host, port)
+        logger.info("deploy: 命令行参数已写回配置 host=%s port=%s", host, port)
+    deploy_daemon()
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
     """在前台直接运行 HTTP 服务（调试用）。"""
     config = load_config()
     configure_logging(config)
-    logger.info("serve command host=%s port=%s", args.host, args.port)
+    # 命令行 --host/--port 显式指定时覆盖配置文件 app.server_host/server_port。
+    host = args.host if args.host is not None else config.server_host
+    port = args.port if args.port is not None else config.server_port
+    logger.info("serve command host=%s port=%s", host, port)
     # uvicorn.run 会阻塞并在启动时自行打印 API 地址，这里先打印 WebUI 提示。
-    url = webui_url(args.host, args.port)
+    url = webui_url(host, port)
     if url:
         _ok(f"WebUI 地址：{url}")
     else:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
-    uvicorn.run("openhachimi_agent.interface.http:app", host=args.host, port=args.port)
+    uvicorn.run("openhachimi_agent.interface.http:app", host=host, port=port)
 
 
 def cmd_update(args: argparse.Namespace) -> None:
@@ -458,12 +458,12 @@ def main() -> None:
 
     # ── 部署与运行 ────────────────────────────────────────────────────────────
     deploy_p = sub.add_parser("deploy", help="部署并注册后台守护服务")
-    deploy_p.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址（默认 {DEFAULT_HOST}）")
-    deploy_p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
+    deploy_p.add_argument("--host", default=None, help="监听地址，覆盖配置文件 app.server_host（默认 127.0.0.1 仅本机，0.0.0.0 开放访问）")
+    deploy_p.add_argument("--port", type=int, default=None, help="监听端口，覆盖配置文件 app.server_port（默认 8765）")
 
     serve_p = sub.add_parser("serve", help="在前台运行 HTTP 服务（调试用）")
-    serve_p.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址（默认 {DEFAULT_HOST}）")
-    serve_p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
+    serve_p.add_argument("--host", default=None, help="监听地址，覆盖配置文件 app.server_host（默认 127.0.0.1 仅本机，0.0.0.0 开放访问）")
+    serve_p.add_argument("--port", type=int, default=None, help="监听端口，覆盖配置文件 app.server_port（默认 8765）")
 
     sub.add_parser("cli", help="进入 CLI 对话（与默认行为相同）")
     

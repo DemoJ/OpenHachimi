@@ -9,8 +9,8 @@
 #   bash deploy.sh [选项]
 #
 # 选项：
-#   -H, --host HOST       监听地址（默认 127.0.0.1）
-#   -p, --port PORT       监听端口（默认 8765）
+#   -H, --host HOST       监听地址（留空则用配置文件 app.server_host，默认 127.0.0.1）
+#   -p, --port PORT       监听端口（留空则用配置文件 app.server_port，默认 8765）
 #   --skip-daemon         只安装依赖，不部署后台守护服务
 #   --skip-webui          跳过 WebUI 前端构建（/ui 页面将不可用）
 #   --repo URL            自定义 Git 仓库地址
@@ -34,8 +34,9 @@ warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 
 # ── 默认参数 ──────────────────────────────────────────────────────────────────
-HOST="127.0.0.1"
-PORT=8765
+# 留空表示不向 hachimi deploy 传参，改用配置文件 app.server_host / app.server_port。
+HOST=""
+PORT=""
 SKIP_DAEMON=false
 SKIP_WEBUI=false
 REPO_URL="https://github.com/DemoJ/OpenHachimi.git"
@@ -50,8 +51,8 @@ ${BOLD}OpenHachimi 一键部署脚本${RESET}
   bash deploy.sh [选项]
 
 选项：
-  -H, --host HOST       后台服务监听地址（默认：127.0.0.1）
-  -p, --port PORT       后台服务监听端口（默认：8765）
+  -H, --host HOST       后台服务监听地址（留空则用配置文件 app.server_host，默认 127.0.0.1 仅本机）
+  -p, --port PORT       后台服务监听端口（留空则用配置文件 app.server_port，默认 8765）
   --skip-daemon         只安装依赖，不部署后台守护服务
   --skip-webui          跳过 WebUI 前端构建（/ui 页面将不可用）
   --repo URL            自定义 Git 仓库地址
@@ -298,8 +299,16 @@ fi
 if [[ "$SKIP_DAEMON" == true ]]; then
     info "步骤 5/5：已跳过后台守护部署（--skip-daemon）。"
 else
-    info "步骤 5/5：部署后台守护服务（host=$HOST port=$PORT）..."
-    "$VENV_HACHIMI" deploy --host "$HOST" --port "$PORT"
+    # HOST/PORT 为空时不传参，由 hachimi deploy 读取配置文件 app.server_host/server_port。
+    DEPLOY_ARGS=()
+    [[ -n "$HOST" ]] && DEPLOY_ARGS+=(--host "$HOST")
+    [[ -n "$PORT" ]] && DEPLOY_ARGS+=(--port "$PORT")
+    if [[ ${#DEPLOY_ARGS[@]} -eq 0 ]]; then
+        info "步骤 5/5：部署后台守护服务（host/port 取自配置文件）..."
+    else
+        info "步骤 5/5：部署后台守护服务（host=$HOST port=$PORT，覆盖配置文件）..."
+    fi
+    "$VENV_HACHIMI" deploy "${DEPLOY_ARGS[@]}"
 fi
 
 # ── 完成提示 ─────────────────────────────────────────────────────────────────

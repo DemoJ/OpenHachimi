@@ -45,21 +45,29 @@ def print_endpoints(host: str, port: int) -> None:
         print("  WebUI 地址：（前端未构建，运行 `cd webui && npm run build` 后重启服务）")
 
 
-def deploy_daemon(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+def deploy_daemon() -> None:
+    """注册后台守护服务。
+
+    service 文件直接运行 `hachimi serve`（不写死 host/port），serve 每次启动时
+    读取配置文件 app.server_host/server_port。因此改配置后 `hachimi restart` 即生效，
+    无需重新 deploy。命令行 --host/--port 由 cmd_deploy 写回配置文件后再生效。
+    """
     system_name = platform.system().lower()
     if system_name == "linux" and _command_exists("systemctl"):
-        deploy_systemd_user_service(host, port)
+        deploy_systemd_user_service()
         return
 
-    deploy_local_script(host, port)
+    deploy_local_script()
 
 
-def deploy_systemd_user_service(host: str, port: int) -> None:
+def deploy_systemd_user_service() -> None:
     config = load_config()
     service_dir = Path.home() / ".config" / "systemd" / "user"
     service_dir.mkdir(parents=True, exist_ok=True)
     service_path = service_dir / f"{SERVICE_NAME}.service"
 
+    # ExecStart 直接运行 `hachimi serve`，host/port 由 serve 启动时读配置文件决定，
+    # 改配置后 restart 即生效，无需重新 deploy。
     service_path.write_text(
         "[Unit]\n"
         "Description=OpenHachimi Agent\n"
@@ -67,7 +75,7 @@ def deploy_systemd_user_service(host: str, port: int) -> None:
         "[Service]\n"
         "Type=simple\n"
         f"WorkingDirectory={config.base_dir}\n"
-        f"ExecStart={_python_executable()} -m openhachimi_agent serve --host {host} --port {port}\n"
+        f"ExecStart={_python_executable()} -m openhachimi_agent serve\n"
         "Restart=on-failure\n"
         "RestartSec=3\n\n"
         "[Install]\n"
@@ -79,27 +87,28 @@ def deploy_systemd_user_service(host: str, port: int) -> None:
     subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=True)
 
     print(f"已部署并启动 systemd user service：{service_path}")
-    print("服务访问地址：")
-    print_endpoints(host, port)
+    print("服务访问地址（host/port 取自配置文件 app.server_host/server_port）：")
+    print_endpoints(config.server_host, config.server_port)
     print("以后直接运行 hachimi 即可进入 CLI。")
 
 
-def deploy_local_script(host: str, port: int) -> None:
+def deploy_local_script() -> None:
     config = load_config()
     script_name = "openhachimi-serve.bat" if platform.system().lower() == "windows" else "openhachimi-serve.sh"
     script_path = config.base_dir / script_name
 
+    # 脚本直接运行 `hachimi serve`，host/port 由 serve 启动时读配置文件决定。
     if script_path.suffix == ".bat":
         content = (
             "@echo off\r\n"
             f"cd /d {config.base_dir}\r\n"
-            f"\"{_python_executable()}\" -m openhachimi_agent serve --host {host} --port {port}\r\n"
+            f"\"{_python_executable()}\" -m openhachimi_agent serve\r\n"
         )
     else:
         content = (
             "#!/usr/bin/env sh\n"
             f"cd '{config.base_dir}'\n"
-            f"'{_python_executable()}' -m openhachimi_agent serve --host {host} --port {port}\n"
+            f"'{_python_executable()}' -m openhachimi_agent serve\n"
         )
 
     script_path.write_text(content, encoding="utf-8")
@@ -107,8 +116,8 @@ def deploy_local_script(host: str, port: int) -> None:
         script_path.chmod(script_path.stat().st_mode | 0o111)
 
     print(f"当前系统未检测到可用 systemd，已生成本地启动脚本：{script_path}")
-    print("运行该脚本即可启动后台服务：")
-    print_endpoints(host, port)
+    print("运行该脚本即可启动后台服务（host/port 取自配置文件）：")
+    print_endpoints(config.server_host, config.server_port)
     print("服务启动后，直接运行 hachimi 即可进入 CLI。")
 
 
