@@ -132,11 +132,34 @@ def remember(
 
 
 def forget_memory(ctx: RunContext[AgentDeps], query_or_ids: str, mode: str = "soft_delete") -> dict[str, object]:
-    """删除或软删除长期记忆。"""
+    """删除或软删除长期记忆。
+
+    参数 query_or_ids 接受两种形式:
+    - 一个或多个 32 位 hex 记忆 ID,以逗号分隔(推荐),例如 ``"id1,id2,id3"``。
+    - 一段搜索词(将走 FTS 模糊匹配命中前 20 条)。
+
+    安全约束:
+    - 通配符 ``*`` / ``%`` / 空字符串等"全量"指代不被支持,会被拒绝。
+      如确需批量删除,请用 list_memory 列出后,以逗号分隔的明确 ID 列表传入。
+    - hard_delete 模式不可恢复;soft_delete 仅标记为 deleted 状态。
+    """
     if not ctx.deps.config.memory.enabled:
         return {"enabled": False, "deleted": 0}
+
+    if not isinstance(query_or_ids, str):
+        return {"deleted": 0, "error": "query_or_ids 必须是字符串"}
+    stripped = query_or_ids.strip()
+    if not stripped:
+        return {"deleted": 0, "error": "query_or_ids 不能为空"}
+    # 显式拒绝通配符 / 全量删除语义。批量删除应当用 list_memory 列举 ID 后逐个/逗号分隔传入。
+    if stripped in {"*", "%", "all", "ALL"} or set(stripped) <= {"*", "%"}:
+        return {
+            "deleted": 0,
+            "error": "拒绝通配符删除。请先用 list_memory 取得具体 ID,再以逗号分隔的 ID 列表传入 query_or_ids。",
+        }
+
     store = get_memory_store(ctx.deps.config)
-    deleted = store.forget(_scope(ctx), query_or_ids, hard_delete=mode == "hard_delete")
+    deleted = store.forget(_scope(ctx), stripped, hard_delete=mode == "hard_delete")
     return {"deleted": deleted, "mode": mode}
 
 

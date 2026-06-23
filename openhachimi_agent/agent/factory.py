@@ -101,9 +101,27 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     def _config_prompt(ctx: RunContext[AgentDeps]) -> str:
         return render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")}) + "\n"
 
-    # 注:时间 / 记忆召回 / 匹配技能等每轮易变内容已从系统提示迁出,
-    # 改由 content.runtime_context.build_volatile_prefix 注入到每轮用户消息前缀,
-    # 使系统提示在会话内保持稳定、可被 provider 缓存。
+    # 每轮易变运行时上下文（当前时间 / TaskFrame 摘要 / 长期记忆召回 / 命中技能定义）
+    # 通过 pydantic-ai 的 @agent.system_prompt 动态钩子注入 system prompt 末尾。
+    #
+    # 之所以放 system prompt 而不是 user-prompt：
+    # - 这些内容在语义上属于"系统给模型的上下文"，不是用户说的话。如果塞到
+    #   user-prompt 前缀，capture_turn_memories 会把"<memory-context>...<SKILL>..."
+    #   也作为"用户输入"抽进长期记忆，雪球越滚越大。
+    # - system prompt 是按 token 前缀渐进式命中 KV cache 的，前面稳定主体仍能
+    #   完整命中；只损失末尾几十~几百 token，远低于把万字 SKILL 塞进 user-prompt
+    #   的代价。
+    # - 动态钩子每次 run 都重新计算，跨天/跨长会话仍能拿到当下时间和当下记忆，
+    #   不会出现"几天后模型还以为是几天前"的问题。
+    @agent.system_prompt
+    def _runtime_dynamic_block(ctx: RunContext[AgentDeps]) -> str:
+        try:
+            from openhachimi_agent.content.runtime_context import build_system_dynamic_block
+
+            return build_system_dynamic_block(ctx.deps)
+        except Exception:  # noqa: BLE001  动态注入失败不应阻断 agent run
+            logger.exception("runtime dynamic block failed")
+            return ""
 
     return agent
 

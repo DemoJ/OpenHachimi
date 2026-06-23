@@ -23,12 +23,12 @@ def needs_planning(task_frame: TaskFrame) -> bool:
 
 
 def build_planner_prompt(task_frame: TaskFrame, message: str) -> str:
+    # TaskFrame 已通过 factory._dynamic_system_prompt 注入到 system prompt 末尾,
+    # 这里 user-prompt 只承载用户原话,planner_task 模板再做轻量包装。
+    del task_frame  # noqa: F841 — kept for backward compatibility with callers
     return render_system_prompt(
         "runtime/planner_task",
-        {
-            "task_frame": task_frame.model_dump_json(ensure_ascii=False),
-            "user_message": message,
-        },
+        {"user_message": message},
     )
 
 
@@ -47,13 +47,9 @@ async def run_planner(ctx: AgentRunContext, task_frame: TaskFrame, get_agent: Ca
     if ctx.stream and ctx.stream_queue is not None:
         await ctx.stream_queue.put(PLANNING_NOTICE)
 
-    # 易变上下文(时间/记忆/技能)注入用户消息前缀,保持系统提示稳定可缓存
-    from openhachimi_agent.content.runtime_context import build_volatile_prefix
-
-    volatile_prefix = build_volatile_prefix(ctx.deps)
+    # 易变上下文（时间/记忆/技能/TaskFrame）已通过 factory._dynamic_system_prompt
+    # 注入到 planner agent 的 system prompt 末尾，user-prompt 只承载用户原话+附件。
     user_content = message_with_attachments(ctx.message, ctx.attachments)
-    if volatile_prefix:
-        user_content = f"{volatile_prefix}\n\n{user_content}"
 
     heartbeat_task: asyncio.Task | None = None
     if ctx.stream:

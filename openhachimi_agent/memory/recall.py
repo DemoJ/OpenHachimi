@@ -62,6 +62,11 @@ def apply_recall_decay(result: MemorySearchResult, *, now: str | None = None) ->
     return result
 
 
+# v2: 这些 memory_type 不应从 L1 召回,避免历史问句/模型回答/定时调度 payload
+# 被当成长期事实注入 system prompt
+_EXCLUDED_L1_TYPES = {"conversation_context", "scheduler_payload"}
+
+
 def select_by_level_budget(
     results: list[MemorySearchResult],
     *,
@@ -70,7 +75,10 @@ def select_by_level_budget(
     include_l3_profile: bool,
 ) -> list[MemorySearchResult]:
     selected: list[MemorySearchResult] = []
-    l1 = [item for item in results if item.level == "L1"][:final_l1_top_k]
+    l1 = [
+        item for item in results
+        if item.level == "L1" and item.memory_type not in _EXCLUDED_L1_TYPES
+    ][:final_l1_top_k]
     l2 = [item for item in results if item.level == "L2"][:final_l2_top_k]
     selected.extend(l1)
     selected.extend(l2)

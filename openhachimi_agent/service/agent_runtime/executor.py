@@ -183,30 +183,28 @@ class ExecutionOutcome:
     self_critique_signal: dict[str, object] | None = None
 
 
-def _prepend_volatile(text: str, prefix: str) -> str:
-    if not prefix:
-        return text
-    return f"{prefix}\n\n{text}"
-
-
 def _build_executor_message(
     task_frame_payload: dict[str, Any] | None,
     message: str,
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
-    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
-    user_message = message_with_attachments(message, attachments or [], vision_result)
-    user_message = _prepend_volatile(user_message, volatile_prefix)
-    if not task_frame_payload:
-        return _with_direct_vision_parts(user_message, vision_result)
+    """构造发送给 Executor 的 user-prompt。
 
+    v2: 不再把 TaskFrame、时间块、记忆召回、SKILL 全文塞进 user-prompt。
+    这些系统级运行时上下文统一由 ``factory._dynamic_system_prompt`` 通过
+    ``@agent.system_prompt`` 钩子注入到 system prompt 末尾。user-prompt 只承载
+    用户原话和附件元数据；对 Executor 单独再渲染 executor_task 模板，只是为了
+    保留一个轻量"任务起点"提示。
+
+    保留 ``task_frame_payload`` 入参是为了向后兼容（已有调用方仍会传），但内部
+    不再嵌入 JSON。
+    """
+    del task_frame_payload  # noqa: F841 — kept for backward compatibility
+    user_message = message_with_attachments(message, attachments or [], vision_result)
     text = render_system_prompt(
         "runtime/executor_task",
-        {
-            "task_frame": json.dumps(task_frame_payload, ensure_ascii=False),
-            "user_message": user_message,
-        },
+        {"user_message": user_message},
     )
     return _with_direct_vision_parts(text, vision_result)
 
@@ -217,14 +215,13 @@ def _build_repair_message(
     verification_signal: dict[str, object],
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
-    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
+    del task_frame_payload  # noqa: F841 — kept for backward compatibility
     text = render_system_prompt(
         "runtime/executor_repair",
         {
-            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
             "verification_signal": json.dumps(verification_signal, ensure_ascii=False),
-            "user_message": _prepend_volatile(message_with_attachments(message, attachments or [], vision_result), volatile_prefix),
+            "user_message": message_with_attachments(message, attachments or [], vision_result),
         },
     )
     return _with_direct_vision_parts(text, vision_result)
@@ -305,9 +302,9 @@ def _build_self_critique_message(
     return render_system_prompt(
         "runtime/self_critique_task",
         {
-            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False, default=str),
+            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
             "user_message": message,
-            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False, default=str),
+            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False),
             "candidate_answer": candidate_answer,
         },
     )
@@ -321,16 +318,15 @@ def _build_self_critique_repair_message(
     execution_evidence: dict[str, object],
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
-    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
+    del task_frame_payload  # noqa: F841 — TaskFrame 已在 system prompt 中注入
     text = render_system_prompt(
         "runtime/executor_self_critique_repair",
         {
-            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False, default=str),
-            "user_message": _prepend_volatile(message_with_attachments(message, attachments or [], vision_result), volatile_prefix),
-            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False, default=str),
+            "user_message": message_with_attachments(message, attachments or [], vision_result),
+            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False),
             "candidate_answer": candidate_answer,
-            "self_critique": self_critique.model_dump_json(ensure_ascii=False),
+            "self_critique": self_critique.model_dump_json(),
         },
     )
     return _with_direct_vision_parts(text, vision_result)
@@ -341,13 +337,12 @@ def _build_retry_message(
     message: str,
     attachments: list[AttachmentRef] | None = None,
     vision_result: VisionPreprocessResult | None = None,
-    volatile_prefix: str = "",
 ) -> str | list[UserContent]:
+    del task_frame_payload  # noqa: F841 — TaskFrame 已在 system prompt 中注入
     text = render_system_prompt(
         "runtime/executor_retry",
         {
-            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
-            "user_message": _prepend_volatile(message_with_attachments(message, attachments or [], vision_result), volatile_prefix),
+            "user_message": message_with_attachments(message, attachments or [], vision_result),
         },
     )
     return _with_direct_vision_parts(text, vision_result)
@@ -370,15 +365,30 @@ def _build_executor_agent(config: AppConfig, role: str, task_frame_payload: dict
     if not task_frame_payload:
         return executor_agent
 
-    relevant_skills = task_frame_payload.get("relevant_skills", [])
-    if not relevant_skills:
+    raw_skills = task_frame_payload.get("relevant_skills", [])
+    if not raw_skills:
+        return executor_agent
+
+    # relevant_skills 在 model_dump(mode="json") 后是 list[dict]（新 SkillMatch
+    # 结构），兼容历史 list[str] 路径以防早期持久化的 task_frame。
+    skill_names: set[str] = set()
+    for item in raw_skills:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+        else:
+            name = str(getattr(item, "name", "") or "").strip()
+        if name:
+            skill_names.add(name)
+    if not skill_names:
         return executor_agent
 
     skills = find_skills(config.skills_dirs)
     allowed_tools_set: set[str] = set()
     is_restricted = False
     for skill in skills:
-        if skill.config.name in relevant_skills and skill.config.allowed_tools:
+        if skill.config.name in skill_names and skill.config.allowed_tools:
             is_restricted = True
             allowed_tools_set.update(skill.config.allowed_tools)
 
@@ -561,9 +571,8 @@ async def _run_executor_with_vision_fallback(
     config: AppConfig,
     stream: bool,
     handle_stream_events: Callable[[object, object], Any] | None,
-    volatile_prefix: str = "",
 ) -> tuple[object, VisionPreprocessResult]:
-    run_message = _build_executor_message(task_frame_payload, message, attachments, vision_result, volatile_prefix=volatile_prefix)
+    run_message = _build_executor_message(task_frame_payload, message, attachments, vision_result)
     try:
         result = await run_executor_once(
             executor_agent=executor_agent,
@@ -586,7 +595,7 @@ async def _run_executor_with_vision_fallback(
         )
         mark_model_vision_support(config, False)
         degraded_vision_result = _degrade_direct_vision_result(vision_result, exc)
-        degraded_message = _build_executor_message(task_frame_payload, message, attachments, degraded_vision_result, volatile_prefix=volatile_prefix)
+        degraded_message = _build_executor_message(task_frame_payload, message, attachments, degraded_vision_result)
         result = await run_executor_once(
             executor_agent=executor_agent,
             run_message=degraded_message,
@@ -611,7 +620,6 @@ async def _replan_after_execution_signal(
         render_system_prompt(
             "runtime/executor_replan",
             {
-                "task_frame": json.dumps(_get_task_frame_payload(ctx.session_state) or {}, ensure_ascii=False),
                 "execution_ledger_signal": json.dumps(signal, ensure_ascii=False),
                 "user_message": ctx.message,
             },
@@ -625,10 +633,9 @@ async def _replan_after_execution_signal(
 
 async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any]) -> ExecutionOutcome:
     task_frame_payload = _get_task_frame_payload(ctx.session_state)
-    # 每轮易变上下文(时间/记忆/技能)注入用户消息前缀,保持系统提示稳定可缓存
-    from openhachimi_agent.content.runtime_context import build_volatile_prefix
-
-    volatile_prefix = build_volatile_prefix(ctx.deps)
+    # 易变上下文（时间/记忆/技能/TaskFrame）已通过 factory._dynamic_system_prompt
+    # 注入到 system prompt 末尾，不再拼到 user-prompt 前缀。user-prompt 只承载
+    # 用户原话和附件元数据，让 capture_turn_memories 拿到的就是干净的输入。
     if image_attachments(ctx.attachments):
         ctx.operation_state.start("vision", "preprocess")
         _mark_vision_processing(ctx.session_state, ctx.config, ctx.attachments)
@@ -664,7 +671,6 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             config=ctx.config,
             stream=ctx.stream,
             handle_stream_events=_executor_stream_handler(ctx, text_buffer),
-            volatile_prefix=volatile_prefix,
         )
     except Exception:
         signal = get_replan_signal(ctx.session_state, ledger_start_seq)
@@ -673,7 +679,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             text_buffer.clear()
             await _replan_after_execution_signal(ctx, signal, get_agent)
             preflight_compress_history(ctx)
-            retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result, volatile_prefix=volatile_prefix)
+            retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result)
             result = await run_executor_once(
                 executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
                 run_message=retry_message,
@@ -692,7 +698,7 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
         text_buffer.clear()
         if ctx.stream and ctx.stream_queue is not None:
             await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n", counted_as_output=False))
-        repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments, vision_result, volatile_prefix=volatile_prefix)
+        repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments, vision_result)
         preflight_compress_history(ctx)
         result = await run_executor_once(
             executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
@@ -741,7 +747,6 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             evidence,
             ctx.attachments,
             vision_result,
-            volatile_prefix=volatile_prefix,
         )
         ctx.operation_state.start("model", "self_critique_repair")
         preflight_compress_history(ctx)

@@ -295,8 +295,9 @@ class SearchStoreMixin:
         ]
 
     def _query_terms(self, query: str) -> list[str]:
+        # 先按"非字母数字非汉字 -> 空格"分词
         cleaned = "".join(char if char.isalnum() or "一" <= char <= "鿿" else " " for char in query)
-        terms = []
+        terms: list[str] = []
         for part in cleaned.split():
             part = part.strip()
             if not part:
@@ -304,8 +305,17 @@ class SearchStoreMixin:
             if len(part) > 32:
                 part = part[:32]
             terms.append(part)
+        # 兜底:整个 query 全是 FTS5 特殊字符(如 "*", "?", "---", "()" 等)时,
+        # 分词结果为空。直接整段塞回去会让 FTS5 抛 "unknown special query"。
+        # 这里再次清洗,**只保留字母数字和汉字**,完全无内容则返回空 list,
+        # 由调用方走 LIKE 兜底或返回空结果。
         if not terms and query.strip():
-            terms.append(query.strip()[:32])
+            sanitized = "".join(
+                char for char in query
+                if char.isalnum() or "一" <= char <= "鿿"
+            )
+            if sanitized:
+                terms.append(sanitized[:32])
         return terms[:12]
 
     def _rank_to_score(self, rank: float, confidence: float) -> float:

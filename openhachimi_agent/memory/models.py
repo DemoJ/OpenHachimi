@@ -93,6 +93,7 @@ class MemoryTurn:
     duration_ms: int = 0
     raw_messages_json_ref: str = ""
     created_at: str = field(default_factory=utc_now_iso)
+    source: str = "user"  # "user" | "scheduled" | "system"
 
 
 @dataclass

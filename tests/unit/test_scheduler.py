@@ -194,8 +194,9 @@ async def test_runner_records_success(tmp_path):
     runs = store.list_runs(task.id)
     updated = store.get_task(task.id)
     assert runs[0].status == "succeeded"
-    assert runs[0].output.startswith("done: [IMPORTANT: 你正在执行一个已经到期的定时任务。]")
-    assert "定时任务内容：\nhello" in runs[0].output
+    # v2: 定时任务 payload 不再 wrap [IMPORTANT:...] 前缀, send_message 直接收到 task.prompt
+    assert runs[0].output == "done: hello"
+    assert service.message == "hello"
     assert service.session_id == f"schedule-{task.id}"
     assert updated.running is False
     assert updated.last_status == "succeeded"
@@ -254,7 +255,8 @@ async def test_runner_uses_isolated_session_by_default(tmp_path):
     assert service.session_id == f"schedule-{task.id}"
 
 
-def test_build_scheduled_execution_prompt_wraps_reminder_task(tmp_path):
+def test_build_scheduled_execution_prompt_returns_task_prompt_only(tmp_path):
+    """v2: _build_scheduled_execution_prompt 只返回 task.prompt,不再 wrap [IMPORTANT:...]"""
     store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
     task = store.create_task(
         name="更新团测系统提醒",
@@ -265,17 +267,14 @@ def test_build_scheduled_execution_prompt_wraps_reminder_task(tmp_path):
 
     prompt = _build_scheduled_execution_prompt(task)
 
-    assert "已经到期的定时任务" in prompt
-    assert "不是用户新发来的普通请求" in prompt
-    assert "不要询问提醒时间" in prompt
-    assert "系统会负责按任务投递配置" in prompt
-    assert "请直接输出提醒消息" in prompt
-    assert "更新团测系统提醒" in prompt
-    assert "提醒用户：⏰ 时间到！请记得更新团测系统。" in prompt
+    assert "已经到期的定时任务" not in prompt
+    assert "不是用户新发来的普通请求" not in prompt
+    assert prompt == "提醒用户：⏰ 时间到！请记得更新团测系统。"
 
 
 @pytest.mark.asyncio
-async def test_runner_sends_wrapped_scheduled_prompt(tmp_path):
+async def test_runner_sends_task_prompt_only(tmp_path):
+    """v2: runner 只发 task.prompt 作为 message, [IMPORTANT] 已在 system prompt(scheduled_executor.md) 中"""
     store = ScheduledTaskStore(tmp_path / "tasks.sqlite3")
     task = store.create_task(
         name="更新团测系统提醒",
@@ -298,9 +297,7 @@ async def test_runner_sends_wrapped_scheduled_prompt(tmp_path):
     await runner.run_task(claimed)
 
     assert service.kwargs["run_mode"] == "scheduled"
-    assert "已经到期的定时任务" in service.message
-    assert "不要询问提醒时间" in service.message
-    assert "提醒用户：⏰ 时间到！请记得更新团测系统。" in service.message
+    assert service.message == "提醒用户：⏰ 时间到！请记得更新团测系统。"
 
 
 def test_store_tracks_delivery_and_inbox(tmp_path):

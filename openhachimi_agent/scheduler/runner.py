@@ -46,15 +46,17 @@ def _build_channel_context(task: ScheduledTask) -> dict[str, Any]:
 
 
 def _build_scheduled_execution_prompt(task: ScheduledTask) -> str:
-    """Wrap the stored task prompt so the model treats it as an already-due job."""
-    return render_system_prompt(
-        "runtime/scheduled_task_execution",
-        {
-            "task_id": task.id,
-            "task_name": task.name,
-            "task_prompt": task.prompt,
-        },
-    )
+    """构建定时任务消息。
+
+    v2: 不再包裹 [IMPORTANT:...] 前缀块(`runtime/scheduled_task_execution` 模板)。
+    scheduled_executor 的 system prompt(`agents/scheduled_executor.md`)已明确声
+    明其角色为定时任务执行者,并包含"禁止调度操作"等约束;在 user-prompt 中再塞
+    一段相同的 system 级指令是冗余的,还会污染长期记忆。
+
+    只返回用户当初定义的任务内容(task.prompt),
+    作为本轮 user-prompt 的原始输入。
+    """
+    return task.prompt
 
 
 class ScheduledTaskRunner:

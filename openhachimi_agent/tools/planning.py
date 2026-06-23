@@ -391,15 +391,22 @@ def update_todo(
     status: Literal["pending", "in-progress", "done", "blocked"],
     notes: str = "",
     evidence: str = "",
+    allowed_tools: list[str] | None = None,
 ) -> str:
     """
-    更新某个 TODO 任务的状态。
+    更新某个 TODO 任务的状态、备注、证据或允许工具。
     当你开始一个任务或完成一个任务时，必须调用此工具更新状态。
-    
+
     参数：
     - task_id: 任务的数字 ID
-    - status: 必须是 "in-progress" 或 "done" 或 "pending"
+    - status: 必须是 "in-progress" / "done" / "pending" / "blocked"
     - notes: 简要记录该任务的进展或结论
+    - evidence: 标记 done 时若任务有 success_criteria 必须提供
+    - allowed_tools: 修正该任务允许使用的工具白名单。**当且仅当**你发现 planner
+      给该任务设置的 allowed_tools 错误地排除了真正需要的工具时使用；传入新的完整
+      工具名列表（例如 ["forget_memory", "list_memory"]）会**覆盖**原有列表，
+      传入 ["*"] 解除限制，传入 [] 同样视为不限制。允许工具发生变化时记得更新
+      notes 说明原因。不需要修改时省略此参数。
     """
     state = _get_state(ctx)
     task = state.tasks.get(task_id)
@@ -421,19 +428,29 @@ def update_todo(
         return f"错误：任务 {task_id} 的依赖尚未完成：{missing}"
     if status == "done" and task.success_criteria and not (notes or evidence):
         return f"错误：任务 {task_id} 设置了成功标准，标记 done 时必须提供 notes 或 evidence。"
-        
+
     task.status = status
     if notes:
         task.notes = notes
     if evidence:
         task.evidence = evidence
-        
+    if allowed_tools is not None:
+        # 接受 list[str];过滤掉空白项;["*"] / ["any"] / [] 均视为"不限制"
+        cleaned = [str(name).strip() for name in allowed_tools if str(name).strip()]
+        task.allowed_tools = cleaned
+        logger.info(
+            "Updated allowed_tools for TODO %d in session %s: %s",
+            task_id,
+            ctx.deps.session_id,
+            cleaned or "<unrestricted>",
+        )
+
     # 重置调用计数器
     state.tool_calls_since_update = 0
     _refresh_active_flag(state)
     _save_state(ctx, state)
     logger.info("Updated TODO %d to %s for session %s", task_id, status, ctx.deps.session_id)
-    
+
     return get_todos(ctx)
 
 
@@ -525,7 +542,13 @@ def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str | Itera
             state=state,
             tool_name=display_name,
             reason=f"当前任务 {task.id} 未授权该工具；允许的工具为：{allowed}。",
-            next_step="改用当前任务允许的工具；如果计划本身不正确，请将任务标记为 blocked，让执行记录触发重规划。",
+            next_step=(
+                "三选一：(a) 改用当前任务允许的工具；"
+                "(b) 如果当前任务的 allowed_tools 本身错误，调用 "
+                f"`update_todo(task_id={task.id}, status=..., allowed_tools=[...])` "
+                "修正白名单（传 ['*'] 或 [] 解除限制）；"
+                "(c) 如果整个计划方向有误，将任务标记为 blocked，让执行记录触发重规划。"
+            ),
         )
     return task
 

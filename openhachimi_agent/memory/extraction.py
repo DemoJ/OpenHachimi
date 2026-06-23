@@ -9,7 +9,7 @@ from typing import Any
 
 from openhachimi_agent.content.prompts import load_system_prompt
 from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.memory.capture import _keywords
+from openhachimi_agent.memory.capture import _keywords, _looks_like_scheduler_payload
 from openhachimi_agent.memory.models import ExtractedMemory, MemoryExtractionResult, MemoryScope, MemoryStability
 from openhachimi_agent.memory.llm import run_memory_extraction
 from openhachimi_agent.memory.privacy import PrivacyGuard
@@ -18,7 +18,18 @@ logger = logging.getLogger(__name__)
 
 PREFERENCE_MARKERS = ("记住", "以后", "偏好", "喜欢", "不喜欢", "prefer", "preference", "like", "dislike")
 CONSTRAINT_MARKERS = ("必须", "不要", "只能", "要求", "禁止", "must", "should not", "do not")
-PROJECT_MARKERS = ("项目", "仓库", "技术栈", "决定", "背景", "架构", "使用")
+# v2 收紧 PROJECT_MARKERS:旧版用"项目/仓库/技术栈/决定/背景/架构/使用"会被系统
+# prompt 命中(里面就有"项目""使用"),导致 system 注入文本被规则抽成 project_context。
+# 新版要求至少一组词同时出现,并且不能是泛词组合。
+PROJECT_KEYWORD_PAIRS = (
+    ("项目", "使用"),
+    ("项目", "技术栈"),
+    ("仓库", "结构"),
+    ("仓库", "决定"),
+    ("我们", "采用"),
+    ("我们", "决定"),
+)
+# 旧 PROJECT_MARKERS 保留为内部参考,但仅在显式 LLM 抽取兜底时使用
 DECISION_MARKERS = ("决定", "选型", "采用", "放弃", "decision", "decide", "choose")
 TEMPORARY_MARKERS = ("今天", "临时", "本周", "这次", "temporary", "today", "this week")
 STABLE_MARKERS = ("以后", "长期", "总是", "偏好", "习惯", "要求", "always", "prefer", "preference")
@@ -37,6 +48,10 @@ def extract_memories_from_turn(
 ) -> MemoryExtractionResult:
     text = user_message.strip()
     if not text:
+        return MemoryExtractionResult()
+    # 防御:即便上游漏过滤,这里仍然拒绝定时任务执行 payload 形态的文本
+    if _looks_like_scheduler_payload(text):
+        logger.info("memory extraction skipped: scheduler payload detected")
         return MemoryExtractionResult()
     guard = privacy_guard or PrivacyGuard()
     decision = guard.should_store(text)
@@ -106,8 +121,11 @@ def _memory_type(text: str, lowered: str) -> str | None:
         return "preference"
     if _contains_any(text, lowered, DECISION_MARKERS):
         return "decision"
-    if _contains_any(text, lowered, PROJECT_MARKERS):
-        return "project_context"
+    # v2: project_context 仅在同时命中一组明确的"项目陈述"双词时才触发,
+    # 避免被"项目""使用"等宽泛词误中。
+    for word_a, word_b in PROJECT_KEYWORD_PAIRS:
+        if word_a in text and word_b in text:
+            return "project_context"
     return None
 
 

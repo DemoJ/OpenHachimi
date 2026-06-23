@@ -46,7 +46,13 @@ class LifecycleStoreMixin:
     def forget(self, scope: MemoryScope, query_or_ids: str, hard_delete: bool = False) -> int:
         ids = [part.strip() for part in query_or_ids.split(",") if part.strip()]
         if len(ids) == 1 and len(ids[0]) < 16:
-            ids = [result.id for result in self.search(scope, query_or_ids, limit=20, include_archived=True)]
+            # 不像是 ID（短于 32 位 hex 的一半），尝试 FTS 模糊匹配兜底；search()
+            # 自身会清洗 FTS5 特殊字符并在无效输入时返回空列表，不再抛
+            # "unknown special query"。
+            try:
+                ids = [result.id for result in self.search(scope, query_or_ids, limit=20, include_archived=True)]
+            except Exception:
+                ids = []
         if not ids:
             return 0
         now = utc_now_iso()

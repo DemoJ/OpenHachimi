@@ -226,11 +226,13 @@ class AgentService:
 
     # ------------------------------------------------------------------ 会话管理（WebUI）
 
-    # WebUI 显示历史会话时需要"用户原始输入"。UserPromptPart 里实际拼了 volatile
-    # 前缀（时间/记忆/技能/任务模板等），无法靠分隔符可靠反向拆分。
-    # turn.run_turn 在保存前会把原话写入 ModelRequest.metadata，这里优先读 metadata；
-    # 没有 metadata 的旧会话回退为整段显示，不折叠。
+    # WebUI 展示历史会话时需要的 metadata 键名。
+    #
+    # ``openhachimi_user_message``  —— 用户原始输入（turn.py 持久化时写入）。
+    # ``openhachimi_system_context`` —— 本轮 system prompt 动态段快照，即模型
+    #     在同一轮里看到的"运行时上下文"（时间 / TaskFrame / 记忆召回 / 命中技能）。
     _USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
+    _SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"
 
     def _extract_text_parts(
         self, messages: list[ModelMessage],
@@ -242,9 +244,10 @@ class AgentService:
         忽略工具调用、工具返回等中间环节。
 
         user 消息额外返回 ``prefix`` 字段（运行时注入的可折叠上下文）：
-          * 当 ``ModelRequest.metadata`` 含 ``openhachimi_user_message`` 键时，
-            ``content`` 直接取这个原话，``prefix`` 为全文里去掉原话剩下的部分；
-          * 否则 ``content`` 是全文、``prefix`` 为空（不折叠，完整显示）。
+          * 优先取 ``metadata["openhachimi_system_context"]`` 作为 prefix（v2 新增）；
+          * 回退到旧逻辑：从 UserPromptPart 全文里去掉 ``openhachimi_user_message``
+            找注入前缀；
+          * 两者都没有时 prefix 为空，不折叠，完整显示。
         """
         from pydantic_ai.messages import TextPart, UserPromptPart
 
@@ -252,7 +255,10 @@ class AgentService:
         for msg in messages:
             if isinstance(msg, ModelRequest):
                 metadata = getattr(msg, "metadata", None) or {}
-                user_message_meta = metadata.get(self._USER_MESSAGE_METADATA_KEY) if isinstance(metadata, dict) else None
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                user_message_meta = metadata.get(self._USER_MESSAGE_METADATA_KEY)
+                system_context_meta = metadata.get(self._SYSTEM_CONTEXT_METADATA_KEY)
 
                 for part in getattr(msg, "parts", ()):
                     if isinstance(part, UserPromptPart):
@@ -265,17 +271,23 @@ class AgentService:
                         if not text.strip():
                             continue
 
+                        # ---- v2 路径：metadata 里有 system 动态块快照，直接用 ----
+                        if isinstance(system_context_meta, str) and system_context_meta.strip():
+                            prefix = system_context_meta.strip()
+                            if isinstance(user_message_meta, str) and user_message_meta:
+                                content = user_message_meta
+                            else:
+                                content = text.strip()
+                            result.append({"role": "user", "content": content, "prefix": prefix})
+                            break
+
+                        # ---- 旧路径：有 user_message 但无 system_context 快照 ----
                         if isinstance(user_message_meta, str) and user_message_meta:
-                            # metadata 还原：content = 用户原话，prefix = 注入的上下文
                             user_msg = user_message_meta
                             stripped = text.rstrip()
                             if stripped.endswith(user_msg):
                                 prefix = stripped[: -len(user_msg)].rstrip("\n").rstrip()
                             else:
-                                # 用户输入被进一步包裹（如 self_critique_repair /
-                                # final_verification_repair 模板渲染），UserPromptPart 全文
-                                # 是系统注入的修复指令而非用户原话。仍以 metadata 为准，
-                                # content 始终是用户原话；prefix 留空（无法可靠抽取）。
                                 logger.debug(
                                     "user_msg not at end of UserPromptPart; using metadata only "
                                     "user_msg_chars=%d prompt_chars=%d prompt_preview=%r",
@@ -285,10 +297,10 @@ class AgentService:
                                 )
                                 prefix = ""
                             result.append({"role": "user", "content": user_msg, "prefix": prefix})
-                        else:
-                            # 旧会话无 metadata：整段显示，不折叠
-                            result.append({"role": "user", "content": text.strip(), "prefix": ""})
-                        # 一个 ModelRequest 只对应一次用户输入
+                            break
+
+                        # ---- 兜底：旧会话无 metadata，整段显示 ----
+                        result.append({"role": "user", "content": text.strip(), "prefix": ""})
                         break
             elif isinstance(msg, ModelResponse):
                 for part in getattr(msg, "parts", ()):

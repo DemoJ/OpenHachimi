@@ -60,22 +60,144 @@ def _error_message(exc: BaseException) -> str:
     return redact_exception(exc)
 
 
-# WebUI 展示历史会话时需要"用户原始输入"，而 UserPromptPart 里实际拼了 volatile 前缀
-# （时间/记忆/技能/任务模板渲染等），无法可靠反向拆出。pydantic-ai 的 ModelRequest
-# 提供 metadata: dict 字段，序列化为 JSON 时完整保留，是稳妥的旁路存储。
+# WebUI 展示历史会话时需要"用户原始输入"，而 UserPromptPart 里实际只承载用户原话
+# （v2 后已不再嵌 volatile 前缀），仍保留 metadata 旁路是为了：
+# 1) 旧会话回放：旧版 UserPromptPart 里拼了 volatile 前缀，仅靠分隔符无法可靠反向
+#    拆出原话，metadata 是稳妥的真值。
+# 2) 兜底安全：万一未来又有路径往 user-prompt 塞了额外文本，metadata 仍能正确还原。
+# 同时 stamp 一份"模型可见的完整 system 级上下文"快照,供 WebUI 在消息气泡的
+# "展开运行时上下文"折叠区展示。
 _USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
+_SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"
 
 
-def _stamp_user_message_metadata(new_history: list, prev_len: int, user_message: str) -> None:
-    """给本轮新增的、首个含 ``UserPromptPart`` 的 ``ModelRequest`` 打用户原始输入。
+def _extract_system_prompt_text(messages: list) -> str:
+    """从一组 ModelMessage 里聚合首个 ModelRequest 的所有 SystemPromptPart。
 
-    Multi-step 单轮中可能多次往 history 追加 ``ModelRequest``（planner、executor_repair
-    等都会 extend），但首个 user 消息就是本轮入口。
+    pydantic-ai 把 ``Agent(system_prompt=...)``、``Agent(instructions=...)`` 以及
+    所有 ``@agent.system_prompt`` 装饰器钩子返回的字符串都合并成一个或多个
+    ``SystemPromptPart`` 放在首个 ``ModelRequest`` 里。我们按顺序拼接,就是
+    模型在那一轮收到的完整系统消息文本(不含工具 schema —— 工具 schema 走
+    OpenAI API 的 ``tools`` 字段,不在 message 里)。
+    """
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+    chunks: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, ModelRequest):
+            continue
+        for part in getattr(msg, "parts", ()):
+            if isinstance(part, SystemPromptPart):
+                text = getattr(part, "content", "")
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text)
+        if chunks:
+            break  # 只取首个含 SystemPromptPart 的 ModelRequest
+    return "\n\n".join(chunks)
+
+
+def _extract_tool_catalog(executor_agent: object) -> str:
+    """提取 executor agent 当前可用的工具清单(工具名 + 一行描述)。
+
+    模型实际通过 OpenAI API ``tools`` 字段收到完整 JSON schema,但展示在 WebUI 里
+    没意义(太长且对用户不友好),所以只返回摘要清单。
+
+    失败不抛异常,返回空串。
+    """
+    try:
+        toolsets = getattr(executor_agent, "_toolsets", None) or getattr(executor_agent, "toolsets", None)
+        if not toolsets:
+            return ""
+        seen: set[str] = set()
+        summary_lines: list[str] = []
+        for toolset in toolsets:
+            tools_attr = getattr(toolset, "tools", None)
+            if tools_attr is None:
+                continue
+            # FunctionToolset.tools 是 dict[str, Tool]; 其它 toolset 可能是 list
+            if isinstance(tools_attr, dict):
+                tool_iter = tools_attr.values()
+            else:
+                tool_iter = tools_attr
+            for tool in tool_iter:
+                name = getattr(tool, "name", None) or getattr(tool, "__name__", "") or ""
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                desc = getattr(tool, "description", "") or ""
+                first_line = ""
+                if desc.strip():
+                    first_line = desc.strip().splitlines()[0].strip()
+                else:
+                    doc = getattr(tool, "__doc__", "") or ""
+                    if doc.strip():
+                        first_line = doc.strip().splitlines()[0].strip()
+                if first_line:
+                    summary_lines.append(f"- `{name}` — {first_line}")
+                else:
+                    summary_lines.append(f"- `{name}`")
+        if not summary_lines:
+            return ""
+        return (
+            "## 可用工具清单\n模型在本轮可以调用以下工具("
+            "由 toolset 自动序列化为 OpenAI tool 协议发送):\n\n"
+            + "\n".join(summary_lines)
+        )
+    except Exception:
+        return ""
+
+
+def _build_full_system_context_snapshot(
+    new_history: list,
+    prev_len: int,
+    executor_agent: object | None,
+) -> str:
+    """聚合本轮模型真正收到的所有 system 级上下文,用于 WebUI 展示。
+
+    内容来源:
+    - 首个 ModelRequest 的所有 SystemPromptPart(已含 base / executor / role
+      instructions / runtime/config / runtime 动态块)
+    - 工具清单摘要(name + 一行描述)
+
+    其中第一部分占绝大多数,准确反映模型在本轮"接收到了什么"。
+    """
+    chunks: list[str] = []
+    # 只看本轮新增的消息(prev_len 之后的 ModelRequest)
+    relevant = new_history[prev_len:] if prev_len < len(new_history) else new_history
+    system_text = _extract_system_prompt_text(relevant)
+    if system_text:
+        chunks.append(system_text)
+    if executor_agent is not None:
+        tool_summary = _extract_tool_catalog(executor_agent)
+        if tool_summary:
+            chunks.append(tool_summary)
+    return "\n\n".join(chunks)
+
+
+def _stamp_turn_metadata(
+    new_history: list,
+    prev_len: int,
+    user_message: str,
+    system_context: str,
+) -> None:
+    """给本轮新增的、首个含 ``UserPromptPart`` 的 ``ModelRequest`` 打两项 metadata：
+
+    - ``openhachimi_user_message``：用户原始输入（不含任何系统注入）。
+    - ``openhachimi_system_context``：本轮 system 级上下文完整快照(静态 system
+      prompt + role instructions + 动态钩子 + 工具清单),给 WebUI 在"运行时
+      上下文"折叠区展示。
+
+    Multi-step 单轮中可能多次往 history 追加 ``ModelRequest``（planner、
+    executor_repair 等都会 extend），但首个 user 消息就是本轮入口。
     """
     from pydantic_ai.messages import ModelRequest, UserPromptPart
 
     if not user_message:
         return
+    payload: dict[str, str] = {_USER_MESSAGE_METADATA_KEY: user_message}
+    if system_context:
+        payload[_SYSTEM_CONTEXT_METADATA_KEY] = system_context
+
     for idx in range(prev_len, len(new_history)):
         msg = new_history[idx]
         if not isinstance(msg, ModelRequest):
@@ -85,13 +207,21 @@ def _stamp_user_message_metadata(new_history: list, prev_len: int, user_message:
         meta = getattr(msg, "metadata", None)
         if meta is None:
             try:
-                msg.metadata = {_USER_MESSAGE_METADATA_KEY: user_message}
+                msg.metadata = dict(payload)
             except Exception:  # noqa: BLE001  # 极端情况 dataclass 被冻结时静默放弃
-                logger.debug("failed to stamp user_message metadata on ModelRequest idx=%d", idx)
+                logger.debug("failed to stamp turn metadata on ModelRequest idx=%d", idx)
             return
-        if _USER_MESSAGE_METADATA_KEY not in meta:
-            meta[_USER_MESSAGE_METADATA_KEY] = user_message
+        # metadata 已存在：补齐我们这两项,不覆盖第三方已有键
+        for k, v in payload.items():
+            if k not in meta:
+                meta[k] = v
         return
+
+
+# 旧名保留为别名,避免第三方/旧代码导入断裂
+_stamp_user_message_metadata = lambda new_history, prev_len, user_message: _stamp_turn_metadata(  # noqa: E731
+    new_history, prev_len, user_message, ""
+)
 
 
 async def run_turn(
@@ -405,7 +535,24 @@ async def run_turn(
             # 拆分被注入的 volatile 前缀（时间/记忆/技能等）。
             # 找的是本轮新增（idx >= len(history)）且含 UserPromptPart 的第一个 ModelRequest，
             # 通常就是承载本轮用户消息的那条。
-            _stamp_user_message_metadata(new_history, len(history), message)
+            # 把"用户原始输入"和"系统级上下文完整快照"持久化到本轮 ModelRequest metadata。
+            # WebUI 用 system_context 展示"运行时上下文"折叠区——其内容是模型在本轮
+            # 真正收到的全部 system 级文本(base prompt + executor role + role
+            # instructions + runtime/config + 动态钩子 + 工具清单),不只是动态钩子部分。
+            try:
+                # 在持久化阶段拿到一份"当前角色 executor agent",用于工具清单提取。
+                # 注意:这里不再产生新的 LLM 调用,仅用来 introspect toolset。
+                _executor_for_intro = service._get_agent(role, "executor")
+            except Exception:
+                _executor_for_intro = None
+            try:
+                _system_context = _build_full_system_context_snapshot(
+                    new_history, len(history), _executor_for_intro
+                )
+            except Exception:
+                logger.debug("system context snapshot failed", exc_info=True)
+                _system_context = ""
+            _stamp_turn_metadata(new_history, len(history), message, _system_context)
             # 上下文压缩:用本轮真实用量判定,触发则压缩(含 LLM 摘要,经 to_thread 避免阻塞事件循环)
             compressor = ctx.context_compressor
             if compressor is not None:
@@ -450,10 +597,18 @@ async def run_turn(
                 effective_message,
                 str(result.output),  # type: ignore[attr-defined]
             )
+            # turn 来源:scheduled / system 不进 L1 抽取(由 capture_turn_memories 处理)
+            if run_mode == "scheduled":
+                capture_source = "scheduled"
+            elif run_mode == "system":
+                capture_source = "system"
+            else:
+                capture_source = "user"
             capture_kwargs = {
                 "task_frame": session_state.get("task_frame") if isinstance(session_state.get("task_frame"), dict) else None,
                 "memory_context_ids": memory_context.ids,
                 "duration_ms": int((time.perf_counter() - start_time) * 1000),
+                "source": capture_source,
             }
             if service.config.memory.capture.async_enabled:
                 async def _capture_memory_background() -> None:

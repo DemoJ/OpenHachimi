@@ -201,9 +201,8 @@ async def test_runner_uses_scheduled_run_mode(tmp_path, mock_config):
     await runner.run_task(task)
 
     assert captured_kwargs.get("run_mode") == "scheduled"
-    assert "已经到期的定时任务" in captured_message
-    assert "不要询问提醒时间" in captured_message
-    assert "安全任务" in captured_message
+    # v2: runner 不再在 user-prompt 里包裹 [IMPORTANT:...] (改由 scheduled_executor system prompt 承担)
+    assert captured_message == "安全任务"
 
 
 @pytest.mark.asyncio

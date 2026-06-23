@@ -119,6 +119,32 @@ def test_build_skill_tool_replaces_arguments_and_includes_skill_root(tmp_path):
     assert "拼接成绝对路径" in result
 
 
+def test_build_skill_tool_dedups_when_skill_already_in_system_prompt(tmp_path):
+    """如果同名 skill 已被被动注入到 system prompt,宏工具只返回参数化 body,
+    不再重复 wrap 完整定义(避免和被动注入重叠浪费上下文)。"""
+    skill = _write_skill(
+        tmp_path / "skills" / "argument-skill",
+        "name: argument-skill\ndescription: Argument skill\narguments:\n  - target",
+        "请读取 references/{{target}}.md",
+    )
+    tool_func = build_skill_tool(skill)
+    args_model = tool_func.__annotations__["args"]
+
+    deps = SimpleNamespace(session_state={"injected_skill_names": ["argument-skill"]})
+    ctx = SimpleNamespace(deps=deps)
+
+    result = tool_func(ctx, args_model(target="guide"))
+
+    # 参数已被填充
+    assert "references/guide.md" in result
+    assert "{{target}}" not in result
+    # 但 wrapper 头尾、execution_intro、path note 全部被省略(避免重复)
+    assert "【Skill Execution:" not in result
+    assert "[Skill Metadata]" not in result
+    assert "拼接成绝对路径" not in result
+    assert "skill_root" not in result
+
+
 def test_download_url_uses_explicit_timeout(tmp_path, monkeypatch):
     captured = {}
 

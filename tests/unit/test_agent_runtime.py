@@ -156,7 +156,8 @@ async def test_ai_resume_decision_restores_suspended_plan():
     assert session_state["plan_status"] == "active"
 
 
-def test_executor_message_preserves_task_frame_contract():
+def test_executor_message_preserves_user_request_only():
+    """v2: TaskFrame 已迁到 system prompt 的动态注入;user-prompt 只承载用户原话。"""
     task_frame = {
         "goal": "只处理指定文件",
         "target_entities": [{"type": "file", "value": "a.py"}],
@@ -165,13 +166,15 @@ def test_executor_message_preserves_task_frame_contract():
 
     message = _build_executor_message(task_frame, "修复 a.py")
 
-    assert "TaskFrame" in message
-    assert "只处理指定文件" in message
-    assert "用户原始任务：修复 a.py" in message
+    # TaskFrame 不再嵌入 user-prompt（避免每轮重复指令前缀）
+    assert "TaskFrame" not in message
+    assert "只处理指定文件" not in message
+    # 用户原始消息必须保留
+    assert "修复 a.py" in message
 
 
 def test_executor_message_without_task_frame_is_raw_message():
-    assert _build_executor_message(None, "直接回答") == "直接回答"
+    assert _build_executor_message(None, "直接回答").strip() == "直接回答"
 
 
 def test_executor_message_with_attachments_adds_safe_summary():

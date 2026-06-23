@@ -80,3 +80,51 @@ def test_remember_queues_embedding_job(mock_config, mock_browser_manager):
     assert result["stored"] is True
     assert result["embedding_status"] == "queued"
     assert job is not None
+
+
+def test_forget_memory_rejects_wildcard(mock_config, mock_browser_manager):
+    """forget_memory(*) 应被显式拒绝, 防止误删全库 + 防止 FTS5 'unknown special query'。"""
+    deps = AgentDeps(
+        config=mock_config,
+        session_id="s1",
+        browser_manager=mock_browser_manager,
+        memory_scope=MemoryScope(role_name="default", session_id="s1"),
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    for wildcard in ("*", "%", "**", "all", "ALL", "  *  "):
+        result = memory_tools.forget_memory(ctx, wildcard, mode="hard_delete")
+        assert result["deleted"] == 0
+        assert "error" in result, f"expected wildcard {wildcard!r} to be rejected"
+
+
+def test_forget_memory_handles_empty_query(mock_config, mock_browser_manager):
+    """空 query 应安全失败而非抛异常。"""
+    deps = AgentDeps(
+        config=mock_config,
+        session_id="s1",
+        browser_manager=mock_browser_manager,
+        memory_scope=MemoryScope(role_name="default", session_id="s1"),
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    result = memory_tools.forget_memory(ctx, "   ", mode="hard_delete")
+    assert result["deleted"] == 0
+    assert "error" in result
+
+
+def test_forget_memory_with_short_non_id_query_does_not_crash(mock_config, mock_browser_manager):
+    """模型传入短查询词(<16 字符且非 hex)走 FTS 兜底, 不应抛 'unknown special query'。"""
+    deps = AgentDeps(
+        config=mock_config,
+        session_id="s1",
+        browser_manager=mock_browser_manager,
+        memory_scope=MemoryScope(role_name="default", session_id="s1"),
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    # 各种容易触发 FTS5 特殊字符报错的查询
+    for tricky in ("()", "---", "?", "\"\"", "OR AND"):
+        result = memory_tools.forget_memory(ctx, tricky, mode="soft_delete")
+        # 不应抛异常;结果 deleted=0 也可接受(没有匹配)
+        assert "deleted" in result
