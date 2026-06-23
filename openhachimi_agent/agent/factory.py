@@ -78,24 +78,121 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         deps_type=AgentDeps,
         toolsets=toolsets,
         defer_model_check=True,
-        retries=3,  # 允许工具调用失败后最多重试 3 次，避免因单次输出格式问题导致整体失败
+        # retries 既覆盖工具调用错误,也覆盖 output_validator 抛出的 ModelRetry。
+        # 一次工具偶发失败(1) + 一次 final-answer validator 打回(1) + 一次 schema
+        # 修正(1) 已耗光 retries=3 → UnexpectedModelBehavior。这里给到 5 是为
+        # validator 重试链留出预算,真正的死循环熔断由 validator 内部计数器和
+        # executor.py 的 replan 兜底负责,不能只靠抬上限。
+        retries=5,
     )
 
     if agent_type in {"executor", "scheduled_executor"}:
+        # 同一轮内 validator 连续打回的次数,用于硬熔断。在 execute_task 入口处
+        # 会清零(见 service.agent_runtime.executor.execute_task)。
+        VALIDATOR_RETRY_KEY = "_final_validator_retries"
+        VALIDATOR_HARD_LIMIT = 2  # 第 0、1 次打回,第 2 次强制放行避免 UnexpectedModelBehavior
+
         @agent.output_validator
         def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
-            from openhachimi_agent.agent.execution import get_final_verification_signal
+            from openhachimi_agent.agent.execution import (
+                _append_ledger_event,
+                get_final_verification_signal,
+            )
             import json
             from pydantic_ai.exceptions import ModelRetry
-            
+
             signal = get_final_verification_signal(ctx.deps.session_state)
-            if signal:
-                raise ModelRetry(
-                    f"[系统拦截] 你不能现在就结束任务并回复最终结果！当前 TODO 列表中仍有未完成的任务，或最后一次执行失败。\n"
-                    f"验证详情：{json.dumps(signal, ensure_ascii=False)}\n"
-                    f"请务必先调用 `update_todo` 工具将所有完成的任务状态更新为 done，或者继续调用工具执行未完成的步骤。"
+            if not signal:
+                return result
+
+            session_state = ctx.deps.session_state
+            counter = int(session_state.get(VALIDATOR_RETRY_KEY, 0) or 0)
+
+            # 同时把"validator 打回"记入 execution_ledger,让上层 executor.py 的
+            # _replan_after_execution_signal 能感知到这条卡死的链条,在合适时机
+            # 触发 replan(get_replan_signal 会看到连续 blocked 事件)。
+            try:
+                _append_ledger_event(
+                    session_state,
+                    tool_name="<final_answer_validator>",
+                    status="blocked",
+                    args={"attempt": counter + 1},
+                    result=signal,
+                    violation=(
+                        json.dumps(signal, ensure_ascii=False)[:500]
+                        if signal
+                        else ""
+                    ),
                 )
-            return result
+            except Exception:
+                logger.debug("failed to append validator event to ledger", exc_info=True)
+
+            # 硬熔断:已经被打回 >=VALIDATOR_HARD_LIMIT 次,放行,把模型的话给用户。
+            # 兜底"无解任务"场景(工具/权限缺失、用户输入不完整、模型坚持自己已完成等),
+            # 避免 UnexpectedModelBehavior 把对话整轮报废。模型本来想说的话会和
+            # 系统追加的"[System] 任务未完成"提示一起返回,由 executor.py 决定追加方式。
+            if counter >= VALIDATOR_HARD_LIMIT:
+                logger.warning(
+                    "final answer validator yielding after %d retries to avoid loop "
+                    "(session=%s); raw signal=%s",
+                    counter,
+                    ctx.deps.session_id,
+                    json.dumps(signal, ensure_ascii=False)[:200],
+                )
+                session_state["_final_validator_yielded"] = True
+                session_state["_final_validator_last_signal"] = signal
+                return result
+
+            session_state[VALIDATOR_RETRY_KEY] = counter + 1
+
+            # 把未完成的 TODO 详情直接列在 ModelRetry 里。原版只说"请调用 update_todo
+            # 将所有完成的任务状态更新为 done"——但任务从未真正完成,模型按指示
+            # 标 done 等同于撒谎;不按又陷入死循环。新版给出具体可操作的下一步,
+            # 让模型从"该不该标 done"转向"先 get_todos 看清状态、再 in-progress、
+            # 再调真实工具",打破认知误区。
+            issues = signal.get("issues", []) if isinstance(signal, dict) else []
+            unfinished_lines: list[str] = []
+            latest_failure_lines: list[str] = []
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                if issue.get("type") == "unfinished_todos":
+                    for item in issue.get("items", [])[:10]:
+                        if isinstance(item, dict):
+                            unfinished_lines.append(
+                                f"  - [{item.get('status', '?')}] #{item.get('id', '?')} {item.get('description', '')}"
+                            )
+                elif issue.get("type") == "latest_execution_not_successful":
+                    latest_failure_lines.append(
+                        f"  - 上一次 `{issue.get('tool_name', '?')}` 以 `{issue.get('status', '?')}` 结束："
+                        f"{(issue.get('detail') or '')[:300]}"
+                    )
+
+            parts = [
+                f"[系统拦截] 你不能现在就给用户最终回复——当前轮的任务尚未真正完成（第 {counter + 1} 次拦截）。",
+            ]
+            if unfinished_lines:
+                parts.append("未完成的 TODO：\n" + "\n".join(unfinished_lines))
+            if latest_failure_lines:
+                parts.append("最近一次工具调用没有成功：\n" + "\n".join(latest_failure_lines))
+            parts.append(
+                "请按以下顺序操作，**不要给用户回复任何文字**：\n"
+                "1. 调用 `get_todos` 查看完整列表；\n"
+                "2. 挑出第一个 status=pending 且依赖已 done 的任务，"
+                "用 `update_todo(id, \"in-progress\")` 标记；\n"
+                "3. 调用相应执行工具（write_file/run_command/web_fetch/research_sources 等）真正完成它；\n"
+                "4. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
+                "5. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），"
+                "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
+                "然后在最终回复里清楚告知用户：已完成什么 / 卡在哪 / 需要什么——"
+                "不要装作完成。"
+            )
+            parts.append(
+                "禁止在文字里模仿工具返回格式（如 \"✅ 任务 X → done\"）；"
+                "系统能区分真假，假陈述会再次被打回。"
+            )
+
+            raise ModelRetry("\n\n".join(parts))
 
     @agent.system_prompt
     def _config_prompt(ctx: RunContext[AgentDeps]) -> str:

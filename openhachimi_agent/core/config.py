@@ -221,6 +221,7 @@ class AppConfig:
     browser_user_agent: str | None
     browser_window_size: str | None
     browser_idle_timeout: int
+    browser_cdp_wait_seconds: int
     telegram_bot_token: str | None
     telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
     show_tool_calls: bool
@@ -678,6 +679,7 @@ def load_config() -> AppConfig:
         browser_user_agent=_config_string(app_config, "browser_user_agent") or None,
         browser_window_size=_config_string(app_config, "browser_window_size") or None,
         browser_idle_timeout=_config_int(app_config, "browser_idle_timeout", 300, minimum=0),
+        browser_cdp_wait_seconds=_config_int(app_config, "browser_cdp_wait_seconds", 45, minimum=5),
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
         show_tool_calls=_config_bool(app_config, "show_tool_calls", True),

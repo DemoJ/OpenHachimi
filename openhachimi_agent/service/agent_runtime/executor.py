@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import UserContent
 from pydantic_ai.usage import UsageLimits
 
@@ -656,6 +656,14 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     executor_agent = _build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode)
     ledger_start_seq = get_ledger_length(ctx.session_state)
     ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
+    # 清零本轮 final-answer validator 的连续打回计数与"yielded"旗标。
+    # 这两个字段由 factory.py 的 _validate_execution_result 维护:counter 用于
+    # VALIDATOR_HARD_LIMIT 硬熔断,yielded 旗标用于本函数末尾决定是否给用户加
+    # "[System] 任务实际未完成"提示。跨轮必须清零,否则上一轮的死循环遗产会
+    # 立刻让新一轮放行。
+    ctx.session_state.pop("_final_validator_retries", None)
+    ctx.session_state.pop("_final_validator_yielded", None)
+    ctx.session_state.pop("_final_validator_last_signal", None)
     text_buffer: list[str] = []
     preflight_compress_history(ctx)
 
@@ -672,11 +680,39 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             stream=ctx.stream,
             handle_stream_events=_executor_stream_handler(ctx, text_buffer),
         )
-    except Exception:
+    except Exception as exc:
         signal = get_replan_signal(ctx.session_state, ledger_start_seq)
+        # validator 反复打回最终会撞 UnexpectedModelBehavior(retries 耗尽)。
+        # 这种情况下 ledger 里要么已经被 _validate_execution_result 写入了
+        # <final_answer_validator> blocked 事件(满足 get_replan_signal 的"连续
+        # >=2 次 blocked"条件),要么只发生过 1 次还不到阈值——此时仍然要救:
+        # 用一个合成的 signal 强行触发 replan,让 planner 看到"答案被反复拦截"
+        # 并据此修订计划(通常是补一步获取缺失信息、或把 blocked 任务拆细)。
+        if (
+            not signal
+            and isinstance(exc, UnexpectedModelBehavior)
+            and int(ctx.session_state.get("_final_validator_retries", 0) or 0) > 0
+        ):
+            signal = {
+                "reason": "final answer validator retry exhausted",
+                "consecutive_failures": int(ctx.session_state.get("_final_validator_retries", 0) or 0),
+                "latest_status": "blocked",
+                "events": [
+                    {
+                        "tool_name": "<final_answer_validator>",
+                        "status": "blocked",
+                        "detail": str(exc)[:500],
+                    }
+                ],
+            }
         if signal and ctx.turn_state.replan_attempts < 1:
             ctx.turn_state.replan_attempts += 1
             text_buffer.clear()
+            # 进入 replan 之前清掉 validator 旗标:replan 会重新跑一次 executor,
+            # 那次的 validator 应该重新计数,而不是带着上次的"yielded"状态。
+            ctx.session_state.pop("_final_validator_retries", None)
+            ctx.session_state.pop("_final_validator_yielded", None)
+            ctx.session_state.pop("_final_validator_last_signal", None)
             await _replan_after_execution_signal(ctx, signal, get_agent)
             preflight_compress_history(ctx)
             retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result)
@@ -693,6 +729,21 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             raise
 
     verification_signal = get_final_verification_signal(ctx.session_state)
+    validator_yielded = bool(ctx.session_state.get("_final_validator_yielded", False))
+    # validator 已经被硬熔断放行,说明模型已被反复证明"突破不了任务未完成的阻塞"
+    # (常见原因:工具/权限缺失、用户输入不完整、模型坚持已完成)。再发起 repair
+    # 轮次毫无意义——下一次 validator 看到 counter 仍在上限,会立刻再次 yield,
+    # 浪费 LLM 调用并把模型反复拉进同一死局。直接把 signal 上抛给 turn.py,
+    # 由后者走 suspend_current_plan + 给用户加 [System] 提示。
+    if verification_signal and validator_yielded:
+        await _flush_buffered_text(ctx, text_buffer)
+        logger.info(
+            "skipping final_verification_repair because validator was yielded "
+            "(task is genuinely stuck, not a recoverable transient) role=%s session_id=%s",
+            ctx.role,
+            ctx.session_id,
+        )
+        return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
     if verification_signal and ctx.turn_state.final_verification_repair_attempts < 1:
         ctx.turn_state.final_verification_repair_attempts += 1
         text_buffer.clear()

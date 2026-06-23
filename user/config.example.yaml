@@ -5,6 +5,7 @@ app:
   browser_user_agent: ""     # 自定义 User-Agent，留空则自动隐藏 Headless 特征
   browser_window_size: ""    # 自定义浏览器窗口尺寸，例如 "1920,1080"，留空则随机生成常见尺寸
   browser_idle_timeout: 300  # 可选: 浏览器空闲多少秒后自动关闭以释放内存。0 为不自动关闭
+  browser_cdp_wait_seconds: 45  # 可选: 等待 Chrome CDP 调试端口就绪的最大秒数。冷启动慢或端口冲突回落时可适当调高
   telegram_bot_token: ""     # Telegram Bot Token，通过 @BotFather 申请后填入。留空则不启用 Telegram 渠道
   telegram_proxy_url: ""     # 代理地址（可选），在无法直连 Telegram 的环境下配置。支持 HTTP/SOCKS5，例如：
                              #   socks5://127.0.0.1:1080

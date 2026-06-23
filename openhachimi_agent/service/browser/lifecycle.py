@@ -260,6 +260,51 @@ class BrowserLifecycleMixin:
                 )
         return env
 
+    def _read_devtools_active_port(self, user_data_dir) -> tuple[int, str] | None:
+        """读取 Chrome 启动后写入 user-data-dir 的 DevToolsActivePort 文件。
+
+        第一行是实际监听端口（即便 --remote-debugging-port 因冲突回落到随机端口，
+        这里也是真实端口），第二行是 ws 路径（如 /devtools/browser/xxxx）。
+        当 Chrome 还没写完该文件时返回 None。
+        """
+        try:
+            path = user_data_dir / "DevToolsActivePort"
+        except TypeError:
+            return None
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not content:
+            return None
+        try:
+            actual_port = int(content[0].strip())
+        except (ValueError, IndexError):
+            return None
+        ws_path = content[1].strip() if len(content) > 1 else ""
+        return actual_port, ws_path
+
+    def _cleanup_stale_singletons(self, user_data_dir) -> None:
+        """启动新 Chrome 前清理可能残留的单例锁。
+
+        当上一次 Chrome 进程异常退出（崩溃、kill -9、宿主服务重启）时，
+        user-data-dir 下的 SingletonLock/SingletonSocket/SingletonCookie（Linux）
+        或 lockfile（部分 Windows 版本）可能残留，导致新进程检测到"已有实例"后
+        把命令行转发给一个不存在的进程然后悄悄退出。
+        只有在确认本进程没有跟踪到活的 Chrome 子进程时才执行清理，避免误杀。
+        """
+        if self._chrome_process and self._chrome_process.poll() is None:
+            return
+        names = ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile")
+        for name in names:
+            target = user_data_dir / name
+            try:
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                    logger.info("已清理残留单例锁: %s", target)
+            except OSError as exc:
+                logger.warning("清理残留单例锁 %s 失败: %s", target, exc)
+
     def _tail_chrome_stderr(self) -> str:
         stderr_path = self.config.log_dir / "chrome-browser.log"
         if not stderr_path.exists():
@@ -387,7 +432,11 @@ class BrowserLifecycleMixin:
                         chrome_path = self._find_chrome_executable()
                         port = self._find_free_port()
                         browser_env = self._browser_process_env(headless)
-                        
+
+                        # 启动前清理可能残留的单例锁，否则新进程会被旧锁挡住
+                        # 自动转发命令行后悄悄退出，导致 --remote-debugging-port 永远不生效。
+                        self._cleanup_stale_singletons(user_data_dir)
+
                         window_size = self.config.browser_window_size
                         if not window_size:
                             window_size = f"{random.randint(1366, 1920)},{random.randint(768, 1080)}"
@@ -428,7 +477,8 @@ class BrowserLifecycleMixin:
                         )
                         chrome_stderr_path = self.config.log_dir / "chrome-browser.log"
                         chrome_stderr_path.parent.mkdir(parents=True, exist_ok=True)
-                        self._chrome_stderr_file = chrome_stderr_path.open("ab", buffering=0)
+                        # 每次启动覆盖写，避免历次 stderr 累积让排障时分不清是哪次启动
+                        self._chrome_stderr_file = chrome_stderr_path.open("wb", buffering=0)
                         self._chrome_process = subprocess.Popen(
                             args,
                             stdout=subprocess.DEVNULL,
@@ -439,25 +489,41 @@ class BrowserLifecycleMixin:
                         self._chrome_cdp_port = port
                         
                         # 等待调试端口就绪
-                        max_retries = 30
-                        for _ in range(max_retries):
+                        cdp_wait_seconds = self.config.browser_cdp_wait_seconds
+                        deadline = asyncio.get_running_loop().time() + cdp_wait_seconds
+                        while asyncio.get_running_loop().time() < deadline:
                             if self._chrome_process.poll() is not None:
                                 stderr_tail = self._tail_chrome_stderr()
                                 detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
                                 raise RuntimeError(
                                     f"Chrome 进程已退出，无法建立 CDP 连接（退出码 {self._chrome_process.returncode}）。{detail}"
                                 )
+                            # 优先从 DevToolsActivePort 读实际端口（Chrome 可能因端口冲突
+                            # 回落到随机端口，这时请求的 port 永远等不到）。
+                            if dev := self._read_devtools_active_port(user_data_dir):
+                                actual_port, _ = dev
+                                if ws := self._get_cdp_websocket_url(actual_port):
+                                    cdp_endpoint = ws
+                                    self._chrome_cdp_port = actual_port
+                                    if actual_port != port:
+                                        logger.info(
+                                            "Chrome 实际 CDP 端口 %d 与请求端口 %d 不同（端口冲突回落），已自动适配。",
+                                            actual_port, port,
+                                        )
+                                    break
+                            # 回退：仍试请求端口（兼容 DevToolsActivePort 未写完或不存在）
                             if websocket_url := self._get_cdp_websocket_url(port):
                                 cdp_endpoint = websocket_url
                                 break
                             await asyncio.sleep(0.5)
-                            
+
                         if not cdp_endpoint:
                             stderr_tail = self._tail_chrome_stderr()
                             detail = f"\nChrome stderr:\n{stderr_tail}" if stderr_tail else ""
                             raise RuntimeError(
-                                f"等待浏览器 CDP 端口 {port} 就绪超时。"
-                                "请查看 Chrome stderr 判断是否为显示环境、权限、沙箱或 profile 锁定问题。"
+                                f"等待浏览器 CDP 端口 {self._chrome_cdp_port or port} 就绪超时（已等待 {cdp_wait_seconds}s）。"
+                                "请查看 Chrome stderr 判断是否为显示环境、权限、沙箱或 profile 锁定问题；"
+                                "若冷启动较慢可调高 app.browser_cdp_wait_seconds。"
                                 f"{detail}"
                             )
                     

@@ -34,6 +34,7 @@ def mock_config(tmp_path: Path):
         browser_user_agent=None,
         browser_window_size=None,
         browser_idle_timeout=300,
+        browser_cdp_wait_seconds=45,
         telegram_bot_token=None,
         telegram_proxy_url=None,
         show_tool_calls=True,
