@@ -326,6 +326,13 @@ async def _handle_start(
 # 默认命令清单
 
 register(CommandSpec(
+    name="new",
+    aliases=("/new", "/新对话", "新对话"),
+    summary="保存当前对话,新建一段对话",
+    handler=_handle_new,
+    tg_menu_label="💾 保存当前对话,新建一段对话",
+))
+register(CommandSpec(
     name="help",
     aliases=("/help", "/帮助", "帮助"),
     summary="查看帮助信息",
@@ -346,13 +353,6 @@ register(CommandSpec(
     summary="切换角色(例:/role default)",
     handler=_handle_role,
     tg_menu_label="🔄 切换角色(如:/role default)",
-))
-register(CommandSpec(
-    name="new",
-    aliases=("/new", "/新对话", "新对话"),
-    summary="保存当前对话,新建一段对话",
-    handler=_handle_new,
-    tg_menu_label="💾 保存当前对话,新建一段对话",
 ))
 register(CommandSpec(
     name="stop",
