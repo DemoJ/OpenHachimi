@@ -2,18 +2,18 @@
   <div class="login-page">
     <div class="login-card">
       <h1>OpenHachimi</h1>
-      <p>请输入访问令牌（HTTP API Token）以登录网页端</p>
-      <label for="token">访问令牌（HTTP API Token）</label>
+      <p>请使用访问令牌（http_api_token）登录</p>
       <input
         id="token"
         v-model="token"
         type="password"
-        placeholder="请在 user/config.yaml 中查看 http_api_token"
+        placeholder="请输入访问令牌"
         @keyup.enter="onLogin"
         autofocus
       />
+      <p class="hint-mono">user/config.yaml → http_api_token</p>
       <p v-if="error" class="error">{{ error }}</p>
-      <button class="btn btn-primary" style="margin-top: 16px; width: 100%;" :disabled="loading" @click="onLogin">
+      <button class="btn btn-primary" :disabled="loading" @click="onLogin">
         {{ loading ? '验证中...' : '登录' }}
       </button>
     </div>

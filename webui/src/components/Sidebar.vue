@@ -2,23 +2,23 @@
   <aside class="sidebar">
     <div class="sidebar-header">
       <h2>OpenHachimi</h2>
-      <button class="btn-new" @click="onNew">➕ 新建会话</button>
+      <button class="btn-new" @click="onNew">+ 新建会话</button>
     </div>
 
     <div class="sidebar-section">
-      <div class="sidebar-section-title">角色</div>
+      <div class="sidebar-section-title">角色 · ROLES</div>
       <ul class="sidebar-list">
         <li
           v-for="r in store.roles"
           :key="r"
           :class="{ active: r === store.currentRole }"
           @click="onSwitchRole(r)"
-        >🎭 {{ r }}</li>
+        >{{ r }}</li>
       </ul>
     </div>
 
     <div class="sidebar-section">
-      <div class="sidebar-section-title">历史会话</div>
+      <div class="sidebar-section-title">历史会话 · SESSIONS</div>
     </div>
     <div class="sidebar-sessions">
       <div
@@ -31,8 +31,8 @@
         <div class="preview">{{ s.preview || '(空会话)' }}</div>
         <div class="time">{{ formatTime(s.mtime) }}</div>
       </div>
-      <div v-if="store.sessions.length === 0" class="session-item" style="color: var(--text-muted)">
-        暂无历史会话
+      <div v-if="store.sessions.length === 0" class="session-item">
+        <div class="preview" style="color: var(--body-mid)">暂无历史会话</div>
       </div>
     </div>
   </aside>

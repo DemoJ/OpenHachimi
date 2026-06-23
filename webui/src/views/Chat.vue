@@ -5,8 +5,8 @@
       <header class="header">
         <div class="brand">{{ store.currentRole || '加载中…' }}</div>
         <div style="display: flex; gap: 12px; align-items: center;">
-          <span class="model-badge" v-if="store.state">🤖 {{ store.state.model }}</span>
-          <button class="btn" style="background: transparent; color: var(--text-secondary)" @click="onLogout">退出</button>
+          <span class="model-badge" v-if="store.state">{{ store.state.model }}</span>
+          <button class="btn" @click="onLogout">退出</button>
         </div>
       </header>
       <MessageList :messages="store.messages" />
