@@ -2,13 +2,13 @@
   <div class="login-page">
     <div class="login-card">
       <h1>OpenHachimi</h1>
-      <p>输入 HTTP API Token 以访问 WebUI</p>
-      <label for="token">API Token</label>
+      <p>请输入访问令牌（HTTP API Token）以登录网页端</p>
+      <label for="token">访问令牌（HTTP API Token）</label>
       <input
         id="token"
         v-model="token"
         type="password"
-        placeholder="在 user/config.yaml 中查看 http_api_token"
+        placeholder="请在 user/config.yaml 中查看 http_api_token"
         @keyup.enter="onLogin"
         autofocus
       />
@@ -34,7 +34,7 @@ const store = useChatStore()
 
 async function onLogin() {
   if (!token.value.trim()) {
-    error.value = '请输入 Token'
+    error.value = '请输入访问令牌（HTTP API Token）'
     return
   }
   loading.value = true
@@ -45,7 +45,7 @@ async function onLogin() {
     store.setToken(token.value.trim())
     router.push('/chat')
   } catch (e) {
-    error.value = (e as Error).message || 'Token 无效或服务器无响应'
+    error.value = (e as Error).message || '访问令牌（HTTP API Token）无效或服务器无响应'
   } finally {
     loading.value = false
   }

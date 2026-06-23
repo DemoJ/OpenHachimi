@@ -92,8 +92,17 @@ def _deployed_endpoint() -> tuple[str, int]:
         return DEFAULT_HOST, DEFAULT_PORT
 
 
+def _configured_token() -> str | None:
+    """读取配置文件中的 HTTP API Token，供启动/部署成功后打印。"""
+    try:
+        return load_config().http_api_token
+    except Exception as exc:
+        logger.debug("failed to load HTTP API token for display: %s", exc)
+        return None
+
+
 def _print_access_info(host: str, port: int) -> None:
-    """打印服务访问地址（API + WebUI）。前端未构建时给出构建提示。"""
+    """打印服务访问地址（API + WebUI）与访问令牌。前端未构建时给出构建提示。"""
     print()
     _ok(f"API   地址：http://{host}:{port}")
     url = webui_url(host, port)
@@ -101,6 +110,11 @@ def _print_access_info(host: str, port: int) -> None:
         _ok(f"WebUI 地址：{url}")
     else:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
+    token = _configured_token()
+    if token:
+        _ok(f"访问令牌（HTTP API Token）：{token}")
+    else:
+        _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
     print()
 
 
@@ -255,12 +269,16 @@ def cmd_serve(args: argparse.Namespace) -> None:
     host = args.host if args.host is not None else config.server_host
     port = args.port if args.port is not None else config.server_port
     logger.info("serve command host=%s port=%s", host, port)
-    # uvicorn.run 会阻塞并在启动时自行打印 API 地址，这里先打印 WebUI 提示。
+    # uvicorn.run 会阻塞并在启动时自行打印 API 地址，这里先打印 WebUI 与访问令牌提示。
     url = webui_url(host, port)
     if url:
         _ok(f"WebUI 地址：{url}")
     else:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
+    if config.http_api_token:
+        _ok(f"访问令牌（HTTP API Token）：{config.http_api_token}")
+    else:
+        _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
     uvicorn.run("openhachimi_agent.interface.http:app", host=host, port=port)
 
 

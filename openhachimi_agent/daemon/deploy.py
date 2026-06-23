@@ -35,14 +35,18 @@ def webui_url(host: str, port: int) -> str | None:
     return None
 
 
-def print_endpoints(host: str, port: int) -> None:
-    """打印 API 与 WebUI 访问地址。前端未构建时给出构建提示。"""
+def print_endpoints(host: str, port: int, token: str | None = None) -> None:
+    """打印 API、WebUI 访问地址与访问令牌。前端未构建时给出构建提示。"""
     print(f"  API   地址：http://{host}:{port}")
     url = webui_url(host, port)
     if url:
         print(f"  WebUI 地址：{url}")
     else:
         print("  WebUI 地址：（前端未构建，运行 `cd webui && npm run build` 后重启服务）")
+    if token:
+        print(f"  访问令牌（HTTP API Token）：{token}")
+    else:
+        print("  访问令牌（HTTP API Token）：（未配置，请检查配置文件 app.http_api_token）")
 
 
 def deploy_daemon() -> None:
@@ -88,7 +92,7 @@ def deploy_systemd_user_service() -> None:
 
     print(f"已部署并启动 systemd user service：{service_path}")
     print("服务访问地址（host/port 取自配置文件 app.server_host/server_port）：")
-    print_endpoints(config.server_host, config.server_port)
+    print_endpoints(config.server_host, config.server_port, config.http_api_token)
     print("以后直接运行 hachimi 即可进入 CLI。")
 
 
@@ -117,7 +121,7 @@ def deploy_local_script() -> None:
 
     print(f"当前系统未检测到可用 systemd，已生成本地启动脚本：{script_path}")
     print("运行该脚本即可启动后台服务（host/port 取自配置文件）：")
-    print_endpoints(config.server_host, config.server_port)
+    print_endpoints(config.server_host, config.server_port, config.http_api_token)
     print("服务启动后，直接运行 hachimi 即可进入 CLI。")
 
 
