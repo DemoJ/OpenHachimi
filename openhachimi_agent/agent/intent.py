@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 TaskKind = Literal[
@@ -20,7 +20,11 @@ TaskKind = Literal[
 Complexity = Literal["simple", "complex"]
 RiskLevel = Literal["low", "medium", "high"]
 AllowedAutonomy = Literal["narrow", "bounded", "broad"]
-ExecutionMode = Literal["direct", "skill_direct", "planned"]
+# 历史上还有 "skill_direct"，那是 router 选 skill 时的特殊 mode；现在 skill
+# 召回由主模型在 executor 阶段通过 get_skill_instructions 主动决定，不再走
+# router → mode 这条耦合，"skill_direct" 退役。老会话 task_frame_json 里如果
+# 仍带这个值，pydantic extra="ignore" + 自定义 validator 会把它降级到 "direct"。
+ExecutionMode = Literal["direct", "planned"]
 PlanContinuationAction = Literal["continue_active_plan", "resume_suspended_plan", "start_new_task"]
 SelfCritiqueVerdict = Literal["pass", "revise"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>()\"'，。；、]+", re.IGNORECASE)
@@ -47,24 +51,15 @@ def _normalize_optional_str(value: Any) -> str | None:
     return value
 
 
-class SkillMatch(BaseModel):
-    """Router 输出的命中技能 + 置信度。
+def _coerce_legacy_execution_mode(value: Any) -> Any:
+    """老会话/老 router 可能输出 "skill_direct"；新模式下退役该值，统一降到 "direct"。
 
-    放入 ``TaskFrame.relevant_skills`` 时,可同时兼容 ``list[str]`` 与
-    ``list[SkillMatch]`` 两种历史/新格式;参见 ``TaskFrame._coerce_relevant_skills``
-    校验器。
+    放在 ``model_validator(mode="before")`` 之前以字段级 validator 形态调用，让
+    pydantic 不再因为非法字面量直接抛 ValidationError。
     """
-
-    name: str
-    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
-    reason: str = ""
-
-    @field_validator("name", mode="before")
-    @classmethod
-    def _strip_name(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            return value.strip()
-        return value
+    if isinstance(value, str) and value.strip().lower() == "skill_direct":
+        return "direct"
+    return value
 
 
 class PlanContinuationDecision(BaseModel):
@@ -86,6 +81,9 @@ class SelfCritiqueDecision(BaseModel):
 class IntentDecision(BaseModel):
     """Structured router output used by the service layer."""
 
+    # 老会话持久化的 task_frame_json 可能仍含 relevant_skills 等已删字段，忽略以兼容。
+    model_config = ConfigDict(extra="ignore")
+
     task_kind: TaskKind = "unknown"
     complexity: Complexity = "simple"
     risk: RiskLevel = "low"
@@ -95,7 +93,6 @@ class IntentDecision(BaseModel):
     clarifying_question: str | None = None
     target_urls: list[str] = Field(default_factory=list)
     must_preserve_targets: bool = False
-    relevant_skills: list[str] = Field(default_factory=list)
     execution_mode: ExecutionMode = "direct"
     rationale: str = ""
 
@@ -103,6 +100,11 @@ class IntentDecision(BaseModel):
     @classmethod
     def _clean_clarifying_question(cls, value: Any) -> Any:
         return _normalize_optional_str(value)
+
+    @field_validator("execution_mode", mode="before")
+    @classmethod
+    def _normalize_execution_mode(cls, value: Any) -> Any:
+        return _coerce_legacy_execution_mode(value)
 
 
 class TargetEntity(BaseModel):
@@ -117,6 +119,10 @@ class TargetEntity(BaseModel):
 class TaskFrame(BaseModel):
     """The task contract shared by routing, planning and execution."""
 
+    # 老会话持久化的 task_frame_json 里仍可能带 relevant_skills（已删除字段）—— 用
+    # extra="ignore" 让 pydantic 直接丢弃，不抛 ValidationError。
+    model_config = ConfigDict(extra="ignore")
+
     user_request: str = ""
     goal: str = ""
     task_kind: TaskKind = "unknown"
@@ -129,7 +135,6 @@ class TaskFrame(BaseModel):
     target_entities: list[TargetEntity] = Field(default_factory=list)
     invariants: list[str] = Field(default_factory=list)
     allowed_autonomy: AllowedAutonomy = "bounded"
-    relevant_skills: list[SkillMatch] = Field(default_factory=list)
     execution_mode: ExecutionMode = "direct"
     replan_triggers: list[str] = Field(default_factory=list)
     direct_execution_reason: str = ""
@@ -139,36 +144,15 @@ class TaskFrame(BaseModel):
     def target_urls(self) -> list[str]:
         return [entity.value for entity in self.target_entities if entity.type == "url"]
 
-    @property
-    def relevant_skill_names(self) -> list[str]:
-        return [match.name for match in self.relevant_skills if match.name]
-
     @field_validator("clarifying_question", mode="before")
     @classmethod
     def _clean_clarifying_question(cls, value: Any) -> Any:
         return _normalize_optional_str(value)
 
-    @field_validator("relevant_skills", mode="before")
+    @field_validator("execution_mode", mode="before")
     @classmethod
-    def _coerce_relevant_skills(cls, value: Any) -> Any:
-        """兼容 LLM 输出 ``["a", "b"]`` 旧格式;统一归一为 list[SkillMatch]。"""
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            return value
-        coerced: list[Any] = []
-        for item in value:
-            if isinstance(item, str):
-                name = item.strip()
-                if name:
-                    coerced.append({"name": name, "confidence": 0.8})
-            elif isinstance(item, dict):
-                # 字典形态保留为 dict,交由 pydantic 解析为 SkillMatch
-                if item.get("name"):
-                    coerced.append(item)
-            else:
-                coerced.append(item)
-        return coerced
+    def _normalize_execution_mode(cls, value: Any) -> Any:
+        return _coerce_legacy_execution_mode(value)
 
 
 _HIGH_RISK_TERMS = ("删除", "覆盖", "发布", "部署", "reset", "clean", "密钥", "token", "登录")
@@ -220,11 +204,7 @@ def build_task_frame(message: str, decision: IntentDecision | None = None) -> Ta
 
     decision = decision or classify_intent_heuristic(message)
     allowed_autonomy: AllowedAutonomy = "broad" if decision.complexity == "complex" else "bounded"
-    execution_mode = decision.execution_mode
-    if decision.requires_plan:
-        execution_mode = "planned"
-    elif decision.relevant_skills:
-        execution_mode = "skill_direct"
+    execution_mode: ExecutionMode = "planned" if decision.requires_plan else decision.execution_mode
 
     replan_triggers = [
         "A tool result contradicts the task frame goal or invariants.",
@@ -253,9 +233,6 @@ def build_task_frame(message: str, decision: IntentDecision | None = None) -> Ta
         target_entities=_target_entities_from_urls(decision.target_urls),
         invariants=invariants,
         allowed_autonomy=allowed_autonomy,
-        # IntentDecision 仍然是 list[str]（旧路径，例如 heuristic 兜底），让
-        # SkillMatch 校验器把它升级为 SkillMatch；置信度按 0.8 兜底。
-        relevant_skills=[{"name": name, "confidence": 0.8} for name in decision.relevant_skills],
         execution_mode=execution_mode,
         replan_triggers=replan_triggers,
         direct_execution_reason=direct_reason,
@@ -295,7 +272,6 @@ def classify_intent_heuristic(message: str) -> IntentDecision:
         requires_user_confirmation=risk == "high",
         target_urls=target_urls,
         must_preserve_targets=bool(target_urls),
-        relevant_skills=[],
         rationale="heuristic fallback (conservative)",
     )
 
@@ -333,11 +309,14 @@ def coerce_intent_decision(value: object, message: str) -> IntentDecision:
 def coerce_task_frame(value: object, message: str) -> TaskFrame:
     """将 Router 返回结果标准化为 TaskFrame。
 
-    v2: 不仅做结构修复和 target_entities 补充,还强行归一化 user_request、
-    剔除 target_entities 中的重复 primary text、修正 clarifying_question 字面量
-    "None" 字符串。task_kind / complexity / requires_plan 等 LLM 判断保留不动。
+    v3: skill 召回退出 TaskFrame 后,这里只做：
+    - 兜底 user_request 来自原始消息；
+    - 去重 target_entities 里和原句重复的 primary text；
+    - 补 LLM 漏掉的显式 URL target_entities；
+    - 检测 skill install/update 请求并加 invariants；
+    - 同步 execution_mode 与 requires_plan。
 
-    此函数是 TaskFrame 的最后一层防御(防御层结构见修复 2+7)。
+    此函数是 TaskFrame 的最后一层防御。
     """
 
     if isinstance(value, TaskFrame):
@@ -350,7 +329,7 @@ def coerce_task_frame(value: object, message: str) -> TaskFrame:
         except Exception:
             frame = build_task_frame(message, coerce_intent_decision(value, message))
 
-    # 1) user_request 兜底:以原始消息为唯一真值(修复 [问题2] —— LLM 可能留空)
+    # 1) user_request 兜底:以原始消息为唯一真值(防 LLM 留空)
     if not (frame.user_request and frame.user_request.strip()):
         frame.user_request = message
 
@@ -362,7 +341,7 @@ def coerce_task_frame(value: object, message: str) -> TaskFrame:
         if not (e.role == "primary" and e.type == "text" and e.value.strip() == msg_norm)
     ]
 
-    # 3) 仅补充 LLM 可能遗漏的显式 URL target_entities(原有逻辑保留)
+    # 3) 仅补充 LLM 可能遗漏的显式 URL target_entities
     detected_urls = extract_urls(message)
     if detected_urls:
         existing_urls = set(frame.target_urls)
@@ -370,15 +349,12 @@ def coerce_task_frame(value: object, message: str) -> TaskFrame:
             if entity.value not in existing_urls:
                 frame.target_entities.append(entity)
 
-    # 4) skill install/update 相关不变(已有)
+    # 4) skill install/update invariants
     if _is_skill_install_or_update_request(message, detected_urls) and not any("install_skill" in invariant for invariant in frame.invariants):
         frame.invariants.append(_skill_install_update_invariant(detected_urls))
 
-    # 5) execution_mode 覆盖(已有)
+    # 5) execution_mode 与 requires_plan 对齐
     if frame.requires_plan:
         frame.execution_mode = "planned"
-    elif frame.relevant_skills and frame.execution_mode == "direct":
-        frame.execution_mode = "skill_direct"
 
     return frame
-

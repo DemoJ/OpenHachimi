@@ -53,6 +53,91 @@ def test_find_skills_returns_copy_of_cached_list(tmp_path):
             _SKILLS_CACHE.clear()
 
 
+def test_find_skills_dedupes_same_name_across_dirs_first_wins(tmp_path):
+    """两个 skills_dirs 里出现同名 skill 时,只保留第一个目录的版本(first wins)。
+
+    场景:用户把 ``user/skills`` 和 ``external_skills_dir`` 都装了同名 skill。
+    旧版会把两条都返回,导致 system prompt 里技能索引出现重复行;新版按
+    ``config.name`` 去重,保留前者。
+    """
+    primary_dir = tmp_path / "primary"
+    external_dir = tmp_path / "external"
+
+    primary_skill = _write_skill(
+        primary_dir / "demo-skill",
+        "name: demo-skill\ndescription: Primary copy",
+        "primary body",
+    )
+    _write_skill(
+        external_dir / "demo-skill",
+        "name: demo-skill\ndescription: External copy",
+        "external body",
+    )
+
+    try:
+        result = find_skills([primary_dir, external_dir])
+        assert [s.config.name for s in result] == ["demo-skill"]
+        # 保留的是 primary_dir 的版本(first wins),不是外部目录的
+        assert result[0].path == primary_skill.path
+        assert result[0].config.description == "Primary copy"
+        assert "primary body" in result[0].body
+    finally:
+        with _SKILLS_CACHE_LOCK:
+            _SKILLS_CACHE.clear()
+
+
+def test_find_skills_keeps_different_names_across_dirs(tmp_path):
+    """两个目录都有 skill 但名字不同时,两个都应保留。"""
+    primary_dir = tmp_path / "primary"
+    external_dir = tmp_path / "external"
+
+    _write_skill(
+        primary_dir / "skill-a",
+        "name: skill-a\ndescription: A",
+        "a",
+    )
+    _write_skill(
+        external_dir / "skill-b",
+        "name: skill-b\ndescription: B",
+        "b",
+    )
+
+    try:
+        result = find_skills([primary_dir, external_dir])
+        names = sorted(s.config.name for s in result)
+        assert names == ["skill-a", "skill-b"]
+    finally:
+        with _SKILLS_CACHE_LOCK:
+            _SKILLS_CACHE.clear()
+
+
+def test_find_skills_dedupes_within_single_dir(tmp_path):
+    """同一目录下两个不同子文件夹用了同一个 frontmatter name —— 也应去重。
+
+    实务场景:用户从 zip 解压 skill 时不小心解出两份,或者手动复制后忘了改 name。
+    保留 ``os.walk`` 先返回的那条(平台行为通常是字母序)。
+    """
+    skills_dir = tmp_path / "skills"
+    _write_skill(
+        skills_dir / "aaa-copy",
+        "name: shared-skill\ndescription: First copy",
+        "first body",
+    )
+    _write_skill(
+        skills_dir / "zzz-copy",
+        "name: shared-skill\ndescription: Second copy",
+        "second body",
+    )
+
+    try:
+        result = find_skills([skills_dir])
+        assert len(result) == 1
+        assert result[0].config.name == "shared-skill"
+    finally:
+        with _SKILLS_CACHE_LOCK:
+            _SKILLS_CACHE.clear()
+
+
 def test_get_skill_instructions_includes_skill_path_metadata(tmp_path):
     skills_dir = tmp_path / "external_skills"
     skill = _write_skill(
@@ -119,9 +204,12 @@ def test_build_skill_tool_replaces_arguments_and_includes_skill_root(tmp_path):
     assert "拼接成绝对路径" in result
 
 
-def test_build_skill_tool_dedups_when_skill_already_in_system_prompt(tmp_path):
-    """如果同名 skill 已被被动注入到 system prompt,宏工具只返回参数化 body,
-    不再重复 wrap 完整定义(避免和被动注入重叠浪费上下文)。"""
+def test_build_skill_tool_always_returns_full_wrapper(tmp_path):
+    """渐进披露后,被动注入路径已废除。无论 session_state 状态如何,带 arguments
+    的宏工具被调用时,总是返回参数化 body + 完整 wrapper(name / path / 执行 intro)。
+
+    这条用例兜底:防止有人误以为还要靠 ``injected_skill_names`` 做去重而再加回那段
+    分支逻辑。"""
     skill = _write_skill(
         tmp_path / "skills" / "argument-skill",
         "name: argument-skill\ndescription: Argument skill\narguments:\n  - target",
@@ -130,6 +218,7 @@ def test_build_skill_tool_dedups_when_skill_already_in_system_prompt(tmp_path):
     tool_func = build_skill_tool(skill)
     args_model = tool_func.__annotations__["args"]
 
+    # 即便 session_state 假装"已经注入过同名 skill",新行为下也应返回完整 wrapper
     deps = SimpleNamespace(session_state={"injected_skill_names": ["argument-skill"]})
     ctx = SimpleNamespace(deps=deps)
 
@@ -138,11 +227,10 @@ def test_build_skill_tool_dedups_when_skill_already_in_system_prompt(tmp_path):
     # 参数已被填充
     assert "references/guide.md" in result
     assert "{{target}}" not in result
-    # 但 wrapper 头尾、execution_intro、path note 全部被省略(避免重复)
-    assert "【Skill Execution:" not in result
-    assert "[Skill Metadata]" not in result
-    assert "拼接成绝对路径" not in result
-    assert "skill_root" not in result
+    # wrapper 完整存在
+    assert "【Skill Execution:" in result
+    assert "[Skill Metadata]" in result
+    assert "skill_root" in result
 
 
 def test_download_url_uses_explicit_timeout(tmp_path, monkeypatch):

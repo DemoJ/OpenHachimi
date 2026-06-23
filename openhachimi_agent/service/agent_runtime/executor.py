@@ -15,10 +15,9 @@ from pydantic_ai.messages import UserContent
 from pydantic_ai.usage import UsageLimits
 
 from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
-from openhachimi_agent.agent.factory import build_executor_agent, build_scheduled_executor_agent
+from openhachimi_agent.agent.factory import build_scheduled_executor_agent
 from openhachimi_agent.agent.intent import SelfCritiqueDecision
 from openhachimi_agent.content.prompts import render_system_prompt
-from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext, has_active_todos
@@ -360,44 +359,18 @@ def _get_task_frame_payload(session_state: dict[str, Any]) -> dict[str, Any] | N
 
 
 def _build_executor_agent(config: AppConfig, role: str, task_frame_payload: dict[str, Any] | None, get_agent: Callable[[str, str], Any], run_mode: str = "interactive"):
-    scheduled_mode = run_mode == "scheduled"
-    executor_agent = build_scheduled_executor_agent(config, role) if scheduled_mode else get_agent(role, "executor")
-    if not task_frame_payload:
-        return executor_agent
+    """选 executor agent 实例。
 
-    raw_skills = task_frame_payload.get("relevant_skills", [])
-    if not raw_skills:
-        return executor_agent
-
-    # relevant_skills 在 model_dump(mode="json") 后是 list[dict]（新 SkillMatch
-    # 结构），兼容历史 list[str] 路径以防早期持久化的 task_frame。
-    skill_names: set[str] = set()
-    for item in raw_skills:
-        if isinstance(item, str):
-            name = item.strip()
-        elif isinstance(item, dict):
-            name = str(item.get("name", "")).strip()
-        else:
-            name = str(getattr(item, "name", "") or "").strip()
-        if name:
-            skill_names.add(name)
-    if not skill_names:
-        return executor_agent
-
-    skills = find_skills(config.skills_dirs)
-    allowed_tools_set: set[str] = set()
-    is_restricted = False
-    for skill in skills:
-        if skill.config.name in skill_names and skill.config.allowed_tools:
-            is_restricted = True
-            allowed_tools_set.update(skill.config.allowed_tools)
-
-    if is_restricted:
-        logger.info("sandboxing executor agent for role=%s run_mode=%s restricted_tools=%s", role, run_mode, allowed_tools_set)
-        if scheduled_mode:
-            return build_scheduled_executor_agent(config, role, allowed_tools=allowed_tools_set)
-        return build_executor_agent(config, role, allowed_tools=allowed_tools_set)
-    return executor_agent
+    渐进披露改造后,我们不再根据 ``task_frame.relevant_skills[*].allowed_tools``
+    在轮内动态重建受限 executor —— skill 召回已经下放给主模型自己,通过
+    ``get_skill_instructions`` 按需读全文,SKILL.md 里的 ``allowed-tools`` 字段
+    不再作为 router 派生的硬性工具沙箱。``task_frame_payload`` 参数保留以兼容
+    调用方签名,但不再被消费。
+    """
+    del task_frame_payload  # 渐进披露后不再用 relevant_skills 派生工具沙箱
+    if run_mode == "scheduled":
+        return build_scheduled_executor_agent(config, role)
+    return get_agent(role, "executor")
 
 
 async def run_executor_once(

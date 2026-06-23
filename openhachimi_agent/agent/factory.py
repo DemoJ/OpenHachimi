@@ -220,10 +220,11 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             logger.exception("runtime dynamic block failed")
             return ""
 
-    # executor agent 额外的按需块(TODO 接力 / direct-mode / skill_direct):
-    # 把过去恒定写在 executor.md 里的几大段策略,按 session 状态按需注入,让简单
-    # direct 任务的 system prompt 真正变短。planner / scheduled_executor 各自的
-    # 角色文档已经明确职责,这套块不在它们身上注册。
+    # executor agent 额外的按需块(TODO 接力 / direct-mode / 技能索引):
+    # 把过去恒定写在 executor.md 里的几大段策略按 session 状态按需注入,并永远
+    # 附上一份"技能索引"(name + 一句话用途,按 category 分组),让主模型自主
+    # 决定要不要调 get_skill_instructions 拉某个 skill 的全文。planner /
+    # scheduled_executor 各自的角色文档已经明确职责,这套块不在它们身上注册。
     if agent_type == "executor":
         @agent.system_prompt
         def _executor_extra_block(ctx: RunContext[AgentDeps]) -> str:
@@ -262,19 +263,14 @@ def _build_router_model(config: AppConfig) -> OpenAIChatModel:
 
 
 def build_router_agent(config: AppConfig) -> Agent:
-    """创建用于路由决策的轻量级 Agent。"""
+    """创建用于路由决策的轻量级 Agent。
+
+    渐进披露改造后 router 不再做 skill 召回 —— skill 选择已下放给主模型在 executor
+    阶段通过 ``get_skill_instructions`` 自助决定。router 只负责产出 task_kind /
+    complexity / risk / requires_plan / execution_mode 等 TaskFrame 元字段。
+    """
     model = _build_router_model(config)
-
-    skills = find_skills(config.skills_dirs)
-    skills_info = "当前可用技能列表（技能名: 描述）：\n"
-    if skills:
-        for skill in skills:
-            skills_info += f"- **{skill.config.name}**: {skill.config.description} (触发时机: {skill.config.when_to_use})\n"
-    else:
-        skills_info += "无\n"
-
-    system_prompt = render_system_prompt("agents/router", {"skills_info": skills_info})
-    
+    system_prompt = load_system_prompt("agents/router")
     return Agent(
         model,
         system_prompt=system_prompt,

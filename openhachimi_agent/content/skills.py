@@ -30,6 +30,9 @@ class SkillConfig(BaseModel):
     when_to_use: Optional[str] = None
     arguments: Optional[list[str]] = None
     context: Optional[str] = None
+    # 可选分组标签,只用于在 system_prompts/runtime/skills_index 索引里按类目展示。
+    # 未声明时归到 "general" 桶,完全向后兼容旧 SKILL.md。
+    category: Optional[str] = None
 
 
 @dataclass
@@ -79,8 +82,42 @@ _SKILLS_CACHE: dict[str, tuple[float, list[Skill]]] = {}
 _SKILLS_CACHE_LOCK = RLock()
 
 
+def _dedupe_skills_first_wins(parsed: list[Skill]) -> list[Skill]:
+    """按 ``config.name`` 去重,保留先扫到的那条(first wins)。
+
+    背景:``skills_dirs`` 通常是 ``[user/skills, external_skills_dir]`` 这样的
+    多目录列表。如果两个目录里出现同名 SKILL.md,旧实现会把两条都返回,导致
+    ``runtime/skills_index`` 索引重复出现同一行,且 ``get_skill_instructions``
+    返回的是第一条 —— 行为已经"first wins",但索引和工具结果不一致。
+
+    现在把去重前置到 ``find_skills`` 层,语义统一:
+    - 先扫到的赢(``skills_dirs`` 的次序决定优先级 —— 项目内 ``user/skills``
+      在外部目录之前,所以项目自带的 skill 永远不会被外部目录的同名 skill 遮蔽)。
+    - 被遮蔽者打一条 ``info`` 日志,方便用户排查"为什么改了外部目录没生效"。
+    """
+    seen: dict[str, Skill] = {}
+    for skill in parsed:
+        name = skill.config.name
+        if name in seen:
+            kept_path = seen[name].path
+            logger.info(
+                "skill name conflict: %r at %s shadowed by earlier %s (first-wins)",
+                name,
+                skill.path,
+                kept_path,
+            )
+            continue
+        seen[name] = skill
+    return list(seen.values())
+
+
 def find_skills(skills_dirs: list[Path]) -> list[Skill]:
-    """Scans provided directories for SKILL.md files and parses them with caching."""
+    """Scans provided directories for SKILL.md files and parses them with caching.
+
+    Skills are returned **deduplicated by ``config.name``** with a first-wins
+    policy across ``skills_dirs`` — earlier directories take precedence over
+    later ones for collisions. See ``_dedupe_skills_first_wins`` for details.
+    """
     cache_key = ":".join(str(p.resolve()) for p in skills_dirs)
 
     current_mtime = 0.0
@@ -107,11 +144,13 @@ def find_skills(skills_dirs: list[Path]) -> list[Skill]:
             if current_mtime > 0 and cached_mtime >= current_mtime:
                 return list(cached_skills)
 
-    skills = []
+    parsed: list[Skill] = []
     for skill_path in skill_paths:
         skill = parse_skill(skill_path)
         if skill:
-            skills.append(skill)
+            parsed.append(skill)
+
+    skills = _dedupe_skills_first_wins(parsed)
 
     with _SKILLS_CACHE_LOCK:
         _SKILLS_CACHE[cache_key] = (current_mtime, list(skills))

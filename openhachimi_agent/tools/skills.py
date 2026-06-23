@@ -511,12 +511,10 @@ def build_skill_tool(skill: Skill) -> Callable:
     调用入参替换成具体值,返回填好的版本——模型用结构化工具调用比让它自己在
     文本里 parse 占位符可靠得多。
 
-    与被动注入(把整段 SKILL.md 塞进 system prompt)的**去重设计**:
-    - 如果 skill 已经在本轮 ``session_state['injected_skill_names']`` 里(即被动
-      注入命中了),宏工具只返回"参数化后的 body 片段",不再 wrap 一份完整的
-      ``format_skill_prompt`` (元信息、路径说明全部省略,因为 system prompt 里
-      已经有同名 skill 的完整描述,模型读那一份即可)。
-    - 否则按完整路径返回(模型才是第一次看到这个 skill)。
+    渐进披露改造后,SKILL.md 全文不再被动注入到 system prompt,所以也就没有
+    "skill 已经在 prompt 里了,工具结果别重复 wrap"这条去重路径了 —— 宏工具
+    无论何时被调用,都返回参数填充后的完整 wrapper(name / path / 执行 intro
+    + body)。
     """
     arg_fields = {arg: (str, ...) for arg in skill.config.arguments or []}
     ArgsModel = create_model(f"{skill.config.name.replace('-', '_').capitalize()}Args", **arg_fields)
@@ -527,22 +525,6 @@ def build_skill_tool(skill: Skill) -> Callable:
             val = getattr(args, arg)
             body = body.replace(f"{{{{{arg}}}}}", str(val))
 
-        # 检查本轮是否已被动注入过同名 skill;若是,只返回参数化后的 body 片段。
-        deps = getattr(ctx, "deps", None)
-        session_state = getattr(deps, "session_state", None) or {}
-        injected: set[str] = set()
-        if isinstance(session_state, dict):
-            raw = session_state.get("injected_skill_names")
-            if isinstance(raw, (set, list, tuple)):
-                injected = {str(name) for name in raw}
-
-        if skill.config.name in injected:
-            # 去重路径:body 已经在 system prompt 里(或其摘要),只把"参数填充
-            # 后的完整 body"返回,模型可以直接拿这份去执行。不再额外包 wrapper、
-            # path note、execution_intro 等(它们在 system prompt 已经声明过了)。
-            return body
-
-        # 未被动注入路径:正常 wrap 一份完整定义返回。
         execution_intro = render_system_prompt("tools/skill_execution_intro", {"skill_name": skill.config.name})
         return format_skill_prompt(skill, body, execution_intro=execution_intro)
 

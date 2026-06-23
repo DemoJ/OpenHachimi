@@ -89,7 +89,9 @@ def test_unparseable_router_output_does_not_force_plan_for_low_risk_task():
     assert decision.execution_mode == "direct"
 
 
-def test_relevant_skill_sets_skill_direct_execution_mode():
+def test_relevant_skills_field_is_dropped_from_legacy_payload():
+    """老会话 task_frame_json 可能仍含 relevant_skills 等已删字段;``extra="ignore"``
+    必须保证反序列化不抛 ValidationError,且新模型实例上没有这个属性。"""
     frame = coerce_task_frame(
         {
             "user_request": "用 demo skill 处理",
@@ -99,6 +101,7 @@ def test_relevant_skill_sets_skill_direct_execution_mode():
             "risk": "low",
             "confidence": 0.8,
             "requires_plan": False,
+            # 已删除的旧字段,extra="ignore" 兜底
             "relevant_skills": ["demo"],
             "target_entities": [],
             "invariants": [],
@@ -106,7 +109,31 @@ def test_relevant_skill_sets_skill_direct_execution_mode():
         "用 demo skill 处理",
     )
 
-    assert frame.execution_mode == "skill_direct"
+    # 字段已彻底删除
+    assert not hasattr(frame, "relevant_skills")
+    # 执行模式不再被 relevant_skills 影响,稳定保持 direct
+    assert frame.execution_mode == "direct"
+
+
+def test_legacy_skill_direct_execution_mode_downgraded_to_direct():
+    """老 router 输出过 execution_mode='skill_direct';现在该值已退役,会被规范回 direct。"""
+    frame = coerce_task_frame(
+        {
+            "user_request": "demo",
+            "goal": "demo",
+            "task_kind": "qa",
+            "complexity": "simple",
+            "risk": "low",
+            "confidence": 0.8,
+            "requires_plan": False,
+            "execution_mode": "skill_direct",
+            "target_entities": [],
+            "invariants": [],
+        },
+        "demo",
+    )
+
+    assert frame.execution_mode == "direct"
 
 
 def test_build_task_frame_no_url_special_handling():
