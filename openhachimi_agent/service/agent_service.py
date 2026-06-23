@@ -68,6 +68,13 @@ class AgentService:
         self._session_states: BoundedDict[str, dict] = BoundedDict(100)
         self._artifact_records: BoundedDict[str, ArtifactRef] = BoundedDict(500)
         self._context_compressors: BoundedDict[str, Any] = BoundedDict(100)
+        # 进程内静态 system prompt 池:hash -> 文本。turn.py 写入,_extract_text_parts 读取。
+        # 大小上限 200 已足够覆盖 (角色数 * 工具集变种 + 滞留),命中失败时按需回填。
+        self._context_static_pool: BoundedDict[str, str] = BoundedDict(200)
+        # 工具目录摘要按 role 缓存:key=f"{role}:executor",value=(text, signature)。
+        # signature 由 mcp_config_signature 和 agent_dependency_mtime_cache 组成,二者
+        # 均在内部状态发生变化时由相关路径主动更新。
+        self._tool_catalog_cache: dict[str, tuple[str, tuple[Any, Any]]] = {}
         logger.info(
             "service initialized model=%s",
             self.config.model_name,
@@ -113,6 +120,7 @@ class AgentService:
             self._mcp_config_signature = result.new_signature
             self._mcp_errors = result.errors
             self._agents.clear()
+            self._tool_catalog_cache.clear()
             await old_stack.aclose()
             logger.info(
                 "MCP toolsets reloaded connected=%d errors=%d",
@@ -229,36 +237,52 @@ class AgentService:
     # WebUI 展示历史会话时需要的 metadata 键名。
     #
     # ``openhachimi_user_message``  —— 用户原始输入（turn.py 持久化时写入）。
-    # ``openhachimi_system_context`` —— 本轮 system prompt 动态段快照，即模型
-    #     在同一轮里看到的"运行时上下文"（时间 / TaskFrame / 记忆召回 / 命中技能）。
+    # ``openhachimi_ctx_dynamic``   —— 本轮 system prompt 末尾的动态段
+    #     (时间/TaskFrame/记忆/技能),由 turn.py 持久化时写入。
+    # ``openhachimi_ctx_static_hash`` —— 稳定段(base/executor/role/config/tools)
+    #     的短哈希;完整文本经 _resolve_static_context 在内存池中查表回填。
+    # ``openhachimi_system_context``  —— 旧版本(v2)的整段快照,读取时作为兜底。
     _USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
-    _SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"
+    _CTX_DYNAMIC_METADATA_KEY = "openhachimi_ctx_dynamic"
+    _CTX_STATIC_HASH_METADATA_KEY = "openhachimi_ctx_static_hash"
+    _SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"  # legacy
 
     def _extract_text_parts(
-        self, messages: list[ModelMessage],
+        self, messages: list[ModelMessage], role: str | None = None,
     ) -> list[dict]:
-        """将 ``pydantic_ai.messages.ModelMessage`` 列表转为简单的 ``{role, content, prefix}`` 结构。
+        """将 ``pydantic_ai.messages.ModelMessage`` 列表转为简单的 ``{role, content, prefix, timestamp, tokens}`` 结构。
 
         遍历 ``ModelRequest``（用户消息）中的 ``UserPromptPart``，
         以及 ``ModelResponse``（Agent 回复）中的 ``TextPart``，
         忽略工具调用、工具返回等中间环节。
 
-        user 消息额外返回 ``prefix`` 字段（运行时注入的可折叠上下文）：
-          * 优先取 ``metadata["openhachimi_system_context"]`` 作为 prefix（v2 新增）；
-          * 回退到旧逻辑：从 UserPromptPart 全文里去掉 ``openhachimi_user_message``
-            找注入前缀；
-          * 两者都没有时 prefix 为空，不折叠，完整显示。
+        user 消息额外返回 ``prefix`` 字段（运行时注入的可折叠上下文）。读取优先级：
+          1. v3:同时读 ``openhachimi_ctx_dynamic`` + ``openhachimi_ctx_static_hash``,
+             由 ``_resolve_static_context(role, hash)`` 查池/重建静态段;
+             prefix = dynamic + "\\n\\n" + static。
+          2. v2 兜底:``openhachimi_system_context`` 整段(老会话历史)。
+          3. v1 兜底:从 UserPromptPart 全文中拆出 ``openhachimi_user_message`` 之前的前缀。
+          4. 兜底:prefix = ""。
+
+        每条消息都会带上 ISO-8601 ``timestamp``：user 取 ``ModelRequest.timestamp``，
+        assistant 取 ``ModelResponse.timestamp``，找不到时为 None。
+        assistant 消息额外返回 ``tokens={"input", "output", "total", "cache_read"}``
+        (来自 ``ModelResponse.usage``);旧会话 / 缺失 usage 时为 None。
         """
         from pydantic_ai.messages import TextPart, UserPromptPart
 
         result: list[dict] = []
         for msg in messages:
+            msg_ts = getattr(msg, "timestamp", None)
+            ts_iso = msg_ts.isoformat() if msg_ts is not None else None
             if isinstance(msg, ModelRequest):
                 metadata = getattr(msg, "metadata", None) or {}
                 if not isinstance(metadata, dict):
                     metadata = {}
                 user_message_meta = metadata.get(self._USER_MESSAGE_METADATA_KEY)
-                system_context_meta = metadata.get(self._SYSTEM_CONTEXT_METADATA_KEY)
+                dynamic_meta = metadata.get(self._CTX_DYNAMIC_METADATA_KEY)
+                static_hash_meta = metadata.get(self._CTX_STATIC_HASH_METADATA_KEY)
+                legacy_system_context_meta = metadata.get(self._SYSTEM_CONTEXT_METADATA_KEY)
 
                 for part in getattr(msg, "parts", ()):
                     if isinstance(part, UserPromptPart):
@@ -271,14 +295,40 @@ class AgentService:
                         if not text.strip():
                             continue
 
-                        # ---- v2 路径：metadata 里有 system 动态块快照，直接用 ----
-                        if isinstance(system_context_meta, str) and system_context_meta.strip():
-                            prefix = system_context_meta.strip()
+                        # 优先采用 UserPromptPart 自带 timestamp（更接近"用户实际发送时刻"）
+                        part_ts = getattr(part, "timestamp", None)
+                        item_ts = part_ts.isoformat() if part_ts is not None else ts_iso
+
+                        # ---- v3 路径：分段 metadata + 静态池回填 ----
+                        prefix_v3 = ""
+                        if isinstance(dynamic_meta, str) and dynamic_meta.strip():
+                            prefix_v3 = dynamic_meta.strip()
+                        if isinstance(static_hash_meta, str) and static_hash_meta:
+                            static_text = self._resolve_static_context(role, static_hash_meta)
+                            if static_text:
+                                prefix_v3 = f"{prefix_v3}\n\n{static_text}" if prefix_v3 else static_text
+                        if prefix_v3:
                             if isinstance(user_message_meta, str) and user_message_meta:
                                 content = user_message_meta
                             else:
                                 content = text.strip()
-                            result.append({"role": "user", "content": content, "prefix": prefix})
+                            result.append({
+                                "role": "user", "content": content, "prefix": prefix_v3,
+                                "timestamp": item_ts, "tokens": None,
+                            })
+                            break
+
+                        # ---- v2 路径：旧整段快照(老会话) ----
+                        if isinstance(legacy_system_context_meta, str) and legacy_system_context_meta.strip():
+                            prefix = legacy_system_context_meta.strip()
+                            if isinstance(user_message_meta, str) and user_message_meta:
+                                content = user_message_meta
+                            else:
+                                content = text.strip()
+                            result.append({
+                                "role": "user", "content": content, "prefix": prefix,
+                                "timestamp": item_ts, "tokens": None,
+                            })
                             break
 
                         # ---- 旧路径：有 user_message 但无 system_context 快照 ----
@@ -296,18 +346,50 @@ class AgentService:
                                     stripped[:120],
                                 )
                                 prefix = ""
-                            result.append({"role": "user", "content": user_msg, "prefix": prefix})
+                            result.append({
+                                "role": "user", "content": user_msg, "prefix": prefix,
+                                "timestamp": item_ts, "tokens": None,
+                            })
                             break
 
                         # ---- 兜底：旧会话无 metadata，整段显示 ----
-                        result.append({"role": "user", "content": text.strip(), "prefix": ""})
+                        result.append({
+                            "role": "user", "content": text.strip(), "prefix": "",
+                            "timestamp": item_ts, "tokens": None,
+                        })
                         break
             elif isinstance(msg, ModelResponse):
+                # 把 ModelResponse.usage 抽成 {input, output, total, cache_read}。
+                # pydantic_ai 的 RequestUsage 字段为 input_tokens / output_tokens /
+                # cache_read_tokens / cache_write_tokens 等。展示层关心:
+                # - input/output:本轮净读写
+                # - total:输入+输出(不含 cache 复算)
+                # - cache_read:缓存命中(KV cache hit),反映省钱/提速能力
+                # cache_write 不展示(噪声大,模型缓存调度对用户透明)。
+                usage = getattr(msg, "usage", None)
+                tokens_dict: dict[str, int] | None = None
+                if usage is not None:
+                    try:
+                        input_t = int(getattr(usage, "input_tokens", 0) or 0)
+                        output_t = int(getattr(usage, "output_tokens", 0) or 0)
+                        cache_read_t = int(getattr(usage, "cache_read_tokens", 0) or 0)
+                        if input_t or output_t:
+                            tokens_dict = {
+                                "input": input_t,
+                                "output": output_t,
+                                "total": input_t + output_t,
+                                "cache_read": cache_read_t,
+                            }
+                    except (TypeError, ValueError):
+                        tokens_dict = None
                 for part in getattr(msg, "parts", ()):
                     if isinstance(part, TextPart):
                         text = str(part.content).strip()
                         if text:
-                            result.append({"role": "assistant", "content": text, "prefix": ""})
+                            result.append({
+                                "role": "assistant", "content": text, "prefix": "",
+                                "timestamp": ts_iso, "tokens": tokens_dict,
+                            })
         return result
 
     def list_sessions(self, role_name: str | None = None, *, with_preview: bool = True) -> dict:
@@ -341,7 +423,7 @@ class AgentService:
                 except Exception:
                     msgs = []
                 msg_count = len(msgs)
-                parts = self._extract_text_parts(msgs)
+                parts = self._extract_text_parts(msgs, role=role)
                 user_msgs = [p["content"] for p in parts if p["role"] == "user"]
                 if user_msgs:
                     preview = user_msgs[0][:80]
@@ -383,7 +465,7 @@ class AgentService:
             raise ValueError("session_id 不能为空")
 
         _, msgs = load_message_history(self.config.memory_dir, role, resolved_session_id)
-        parts = self._extract_text_parts(msgs)
+        parts = self._extract_text_parts(msgs, role=role)
 
         from openhachimi_agent.transport.api_models import MessageItem
 
@@ -624,6 +706,65 @@ class AgentService:
         )
         self._context_compressors[session_id] = compressor
         return compressor
+
+    # ------------------------------------------------------------------ 工具目录缓存
+
+    def _get_cached_tool_catalog(self, role: str, executor_agent: object) -> str:
+        """按 role + 当前签名返回缓存的工具目录摘要,未命中或过期则重建。
+
+        ``turn.py`` 在 ``_build_executor_static_context`` 中调用此方法获取
+        工具清单,不再每轮遍历所有 toolset。
+        """
+        key = f"{role}:executor"
+        sig = (self._mcp_config_signature, self._agent_dependency_mtime_cache)
+        cached = self._tool_catalog_cache.get(key)
+        if cached is not None and cached[1] == sig:
+            return cached[0]
+        try:
+            from openhachimi_agent.service.agent_runtime.turn import _extract_tool_catalog
+
+            text = _extract_tool_catalog(executor_agent)
+        except Exception:
+            logger.debug("tool catalog extraction failed for role=%s", role, exc_info=True)
+            text = ""
+        self._tool_catalog_cache[key] = (text, sig)
+        return text
+
+    # ------------------------------------------------------------------ 上下文静态池
+
+    def _ensure_context_static(self, hash_key: str, text: str) -> None:
+        """将静态 system prompt 段写入进程内池(de facto 去重)。"""
+        if hash_key and text and not self._context_static_pool.get(hash_key):
+            self._context_static_pool[hash_key] = text
+
+    def _resolve_static_context(self, role: str | None, hash_key: str) -> str:
+        """从进程内池按 hash 取出静态段;池中不存在时尝试按 role 重建当前版本。
+
+        重建仅在 hash 与当前版本一致时写入池(避免攒入旧 hash),不一致时静默降级。
+        """
+        if not hash_key:
+            return ""
+        text = self._context_static_pool.get(hash_key)
+        if text is not None:
+            return text
+        # 池中不存在:尝试重建当前版本的静态段,若哈希相同则写入池
+        if role:
+            try:
+                executor_agent = self._get_agent(role, "executor")
+            except Exception:
+                return ""
+            try:
+                from openhachimi_agent.service.agent_runtime.turn import _build_executor_static_context, _compute_static_hash
+
+                rebuilt = _build_executor_static_context(self.config, role, executor_agent, service=self)
+                rebuilt_hash = _compute_static_hash(rebuilt)
+                if rebuilt_hash == hash_key:
+                    self._context_static_pool[hash_key] = rebuilt
+                    return rebuilt
+                # 哈希不匹配 → 配置或依赖已变,旧 hash 的静态段已无意义,不写入
+            except Exception:
+                logger.debug("failed to rebuild static context for hash=%s role=%s", hash_key, role, exc_info=True)
+        return ""
 
     # ------------------------------------------------------------------ Agent 构建与工件
 

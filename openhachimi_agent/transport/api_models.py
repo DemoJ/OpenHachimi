@@ -218,7 +218,10 @@ class MessageItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str                          # 用户实际输入（user）或 Agent 回复（assistant）
     prefix: str = ""                      # 仅 user 消息：运行时注入的上下文前缀（时间/记忆/技能等），可折叠显示
-    timestamp: str | None = None
+    timestamp: str | None = None          # ISO-8601；user 取 ModelRequest.timestamp，assistant 取 ModelResponse.timestamp
+    # 仅 assistant：本轮请求的 token 用量。pydantic_ai 的 ModelResponse.usage 提供，
+    # 旧会话或缺失 usage 时为 None。键固定为 ``input`` / ``output`` / ``total``。
+    tokens: dict[str, int] | None = None
 
 
 class SessionMessagesResponse(BaseModel):

@@ -65,44 +65,147 @@ def _error_message(exc: BaseException) -> str:
 # 1) 旧会话回放：旧版 UserPromptPart 里拼了 volatile 前缀，仅靠分隔符无法可靠反向
 #    拆出原话，metadata 是稳妥的真值。
 # 2) 兜底安全：万一未来又有路径往 user-prompt 塞了额外文本，metadata 仍能正确还原。
-# 同时 stamp 一份"模型可见的完整 system 级上下文"快照,供 WebUI 在消息气泡的
-# "展开运行时上下文"折叠区展示。
+# 同时 stamp 两段"模型可见的 system 级上下文"快照,供 WebUI 在消息气泡的"运行时
+# 上下文"折叠区展示。
+#
+# v3 改造（拆分静态/动态）：
+# - 旧设计把整段 system prompt 文本（base.md + executor.md + role.md + config.md
+#   + 工具清单 + 时间 + TaskFrame + 记忆 + 技能）原样塞进 metadata.openhachimi_system_context，
+#   每条消息 5-15 KB,跨百轮膨胀到几 MB,且其中绝大多数是逐字相同的稳定段。
+# - 新设计拆成两段持久化:
+#     ``openhachimi_ctx_dynamic`` —— 每轮变的(时间/TaskFrame/记忆/命中技能),
+#         由 build_system_dynamic_block(deps) 渲染,几百字到几 KB。
+#     ``openhachimi_ctx_static_hash`` —— 稳定段(base/executor/role/config/tools)
+#         的 SHA256[:16] 短哈希。完整文本写入 service 进程内 BoundedDict 池,
+#         消息历史里只留 16 字符哈希。
+#   读取时由 AgentService._resolve_static_context(role, hash) 从池中取出;池为空
+#   时按 role 重建当前静态文本,哈希一致即回填池,不一致时降级只显示 dynamic。
+# - 旧 key ``openhachimi_system_context`` 仍被读取作为旧会话回退;新路径不再写入。
 _USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
-_SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"
+_SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"  # legacy, read-only
+_CTX_DYNAMIC_METADATA_KEY = "openhachimi_ctx_dynamic"
+_CTX_STATIC_HASH_METADATA_KEY = "openhachimi_ctx_static_hash"
 
 
-def _extract_system_prompt_text(messages: list) -> str:
-    """从一组 ModelMessage 里聚合首个 ModelRequest 的所有 SystemPromptPart。
+def _stamp_turn_metadata(
+    new_history: list,
+    prev_len: int,
+    user_message: str,
+    dynamic_context: str,
+    static_hash: str,
+) -> None:
+    """给本轮新增的、首个含 ``UserPromptPart`` 的 ``ModelRequest`` 打 metadata：
 
-    pydantic-ai 把 ``Agent(system_prompt=...)``、``Agent(instructions=...)`` 以及
-    所有 ``@agent.system_prompt`` 装饰器钩子返回的字符串都合并成一个或多个
-    ``SystemPromptPart`` 放在首个 ``ModelRequest`` 里。我们按顺序拼接,就是
-    模型在那一轮收到的完整系统消息文本(不含工具 schema —— 工具 schema 走
-    OpenAI API 的 ``tools`` 字段,不在 message 里)。
+    - ``openhachimi_user_message``：用户原始输入（不含任何系统注入）。
+    - ``openhachimi_ctx_dynamic``：本轮 system prompt 末尾的动态段(时间/
+      TaskFrame/记忆/命中技能)。
+    - ``openhachimi_ctx_static_hash``：本轮 executor 静态 system 段(base/
+      executor/role/config/tools)的短哈希。完整文本在 ``AgentService._context_static_pool``
+      内查表;读取时按需重建。
+
+    Multi-step 单轮中可能多次往 history 追加 ``ModelRequest``（planner、
+    executor_repair 等都会 extend），但首个 user 消息就是本轮入口。
     """
-    from pydantic_ai.messages import ModelRequest, SystemPromptPart
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-    chunks: list[str] = []
-    for msg in messages:
+    if not user_message:
+        return
+    payload: dict[str, str] = {_USER_MESSAGE_METADATA_KEY: user_message}
+    if dynamic_context:
+        payload[_CTX_DYNAMIC_METADATA_KEY] = dynamic_context
+    if static_hash:
+        payload[_CTX_STATIC_HASH_METADATA_KEY] = static_hash
+
+    for idx in range(prev_len, len(new_history)):
+        msg = new_history[idx]
         if not isinstance(msg, ModelRequest):
             continue
-        for part in getattr(msg, "parts", ()):
-            if isinstance(part, SystemPromptPart):
-                text = getattr(part, "content", "")
-                if isinstance(text, str) and text.strip():
-                    chunks.append(text)
-        if chunks:
-            break  # 只取首个含 SystemPromptPart 的 ModelRequest
+        if not any(isinstance(part, UserPromptPart) for part in getattr(msg, "parts", ())):
+            continue
+        meta = getattr(msg, "metadata", None)
+        if meta is None:
+            try:
+                msg.metadata = dict(payload)
+            except Exception:  # noqa: BLE001  # 极端情况 dataclass 被冻结时静默放弃
+                logger.debug("failed to stamp turn metadata on ModelRequest idx=%d", idx)
+            return
+        # metadata 已存在：补齐我们这几项,不覆盖第三方已有键
+        for k, v in payload.items():
+            if k not in meta:
+                meta[k] = v
+        return
+
+
+# 旧名保留为别名,避免第三方/旧代码导入断裂
+_stamp_user_message_metadata = lambda new_history, prev_len, user_message: _stamp_turn_metadata(  # noqa: E731
+    new_history, prev_len, user_message, "", ""
+)
+
+
+def _build_executor_static_context(
+    config: AppConfig,
+    role: str,
+    executor_agent: object,
+    service: "AgentService | None" = None,
+) -> str:
+    """直接构建 executor 的静态 system prompt 段(不含每轮动态注入的部分)。
+
+    包括:base.md + agents/executor.md + role instructions + runtime/config.md
+    + 可用工具摘要清单。
+    """
+    from openhachimi_agent.content.prompts import load_system_prompt, render_system_prompt
+    from openhachimi_agent.content.roles import load_role_content
+
+    chunks: list[str] = []
+    try:
+        base = load_system_prompt("base")
+        if base:
+            chunks.append(base)
+    except Exception:
+        logger.debug("failed to load base.md", exc_info=True)
+    try:
+        executor_prompt = load_system_prompt("agents/executor")
+        if executor_prompt:
+            chunks.append(executor_prompt)
+    except Exception:
+        logger.debug("failed to load executor.md", exc_info=True)
+    try:
+        role_content = load_role_content(config.roles_dir, role)
+        if role_content:
+            chunks.append(role_content)
+    except Exception:
+        logger.debug("failed to load role content role=%s", role, exc_info=True)
+    try:
+        config_prompt = render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")})
+        if config_prompt:
+            chunks.append(config_prompt)
+    except Exception:
+        logger.debug("failed to render config.md", exc_info=True)
+
+    # 工具目录摘要 — 优先走 service 缓存
+    if service is not None:
+        try:
+            tool_text = service._get_cached_tool_catalog(role, executor_agent)
+            if tool_text:
+                chunks.append(tool_text)
+        except Exception:
+            logger.debug("failed to get tool catalog from service", exc_info=True)
+    else:
+        try:
+            tool_text = _extract_tool_catalog(executor_agent)
+            if tool_text:
+                chunks.append(tool_text)
+        except Exception:
+            logger.debug("failed to extract tool catalog", exc_info=True)
+
     return "\n\n".join(chunks)
 
 
 def _extract_tool_catalog(executor_agent: object) -> str:
     """提取 executor agent 当前可用的工具清单(工具名 + 一行描述)。
 
-    模型实际通过 OpenAI API ``tools`` 字段收到完整 JSON schema,但展示在 WebUI 里
-    没意义(太长且对用户不友好),所以只返回摘要清单。
-
-    失败不抛异常,返回空串。
+    作为未命中 service 缓存的本地兜底。service 层有按 role+mcp_signature 缓存的
+    版本;此函数留作 "no service" 容错路径。
     """
     try:
         toolsets = getattr(executor_agent, "_toolsets", None) or getattr(executor_agent, "toolsets", None)
@@ -114,7 +217,6 @@ def _extract_tool_catalog(executor_agent: object) -> str:
             tools_attr = getattr(toolset, "tools", None)
             if tools_attr is None:
                 continue
-            # FunctionToolset.tools 是 dict[str, Tool]; 其它 toolset 可能是 list
             if isinstance(tools_attr, dict):
                 tool_iter = tools_attr.values()
             else:
@@ -147,81 +249,50 @@ def _extract_tool_catalog(executor_agent: object) -> str:
         return ""
 
 
-def _build_full_system_context_snapshot(
-    new_history: list,
-    prev_len: int,
-    executor_agent: object | None,
-) -> str:
-    """聚合本轮模型真正收到的所有 system 级上下文,用于 WebUI 展示。
+def _build_executor_dynamic_context(deps: AgentDeps | None) -> str:
+    """构造 executor 本轮动态 system prompt 段(时间/TaskFrame/记忆/匹配技能)。
 
-    内容来源:
-    - 首个 ModelRequest 的所有 SystemPromptPart(已含 base / executor / role
-      instructions / runtime/config / runtime 动态块)
-    - 工具清单摘要(name + 一行描述)
-
-    其中第一部分占绝大多数,准确反映模型在本轮"接收到了什么"。
+    主动调用 ``build_system_dynamic_block(deps)`` 生成,与 executor agent 的
+    ``@agent.system_prompt _runtime_dynamic_block`` 钩子生成的内容完全相同。
+    不再从历史消息中抽取,避免 multi-step turn 中取到 router 而非 executor
+    system prompt 的问题。
     """
-    chunks: list[str] = []
-    # 只看本轮新增的消息(prev_len 之后的 ModelRequest)
-    relevant = new_history[prev_len:] if prev_len < len(new_history) else new_history
-    system_text = _extract_system_prompt_text(relevant)
-    if system_text:
-        chunks.append(system_text)
-    if executor_agent is not None:
-        tool_summary = _extract_tool_catalog(executor_agent)
-        if tool_summary:
-            chunks.append(tool_summary)
-    return "\n\n".join(chunks)
+    from openhachimi_agent.content.runtime_context import build_system_dynamic_block
+
+    try:
+        return build_system_dynamic_block(deps)
+    except Exception:  # noqa: BLE001
+        logger.debug("build_executor_dynamic_context failed", exc_info=True)
+        return ""
 
 
-def _stamp_turn_metadata(
-    new_history: list,
-    prev_len: int,
-    user_message: str,
-    system_context: str,
-) -> None:
-    """给本轮新增的、首个含 ``UserPromptPart`` 的 ``ModelRequest`` 打两项 metadata：
+def _compute_static_hash(text: str) -> str:
+    """计算静态 system prompt 段的短内容哈希。
 
-    - ``openhachimi_user_message``：用户原始输入（不含任何系统注入）。
-    - ``openhachimi_system_context``：本轮 system 级上下文完整快照(静态 system
-      prompt + role instructions + 动态钩子 + 工具清单),给 WebUI 在"运行时
-      上下文"折叠区展示。
-
-    Multi-step 单轮中可能多次往 history 追加 ``ModelRequest``（planner、
-    executor_repair 等都会 extend），但首个 user 消息就是本轮入口。
+    使用 SHA256 前 16 字符,碰撞概率极低(2^64 空间),足够区分依赖变化。
     """
-    from pydantic_ai.messages import ModelRequest, UserPromptPart
+    import hashlib
 
-    if not user_message:
-        return
-    payload: dict[str, str] = {_USER_MESSAGE_METADATA_KEY: user_message}
-    if system_context:
-        payload[_SYSTEM_CONTEXT_METADATA_KEY] = system_context
-
-    for idx in range(prev_len, len(new_history)):
-        msg = new_history[idx]
-        if not isinstance(msg, ModelRequest):
-            continue
-        if not any(isinstance(part, UserPromptPart) for part in getattr(msg, "parts", ())):
-            continue
-        meta = getattr(msg, "metadata", None)
-        if meta is None:
-            try:
-                msg.metadata = dict(payload)
-            except Exception:  # noqa: BLE001  # 极端情况 dataclass 被冻结时静默放弃
-                logger.debug("failed to stamp turn metadata on ModelRequest idx=%d", idx)
-            return
-        # metadata 已存在：补齐我们这两项,不覆盖第三方已有键
-        for k, v in payload.items():
-            if k not in meta:
-                meta[k] = v
-        return
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-# 旧名保留为别名,避免第三方/旧代码导入断裂
-_stamp_user_message_metadata = lambda new_history, prev_len, user_message: _stamp_turn_metadata(  # noqa: E731
-    new_history, prev_len, user_message, ""
-)
+def _snapshot_executor_context(
+    config: AppConfig,
+    role: str,
+    executor_agent: object,
+    deps: AgentDeps,
+    service: "AgentService | None" = None,
+) -> tuple[str, str, str]:
+    """构造本轮 executor 的 system 级上下文快照,返回 (static_text, dynamic_text, static_hash)。
+
+    替代旧版 ``_build_full_system_context_snapshot``,优势:
+    - 不再从历史消息反向抽取 SystemPromptPart(避免 multi-step turn 取到 router)
+    - 静态/动态分离:静态段写入哈希池去重,动态段每轮单独持久化
+    """
+    static_text = _build_executor_static_context(config, role, executor_agent, service=service)
+    dynamic_text = _build_executor_dynamic_context(deps)
+    static_hash = _compute_static_hash(static_text)
+    return static_text, dynamic_text, static_hash
 
 
 async def run_turn(
@@ -319,7 +390,16 @@ async def run_turn(
         ctx.stream_event_handler = build_stream_event_handler(stream_queue, ctx.operation_state)
         ctx.context_compressor = service._get_context_compressor(actual_session_id, memory_scope)
 
+        # MCP 配置在单轮内只刷新一次:router/planner/executor 三段编排原本各自调用一次,
+        # 实际同一轮内文件 mtime 不会变,重复 stat + signature compare 是浪费。
+        # closure 标志位负责短路第 2/3 次调用。
+        _mcp_refreshed = False
+
         async def refresh_mcp_config() -> None:
+            nonlocal _mcp_refreshed
+            if _mcp_refreshed:
+                return
+            _mcp_refreshed = True
             await service._maybe_reload_mcp_toolsets()
             ctx.config = service.config
             deps.config = service.config
@@ -530,29 +610,30 @@ async def run_turn(
             service.register_artifacts(turn_artifacts)
             new_history = list(result.all_messages())  # type: ignore[attr-defined]
 
-            # 把"用户原始输入"持久化到本轮 ModelRequest 的 metadata 里。
-            # 这样 WebUI 等下游展示历史会话时可以精确取到用户那句话，无需启发式
-            # 拆分被注入的 volatile 前缀（时间/记忆/技能等）。
-            # 找的是本轮新增（idx >= len(history)）且含 UserPromptPart 的第一个 ModelRequest，
-            # 通常就是承载本轮用户消息的那条。
-            # 把"用户原始输入"和"系统级上下文完整快照"持久化到本轮 ModelRequest metadata。
-            # WebUI 用 system_context 展示"运行时上下文"折叠区——其内容是模型在本轮
-            # 真正收到的全部 system 级文本(base prompt + executor role + role
-            # instructions + runtime/config + 动态钩子 + 工具清单),不只是动态钩子部分。
+            # 持久化阶段构造 executor 系统级上下文快照,分两段写入 ModelRequest metadata:
+            # - openhachimi_ctx_dynamic:本轮变的(时间/TaskFrame/记忆/技能)
+            # - openhachimi_ctx_static_hash:稳定段(base/executor/role/config/tools)的短哈希
+            # 完整静态文本写到 service._context_static_pool,读取时再回填。
+            # 注意:这里不再产生新的 LLM 调用,executor agent 仅用来 introspect toolset。
+            _static_text = ""
+            _dynamic_text = ""
+            _static_hash = ""
             try:
-                # 在持久化阶段拿到一份"当前角色 executor agent",用于工具清单提取。
-                # 注意:这里不再产生新的 LLM 调用,仅用来 introspect toolset。
                 _executor_for_intro = service._get_agent(role, "executor")
             except Exception:
                 _executor_for_intro = None
             try:
-                _system_context = _build_full_system_context_snapshot(
-                    new_history, len(history), _executor_for_intro
+                _static_text, _dynamic_text, _static_hash = _snapshot_executor_context(
+                    service.config, role, _executor_for_intro, deps, service=service
                 )
             except Exception:
                 logger.debug("system context snapshot failed", exc_info=True)
-                _system_context = ""
-            _stamp_turn_metadata(new_history, len(history), message, _system_context)
+            if _static_hash and _static_text:
+                try:
+                    service._ensure_context_static(_static_hash, _static_text)
+                except Exception:
+                    logger.debug("failed to register static context to pool", exc_info=True)
+            _stamp_turn_metadata(new_history, len(history), message, _dynamic_text, _static_hash)
             # 上下文压缩:用本轮真实用量判定,触发则压缩(含 LLM 摘要,经 to_thread 避免阻塞事件循环)
             compressor = ctx.context_compressor
             if compressor is not None:

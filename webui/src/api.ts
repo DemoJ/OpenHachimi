@@ -82,7 +82,9 @@ export interface MessageItem {
   role: 'user' | 'assistant'
   content: string
   prefix?: string                       // 仅 user 消息：运行时注入的上下文前缀，可折叠
-  timestamp: string | null
+  timestamp: string | null              // ISO-8601；user=收到时间，assistant=模型回复时间
+  // 仅 assistant：本轮请求的 token 用量；旧会话 / 流式中尚未拿到 usage 时为 null
+  tokens?: { input: number; output: number; total: number; cache_read?: number } | null
 }
 
 export interface SessionMessagesResponse {

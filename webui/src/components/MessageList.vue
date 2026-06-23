@@ -7,6 +7,8 @@
         :role="m.role"
         :content="m.content"
         :prefix="m.prefix"
+        :timestamp="m.timestamp"
+        :tokens="m.tokens"
         :streaming="isStreaming(idx)"
       />
       <div v-if="messages.length === 0 && !generating" style="text-align: center; color: var(--text-muted); margin-top: 40px;">

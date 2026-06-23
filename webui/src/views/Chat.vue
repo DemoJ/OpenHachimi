@@ -40,20 +40,21 @@ function abortCurrentStream(reason: string) {
 }
 
 /**
- * 流结束后从后端拉一次完整历史，把运行时上下文 prefix 回填到本地乐观渲染的
- * user 消息上，让"展开运行时上下文"按钮出现，无需用户刷新页面。
+ * 流结束后从后端拉一次完整历史，把后端权威的 timestamp / tokens / prefix
+ * 回填到本地乐观渲染的消息上，让"展开运行时上下文"按钮、回复时间与 token 计数
+ * 都无需用户刷新页面就能出现。
  *
  * 新会话首条消息时 store.currentSessionId 还是 null，此时从 refreshSessions()
  * 拉到的最新一条会话就是本轮 —— 顺手把它写回 store.currentSessionId，
  * 让 /stop 等按钮也能正确工作。
  */
-async function syncPrefixesFromServer() {
+async function syncMessagesFromServer() {
   let sid = store.currentSessionId
   if (!sid) {
     // refreshSessions 已在 onDone 里调过，这里直接读 store
     const latest = store.sessions[0]
     if (!latest) {
-      console.warn('[Chat] syncPrefixesFromServer: no session found')
+      console.warn('[Chat] syncMessagesFromServer: no session found')
       return
     }
     sid = latest.session_id
@@ -63,24 +64,43 @@ async function syncPrefixesFromServer() {
 
   try {
     const res = await getSessionMessages(sid, store.currentRole)
-    // 只把 prefix 回填到现有 user 消息（按顺序对齐），不替换整条消息体 ——
-    // 避免覆盖 SSE 期间流式追加的 assistant 内容，也避免触发 MessageList 的滚动闪烁。
+    // 按顺序对齐本地与远端消息（按 role 匹配），只回填 metadata 字段，
+    // 不替换 content —— 避免覆盖 SSE 期间流式追加的 assistant 文本，也避免触发
+    // MessageList 的滚动闪烁。
     const local = store.messages
     const remote = res.messages
     let li = 0
-    let filled = 0
+    let filledPrefix = 0
+    let filledTime = 0
+    let filledTokens = 0
     for (const rm of remote) {
       while (li < local.length && local[li].role !== rm.role) li += 1
       if (li >= local.length) break
-      if (local[li].role === 'user' && rm.role === 'user' && rm.prefix && !local[li].prefix) {
-        local[li].prefix = rm.prefix
-        filled += 1
+      const lm = local[li]
+      if (lm.role === 'user' && rm.role === 'user' && rm.prefix && !lm.prefix) {
+        lm.prefix = rm.prefix
+        filledPrefix += 1
+      }
+      // 用后端 ISO timestamp 覆盖本地的乐观时间戳（来源更权威，与持久化历史一致）
+      if (rm.timestamp) {
+        lm.timestamp = rm.timestamp
+        filledTime += 1
+      }
+      // tokens 仅 assistant 有；流式期间没办法实时拿，靠这次回填补齐
+      if (rm.role === 'assistant' && rm.tokens) {
+        lm.tokens = rm.tokens
+        filledTokens += 1
       }
       li += 1
     }
-    console.info('[Chat] prefix sync done', { sid, filled })
+    console.info('[Chat] message meta sync done', {
+      sid,
+      filledPrefix,
+      filledTime,
+      filledTokens,
+    })
   } catch (err) {
-    console.warn('[Chat] prefix sync failed', err)
+    console.warn('[Chat] message meta sync failed', err)
   }
 }
 
@@ -120,8 +140,15 @@ async function onSend(text: string) {
     return
   }
 
-  // 用户实时输入的消息没有运行时前缀，prefix 留空
-  store.messages.push({ role: 'user', content: text, prefix: '', timestamp: null })
+  // 用户实时输入的消息没有运行时前缀，prefix 留空；
+  // timestamp 本地乐观打一次，流结束后 syncMessagesFromServer 会用后端权威值覆盖。
+  store.messages.push({
+    role: 'user',
+    content: text,
+    prefix: '',
+    timestamp: new Date().toISOString(),
+    tokens: null,
+  })
   store.setGenerating(true)
   abortCtrl = new AbortController()
   const ctrl = abortCtrl
@@ -145,11 +172,13 @@ async function onSend(text: string) {
       onDone() {
         console.info('[Chat] stream done')
         store.setGenerating(false)
-        // 刷新会话列表 + 回填本轮的运行时上下文 prefix。
-        // 用户实时输入的消息是乐观渲染（prefix=''），但后端在 turn.run_turn 里会注入
-        // 时间/记忆/技能/TaskFrame 等 volatile 上下文。流结束后拉一次完整历史，
-        // 把这些 prefix 回填到本轮 user 消息上，"展开运行时上下文"按钮才会出现。
-        store.refreshSessions().then(() => syncPrefixesFromServer()).catch((err) => {
+        // 刷新会话列表 + 回填本轮 prefix / timestamp / tokens。
+        // 用户实时输入的消息是乐观渲染（prefix=''、本地 timestamp），但后端 turn.run_turn
+        // 会注入 system_context、并把权威 timestamp + ModelResponse.usage 持久化。
+        // 流结束后拉一次完整历史，把这些 metadata 回填到本轮消息上：
+        // - user：补 prefix（运行时上下文）+ 校正 timestamp
+        // - assistant：补 timestamp + token 用量
+        store.refreshSessions().then(() => syncMessagesFromServer()).catch((err) => {
           console.warn('[Chat] post-stream refresh failed', err)
         })
       },

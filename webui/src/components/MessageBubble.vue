@@ -2,11 +2,15 @@
   <div class="message" :class="role">
     <div class="message-header">
       <span class="role-label">{{ role === 'user' ? 'YOU' : 'AGENT' }}</span>
-      <button
-        v-if="hasPrefix"
-        class="toggle-btn"
-        @click="expanded = !expanded"
-      >{{ expanded ? '收起' : '展开运行时上下文' }}</button>
+      <span class="message-meta">
+        <span v-if="formattedTime" class="meta-time" :title="rawTimeTitle">{{ formattedTime }}</span>
+        <span v-if="tokenLabel" class="meta-tokens" :title="tokenTitle">{{ tokenLabel }}</span>
+        <button
+          v-if="hasPrefix"
+          class="toggle-btn"
+          @click="expanded = !expanded"
+        >{{ expanded ? '收起' : '展开运行时上下文' }}</button>
+      </span>
     </div>
 
     <!-- 折叠区：仅 user 消息且后端注入了前缀时展示 -->
@@ -30,6 +34,8 @@ const props = defineProps<{
   content: string
   prefix?: string
   streaming?: boolean
+  timestamp?: string | null
+  tokens?: { input: number; output: number; total: number; cache_read?: number } | null
 }>()
 
 // prefix 由后端拆好（按哨兵分隔符），无前缀就是空串。无需任何启发式。
@@ -39,9 +45,80 @@ const expanded = ref(false)
 
 const renderedContent = computed(() => renderMarkdown(props.content || ''))
 const renderedPrefix = computed(() => renderMarkdown(props.prefix || ''))
+
+// ---- 时间展示 ----
+// 显示策略：当天的消息只显示 HH:mm，跨日的加上 MM-DD。title 给出完整本地时间。
+function pad(n: number): string {
+  return n < 10 ? '0' + n : String(n)
+}
+const parsedTime = computed<Date | null>(() => {
+  if (!props.timestamp) return null
+  const d = new Date(props.timestamp)
+  return isNaN(d.getTime()) ? null : d
+})
+const formattedTime = computed<string>(() => {
+  const d = parsedTime.value
+  if (!d) return ''
+  const now = new Date()
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return sameDay ? hm : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`
+})
+const rawTimeTitle = computed<string>(() => {
+  const d = parsedTime.value
+  return d ? d.toLocaleString() : ''
+})
+
+// ---- token 展示 ----
+// 例：↑1.2k ↓318（总 1.5k）。input/output 都为 0 时不展示。
+// 缓存命中 cache_read 不显示在 chip 上(避免拥挤),但放进 title。
+function fmtTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
+  return String(n)
+}
+const tokenLabel = computed<string>(() => {
+  if (props.role !== 'assistant') return ''
+  const t = props.tokens
+  if (!t) return ''
+  if (!t.input && !t.output) return ''
+  return `↑${fmtTokens(t.input)} ↓${fmtTokens(t.output)}`
+})
+const tokenTitle = computed<string>(() => {
+  const t = props.tokens
+  if (!t) return ''
+  const parts = [`输入 ${t.input}`, `输出 ${t.output}`, `合计 ${t.total} tokens`]
+  if (typeof t.cache_read === 'number' && t.cache_read > 0) {
+    parts.push(`缓存命中 ${t.cache_read} tokens`)
+  }
+  return parts.join(' · ')
+})
 </script>
 
 <style scoped>
+.message-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-sm);
+}
+.meta-time,
+.meta-tokens {
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--body-mid);
+  letter-spacing: 0.4px;
+}
+.meta-tokens {
+  padding: 1px 6px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+
 .toggle-btn {
   background: transparent;
   border: 1px solid var(--pill-border);

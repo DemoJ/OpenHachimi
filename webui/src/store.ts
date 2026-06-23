@@ -87,7 +87,16 @@ export const useChatStore = defineStore('chat', {
       if (last && last.role === 'assistant') {
         last.content += text
       } else {
-        this.messages.push({ role: 'assistant', content: text, prefix: '', timestamp: null })
+        // 首个 assistant chunk 到达：用客户端本地时间乐观打 timestamp，
+        // 流结束后 syncMessagesFromServer 会用后端 ModelResponse.timestamp 覆盖。
+        // tokens 此刻还拿不到（usage 只在 ModelResponse 终结时聚合），先留 null。
+        this.messages.push({
+          role: 'assistant',
+          content: text,
+          prefix: '',
+          timestamp: new Date().toISOString(),
+          tokens: null,
+        })
       }
     },
     setActivity(text: string | null) {
