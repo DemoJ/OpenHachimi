@@ -63,6 +63,35 @@ _MAX_INJECTED_SKILLS = 2
 _SKILL_FULL_INLINE_CONFIDENCE = 0.85
 _SKILL_FULL_INLINE_MAX_CHARS = 4000
 
+# "信息检索原则"块触发关键词集合。
+# 设计:与其在 router 端枚举更多 task_kind / execution_mode,不如直接看 router
+# 已经命中的技能描述 —— 用户装的 web-search / research / browser-automation 类
+# 技能,其 name/description/when_to_use 里几乎都会含下列任意一个词。命中即注入,
+# 不命中(闲聊、纯本地代码任务)就不注入。中文/英文都覆盖,避免任一来源被漏掉。
+_WEB_SEARCH_SKILL_KEYWORDS = (
+    "search",
+    "research",
+    "web",
+    "browser",
+    "scrape",
+    "crawl",
+    "fetch",
+    "搜索",
+    "检索",
+    "网搜",
+    "网页",
+    "调研",
+    "调查",
+    "研究",
+    "情报",
+    "资讯",
+)
+
+# task_kind 命中"研究类"任务时也注入。注意 TaskKind 字面量目前只有 "research";
+# 这里多列 "investigation" 是给 router 输出超出约定时的兼容兜底,不在合法集里
+# 但不会报错(`coerce_task_frame` 会回退为 unknown,这里再二次防御也无妨)。
+_WEB_SEARCH_TASK_KINDS = {"research", "investigation"}
+
 
 def _time_block() -> str:
     """构造当前真实时间块。每次调用都重新取当前时间，保证跨天/跨会话正确。"""
@@ -248,6 +277,85 @@ def _skills_block(deps: AgentDeps) -> str:
     return render_system_prompt("runtime/matched_skills", {"skills": "\n\n".join(injected)})
 
 
+def _skill_matches_web_search(skill: Any) -> bool:
+    """技能是否属于"网搜/研究类"——按 name/description/when_to_use 关键词命中。
+
+    用户安装的网搜技能(web-search / deep-research / browser-automation 等)
+    在元数据里几乎都会含下列关键词之一。规则放宽不放严:命中即注入,避免漏掉
+    那些虽然内部用到网搜、但 task_kind 被 router 标成 "qa" 的边缘场景。
+    """
+    cfg = getattr(skill, "config", None)
+    if cfg is None:
+        return False
+    fields = [
+        getattr(cfg, "name", "") or "",
+        getattr(cfg, "description", "") or "",
+        getattr(cfg, "when_to_use", "") or "",
+    ]
+    blob = " ".join(fields).lower()
+    if not blob:
+        return False
+    return any(keyword in blob for keyword in _WEB_SEARCH_SKILL_KEYWORDS)
+
+
+def _has_web_search_skill(deps: AgentDeps, task_frame_dict: dict[str, Any]) -> bool:
+    """relevant_skills 里有没有"网搜类"技能。
+
+    只看 router 列入 relevant_skills 的技能(已经过路由判断),不扫全量技能目录,
+    避免"用户装了个 web-search 但本轮根本没用"也无脑触发。
+    """
+    raw_skills = task_frame_dict.get("relevant_skills") or []
+    matched_names: list[str] = []
+    for item in raw_skills:
+        normalized = _normalize_skill_match(item)
+        if normalized:
+            matched_names.append(normalized[0])
+    if not matched_names:
+        return False
+    skills_dirs = getattr(deps, "skills_dirs", None)
+    if not skills_dirs:
+        return False
+    try:
+        all_skills = find_skills(skills_dirs)
+    except Exception:  # noqa: BLE001
+        return False
+    skill_map = {s.config.name: s for s in all_skills}
+    for name in matched_names:
+        skill = skill_map.get(name)
+        if skill is None:
+            continue
+        if _skill_matches_web_search(skill):
+            return True
+    return False
+
+
+def _web_search_rules_block(deps: AgentDeps) -> str:
+    """"信息检索原则"按需注入块。
+
+    触发条件(任一命中即注入):
+    - 本轮 TaskFrame.task_kind 是 "research"(或 router 偶发输出的 "investigation")
+    - 本轮 router 命中的 relevant_skills 中,有 name/description/when_to_use 含
+      搜索/检索/research/browser 等关键词的技能
+
+    不命中(闲聊、纯本地代码任务、跑 lint 等)就完全不注入,省掉每轮几十 token。
+    """
+    session_state = getattr(deps, "session_state", None)
+    if not isinstance(session_state, dict):
+        return ""
+    task_frame_dict = session_state.get("task_frame")
+    if not isinstance(task_frame_dict, dict):
+        return ""
+    task_kind = task_frame_dict.get("task_kind")
+    triggered = task_kind in _WEB_SEARCH_TASK_KINDS or _has_web_search_skill(deps, task_frame_dict)
+    if not triggered:
+        return ""
+    try:
+        return render_system_prompt("runtime/web_search_rules")
+    except Exception:  # noqa: BLE001
+        logger.debug("web_search_rules render failed", exc_info=True)
+        return ""
+
+
 def _task_frame_block(deps: AgentDeps) -> str:
     """把当前轮次的 TaskFrame 摘要写进 system prompt，作为执行者的硬约束。
 
@@ -276,12 +384,139 @@ def _task_frame_block(deps: AgentDeps) -> str:
     return rendered
 
 
+# ── executor 专用动态段(只在 executor agent 上注册;planner/scheduled_executor
+# 不挂这套) ──
+#
+# 拆分思路:把原本 executor.md 里"按场景才有用"的几大段挪出来,按本轮 session
+# 状态判断是否注入,从而让简单 direct 任务的 system prompt 真正变短。
+#
+# 触发矩阵:
+#   - executor_todo_handoff.md  ← has_active_todos(session_state)
+#   - executor_direct_mode.md   ← execution_mode in {"direct", "skill_direct"}
+#                                  且 has_active_todos == False
+#   - executor_skill_direct.md  ← execution_mode == "skill_direct"
+#                                  且 has_active_todos == False
+#
+# "通用底线"(严禁假完成/伪造工具结果)随 TODO 接力一起出现 —— 这条只在有 TODO
+# 时才有真正意义,简单单步任务里它本身就是噪声。
+
+
+def _has_active_todos_in_state(session_state: dict[str, Any]) -> bool:
+    """轻量复刻 ``service.agent_runtime.context.has_active_todos``。
+
+    内联在这里是为了避免 ``content.runtime_context`` 反向 import ``service.*``,
+    防止循环依赖。语义须与上层严格一致:既要 ``todo_state.is_active`` 为真,
+    又要存在至少一个 ``status != "done"`` 的任务。如果上层语义日后扩展,
+    需要同步这里。
+    """
+    todo_state = session_state.get("todo_state")
+    if not getattr(todo_state, "is_active", False):
+        return False
+    tasks = getattr(todo_state, "tasks", None)
+    if not isinstance(tasks, dict) or not tasks:
+        return False
+    return any(getattr(task, "status", None) != "done" for task in tasks.values())
+
+
+def _todo_handoff_block(deps: AgentDeps) -> str:
+    """有活动 TODO 才注入"执行接力规则 + 通用底线"。
+
+    无 TODO 的简单任务(问候/单步问答/纯回答)永远不会触发这段,省掉约 400 token。
+    """
+    session_state = getattr(deps, "session_state", None)
+    if not isinstance(session_state, dict):
+        return ""
+    if not _has_active_todos_in_state(session_state):
+        return ""
+    try:
+        return render_system_prompt("runtime/executor_todo_handoff")
+    except Exception:  # noqa: BLE001
+        logger.debug("executor_todo_handoff render failed", exc_info=True)
+        return ""
+
+
+def _direct_mode_block(deps: AgentDeps) -> str:
+    """direct / skill_direct 且无活动 TODO 时,注入"不要给低风险任务造 TODO"提示。
+
+    有活动 TODO 时这条会和 _todo_handoff_block 的"严格按 TODO 执行"冲突,因此
+    显式互斥:有 TODO → 走接力规则,无 TODO → 走 direct 提示。
+    """
+    session_state = getattr(deps, "session_state", None)
+    if not isinstance(session_state, dict):
+        return ""
+    if _has_active_todos_in_state(session_state):
+        return ""
+    task_frame_dict = session_state.get("task_frame")
+    if not isinstance(task_frame_dict, dict):
+        return ""
+    mode = task_frame_dict.get("execution_mode")
+    if mode not in {"direct", "skill_direct"}:
+        return ""
+    try:
+        return render_system_prompt("runtime/executor_direct_mode")
+    except Exception:  # noqa: BLE001
+        logger.debug("executor_direct_mode render failed", exc_info=True)
+        return ""
+
+
+def _skill_direct_block(deps: AgentDeps) -> str:
+    """skill_direct 且无活动 TODO 时,追加"skill 是主流程,不要再宽泛探索"。
+
+    与 _direct_mode_block 互不重复:前者讲"低风险不造 TODO",这里讲"skill 优先",
+    两段语义不同,都需要时一起注入。
+    """
+    session_state = getattr(deps, "session_state", None)
+    if not isinstance(session_state, dict):
+        return ""
+    if _has_active_todos_in_state(session_state):
+        return ""
+    task_frame_dict = session_state.get("task_frame")
+    if not isinstance(task_frame_dict, dict):
+        return ""
+    if task_frame_dict.get("execution_mode") != "skill_direct":
+        return ""
+    try:
+        return render_system_prompt("runtime/executor_skill_direct")
+    except Exception:  # noqa: BLE001
+        logger.debug("executor_skill_direct render failed", exc_info=True)
+        return ""
+
+
+def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
+    """构造仅 executor agent 需要的额外动态段,追加在通用动态段之后。
+
+    设计为单独函数而非合并进 ``build_system_dynamic_block`` 的原因:planner /
+    scheduled_executor 不应被 "TODO 接力 / direct-mode 偏好" 这类提示词污染 ——
+    它们各自的角色提示词已经明确了职责。把 executor 专用块单独出口,在
+    ``factory.py`` 中只对 executor agent 注册。
+
+    输出顺序:``[执行接力规则? + 通用底线] [直接执行模式提示?] [Skill 主流程?]``。
+    所有块都按需,任一未触发即跳过。
+    """
+    if deps is None:
+        return ""
+    blocks: list[str] = []
+    handoff = _todo_handoff_block(deps)
+    if handoff:
+        blocks.append(handoff)
+    direct = _direct_mode_block(deps)
+    if direct:
+        blocks.append(direct)
+    skill_direct = _skill_direct_block(deps)
+    if skill_direct:
+        blocks.append(skill_direct)
+    return "\n\n".join(blocks)
+
+
 def build_system_dynamic_block(deps: AgentDeps | None) -> str:
     """构造**每轮**应该追加到 system prompt 末尾的动态段。
 
-    输出顺序：``[时间] [TaskFrame 摘要] [记忆召回] [匹配技能]``。任一块为空或异常
-    则跳过；整体以空行分隔。当 deps 为 None / 异常时返回空字符串，保证 agent
-    构建期间（deps 还没准备好）的安全。
+    输出顺序：``[时间] [TaskFrame 摘要] [记忆召回] [匹配技能] [信息检索原则?]``。
+    任一块为空或异常则跳过；整体以空行分隔。当 deps 为 None / 异常时返回空字符串，
+    保证 agent 构建期间（deps 还没准备好）的安全。
+
+    "信息检索原则"块按需注入（仅当本轮 task_kind 是研究类、或 router 命中了
+    网搜/研究类技能时才出现），避免闲聊等非检索场景被注入无关提示词。
     """
     if deps is None:
         # 即便没有 deps 也应该至少提供当前时间，便于模型在"会话开始第一轮模板渲染"
@@ -300,6 +535,9 @@ def build_system_dynamic_block(deps: AgentDeps | None) -> str:
     skills_block = _skills_block(deps)
     if skills_block:
         blocks.append(skills_block)
+    web_search_block = _web_search_rules_block(deps)
+    if web_search_block:
+        blocks.append(web_search_block)
     return "\n\n".join(blocks)
 
 
@@ -323,5 +561,6 @@ def build_volatile_prefix(deps: AgentDeps | None) -> str:
 
 __all__ = [
     "build_system_dynamic_block",
+    "build_executor_extra_dynamic_block",
     "build_volatile_prefix",
 ]

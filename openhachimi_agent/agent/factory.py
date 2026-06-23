@@ -220,6 +220,21 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             logger.exception("runtime dynamic block failed")
             return ""
 
+    # executor agent 额外的按需块(TODO 接力 / direct-mode / skill_direct):
+    # 把过去恒定写在 executor.md 里的几大段策略,按 session 状态按需注入,让简单
+    # direct 任务的 system prompt 真正变短。planner / scheduled_executor 各自的
+    # 角色文档已经明确职责,这套块不在它们身上注册。
+    if agent_type == "executor":
+        @agent.system_prompt
+        def _executor_extra_block(ctx: RunContext[AgentDeps]) -> str:
+            try:
+                from openhachimi_agent.content.runtime_context import build_executor_extra_dynamic_block
+
+                return build_executor_extra_dynamic_block(ctx.deps)
+            except Exception:  # noqa: BLE001
+                logger.exception("executor extra dynamic block failed")
+                return ""
+
     return agent
 
 

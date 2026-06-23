@@ -253,20 +253,36 @@ def _extract_tool_catalog(executor_agent: object) -> str:
 
 
 def _build_executor_dynamic_context(deps: AgentDeps | None) -> str:
-    """构造 executor 本轮动态 system prompt 段(时间/TaskFrame/记忆/匹配技能)。
+    """构造 executor 本轮动态 system prompt 段(时间/TaskFrame/记忆/匹配技能 +
+    executor 专用按需块)。
 
-    主动调用 ``build_system_dynamic_block(deps)`` 生成,与 executor agent 的
-    ``@agent.system_prompt _runtime_dynamic_block`` 钩子生成的内容完全相同。
+    主动调用 ``build_system_dynamic_block(deps)`` 和
+    ``build_executor_extra_dynamic_block(deps)`` 生成,与 executor agent 的
+    ``@agent.system_prompt`` 钩子拼装顺序保持一致(common 在前、executor 专用
+    块在后),WebUI"展开运行时上下文"按钮才能看到与模型完全相同的快照。
+
     不再从历史消息中抽取,避免 multi-step turn 中取到 router 而非 executor
     system prompt 的问题。
     """
-    from openhachimi_agent.content.runtime_context import build_system_dynamic_block
+    from openhachimi_agent.content.runtime_context import (
+        build_executor_extra_dynamic_block,
+        build_system_dynamic_block,
+    )
 
+    parts: list[str] = []
     try:
-        return build_system_dynamic_block(deps)
+        common = build_system_dynamic_block(deps)
+        if common:
+            parts.append(common)
     except Exception:  # noqa: BLE001
-        logger.debug("build_executor_dynamic_context failed", exc_info=True)
-        return ""
+        logger.debug("build_system_dynamic_block failed", exc_info=True)
+    try:
+        executor_extra = build_executor_extra_dynamic_block(deps)
+        if executor_extra:
+            parts.append(executor_extra)
+    except Exception:  # noqa: BLE001
+        logger.debug("build_executor_extra_dynamic_block failed", exc_info=True)
+    return "\n\n".join(parts)
 
 
 def _compute_static_hash(text: str) -> str:
