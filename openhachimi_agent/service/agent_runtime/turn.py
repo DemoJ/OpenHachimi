@@ -23,7 +23,10 @@ from openhachimi_agent.core.redaction import redact_exception, redact_text
 from openhachimi_agent.memory.capture import capture_turn_memories
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.memory.recall import recall_memories
-from openhachimi_agent.service.agent_runtime.commands import SIGNAL_LABELS
+from openhachimi_agent.service.agent_runtime.commands import (
+    SIGNAL_LABELS,
+    channel_code_from_context,
+)
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
     complete_current_plan,
@@ -322,6 +325,9 @@ async def run_turn(
         if channel_context and channel_context.get("session_scope_key")
         else None
     )
+    # 渠道归属：从 channel_context 提取 channel_code（仅接受 CHANNEL_CODES 内的值），
+    # 未识别时退到外层 channel 形参。后续传给 save_message_history 写 sidecar。
+    resolved_channel_code = channel_code_from_context(channel_context)
     attachment_list = list(attachments or [])
     effective_message = message_with_attachments(message, attachment_list)
 
@@ -670,6 +676,8 @@ async def run_turn(
                 role,
                 actual_session_id,
                 history_json,
+                latest_scope,
+                resolved_channel_code,
                 latest_scope,
             )
             capture_args = (

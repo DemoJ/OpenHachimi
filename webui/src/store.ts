@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import type { SessionSummary, MessageItem, StateResponse } from './api'
-import { fetchRoles, listSessions, fetchState } from './api'
+import { fetchRoles, listSessions, fetchState, fetchChannels, getSessionMessages } from './api'
 import { getToken, clearToken } from './api'
 
 interface ChatStoreState {
@@ -10,6 +10,10 @@ interface ChatStoreState {
   currentRole: string
   currentSessionId: string | null
   sessions: SessionSummary[]
+  // 渠道筛选:WebUI 默认看 webui 渠道自己的会话;切换到 cli/telegram/weixin
+  // 时筛选 sidebar 列表,并把发消息时绑定到该渠道。
+  channels: string[]
+  currentChannel: string
   messages: MessageItem[]
   isGenerating: boolean
   // Agent 当前正在执行的动作文案（来自 SSE 的 temporary 工具调用事件）。
@@ -25,6 +29,8 @@ export const useChatStore = defineStore('chat', {
     currentRole: '',
     currentSessionId: null,
     sessions: [],
+    channels: ['webui', 'cli', 'telegram', 'weixin'],
+    currentChannel: 'webui',
     messages: [],
     isGenerating: false,
     activity: null,
@@ -50,6 +56,8 @@ export const useChatStore = defineStore('chat', {
       this.currentRole = ''
       this.currentSessionId = null
       this.sessions = []
+      this.channels = ['webui', 'cli', 'telegram', 'weixin']
+      this.currentChannel = 'webui'
       this.messages = []
       this.isGenerating = false
       this.activity = null
@@ -57,12 +65,16 @@ export const useChatStore = defineStore('chat', {
     },
     async loadInit(role?: string) {
       try {
-        const [s, r] = await Promise.all([fetchState(), fetchRoles()])
+        const [s, r, ch] = await Promise.all([fetchState(), fetchRoles(), fetchChannels().catch(() => null)])
         this.state = s
         this.roles = r.roles
         const targetRole = role || r.current_role
         this.currentRole = targetRole
-        const sessionsRes = await listSessions(targetRole)
+        if (ch && ch.channels.length > 0) {
+          this.channels = ch.channels
+          this.currentChannel = ch.default || 'webui'
+        }
+        const sessionsRes = await listSessions(targetRole, this.currentChannel)
         this.sessions = sessionsRes.sessions
         return r
       } catch {
@@ -74,14 +86,39 @@ export const useChatStore = defineStore('chat', {
     },
     async refreshSessions(role?: string) {
       const r = role || this.currentRole
-      const res = await listSessions(r)
+      const res = await listSessions(r, this.currentChannel)
       this.sessions = res.sessions
     },
-    setCurrentSession(id: string) {
+    setCurrentSession(id: string | null) {
       this.currentSessionId = id
     },
     setMessages(msgs: MessageItem[]) {
       this.messages = msgs
+    },
+    async setCurrentChannel(channel: string) {
+      // 切换渠道:重新拉 sidebar 列表,自动选中 mtime 最新一条并加载消息;
+      // 列表为空时把 currentSessionId 置 null,空白页直发会自动新建一条绑该渠道。
+      this.currentChannel = channel
+      try {
+        const res = await listSessions(this.currentRole, channel)
+        this.sessions = res.sessions
+        if (res.sessions.length > 0) {
+          const top = res.sessions[0]
+          this.currentSessionId = top.session_id
+          try {
+            const msgs = await getSessionMessages(top.session_id, this.currentRole)
+            this.messages = msgs.messages
+          } catch (err) {
+            console.warn('[store] failed to load messages after channel switch', err)
+            this.messages = []
+          }
+        } else {
+          this.currentSessionId = null
+          this.messages = []
+        }
+      } catch (err) {
+        console.warn('[store] failed to refresh sessions after channel switch', err)
+      }
     },
     appendAssistantChunk(text: string) {
       const last = this.messages[this.messages.length - 1]

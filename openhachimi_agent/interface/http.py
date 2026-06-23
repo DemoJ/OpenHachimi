@@ -32,6 +32,7 @@ from openhachimi_agent.scheduler.scheduler import TaskScheduler
 from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.transport.api_models import (
+    ChannelListResponse,
     ChatRequest,
     CommandDispatchRequest,
     CommandDispatchResponse,
@@ -419,12 +420,29 @@ def preview_schedule_delivery(task_id: str, svc: ScheduledTaskService = Depends(
 @app.post("/chat")
 async def chat(request: ChatRequest, service: AgentService = Depends(get_service)):
     logger.info("http chat request message_chars=%d attachment_count=%d stream=false", len(request.message), len(request.attachments))
-    channel_context = {"type": "http", "platform": "http", "session_id": request.session_id, "role": request.role}
+    channel_code = request.channel or "webui"
+    # WebUI/外部 API 调用 /chat 时,若没指定 session_id,scope_key 用 channel_code 自身
+    # —— 让每个渠道有独立的 latest 指针,不再跟其他渠道共用全局 latest。
+    session_scope_key = channel_code if request.session_id is None else None
+    resolved_session_id = request.session_id
+    if resolved_session_id is None and channel_code == "webui":
+        # WebUI 空白页直发:自动新建一条 session 并绑死渠道,等价于自动触发一次 /new。
+        new_resp = service.new_session_for_channel(request.role, channel_code)
+        resolved_session_id = new_resp.session_id
+    channel_context = {
+        "type": "http",
+        "platform": "http",
+        "channel_code": channel_code,
+        "session_id": resolved_session_id,
+        "role": request.role,
+    }
+    if session_scope_key:
+        channel_context["session_scope_key"] = session_scope_key
     try:
         return await service.send_message(
             request.message,
             request.role,
-            request.session_id,
+            resolved_session_id,
             attachments=request.attachments,
             channel_context=channel_context,
         )
@@ -443,26 +461,59 @@ def chat_stream(
         len(api_request.message),
         len(api_request.attachments),
     )
+    channel_code = api_request.channel or "webui"
+    resolved_session_id = api_request.session_id
+    auto_created = False
+    if resolved_session_id is None and channel_code == "webui":
+        # 空白页直发 → 自动新建会话,sidecar 立刻把它绑到 webui 渠道。
+        new_resp = service.new_session_for_channel(api_request.role, channel_code)
+        resolved_session_id = new_resp.session_id
+        auto_created = True
+    # 没指定 session 时,scope_key 用 channel_code,保证后续 latest 走 latest_by_scope/
+    session_scope_key = channel_code if api_request.session_id is None else None
 
     async def sse_generator():
         event_count = 0
         channel_context = {
             "type": "http",
             "platform": "http",
-            "session_id": api_request.session_id,
+            "channel_code": channel_code,
+            "session_id": resolved_session_id,
             "role": api_request.role,
         }
+        if session_scope_key:
+            channel_context["session_scope_key"] = session_scope_key
         logger.info(
-            "sse stream opened role=%s session_id=%s message_chars=%d",
+            "sse stream opened role=%s session_id=%s channel=%s auto_created=%s message_chars=%d",
             api_request.role,
-            api_request.session_id,
+            resolved_session_id,
+            channel_code,
+            auto_created,
             len(api_request.message),
         )
         try:
+            # 把后端解析出的 session_id 通过首事件回传给前端,让 store.currentSessionId
+            # 在空白页直发场景下能立刻同步——避免 SSE 流结束后还要靠 sessions[0] 兜底。
+            if resolved_session_id:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "session",
+                            "session_id": resolved_session_id,
+                            "channel": channel_code,
+                            "auto_created": auto_created,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+                event_count += 1
+
             async for event in service.stream_events(
                 api_request.message,
                 api_request.role,
-                api_request.session_id,
+                resolved_session_id,
                 attachments=api_request.attachments,
                 channel_context=channel_context,
             ):
@@ -474,7 +525,7 @@ def chat_stream(
                         "event_count=%d role=%s session_id=%s",
                         event_count,
                         api_request.role,
-                        api_request.session_id,
+                        resolved_session_id,
                     )
                     return
 
@@ -497,14 +548,14 @@ def chat_stream(
                 "sse stream closing reason=done event_count=%d role=%s session_id=%s",
                 event_count,
                 api_request.role,
-                api_request.session_id,
+                resolved_session_id,
             )
         except Exception as exc:
             logger.exception(
                 "sse stream closing reason=error event_count=%d role=%s session_id=%s",
                 event_count,
                 api_request.role,
-                api_request.session_id,
+                resolved_session_id,
             )
             yield f"data: {json.dumps({'error': safe_error_detail(exc)}, ensure_ascii=False)}\n\n"
 
@@ -551,9 +602,21 @@ def latest_session(role: str | None = None, service: AgentService = Depends(get_
 
 
 @app.get("/sessions")
-def list_sessions(role: str | None = None, service: AgentService = Depends(get_service)) -> SessionListResponse:
-    logger.info("http list sessions request role=%s", role)
-    return SessionListResponse(**service.list_sessions(role))
+def list_sessions(
+    role: str | None = None,
+    channel: str | None = None,
+    service: AgentService = Depends(get_service),
+) -> SessionListResponse:
+    logger.info("http list sessions request role=%s channel=%s", role, channel)
+    return SessionListResponse(**service.list_sessions(role, channel=channel))
+
+
+@app.get("/channels")
+def list_channels() -> ChannelListResponse:
+    """返回可选渠道枚举,前端筛选下拉用。"""
+    from openhachimi_agent.storage.session_meta import CHANNEL_CODES, DEFAULT_CHANNEL
+
+    return ChannelListResponse(channels=list(CHANNEL_CODES), default=DEFAULT_CHANNEL)
 
 
 @app.post("/sessions/load")

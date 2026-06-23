@@ -26,6 +26,7 @@ from openhachimi_agent.service.agent_runtime.command_registry import (
     parse_command,
 )
 from openhachimi_agent.service.agent_runtime.commands import (
+    channel_code_from_context,
     latest_scope_from_context,
 )
 from openhachimi_agent.service.agent_runtime.mcp_manager import (
@@ -34,7 +35,7 @@ from openhachimi_agent.service.agent_runtime.mcp_manager import (
 )
 from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.service.agent_runtime.turn import run_turn
-from openhachimi_agent.storage.memory import load_message_history, save_message_history, start_new_session
+from openhachimi_agent.storage.memory import get_memory_path, load_message_history, save_message_history, start_new_session
 from openhachimi_agent.transport.api_models import (
     AgentState,
     ArtifactRef,
@@ -232,6 +233,55 @@ class AgentService:
             session_id=session_id,
         )
 
+    def new_session_for_channel(
+        self,
+        role_name: str | None,
+        channel_code: str,
+        *,
+        latest_scope: str | None = None,
+    ) -> CommandResponse:
+        """为指定渠道新建会话并立即写 sidecar 绑定渠道归属。
+
+        WebUI 在用户没有选中会话直接发消息时（空白页自动 /new）调用此方法,
+        保证新会话从一开始就有渠道标签,不会落到 ``DEFAULT_CHANNEL`` 默认值。
+        ``latest_scope`` 未传时默认用 ``channel_code`` 自身作为 scope —— 这
+        与 HTTP /chat/stream 的 ``session_scope_key`` 行为对齐。
+        """
+        from openhachimi_agent.storage.session_meta import (
+            CHANNEL_CODES,
+            DEFAULT_CHANNEL,
+            save_meta,
+        )
+
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        if channel_code not in CHANNEL_CODES:
+            channel_code = DEFAULT_CHANNEL
+        scope = validate_latest_scope(latest_scope or channel_code)
+        session_id = start_new_session(self.config.memory_dir, role, scope)
+        try:
+            save_meta(
+                self.config.memory_dir,
+                role,
+                session_id,
+                channel=channel_code,
+                scope_key=scope,
+            )
+        except Exception:
+            logger.exception(
+                "failed to write session meta on new_session_for_channel role=%s session_id=%s channel=%s",
+                role, session_id, channel_code,
+            )
+        logger.info(
+            "new session for channel role=%s session_id=%s channel=%s scope=%s",
+            role, session_id, channel_code, scope,
+        )
+        return CommandResponse(
+            message="已新建会话。",
+            role=role,
+            session_id=session_id,
+        )
+
     # ------------------------------------------------------------------ 会话管理（WebUI）
 
     # WebUI 展示历史会话时需要的 metadata 键名。
@@ -392,19 +442,34 @@ class AgentService:
                             })
         return result
 
-    def list_sessions(self, role_name: str | None = None, *, with_preview: bool = True) -> dict:
+    def list_sessions(
+        self,
+        role_name: str | None = None,
+        *,
+        with_preview: bool = True,
+        channel: str | None = None,
+    ) -> dict:
         """列出指定角色的所有历史会话。
 
+        ``channel`` 非空时按渠道过滤(``infer_channel`` 给老会话兜底为 ``webui``)。
         返回 ``{"role": str, "sessions": [SessionSummary, ...]}``。
         """
         from openhachimi_agent.storage.memory import list_sessions as _list_sessions
+        from openhachimi_agent.storage.session_meta import is_known_channel
 
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
         raw = _list_sessions(self.config.memory_dir, role)
 
+        filter_channel: str | None = None
+        if channel is not None and is_known_channel(channel):
+            filter_channel = channel
+
         sessions: list[dict] = []
         for s in raw:
+            session_channel = s.get("channel", "webui")
+            if filter_channel is not None and session_channel != filter_channel:
+                continue
             created_at: str | None = None
             sid = s["session_id"]
             # 解析 session_id 前缀 "YYYYMMDD-HHMMSS-..."
@@ -435,22 +500,32 @@ class AgentService:
                 "mtime": s["mtime"],
                 "preview": preview,
                 "message_count": msg_count,
+                "channel": session_channel,
             })
 
         return {"role": role, "sessions": sessions}
 
     def load_session(self, role_name: str | None = None, session_id: str | None = None, latest_scope: str | None = None) -> CommandResponse:
-        from openhachimi_agent.storage.memory import save_latest_session_id
+        """切换到指定会话——只做存在性校验,不再写全局 ``latest``。
 
+        旧实现会把目标 session_id 写到 ``latest_scope`` 对应的 latest 指针,这是
+        跨渠道串号的根因:WebUI 在侧栏点开某条 IM 会话查看时,会污染全局 latest,
+        导致下一次 WebUI 不带 ``session_id`` 发消息时把消息追加到 IM 的 .json。
+        现在 load_session 只检查目标会话存在;前端把它写入 currentSessionId,
+        后续发送时显式带上 session_id 即可。
+        """
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
         resolved_session_id = self._normalize_session_id(session_id)
         if not resolved_session_id:
             raise ValueError("session_id 不能为空，请指定要加载的会话")
 
-        scope = validate_latest_scope(latest_scope)
-        save_latest_session_id(self.config.memory_dir, role, resolved_session_id, scope)
-        logger.info("loaded session role=%s session_id=%s scope=%s", role, resolved_session_id, scope)
+        # 触发存在性校验:不存在时让上层把错误透传给前端
+        memory_path = get_memory_path(self.config.memory_dir, role, resolved_session_id)
+        if not memory_path.exists():
+            raise FileNotFoundError(f"会话不存在: {resolved_session_id}")
+        _ = validate_latest_scope(latest_scope)
+        logger.info("loaded session role=%s session_id=%s", role, resolved_session_id)
         return CommandResponse(
             message="已切换到指定会话。",
             role=role,

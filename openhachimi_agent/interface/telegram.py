@@ -223,6 +223,7 @@ class TelegramBot:
         channel_context = {
             "type": "telegram",
             "platform": "telegram",
+            "channel_code": "telegram",
             "chat_id": update.effective_chat.id if update.effective_chat else update.message.chat_id,
             "user_id": update.effective_user.id if update.effective_user else 0,
             "thread_id": getattr(update.message, "message_thread_id", None),
@@ -531,6 +532,7 @@ class TelegramBot:
                 channel_context = {
                     "type": "telegram",
                     "platform": "telegram",
+                    "channel_code": "telegram",
                     "chat_id": update.effective_chat.id if update.effective_chat else update.message.chat_id,
                     "user_id": user_id,
                     "thread_id": getattr(update.message, "message_thread_id", None),

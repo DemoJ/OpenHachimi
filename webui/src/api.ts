@@ -53,11 +53,17 @@ export interface SessionSummary {
   mtime: number
   preview: string
   message_count: number
+  channel: string
 }
 
 export interface SessionListResponse {
   role: string
   sessions: SessionSummary[]
+}
+
+export interface ChannelListResponse {
+  channels: string[]
+  default: string
 }
 
 export interface StateResponse {
@@ -102,9 +108,16 @@ export function fetchRoles() {
   return get<RolesResponse>('/roles')
 }
 
-export function listSessions(role?: string) {
-  const q = role ? `?role=${encodeURIComponent(role)}` : ''
+export function listSessions(role?: string, channel?: string) {
+  const params: string[] = []
+  if (role) params.push(`role=${encodeURIComponent(role)}`)
+  if (channel) params.push(`channel=${encodeURIComponent(channel)}`)
+  const q = params.length ? `?${params.join('&')}` : ''
   return get<SessionListResponse>(`/sessions${q}`)
+}
+
+export function fetchChannels() {
+  return get<ChannelListResponse>('/channels')
 }
 
 export function loadSession(role: string | null, session_id: string) {

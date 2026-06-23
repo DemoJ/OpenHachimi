@@ -15,6 +15,11 @@ from openhachimi_agent.core.identifiers import (
     validate_role_name,
     validate_session_id,
 )
+from openhachimi_agent.storage.session_meta import (
+    infer_channel,
+    is_meta_filename,
+    save_meta,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -124,29 +129,47 @@ def save_message_history(
     session_id: str,
     history_json: bytes,
     latest_scope: str | None = None,
+    channel: str | None = None,
+    scope_key: str | None = None,
 ) -> None:
-    """将消息历史以 JSON 形式写入磁盘。"""
+    """将消息历史以 JSON 形式写入磁盘。
+
+    ``channel`` 与 ``scope_key`` 在 sidecar 不存在时写入 ``{session_id}.meta.json``,
+    用来声明这条会话最初是从哪个渠道写出来的;后续再写不会覆盖,以保证渠道归属
+    由首条消息决定。
+    """
     role = _role_name(role_name)
     safe_session_id = validate_session_id(session_id, allow_legacy=False)
     role_memory_dir = get_role_memory_dir(memory_dir, role)
     role_memory_dir.mkdir(parents=True, exist_ok=True)
     get_memory_path(memory_dir, role, safe_session_id).write_bytes(history_json)
     save_latest_session_id(memory_dir, role, safe_session_id, latest_scope)
+    if channel:
+        # 首次写入时落 sidecar;已有 sidecar 不动(渠道归属只由首条消息决定)。
+        try:
+            save_meta(memory_dir, role, safe_session_id, channel=channel, scope_key=scope_key)
+        except Exception:
+            logger.exception(
+                "failed to save session meta role=%s session_id=%s channel=%s",
+                role, safe_session_id, channel,
+            )
     logger.debug(
-        "message history saved role=%s session_id=%s bytes=%d scope=%s",
+        "message history saved role=%s session_id=%s bytes=%d scope=%s channel=%s",
         role,
         safe_session_id,
         len(history_json),
         latest_scope,
+        channel,
     )
 
 
 def list_sessions(memory_dir: Path, role_name: str) -> list[dict]:
     """列举指定角色目录下所有持久化会话文件。
 
-    返回按 mtime 倒序排列的 ``{session_id, mtime, size_bytes}`` 列表，
-    跳过 ``latest`` 文件、``latest_by_scope`` 子目录以及无法通过
-    ``validate_session_id`` 校验的文件。
+    返回按 mtime 倒序排列的 ``{session_id, mtime, size_bytes, channel}`` 列表，
+    跳过 ``latest`` 文件、``latest_by_scope`` 子目录、``*.meta.json`` sidecar，
+    以及无法通过 ``validate_session_id`` 校验的文件。``channel`` 取自 sidecar，
+    缺失时回退到 ``DEFAULT_CHANNEL``（``webui``）。
     """
     role = _role_name(role_name)
     role_dir = get_role_memory_dir(memory_dir, role)
@@ -158,6 +181,9 @@ def list_sessions(memory_dir: Path, role_name: str) -> list[dict]:
         if entry.is_dir():
             continue
         if entry.suffix != ".json":
+            continue
+        # 排除 sidecar：它们也是 .json，但文件名形如 {sid}.meta.json
+        if is_meta_filename(entry.name):
             continue
         session_id = entry.stem
         try:
@@ -173,6 +199,7 @@ def list_sessions(memory_dir: Path, role_name: str) -> list[dict]:
             "session_id": session_id,
             "mtime": stat.st_mtime,
             "size_bytes": stat.st_size,
+            "channel": infer_channel(memory_dir, role, session_id),
         })
 
     items.sort(key=lambda x: x["mtime"], reverse=True)

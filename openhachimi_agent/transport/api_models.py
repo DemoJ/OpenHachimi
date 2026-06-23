@@ -39,6 +39,10 @@ class ChatRequest(BaseModel):
     message: str = Field(default="")
     role: str | None = None
     session_id: str | None = None
+    # 渠道编码。WebUI/CLI/Telegram/微信 各自传入对应平台名,后端用它在
+    # sidecar 中绑定会话归属并配合 latest_by_scope 做隔离。WebUI 未传时
+    # 由 HTTP 入口兜底为 "webui"。
+    channel: Literal["webui", "cli", "telegram", "weixin"] | None = None
     attachments: list[AttachmentRef] = Field(default_factory=list)
 
 
@@ -202,11 +206,18 @@ class SessionSummary(BaseModel):
     mtime: float                         # 文件 mtime 秒级时间戳
     preview: str = ""                    # 首条用户消息截断片段
     message_count: int = 0
+    channel: str = "webui"               # 渠道归属;老会话(无 sidecar)默认归 webui
 
 
 class SessionListResponse(BaseModel):
     role: str
     sessions: list[SessionSummary] = Field(default_factory=list)
+
+
+class ChannelListResponse(BaseModel):
+    """前端渠道筛选下拉用:全量渠道枚举 + 默认选中项。"""
+    channels: list[str]
+    default: str
 
 
 class SessionLoadRequest(BaseModel):

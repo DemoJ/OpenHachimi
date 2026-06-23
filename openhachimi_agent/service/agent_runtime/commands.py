@@ -14,6 +14,7 @@ from openhachimi_agent.service.agent_runtime.command_registry import (
     parse_command,
 )
 from openhachimi_agent.service.agent_runtime.streaming import SIGNAL_LABELS
+from openhachimi_agent.storage.session_meta import CHANNEL_CODES
 
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "SIGNAL_LABELS",
     "parse_command",
     "latest_scope_from_context",
+    "channel_code_from_context",
 ]
 
 
@@ -33,3 +35,13 @@ def latest_scope_from_context(channel_context: dict[str, object] | None) -> str 
     if not scope:
         return None
     return validate_latest_scope(str(scope))
+
+
+def channel_code_from_context(channel_context: dict[str, object] | None) -> str | None:
+    """从 channel_context 中提取 channel_code，未注册的值返回 None。"""
+    if not channel_context:
+        return None
+    code = channel_context.get("channel_code")
+    if not isinstance(code, str):
+        return None
+    return code if code in CHANNEL_CODES else None

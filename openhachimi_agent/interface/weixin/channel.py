@@ -567,6 +567,7 @@ class WeixinChannel:
         channel_context = {
             "type": "weixin",
             "platform": "weixin",
+            "channel_code": "weixin",
             "session_scope_key": prepared.scope_key,
         }
 

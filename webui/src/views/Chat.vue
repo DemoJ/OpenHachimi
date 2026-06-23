@@ -5,6 +5,12 @@
       <header class="header">
         <div class="brand">{{ store.currentRole || '加载中…' }}</div>
         <div style="display: flex; gap: 12px; align-items: center;">
+          <label class="channel-picker">
+            <span class="channel-picker-label">渠道</span>
+            <select :value="store.currentChannel" @change="onChannelChange" :disabled="store.isGenerating">
+              <option v-for="c in store.channels" :key="c" :value="c">{{ channelLabel(c) }}</option>
+            </select>
+          </label>
           <span class="model-badge" v-if="store.state">{{ store.state.model }}</span>
           <button class="btn" @click="onLogout">退出</button>
         </div>
@@ -44,22 +50,15 @@ function abortCurrentStream(reason: string) {
  * 回填到本地乐观渲染的消息上，让"展开运行时上下文"按钮、回复时间与 token 计数
  * 都无需用户刷新页面就能出现。
  *
- * 新会话首条消息时 store.currentSessionId 还是 null，此时从 refreshSessions()
- * 拉到的最新一条会话就是本轮 —— 顺手把它写回 store.currentSessionId，
- * 让 /stop 等按钮也能正确工作。
+ * 新会话首条消息时 store.currentSessionId 来自 SSE 首个 type=session 事件的
+ * onSession 回调；如果回调未触发（理论上不该发生），这里只记日志并返回，
+ * 不再回退到 sessions[0] —— 那是渠道隔离前的兜底，会跨渠道挑错会话。
  */
 async function syncMessagesFromServer() {
-  let sid = store.currentSessionId
+  const sid = store.currentSessionId
   if (!sid) {
-    // refreshSessions 已在 onDone 里调过，这里直接读 store
-    const latest = store.sessions[0]
-    if (!latest) {
-      console.warn('[Chat] syncMessagesFromServer: no session found')
-      return
-    }
-    sid = latest.session_id
-    store.setCurrentSession(sid)
-    console.info('[Chat] picked up newly-created session', { sid })
+    console.warn('[Chat] syncMessagesFromServer: no currentSessionId after stream done')
+    return
   }
 
   try {
@@ -132,6 +131,26 @@ function onSessionLoaded() {
   store.setGenerating(false)
 }
 
+const CHANNEL_LABELS: Record<string, string> = {
+  webui: 'WebUI',
+  cli: 'CLI',
+  telegram: 'Telegram',
+  weixin: '微信',
+}
+
+function channelLabel(code: string): string {
+  return CHANNEL_LABELS[code] ?? code
+}
+
+async function onChannelChange(e: Event) {
+  const target = e.target as HTMLSelectElement
+  const channel = target.value
+  if (channel === store.currentChannel) return
+  abortCurrentStream('channel-changed')
+  store.setGenerating(false)
+  await store.setCurrentChannel(channel)
+}
+
 async function onSend(text: string) {
   // 防御：理论上 ChatInput 已经在 generating=true 时禁用了发送，
   // 这里再兜底一次，防止异常路径下产生并发流。
@@ -169,6 +188,14 @@ async function onSend(text: string) {
         if (store.activity) store.setActivity(null)
         store.appendAssistantChunk(t)
       },
+      onSession(sid) {
+        // 后端首事件:把空白页直发自动新建的 session_id 回填到 store,
+        // 后续 /stop、syncMessagesFromServer 都能直接拿到正确 id。
+        if (!store.currentSessionId) {
+          console.info('[Chat] session bound from stream', { sid })
+          store.setCurrentSession(sid)
+        }
+      },
       onDone() {
         console.info('[Chat] stream done')
         store.setGenerating(false)
@@ -194,7 +221,7 @@ async function onSend(text: string) {
         }
         store.setGenerating(false)
       },
-    }, ctrl.signal)
+    }, ctrl.signal, { sessionId: store.currentSessionId, channel: store.currentChannel })
   } catch (err) {
     console.warn('[Chat] chatStream threw', err)
     store.setGenerating(false)
@@ -223,3 +250,29 @@ function onLogout() {
   router.replace('/login')
 }
 </script>
+
+<style scoped>
+.channel-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--body-mid, #888);
+}
+.channel-picker-label {
+  font-weight: 500;
+}
+.channel-picker select {
+  background: transparent;
+  border: 1px solid var(--border-soft, #444);
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.channel-picker select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+</style>

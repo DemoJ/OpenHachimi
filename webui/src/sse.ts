@@ -9,12 +9,18 @@ export interface SSEPayload {
   tool_icon?: string
   done?: boolean
   error?: string
+  // type === "session" 时携带:后端把空白页直发场景下自动新建的 session_id 在
+  // 首事件回传给前端,让 store.currentSessionId 立即同步,避免落到 sessions[0] 兜底。
+  session_id?: string
+  channel?: string
+  auto_created?: boolean
 }
 
 export interface SSECallbacks {
   onChunk: (text: string, temporary: boolean) => void
   onDone: () => void
   onError: (err: string | Error) => void
+  onSession?: (sessionId: string, channel?: string, autoCreated?: boolean) => void
 }
 
 /**
@@ -35,6 +41,7 @@ export async function chatStream(
   role: string | null,
   callbacks: SSECallbacks,
   signal?: AbortSignal,
+  options?: { sessionId?: string | null; channel?: string },
 ): Promise<void> {
   const token = getToken()
   const startedAt = performance.now()
@@ -49,7 +56,10 @@ export async function chatStream(
     callbacks.onDone()
   }
 
-  console.info('[SSE] opening stream', { role, messageChars: message.length })
+  const sessionId = options?.sessionId ?? null
+  const channel = options?.channel ?? 'webui'
+
+  console.info('[SSE] opening stream', { role, channel, sessionId, messageChars: message.length })
 
   try {
     await fetchEventSource('/chat/stream', {
@@ -58,7 +68,7 @@ export async function chatStream(
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ message, role }),
+      body: JSON.stringify({ message, role, session_id: sessionId, channel }),
       signal,
       // 防止 tab 切后台时库自动 close 连接（默认 false）
       openWhenHidden: true,
@@ -103,6 +113,12 @@ export async function chatStream(
           if (data.error) {
             console.warn('[SSE] server reported error', data.error)
             callbacks.onError(data.error)
+            return
+          }
+          if (data.type === 'session' && data.session_id) {
+            // 后端首事件:把空白页直发自动新建的 session_id 同步给前端 store。
+            console.info('[SSE] session bound', { sid: data.session_id, channel: data.channel, autoCreated: data.auto_created })
+            callbacks.onSession?.(data.session_id, data.channel, data.auto_created)
             return
           }
           if (data.text !== undefined) {

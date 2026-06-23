@@ -28,7 +28,10 @@
         :class="{ active: s.session_id === store.currentSessionId }"
         @click="onLoadSession(s.session_id)"
       >
-        <div class="preview">{{ s.preview || '(空会话)' }}</div>
+        <div class="preview-row">
+          <span class="preview">{{ s.preview || '(空会话)' }}</span>
+          <span class="channel-tag" v-if="s.channel">{{ channelLabel(s.channel) }}</span>
+        </div>
         <div class="time">{{ formatTime(s.mtime) }}</div>
       </div>
       <div v-if="store.sessions.length === 0" class="session-item">
@@ -44,6 +47,17 @@ import { newSession, switchRole, loadSession, getSessionMessages } from '../api'
 
 const store = useChatStore()
 const emit = defineEmits<{ (e: 'role-changed' | 'session-loaded'): void }>()
+
+const CHANNEL_LABELS: Record<string, string> = {
+  webui: 'WebUI',
+  cli: 'CLI',
+  telegram: 'TG',
+  weixin: '微信',
+}
+
+function channelLabel(code: string): string {
+  return CHANNEL_LABELS[code] ?? code
+}
 
 function formatTime(mtime: number): string {
   const d = new Date(mtime * 1000)
@@ -93,3 +107,28 @@ async function onLoadSession(session_id: string) {
   }
 }
 </script>
+
+<style scoped>
+.preview-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.preview-row .preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.channel-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(120, 120, 160, 0.18);
+  color: var(--body-mid, #888);
+  letter-spacing: 0.04em;
+}
+</style>

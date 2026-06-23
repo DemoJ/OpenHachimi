@@ -159,7 +159,8 @@ class EmbeddedBackend:
         return self.service.list_roles().roles
 
     async def latest_session(self, role: str) -> tuple[str, str]:
-        resp = self.service.latest_session(role)
+        # CLI 走自己的 scope=cli,与 WebUI/IM 隔离,不再读写全局 latest。
+        resp = self.service.latest_session(role, latest_scope="cli")
         return resp.role, resp.session_id
 
     async def dispatch_command(
@@ -168,7 +169,14 @@ class EmbeddedBackend:
         role: str,
         session_id: str,
     ) -> CommandOutcome | None:
-        channel_context = {"type": "cli", "platform": "cli", "session_id": session_id, "role": role}
+        channel_context = {
+            "type": "cli",
+            "platform": "cli",
+            "channel_code": "cli",
+            "session_scope_key": "cli",
+            "session_id": session_id,
+            "role": role,
+        }
         return await self.service.dispatch_command(
             message,
             role=role,
@@ -178,7 +186,14 @@ class EmbeddedBackend:
         )
 
     async def stream_message(self, message: str, role: str, session_id: str) -> AsyncIterator[str | StreamEventItem]:
-        channel_context = {"type": "cli", "platform": "cli", "session_id": session_id, "role": role}
+        channel_context = {
+            "type": "cli",
+            "platform": "cli",
+            "channel_code": "cli",
+            "session_scope_key": "cli",
+            "session_id": session_id,
+            "role": role,
+        }
         async for event in self.service.stream_events(message, role, session_id, channel_context=channel_context):
             yield event
 
@@ -195,6 +210,10 @@ class HttpBackend:
         return resp.get("roles", [])
 
     async def latest_session(self, role: str) -> tuple[str, str]:
+        # CLI HTTP 客户端启动时拉一次 latest:scope=cli 走专属 latest_by_scope/,
+        # 避免被 WebUI / IM 的 latest 写入污染。/session/latest 当前没有 scope 形参,
+        # 暂时仍走全局 latest;后端 latest_session 已读 scope=None,长期方案见 TODO。
+        # TODO(channel-isolation): 给 /session/latest 加 ?scope=cli 后切到隔离 scope。
         qs = urlencode({'role': role})
         resp = await asyncio.to_thread(request_json, self.server_url, "GET", f"/session/latest?{qs}")
         return resp["role"], resp["session_id"]
@@ -211,7 +230,7 @@ class HttpBackend:
                 self.server_url,
                 "POST",
                 "/commands",
-                {"message": message, "role": role, "session_id": session_id},
+                {"message": message, "role": role, "session_id": session_id, "channel": "cli"},
             )
         except HTTPError as exc:
             raise RuntimeError(error_detail(exc)) from exc
@@ -236,6 +255,7 @@ class HttpBackend:
                     "message": message,
                     "role": role,
                     "session_id": session_id,
+                    "channel": "cli",
                 }):
                     loop.call_soon_threadsafe(q.put_nowait, chunk)
                 loop.call_soon_threadsafe(q.put_nowait, None)
