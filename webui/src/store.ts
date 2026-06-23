@@ -66,7 +66,8 @@ export const useChatStore = defineStore('chat', {
         this.sessions = sessionsRes.sessions
         return r
       } catch {
-        this.logout()
+        // 不清空 token，让上层决定如何处理。
+
         throw new Error('获取初始化数据失败')
 
       }
