@@ -14,7 +14,7 @@ from openhachimi_agent.service.agent_runtime.command_registry import (
     parse_command,
 )
 from openhachimi_agent.service.agent_runtime.streaming import SIGNAL_LABELS
-from openhachimi_agent.storage.session_meta import CHANNEL_CODES
+from openhachimi_agent.storage.session_store import CHANNEL_CODES
 
 
 __all__ = [

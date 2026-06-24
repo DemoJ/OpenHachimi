@@ -614,7 +614,7 @@ def list_sessions(
 @app.get("/channels")
 def list_channels() -> ChannelListResponse:
     """返回可选渠道枚举,前端筛选下拉用。"""
-    from openhachimi_agent.storage.session_meta import CHANNEL_CODES, DEFAULT_CHANNEL
+    from openhachimi_agent.storage.session_store import CHANNEL_CODES, DEFAULT_CHANNEL
 
     return ChannelListResponse(channels=list(CHANNEL_CODES), default=DEFAULT_CHANNEL)
 

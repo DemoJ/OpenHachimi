@@ -1,14 +1,12 @@
 """任务规划与 TODO 追踪系统。"""
 
 import logging
-import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from collections.abc import Iterable
 from typing import Literal
 from typing_extensions import TypedDict
 from functools import wraps
 import inspect
-from pathlib import Path
 
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
@@ -58,85 +56,30 @@ class TodoState:
     tool_calls_since_update: int = 0
     is_active: bool = False
 
-def _get_todos_file_path(ctx: RunContext[AgentDeps]) -> Path:
-    todos_dir = ctx.deps.config.memory_dir / "todos"
-    todos_dir.mkdir(parents=True, exist_ok=True)
-    return todos_dir / f"{ctx.deps.session_id}.json"
-
 def _load_state(ctx: RunContext[AgentDeps]) -> TodoState:
-    path = _get_todos_file_path(ctx)
-    if not path.exists():
+    """从 SessionStore 加载本会话 TODO 状态。
+
+    旧实现读 ``{memory_dir}/todos/{session_id}.json``,现在改走
+    ``ctx.deps.session_store.load_todo_state``。Store 内部已经把"文件不存在 /
+    JSON 解析失败 / 字段类型异常"统一兜底为空 ``TodoState()`` + log warning,
+    与原本 ``_load_state`` 的健壮性语义一致。
+    """
+    store = getattr(ctx.deps, "session_store", None)
+    if store is None:
+        # 离线/构造期 deps 无 session_store:返回空,与旧路径"文件不存在"等价
         return TodoState()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning("Failed to load TODO state from %s: %s", path, e)
-        return TodoState()
-
-    state = TodoState(
-        goal=str(data.get("goal", "")),
-        invariants=[str(item) for item in data.get("invariants", []) if item],
-        tool_calls_since_update=data.get("tool_calls_since_update", 0),
-        is_active=data.get("is_active", False)
-    )
-
-    raw_tasks = data.get("tasks", {})
-    if not isinstance(raw_tasks, dict):
-        logger.warning("TODO state %s has invalid tasks payload: %r", path, type(raw_tasks).__name__)
-        return state
-
-    for k, v in raw_tasks.items():
-        try:
-            task_id = int(k)
-            if not isinstance(v, dict):
-                raise ValueError(f"task payload must be object, got {type(v).__name__}")
-
-            status = v.get("status", "pending")
-            if status not in {"pending", "in-progress", "done", "blocked"}:
-                status = "pending"
-
-            parent_id = v.get("parent_id")
-            if parent_id is not None:
-                parent_id = int(parent_id)
-
-            depends_on = v.get("depends_on", [])
-            if not isinstance(depends_on, list):
-                depends_on = []
-            depends_on = [int(dep_id) for dep_id in depends_on]
-
-            allowed_tools = v.get("allowed_tools", [])
-            if not isinstance(allowed_tools, list):
-                allowed_tools = []
-
-            risk_level = v.get("risk_level", "low")
-            if risk_level not in {"low", "medium", "high"}:
-                risk_level = "low"
-
-            state.tasks[task_id] = TodoTask(
-                id=task_id,
-                description=str(v.get("description", "Unnamed Task")),
-                status=status,
-                notes=str(v.get("notes", "")),
-                parent_id=parent_id,
-                depends_on=depends_on,
-                allowed_tools=[str(tool) for tool in allowed_tools],
-                success_criteria=str(v.get("success_criteria", "")),
-                verification=str(v.get("verification", "")),
-                risk_level=risk_level,
-                evidence=str(v.get("evidence", "")),
-            )
-        except Exception as e:
-            logger.warning("Skipped corrupted TODO task %r from %s: %s", k, path, e)
-
-    return state
+    return store.load_todo_state(ctx.deps.session_id)
 
 def _save_state(ctx: RunContext[AgentDeps], state: TodoState):
-    path = _get_todos_file_path(ctx)
+    """把当前 TODO 状态写回 SessionStore。"""
+    store = getattr(ctx.deps, "session_store", None)
+    if store is None:
+        logger.warning("session_store missing on deps, TODO state will not be persisted")
+        return
     try:
-        data = asdict(state)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        logger.warning("Failed to save TODO state to %s: %s", path, e)
+        store.save_todo_state(ctx.deps.session_id, state)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Failed to save TODO state session_id=%s: %s", ctx.deps.session_id, e)
 
 def _get_state(ctx: RunContext[AgentDeps]) -> TodoState:
     session_state = ctx.deps.session_state

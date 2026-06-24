@@ -58,10 +58,14 @@ def mock_browser_manager():
 
 @pytest.fixture
 def mock_agent_deps(mock_config, mock_browser_manager):
+    # 跟 memory.db_path 现有用真实 SQLite 文件的套路对齐 —— SessionStore 自带 schema
+    # 自举,tmp_path 范围内一次性建好,够整轮测试用。
+    from openhachimi_agent.storage.session_store import SessionStore
     return AgentDeps(
         config=mock_config,
         session_id="test_session_123",
         browser_manager=mock_browser_manager,
         process_manager=MagicMock(),
-        session_state={}
+        session_state={},
+        session_store=SessionStore(mock_config.memory_dir / "sessions.sqlite3"),
     )

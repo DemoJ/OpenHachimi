@@ -2,7 +2,8 @@
 的按需注入回归测试。
 
 重点覆盖:
-- "信息检索原则" 块:闲聊不注入,research task_kind 或工作区装有网搜类技能时注入。
+- "信息检索原则" 块:闲聊不注入,research task_kind 命中时注入;工作区是否装了
+  网搜/研究类 skill **不**再影响这块(skill 自身的 SKILL.md 去承载相关约束)。
 - executor 专用动态段:TODO 接力 / direct-mode / 技能索引按本轮 session 状态触发。
 """
 
@@ -172,8 +173,13 @@ def test_investigation_task_kind_injects_web_search_rules(mock_config):
     assert _WEB_SEARCH_HEADING in block
 
 
-def test_workspace_web_search_skill_injects_rules(mock_config, tmp_path):
-    """工作区里装了网搜类技能 → 即便 task_kind 不是 research 也注入。"""
+def test_workspace_web_search_skill_does_not_inject_rules(mock_config, tmp_path):
+    """工作区装了网搜类技能但本轮 task_kind != research → **不**应注入。
+
+    历史回归:旧实现会扫 SKILL.md 的 name/description/when_to_use,只要装了
+    deep-research 之类的 skill 就强制注入"信息检索原则",导致"你好"这类闲聊
+    也被污染。现在只看本轮意图,skill 自身的 SKILL.md 内部去承载相应约束。
+    """
     skills_dir = tmp_path / "skills_root"
     _write_skill(
         skills_dir,
@@ -193,11 +199,11 @@ def test_workspace_web_search_skill_injects_rules(mock_config, tmp_path):
         },
     )
     block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING in block
+    assert _WEB_SEARCH_HEADING not in block
 
 
-def test_workspace_chinese_search_skill_injects_rules(mock_config, tmp_path):
-    """中文描述含'搜索/检索'的技能也应触发(关键词中文覆盖)。"""
+def test_workspace_chinese_search_skill_does_not_inject_rules(mock_config, tmp_path):
+    """中文描述含'搜索/检索'的技能在闲聊场景下也**不**应触发(回归用例)。"""
     skills_dir = tmp_path / "skills_root"
     _write_skill(
         skills_dir,
@@ -217,7 +223,7 @@ def test_workspace_chinese_search_skill_injects_rules(mock_config, tmp_path):
         },
     )
     block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING in block
+    assert _WEB_SEARCH_HEADING not in block
 
 
 def test_workspace_irrelevant_skill_does_not_inject_rules(mock_config, tmp_path):

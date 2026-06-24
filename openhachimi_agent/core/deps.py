@@ -15,6 +15,9 @@ class AgentDeps:
     memory_scope: MemoryScope | None = None
     memory_context: MemoryContext | None = None
     memory_service: Any = None
+    # SessionStore;为避免 storage <-> core 循环 import 用 Any。tools(如 planning)
+    # 通过 ctx.deps.session_store 访问会话级 SQLite 库。
+    session_store: Any = None
     run_mode: str = "interactive"
     channel_context: dict[str, Any] = field(default_factory=dict)
     scheduler_context: dict[str, Any] = field(default_factory=dict)

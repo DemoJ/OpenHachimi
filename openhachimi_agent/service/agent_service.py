@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from typing import Any
 
-from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
 
 from openhachimi_agent.content.roles import list_role_names, load_role_content
@@ -35,7 +34,6 @@ from openhachimi_agent.service.agent_runtime.mcp_manager import (
 )
 from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.service.agent_runtime.turn import run_turn
-from openhachimi_agent.storage.memory import get_memory_path, load_message_history, save_message_history, start_new_session
 from openhachimi_agent.transport.api_models import (
     AgentState,
     ArtifactRef,
@@ -63,9 +61,13 @@ class AgentService:
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         from openhachimi_agent.service.browser import BrowserManager
         from openhachimi_agent.service.process import ProcessManager
+        from openhachimi_agent.storage.session_store import SessionStore
         from openhachimi_agent.tools.utils import BoundedDict
         self.browser_manager = BrowserManager(config)
         self.process_manager = ProcessManager()
+        # 会话级 SQLite 库:消息历史 + 渠道元数据 + 最新指针 + TODO state。
+        # 取代旧的 .memory/{role}/*.json + *.meta.json + latest* + todos/*.json 文件方案。
+        self.session_store = SessionStore(config.memory_dir / "sessions.sqlite3")
         self._session_states: BoundedDict[str, dict] = BoundedDict(100)
         self._artifact_records: BoundedDict[str, ArtifactRef] = BoundedDict(500)
         self._context_compressors: BoundedDict[str, Any] = BoundedDict(100)
@@ -163,15 +165,10 @@ class AgentService:
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
         scope = validate_latest_scope(latest_scope)
-        from openhachimi_agent.storage.memory import (
-            create_session_id,
-            load_latest_session_id,
-            save_latest_session_id,
-        )
-        session_id = load_latest_session_id(self.config.memory_dir, role, scope)
-        if not session_id or session_id == "legacy":
-            session_id = create_session_id()
-            save_latest_session_id(self.config.memory_dir, role, session_id, scope)
+        session_id = self.session_store.get_latest_session_id(role, scope)
+        if not session_id:
+            session_id = self.session_store.new_session_id()
+            self.session_store.set_latest_session_id(role, session_id, scope)
             logger.info("no latest session found, created new session role=%s session_id=%s scope=%s", role, session_id, scope)
         else:
             logger.info("loaded latest session role=%s session_id=%s scope=%s", role, session_id, scope)
@@ -186,7 +183,7 @@ class AgentService:
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
         scope = validate_latest_scope(latest_scope)
-        session_id = start_new_session(self.config.memory_dir, role, scope)
+        session_id = self.session_store.start_new_session(role, scope)
         logger.info(
             "new session role=%s session_id=%s scope=%s",
             role,
@@ -220,7 +217,7 @@ class AgentService:
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
         scope = validate_latest_scope(latest_scope)
-        session_id = start_new_session(self.config.memory_dir, role, scope)
+        session_id = self.session_store.start_new_session(role, scope)
         logger.info(
             "switched role to role=%s session_id=%s scope=%s",
             role,
@@ -240,38 +237,24 @@ class AgentService:
         *,
         latest_scope: str | None = None,
     ) -> CommandResponse:
-        """为指定渠道新建会话并立即写 sidecar 绑定渠道归属。
+        """为指定渠道新建会话并立即在 SessionStore 写入渠道归属。
 
-        WebUI 在用户没有选中会话直接发消息时（空白页自动 /new）调用此方法,
+        WebUI 在用户没有选中会话直接发消息时(空白页自动 /new)调用此方法,
         保证新会话从一开始就有渠道标签,不会落到 ``DEFAULT_CHANNEL`` 默认值。
         ``latest_scope`` 未传时默认用 ``channel_code`` 自身作为 scope —— 这
         与 HTTP /chat/stream 的 ``session_scope_key`` 行为对齐。
         """
-        from openhachimi_agent.storage.session_meta import (
-            CHANNEL_CODES,
-            DEFAULT_CHANNEL,
-            save_meta,
-        )
+        from openhachimi_agent.storage.session_store import CHANNEL_CODES, DEFAULT_CHANNEL
 
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
         if channel_code not in CHANNEL_CODES:
             channel_code = DEFAULT_CHANNEL
         scope = validate_latest_scope(latest_scope or channel_code)
-        session_id = start_new_session(self.config.memory_dir, role, scope)
-        try:
-            save_meta(
-                self.config.memory_dir,
-                role,
-                session_id,
-                channel=channel_code,
-                scope_key=scope,
-            )
-        except Exception:
-            logger.exception(
-                "failed to write session meta on new_session_for_channel role=%s session_id=%s channel=%s",
-                role, session_id, channel_code,
-            )
+        # start_new_session 内部:写 sessions(channel 首写定终身)+ 写 pointer,一并完成。
+        session_id = self.session_store.start_new_session(
+            role, scope, channel=channel_code, scope_key=scope,
+        )
         logger.info(
             "new session for channel role=%s session_id=%s channel=%s scope=%s",
             role, session_id, channel_code, scope,
@@ -451,28 +434,19 @@ class AgentService:
     ) -> dict:
         """列出指定角色的所有历史会话。
 
-        ``channel`` 非空时按渠道过滤(``infer_channel`` 给老会话兜底为 ``webui``)。
+        ``channel`` 非空时按渠道过滤(SessionStore 内部对未知渠道做 DEFAULT_CHANNEL 兜底)。
         返回 ``{"role": str, "sessions": [SessionSummary, ...]}``。
         """
-        from openhachimi_agent.storage.memory import list_sessions as _list_sessions
-        from openhachimi_agent.storage.session_meta import is_known_channel
-
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
-        raw = _list_sessions(self.config.memory_dir, role)
-
-        filter_channel: str | None = None
-        if channel is not None and is_known_channel(channel):
-            filter_channel = channel
+        # store 端已经做了渠道过滤;传非法 channel 会被忽略(返回全部),与旧语义一致。
+        raw = self.session_store.list_sessions(role, channel=channel)
 
         sessions: list[dict] = []
         for s in raw:
-            session_channel = s.get("channel", "webui")
-            if filter_channel is not None and session_channel != filter_channel:
-                continue
-            created_at: str | None = None
             sid = s["session_id"]
-            # 解析 session_id 前缀 "YYYYMMDD-HHMMSS-..."
+            created_at: str | None = None
+            # 解析 session_id 前缀 "YYYYMMDD-HHMMSS-..." 还原 created_at(展示用)。
             if "-" in sid:
                 try:
                     dt = datetime.strptime(sid[:15], "%Y%m%d-%H%M%S")
@@ -484,7 +458,7 @@ class AgentService:
             msg_count = 0
             if with_preview:
                 try:
-                    _, msgs = load_message_history(self.config.memory_dir, role, sid)
+                    _, msgs = self.session_store.load_messages(role, sid)
                 except Exception:
                     msgs = []
                 msg_count = len(msgs)
@@ -500,7 +474,7 @@ class AgentService:
                 "mtime": s["mtime"],
                 "preview": preview,
                 "message_count": msg_count,
-                "channel": session_channel,
+                "channel": s.get("channel", "webui"),
             })
 
         return {"role": role, "sessions": sessions}
@@ -521,8 +495,7 @@ class AgentService:
             raise ValueError("session_id 不能为空，请指定要加载的会话")
 
         # 触发存在性校验:不存在时让上层把错误透传给前端
-        memory_path = get_memory_path(self.config.memory_dir, role, resolved_session_id)
-        if not memory_path.exists():
+        if not self.session_store.session_exists(role, resolved_session_id):
             raise FileNotFoundError(f"会话不存在: {resolved_session_id}")
         _ = validate_latest_scope(latest_scope)
         logger.info("loaded session role=%s session_id=%s", role, resolved_session_id)
@@ -539,7 +512,7 @@ class AgentService:
         if not resolved_session_id:
             raise ValueError("session_id 不能为空")
 
-        _, msgs = load_message_history(self.config.memory_dir, role, resolved_session_id)
+        _, msgs = self.session_store.load_messages(role, resolved_session_id)
         parts = self._extract_text_parts(msgs, role=role)
 
         from openhachimi_agent.transport.api_models import MessageItem
@@ -696,9 +669,15 @@ class AgentService:
         focus_topic: str = "",
         latest_scope: str | None = None,
     ) -> ChatResponse:
-        """手动压缩指定会话的上下文历史(可带焦点主题)。"""
+        """手动压缩指定会话的上下文历史(可带焦点主题)。
+
+        与 turn.py 的 ``run_turn`` 一样套住 per-session asyncio.Lock —— 旧实现
+        没套,理论上一次手动 /compress 可能在 turn 写入 session 的瞬间插队读旧
+        history 然后用陈旧值覆盖回去。SQLite 端虽有 ``BEGIN IMMEDIATE`` 兜底,
+        应用层这把锁还是要拿,belt-and-suspenders。
+        """
         role = self._normalize_role(role)
-        actual_session_id, history = load_message_history(self.config.memory_dir, role, session_id, latest_scope)
+        actual_session_id, history = self.session_store.load_messages(role, session_id, latest_scope)
         if not history:
             return ChatResponse(output="当前会话无历史可压缩。", role=role, session_id=actual_session_id)
         memory_scope = MemoryScope(
@@ -731,15 +710,16 @@ class AgentService:
                 role=role,
                 session_id=actual_session_id,
             )
-        history_json = ModelMessagesTypeAdapter.dump_json(compressed)
-        await asyncio.to_thread(
-            save_message_history,
-            self.config.memory_dir,
-            role,
-            actual_session_id,
-            history_json,
-            latest_scope,
-        )
+        # 写回阶段:套 session lock,与 turn.py 的写入路径互斥。
+        lock = self._get_session_lock(actual_session_id)
+        async with lock:
+            await asyncio.to_thread(
+                self.session_store.save_messages,
+                role,
+                actual_session_id,
+                compressed,
+                scope=latest_scope,
+            )
         savings = compressor._last_compression_savings_pct  # noqa: SLF001
         focus_hint = f"(焦点:{focus})" if focus else ""
         return ChatResponse(

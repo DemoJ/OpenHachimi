@@ -46,31 +46,14 @@ logger = logging.getLogger(__name__)
 
 _WEEKDAY_ZH = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 
-# "信息检索原则"块触发关键词集合。
-# 设计:既然主模型可以自己看 skill 索引、按需读全文,我们不再需要 router 来选
-# skill。只需要扫一遍工作区里现有 skill 的 name/description/when_to_use,看有没有
-# "网搜/研究类"的存在,以此决定是否注入"信息检索原则"。中文/英文都覆盖。
-_WEB_SEARCH_SKILL_KEYWORDS = (
-    "search",
-    "research",
-    "web",
-    "browser",
-    "scrape",
-    "crawl",
-    "fetch",
-    "搜索",
-    "检索",
-    "网搜",
-    "网页",
-    "调研",
-    "调查",
-    "研究",
-    "情报",
-    "资讯",
-)
-
-# task_kind 命中"研究类"任务时也注入。注意 TaskKind 字面量目前只有 "research";
-# 这里多列 "investigation" 是给 router 输出超出约定时的兼容兜底。
+# "信息检索原则"块只在本轮 TaskFrame.task_kind 命中"研究类"任务时注入。
+# 注意 TaskKind 字面量目前只有 "research";这里多列 "investigation" 是给 router 输出
+# 超出约定时的兼容兜底。
+#
+# 旧实现还会扫工作区里 SKILL.md 的 name/description/when_to_use,只要装了任意
+# "网搜/研究类" skill 就强制注入这条提示——结果"你好"这类闲聊也会被污染
+# (deep-research / find-skills 等装了就触发)。现在改回"只看本轮意图":普通
+# 网搜 skill 自己的 SKILL.md 里若需要约束年份等,应在自身的提示词里承载。
 _WEB_SEARCH_TASK_KINDS = {"research", "investigation"}
 
 # 技能索引里 SKILL.md 未声明 category 时的默认分组名。
@@ -105,61 +88,26 @@ def _memory_block(deps: AgentDeps) -> str:
         return ""
 
 
-def _skill_matches_web_search(skill: Skill) -> bool:
-    """技能是否属于"网搜/研究类"——按 name/description/when_to_use 关键词命中。
-
-    用户安装的网搜技能(web-search / deep-research / browser-automation 等)
-    在元数据里几乎都会含下列关键词之一。规则放宽不放严:命中即注入,避免漏掉
-    那些虽然内部用到网搜、但 task_kind 被标成 "qa" 的边缘场景。
-    """
-    cfg = getattr(skill, "config", None)
-    if cfg is None:
-        return False
-    fields = [
-        getattr(cfg, "name", "") or "",
-        getattr(cfg, "description", "") or "",
-        getattr(cfg, "when_to_use", "") or "",
-    ]
-    blob = " ".join(fields).lower()
-    if not blob:
-        return False
-    return any(keyword in blob for keyword in _WEB_SEARCH_SKILL_KEYWORDS)
-
-
-def _has_web_search_skill(deps: AgentDeps) -> bool:
-    """工作区里有没有"网搜类"技能。
-
-    渐进披露后,我们不再通过 router 输出的 relevant_skills 来判定,而是直接扫
-    全量 skill。语义微调:之前问"router 选中了网搜技能吗",现在问"用户装了
-    网搜技能吗"。后者更宽松,但代价只是几十 token 的"信息检索原则"提示,值。
-    """
-    skills_dirs = getattr(deps, "skills_dirs", None)
-    if not skills_dirs:
-        return False
-    try:
-        skills = find_skills(skills_dirs)
-    except Exception:  # noqa: BLE001
-        return False
-    return any(_skill_matches_web_search(skill) for skill in skills)
-
-
 def _web_search_rules_block(deps: AgentDeps) -> str:
-    """"信息检索原则"按需注入块。
+    """"信息检索原则"按需注入块——只看本轮 TaskFrame.task_kind。
 
-    触发条件(任一命中即注入):
-    - 本轮 TaskFrame.task_kind 是 "research"(或 router 偶发输出的 "investigation")
-    - 工作区内安装了任一网搜/研究类 skill(按关键词命中 name/description/when_to_use)
+    旧实现会扫工作区里所有 SKILL.md 的 name/description/when_to_use,只要装了
+    任意"网搜/研究类" skill 就注入这条提示。结果是问"你好"这类闲聊也会被污染:
+    只要本机装了 deep-research / netease-music(描述里有"搜索")/ find-skills
+    (描述里有 search)等任意一条,system prompt 就会多出这段年份约束。
 
-    不命中(闲聊、纯本地代码任务、跑 lint 等)就完全不注入,省掉每轮几十 token。
+    渐进披露之后,网搜类 skill 的提示词应在自身 SKILL.md 内承载这种约束(模型
+    按需 ``get_skill_instructions`` 拉全文时会看到)。运行时这里只负责本轮意图
+    确实是"研究类"任务时的兜底提示。
     """
     session_state = getattr(deps, "session_state", None)
-    task_kind: Any = None
-    if isinstance(session_state, dict):
-        task_frame_dict = session_state.get("task_frame")
-        if isinstance(task_frame_dict, dict):
-            task_kind = task_frame_dict.get("task_kind")
-    triggered = task_kind in _WEB_SEARCH_TASK_KINDS or _has_web_search_skill(deps)
-    if not triggered:
+    if not isinstance(session_state, dict):
+        return ""
+    task_frame_dict = session_state.get("task_frame")
+    if not isinstance(task_frame_dict, dict):
+        return ""
+    task_kind = task_frame_dict.get("task_kind")
+    if task_kind not in _WEB_SEARCH_TASK_KINDS:
         return ""
     try:
         return render_system_prompt("runtime/web_search_rules")
@@ -375,8 +323,9 @@ def build_system_dynamic_block(deps: AgentDeps | None) -> str:
     或异常则跳过;整体以空行分隔。当 deps 为 None / 异常时返回空字符串,保证 agent
     构建期间(deps 还没准备好)的安全。
 
-    "信息检索原则"块按需注入(仅当本轮 task_kind 是研究类、或工作区装了
-    网搜/研究类 skill 时才出现),避免闲聊等非检索场景被注入无关提示词。
+    "信息检索原则"块按需注入(仅当本轮 task_kind 是研究类时才出现),避免闲聊
+    等非检索场景被注入无关提示词。网搜类 skill 自身的提示词应在 SKILL.md 内
+    承载相应约束。
     """
     if deps is None:
         # 即便没有 deps 也应该至少提供当前时间，便于模型在"会话开始第一轮模板渲染"

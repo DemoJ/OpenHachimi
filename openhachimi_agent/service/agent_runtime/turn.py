@@ -15,7 +15,6 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING
 
-from pydantic_ai import ModelMessagesTypeAdapter
 
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.core.identifiers import validate_latest_scope
@@ -48,7 +47,6 @@ from openhachimi_agent.service.agent_runtime.streaming import (
     consume_stream_queue,
     system_stream_event,
 )
-from openhachimi_agent.storage.memory import load_message_history, save_message_history
 from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef, ChatResponse
 
 
@@ -354,7 +352,7 @@ async def run_turn(
             channel_context_data.update(delivery_target)
     channel_name = str(channel_context_data.get("type") or channel_context_data.get("platform") or "local")
 
-    actual_session_id, history = load_message_history(service.config.memory_dir, role, session_id, latest_scope)
+    actual_session_id, history = service.session_store.load_messages(role, session_id, latest_scope)
     lock = service._get_session_lock(actual_session_id)
 
     async with lock:
@@ -390,6 +388,7 @@ async def run_turn(
             session_state=session_state,
             memory_scope=memory_scope,
             memory_context=memory_context,
+            session_store=service.session_store,
             run_mode=run_mode,
             channel_context=channel_context_data,
             scheduler_context=dict(scheduler_context or {}),
@@ -684,17 +683,17 @@ async def run_turn(
                             actual_session_id,
                             exc_info=True,
                         )
-            history_json = ModelMessagesTypeAdapter.dump_json(new_history)
-
+            # SessionStore.save_messages 接 list[ModelMessage],store 内部按条入 SQLite。
+            # 这里不再手动 dump_json —— v3 文件方案的"每轮全量字节落盘"已经退役。
+            # scope_key 与旧 save_message_history 一致沿用 latest_scope 值。
             await asyncio.to_thread(
-                save_message_history,
-                service.config.memory_dir,
+                service.session_store.save_messages,
                 role,
                 actual_session_id,
-                history_json,
-                latest_scope,
-                resolved_channel_code,
-                latest_scope,
+                new_history,
+                scope=latest_scope,
+                channel=resolved_channel_code,
+                scope_key=latest_scope,
             )
             capture_args = (
                 service.config,
