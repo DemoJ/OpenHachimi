@@ -12,15 +12,20 @@ from typing import Any
 
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import UserContent
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
 from pydantic_ai.usage import UsageLimits
 
 from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
 from openhachimi_agent.agent.factory import build_scheduled_executor_agent
-from openhachimi_agent.agent.intent import SelfCritiqueDecision
 from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
-from openhachimi_agent.service.agent_runtime.context import AgentRunContext, has_active_todos
+from openhachimi_agent.service.agent_runtime.context import (
+    AgentRunContext,
+    has_active_todos,
+    has_restorable_suspended_plan,
+    restore_suspended_plan,
+)
 from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.transport.api_models import AttachmentRef
 from openhachimi_agent.vision.capabilities import mark_model_vision_support
@@ -179,7 +184,6 @@ def _degrade_direct_vision_result(vision_result: VisionPreprocessResult, error: 
 class ExecutionOutcome:
     result: Any
     final_verification_signal: dict[str, object] | None = None
-    self_critique_signal: dict[str, object] | None = None
 
 
 def _build_executor_message(
@@ -221,111 +225,6 @@ def _build_repair_message(
         {
             "verification_signal": json.dumps(verification_signal, ensure_ascii=False),
             "user_message": message_with_attachments(message, attachments or [], vision_result),
-        },
-    )
-    return _with_direct_vision_parts(text, vision_result)
-
-
-def _compact_text(value: object, max_chars: int = 1200) -> str:
-    text = str(value or "")
-    text = " ".join(text.split())
-    if len(text) > max_chars:
-        return text[: max_chars - 3] + "..."
-    return text
-
-
-def _summarize_todo_state(session_state: dict[str, Any]) -> list[dict[str, object]]:
-    todo_state = session_state.get("todo_state")
-    tasks = getattr(todo_state, "tasks", None)
-    if not isinstance(tasks, dict):
-        return []
-    return [
-        {
-            "id": getattr(task, "id", task_id),
-            "description": getattr(task, "description", ""),
-            "status": getattr(task, "status", ""),
-            "success_criteria": getattr(task, "success_criteria", ""),
-            "notes": getattr(task, "notes", ""),
-        }
-        for task_id, task in list(tasks.items())[:20]
-    ]
-
-
-def _summarize_execution_evidence(session_state: dict[str, Any], max_events: int = 30) -> dict[str, object]:
-    ledger = session_state.get("execution_ledger", [])
-    turn_start_seq = int(session_state.get("current_turn_ledger_start_seq", 0) or 0)
-    current_turn_events = []
-    if isinstance(ledger, list):
-        current_turn_events = [
-            {
-                "seq": event.get("seq"),
-                "tool_name": event.get("tool_name"),
-                "status": event.get("status"),
-                "task_id": event.get("task_id"),
-                "args": event.get("args", {}),
-                "result_preview": _compact_text(event.get("result_preview", ""), 500),
-                "violation": _compact_text(event.get("violation", ""), 500),
-            }
-            for event in ledger
-            if isinstance(event, dict) and int(event.get("seq", 0)) > turn_start_seq
-        ][-max_events:]
-
-    artifacts = [
-        {
-            "id": getattr(artifact, "id", ""),
-            "filename": getattr(artifact, "filename", ""),
-            "content_type": getattr(artifact, "content_type", ""),
-            "local_path": getattr(artifact, "local_path", ""),
-        }
-        for artifact in session_state.get("turn_artifacts", [])
-    ]
-
-    return {
-        "todos": _summarize_todo_state(session_state),
-        "current_turn_events": current_turn_events,
-        "artifacts": artifacts,
-        "known_paths": session_state.get("known_paths", {}),
-    }
-
-
-def _result_output(result: object) -> str:
-    return str(getattr(result, "output", getattr(result, "data", "")) or "")
-
-
-def _build_self_critique_message(
-    task_frame_payload: dict[str, Any] | None,
-    message: str,
-    candidate_answer: str,
-    execution_evidence: dict[str, object],
-) -> str:
-    return render_system_prompt(
-        "runtime/self_critique_task",
-        {
-            "task_frame": json.dumps(task_frame_payload or {}, ensure_ascii=False),
-            "user_message": message,
-            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False),
-            "candidate_answer": candidate_answer,
-        },
-    )
-
-
-def _build_self_critique_repair_message(
-    task_frame_payload: dict[str, Any] | None,
-    message: str,
-    candidate_answer: str,
-    self_critique: SelfCritiqueDecision,
-    execution_evidence: dict[str, object],
-    attachments: list[AttachmentRef] | None = None,
-    vision_result: VisionPreprocessResult | None = None,
-) -> str | list[UserContent]:
-    del task_frame_payload  # noqa: F841 — TaskFrame 已在 system prompt 中注入
-    text = render_system_prompt(
-        "runtime/executor_self_critique_repair",
-        {
-            "user_message": message_with_attachments(message, attachments or [], vision_result),
-            "execution_evidence": json.dumps(execution_evidence, ensure_ascii=False),
-            "candidate_answer": candidate_answer,
-            "self_critique": self_critique.model_dump_json(),
         },
     )
     return _with_direct_vision_parts(text, vision_result)
@@ -433,10 +332,10 @@ def preflight_compress_history(ctx: AgentRunContext) -> None:
 def _executor_stream_handler(ctx: AgentRunContext, text_buffer: list[str]) -> Callable[[object, object], Any] | None:
     # 正文实时流式：直接复用 turn.py 里构建的无缓冲 handler（ctx.stream_event_handler），
     # 不再传 text_buffer。原来传 text_buffer 会把所有正文 chunk 缓冲到 list 里，
-    # 直到 self_critique 跑完才在 _flush_buffered_text 一次性 flush，导致 WebUI
+    # 直到下游裁判跑完才在 _flush_buffered_text 一次性 flush，导致 WebUI
     # 看不到逐字打字机效果、整段回复在最后才一口气出现。
     #
-    # 取消缓冲的代价：self_critique / final_verification 要求重写时，首版正文已经
+    # 取消缓冲的代价：final_verification 要求重写时，首版正文已经
     # 流式显示给用户了，repair 的输出会作为续写追加在同一条 assistant 消息后，
     # 中间有 [System] 提示分隔。这与 ChatGPT/Claude 等主流产品的行为一致，
     # 优于"长时间静默后一次性吐出"。
@@ -455,81 +354,6 @@ async def _flush_buffered_text(ctx: AgentRunContext, text_buffer: list[str]) -> 
     for chunk in text_buffer:
         await ctx.stream_queue.put(StreamEventItem(type="text", text=chunk))
     text_buffer.clear()
-
-
-def _self_critique_signal(decision: SelfCritiqueDecision) -> dict[str, object]:
-    return {
-        "reason": "self critique requires revision",
-        "issues": [
-            {
-                "type": "self_critique_revision_required",
-                "items": decision.issues,
-                "repair_instructions": decision.repair_instructions,
-                "confidence": decision.confidence,
-                "rationale": decision.rationale,
-            }
-        ],
-    }
-
-
-def _should_run_self_critique(ctx: AgentRunContext, task_frame_payload: dict[str, Any] | None) -> bool:
-    """是否对本轮最终回复执行自检。
-
-    自检会额外发起一次 LLM 调用并阻塞回复返回，对简单任务（问候、信息查询等）
-    收益小、延迟代价大。因此只有「经历了复杂规划」的任务才自检：
-
-    - 本轮有活动 TODO（实际创建并执行了多步计划）—— 最强信号；
-    - TaskFrame 标记 requires_plan / execution_mode=planned / complexity=complex。
-
-    简单 direct / skill_direct 任务直接返回，跳过自检。
-    """
-    if has_active_todos(ctx.session_state):
-        return True
-    if task_frame_payload:
-        if task_frame_payload.get("requires_plan"):
-            return True
-        if task_frame_payload.get("execution_mode") == "planned":
-            return True
-        if task_frame_payload.get("complexity") == "complex":
-            return True
-    return False
-
-
-async def _run_self_critique(
-    ctx: AgentRunContext,
-    get_agent: Callable[[str, str], Any],
-    task_frame_payload: dict[str, Any] | None,
-    result: object,
-) -> SelfCritiqueDecision:
-    candidate_answer = _result_output(result)
-    evidence = _summarize_execution_evidence(ctx.session_state)
-    prompt = _build_self_critique_message(task_frame_payload, ctx.message, candidate_answer, evidence)
-    ctx.operation_state.start("model", "self_critique")
-    critic_agent = get_agent(ctx.role, "self_critique")
-    try:
-        critic_result = await asyncio.wait_for(
-            critic_agent.run(prompt),
-            timeout=min(60, ctx.config.agent_timeout_seconds),
-        )
-        data = getattr(critic_result, "data", getattr(critic_result, "output", None))
-        decision = SelfCritiqueDecision.model_validate(data)
-    except Exception as exc:
-        logger.warning("self critique failed; allowing executor result role=%s session_id=%s error=%s", ctx.role, ctx.session_id, exc)
-        return SelfCritiqueDecision(
-            verdict="pass",
-            confidence=0.0,
-            rationale=f"self critique failed: {exc.__class__.__name__}",
-        )
-
-    logger.info(
-        "self critique verdict=%s confidence=%.2f issues=%d role=%s session_id=%s",
-        decision.verdict,
-        decision.confidence,
-        len(decision.issues),
-        ctx.role,
-        ctx.session_id,
-    )
-    return decision
 
 
 async def _run_executor_with_vision_fallback(
@@ -701,6 +525,20 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
         else:
             raise
 
+    # clarify_user 抛了 CallDeferred:run 已被 pydantic-ai 在 graph 层合法终止,
+    # output 是 DeferredToolRequests 而非 final answer。下游 final_verification /
+    # validator 等裁判全部跳过——任务在"等用户输入"这个合法暂停态,任何"补齐缺口"
+    # 的尝试都会误伤(详见 tools/clarification.py 与 turn.py 的 deferred 分支处理)。
+    if isinstance(getattr(result, "output", None), DeferredToolRequests):
+        await _flush_buffered_text(ctx, text_buffer)
+        logger.info(
+            "execute_task: deferred tool request (clarify_user) — short-circuit "
+            "role=%s session_id=%s",
+            ctx.role,
+            ctx.session_id,
+        )
+        return ExecutionOutcome(result=result)
+
     verification_signal = get_final_verification_signal(ctx.session_state)
     validator_yielded = bool(ctx.session_state.get("_final_validator_yielded", False))
     # validator 已经被硬熔断放行,说明模型已被反复证明"突破不了任务未完成的阻塞"
@@ -733,65 +571,124 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             stream=ctx.stream,
             handle_stream_events=_executor_stream_handler(ctx, text_buffer),
         )
+        # repair 后模型可能又调 clarify_user 触发 deferred,这种情况也走短路。
+        if isinstance(getattr(result, "output", None), DeferredToolRequests):
+            await _flush_buffered_text(ctx, text_buffer)
+            return ExecutionOutcome(result=result)
         verification_signal = get_final_verification_signal(ctx.session_state)
 
     if verification_signal:
         await _flush_buffered_text(ctx, text_buffer)
         return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
 
-    # 简单任务（问候、信息查询等 direct/skill_direct）跳过自检，
-    # 避免对低风险任务做额外 LLM 调用造成无谓延迟。只有经历了复杂规划
-    # （活动 TODO / requires_plan / planned / complex）的任务才自检。
-    if not _should_run_self_critique(ctx, task_frame_payload):
-        await _flush_buffered_text(ctx, text_buffer)
-        logger.info(
-            "self critique skipped (simple task) role=%s session_id=%s",
+    await _flush_buffered_text(ctx, text_buffer)
+    return ExecutionOutcome(result=result)
+
+
+def _find_pending_clarify_tool_call(history: list[Any]) -> str | None:
+    """在历史末尾扫描未被 tool-return 消费的 clarify_user ToolCallPart。
+
+    主要用于 session_state["_user_clarification"] 因为某些原因(进程重启、状态
+    损坏)缺失 tool_call_id 时的兜底,以最大限度恢复 deferred 续接。
+    """
+    from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+
+    consumed: set[str] = set()
+    for msg in reversed(history):
+        if isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, ToolReturnPart):
+                    consumed.add(part.tool_call_id)
+        elif isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if (
+                    isinstance(part, ToolCallPart)
+                    and part.tool_name == "clarify_user"
+                    and part.tool_call_id not in consumed
+                ):
+                    return part.tool_call_id
+            # 最近的 ModelResponse 没有 pending clarify → 不是一次 clarify resume
+            break
+    return None
+
+
+async def execute_task_resume(
+    ctx: AgentRunContext,
+    get_agent: Callable[[str, str], Any],
+) -> ExecutionOutcome | None:
+    """处理 clarify_user 触发的下一轮:把用户回复以 deferred tool result 形式
+    无感知地灌回模型。
+
+    返回 None 表示无法 resume(状态损坏或 history 中找不到 pending tool call),
+    上层应清理 ``_user_clarification`` 并退回正常 execute_task 路径。
+    """
+    info = ctx.session_state.get("_user_clarification", {}) or {}
+    tool_call_id = info.get("tool_call_id") or _find_pending_clarify_tool_call(ctx.history)
+    if not tool_call_id:
+        logger.warning(
+            "execute_task_resume: pending _user_clarification has no tool_call_id and "
+            "history lacks an unconsumed clarify_user call; fall back to normal flow. "
+            "role=%s session_id=%s",
             ctx.role,
             ctx.session_id,
         )
-        return ExecutionOutcome(result=result)
+        ctx.session_state.pop("_user_clarification", None)
+        return None
 
-    critique = await _run_self_critique(ctx, get_agent, task_frame_payload, result)
-    if critique.verdict == "pass":
+    # 恢复挂起的活动计划(若有):上一次 clarify_user 触发的 suspend_current_plan 把
+    # todo_state.is_active 翻成了 False。回灌结果前先把它翻回去,模型回到工具循环
+    # 之后才能正常 with_execution_guard。
+    if has_restorable_suspended_plan(ctx.session_state):
+        restore_suspended_plan(ctx.session_state, deps=ctx.deps)
+
+    task_frame_payload = _get_task_frame_payload(ctx.session_state)
+    ledger_start_seq = get_ledger_length(ctx.session_state)
+    ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
+    ctx.session_state.pop("_final_validator_retries", None)
+    ctx.session_state.pop("_final_validator_yielded", None)
+    ctx.session_state.pop("_final_validator_last_signal", None)
+
+    results = DeferredToolResults(calls={tool_call_id: ctx.message})
+    executor_agent = _build_executor_agent(
+        ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode,
+    )
+    ctx.operation_state.start("model", "executor_resume")
+    preflight_compress_history(ctx)
+    text_buffer: list[str] = []
+
+    run_kwargs: dict[str, Any] = {
+        "message_history": ctx.history,
+        "deferred_tool_results": results,
+        "deps": ctx.deps,
+        "usage_limits": UsageLimits(request_limit=60),
+    }
+    if ctx.stream and ctx.stream_event_handler is not None:
+        run_kwargs["event_stream_handler"] = ctx.stream_event_handler
+
+    logger.info(
+        "execute_task_resume: feeding user reply as deferred tool result "
+        "session_id=%s tool_call_id=%s reply_chars=%d",
+        ctx.session_id,
+        tool_call_id,
+        len(ctx.message),
+    )
+
+    # 注意:run 的第一个位置参数(user_prompt)传 None —— 用户当前消息已经作为
+    # tool return 注入,不再独立作 user-prompt;否则 graph 会拼一个空 ModelRequest
+    # 让模型困惑。
+    result = await executor_agent.run(None, **run_kwargs)
+
+    # 消费成功 → 清掉 _user_clarification 标志(无论本轮是否又触发了新的 deferred)。
+    ctx.session_state.pop("_user_clarification", None)
+
+    # 模型在 resume 之后又调用了一次 clarify_user → 输出仍是 DeferredToolRequests,
+    # 走和正常 execute_task 一致的短路语义。
+    if isinstance(getattr(result, "output", None), DeferredToolRequests):
         await _flush_buffered_text(ctx, text_buffer)
         return ExecutionOutcome(result=result)
 
-    if ctx.turn_state.self_critique_repair_attempts < 1:
-        ctx.turn_state.self_critique_repair_attempts += 1
-        text_buffer.clear()
-        if ctx.stream and ctx.stream_queue is not None:
-            await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 自检发现最终回复需要修正，正在补齐...\n", counted_as_output=False))
+    verification_signal = get_final_verification_signal(ctx.session_state)
+    if verification_signal:
+        return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
+    return ExecutionOutcome(result=result)
 
-        evidence = _summarize_execution_evidence(ctx.session_state)
-        repair_message = _build_self_critique_repair_message(
-            task_frame_payload,
-            ctx.message,
-            _result_output(result),
-            critique,
-            evidence,
-            ctx.attachments,
-            vision_result,
-        )
-        ctx.operation_state.start("model", "self_critique_repair")
-        preflight_compress_history(ctx)
-        result = await run_executor_once(
-            executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
-            run_message=repair_message,
-            history=ctx.history,
-            deps=ctx.deps,
-            config=ctx.config,
-            stream=ctx.stream,
-            handle_stream_events=_executor_stream_handler(ctx, text_buffer),
-        )
-        verification_signal = get_final_verification_signal(ctx.session_state)
-        if verification_signal:
-            await _flush_buffered_text(ctx, text_buffer)
-            return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
-
-        critique = await _run_self_critique(ctx, get_agent, task_frame_payload, result)
-        if critique.verdict == "pass":
-            await _flush_buffered_text(ctx, text_buffer)
-            return ExecutionOutcome(result=result)
-
-    await _flush_buffered_text(ctx, text_buffer)
-    return ExecutionOutcome(result=result, self_critique_signal=_self_critique_signal(critique))

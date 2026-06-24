@@ -187,10 +187,25 @@ _PLANNER_CONTEXT_TOOLS = [
     if getattr(tool, "__name__", "") in _planner_allowed_names
 ]
 
+# Planner 故意不注册 clarify_user:
+# - planner 没有执行类工具(无 run_command / 无 browser_* / 无 MCP),无法做出
+#   "我已经试过工具自查、确认信息只能由用户提供"这种合法触发条件;
+# - planner 的"只读自查"证据强度不足(只能看本地静态文件),据此提前 clarify 会
+#   退化为"懒规划"——把不确定打包成用户必答题;
+# - 语义层的歧义由 router 阶段的 ``TaskFrame.clarifying_question`` 通道承担,
+#   不需要 planner 在执行计划阶段重复一次;
+# - 真正缺资源时,正确做法是把"探测/确认 X"列成 TODO,让 executor 在真实证据上
+#   决定要不要 clarify_user(executor 工具集仍注册)。
+#
+# 同样地,``create_todos`` 也不再放进 PLANNER_TOOLSET —— 它已经通过
+# ``factory.py`` 的 ``ToolOutput(create_todos)`` 作为 *output tool* 挂到 planner
+# agent 上,模型一调它就视为 final answer,graph 立即终止 run。这样彻底取消了
+# "planner 调完 create_todos 后再 emit 一段重复文本"那个第 2 步 LLM 调用。
+# ``get_todos`` 仍然保留作为调研类只读工具(planner 可以在新 plan 之前查看
+# 既有计划状态)。
 PLANNER_TOOLSET = FunctionToolset(
     tools=_PLANNER_CONTEXT_TOOLS
-    + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS]
-    + [with_execution_ledger(clarify_user)],
+    + [with_execution_ledger(get_todos)],
     max_retries=3,
 )
 

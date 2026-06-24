@@ -85,6 +85,14 @@ def _append_ledger_event(
 
 
 def _exception_ledger_status(exc: Exception) -> str:
+    # CallDeferred / ApprovalRequired 是 pydantic-ai 的"挂起本次 run"控制流
+    # 信号(由 clarify_user 等 deferred 工具主动抛出),不是错误。ledger 里把它
+    # 记成 ``deferred``,避免污染 ``get_replan_signal`` 的连续 blocked 计数,也
+    # 让 ``get_final_verification_signal`` 不会错误地把它当成"最近一次失败"。
+    from pydantic_ai.exceptions import ApprovalRequired, CallDeferred
+
+    if isinstance(exc, (CallDeferred, ApprovalRequired)):
+        return "deferred"
     return "blocked" if getattr(exc, "ledger_status", "") == "blocked" else "failed"
 
 
@@ -165,7 +173,15 @@ def get_replan_signal(session_state: dict[str, Any], since_seq: int = 0) -> dict
 
 
 def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, object] | None:
-    """Check whether the run has enough evidence to claim completion."""
+    """Check whether the run has enough evidence to claim completion.
+
+    "未完成"只包含 ``pending`` / ``in-progress`` —— 这两种状态意味着任务还没动
+    或正在进行,模型不应在此时声明完成。``blocked`` 与 ``done`` 都视为终止态:
+    ``done`` 是成功完成,``blocked`` 是模型已诚实声明"这一步走不通(缺资源/缺
+    凭据/外部条件不满足)"。把 blocked 也算成"未完成证据"会让用户在合法暂停态
+    上看到"[最终验证未通过] 当前执行结果仍缺少完成证据" 之类的吓人提示,而那
+    其实只是模型按要求把 task 标了 blocked 而已。
+    """
 
     issues: list[dict[str, object]] = []
 
@@ -179,7 +195,7 @@ def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, ob
                 "status": getattr(task, "status", ""),
             }
             for task_id, task in tasks.items()
-            if getattr(task, "status", None) != "done"
+            if getattr(task, "status", None) not in {"done", "blocked"}
         ]
         if unfinished:
             issues.append({"type": "unfinished_todos", "items": unfinished})
@@ -192,7 +208,15 @@ def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, ob
             if isinstance(event, dict) and int(event.get("seq", 0)) > turn_start_seq
         ]
         latest = current_turn_events[-1] if current_turn_events else None
-        if isinstance(latest, dict) and latest.get("status") in {"blocked", "failed"}:
+        if isinstance(latest, dict) and latest.get("status") == "failed":
+            # 注意:这里只看 ``failed``,不再看 ``blocked``。``blocked`` 在
+            # ledger 里有两种来源:
+            # 1. 工具体内 raise ExecutionGuardViolation(planning.py) —— 这是
+            #    "模型违反 TODO 守卫"的内部信号,跟用户层"任务被阻塞"无关;
+            # 2. validator 打回 —— 已通过 final-answer validator 的 pass-through
+            #    机制独立处理。
+            # 把 ``blocked`` 当成"最近一次执行失败"会和 unfinished_todos 的过滤
+            # (blocked 任务被视为合法终止)产生语义冲突。
             issues.append(
                 {
                     "type": "latest_execution_not_successful",

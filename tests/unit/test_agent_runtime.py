@@ -9,7 +9,6 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent
 
 from openhachimi_agent.agent.intent import PlanContinuationDecision
-from openhachimi_agent.agent.intent import SelfCritiqueDecision
 from openhachimi_agent.agent.intent import TaskFrame
 from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.service.agent_runtime.context import (
@@ -21,8 +20,6 @@ from openhachimi_agent.service.agent_runtime.context import (
 )
 from openhachimi_agent.service.agent_runtime.executor import (
     _build_executor_message,
-    _build_self_critique_message,
-    _build_self_critique_repair_message,
     _run_executor_with_vision_fallback,
     execute_task,
 )
@@ -273,103 +270,19 @@ async def test_direct_vision_http_error_retries_without_image_parts():
     assert "主模型图片输入错误" in agent.messages[1]
 
 
-def test_self_critique_prompt_includes_candidate_and_evidence():
-    message = _build_self_critique_message(
-        {"goal": "修复 a.py"},
-        "请修复 a.py",
-        "已经修好了",
-        {"current_turn_events": [{"tool_name": "replace_in_file", "status": "succeeded"}]},
-    )
+def test_self_critique_removed():
+    """self_critique 已经从执行编排中删除:验证相应符号不再可导入,防止误恢复。"""
+    import openhachimi_agent.service.agent_runtime.executor as executor_mod
 
-    assert "修复 a.py" in message
-    assert "已经修好了" in message
-    assert "replace_in_file" in message
-
-
-def test_self_critique_repair_prompt_includes_repair_instructions():
-    message = _build_self_critique_repair_message(
-        {"goal": "创建 report.md"},
-        "创建报告",
-        "报告已创建",
-        SelfCritiqueDecision(verdict="revise", issues=["缺少发布文件"], repair_instructions="创建并发布 report.md"),
-        {"current_turn_events": []},
-    )
-
-    assert "缺少发布文件" in message
-    assert "创建并发布 report.md" in message
-    assert "报告已创建" in message
-
-
-@pytest.mark.asyncio
-async def test_execute_task_repairs_after_self_critique_revision(mock_config):
-    session_state = {"task_frame": {"complexity": "complex", "requires_plan": True, "execution_mode": "planned"}}
-    deps = SimpleNamespace(run_mode="interactive", session_state=session_state)
-    ctx = AgentRunContext(
-        config=mock_config,
-        role="default",
-        session_id="session-1",
-        message="请生成摘要",
-        attachments=[],
-        history=[],
-        deps=deps,
-        session_state=session_state,
-        stream=False,
-    )
-    executor = FakeSequenceAgent(["候选摘要", "修正后的摘要"])
-    critic = FakeSequenceAgent([
-        SelfCritiqueDecision(verdict="revise", issues=["遗漏用户要求"], repair_instructions="补齐摘要重点"),
-        SelfCritiqueDecision(verdict="pass", confidence=0.9),
-    ])
-
-    def get_agent(_role, agent_type):
-        if agent_type == "executor":
-            return executor
-        if agent_type == "self_critique":
-            return critic
-        raise AssertionError(agent_type)
-
-    outcome = await execute_task(ctx, get_agent)
-
-    assert outcome.result.output == "修正后的摘要"
-    assert outcome.self_critique_signal is None
-    assert len(executor.messages) == 2
-    assert "候选摘要" in executor.messages[1]
-    assert len(critic.messages) == 2
-
-
-@pytest.mark.asyncio
-async def test_execute_task_returns_signal_when_self_critique_still_fails(mock_config):
-    session_state = {"task_frame": {"complexity": "complex", "requires_plan": True, "execution_mode": "planned"}}
-    deps = SimpleNamespace(run_mode="interactive", session_state=session_state)
-    ctx = AgentRunContext(
-        config=mock_config,
-        role="default",
-        session_id="session-1",
-        message="请生成摘要",
-        attachments=[],
-        history=[],
-        deps=deps,
-        session_state=session_state,
-        stream=False,
-    )
-    executor = FakeSequenceAgent(["候选摘要", "仍然不完整"])
-    critic = FakeSequenceAgent([
-        SelfCritiqueDecision(verdict="revise", issues=["缺少结论"], repair_instructions="补结论"),
-        SelfCritiqueDecision(verdict="revise", issues=["仍缺少结论"], repair_instructions="明确结论"),
-    ])
-
-    def get_agent(_role, agent_type):
-        if agent_type == "executor":
-            return executor
-        if agent_type == "self_critique":
-            return critic
-        raise AssertionError(agent_type)
-
-    outcome = await execute_task(ctx, get_agent)
-
-    assert outcome.result.output == "仍然不完整"
-    assert outcome.self_critique_signal is not None
-    assert outcome.self_critique_signal["issues"][0]["type"] == "self_critique_revision_required"
+    for name in (
+        "_build_self_critique_message",
+        "_build_self_critique_repair_message",
+        "_should_run_self_critique",
+        "_run_self_critique",
+        "_self_critique_signal",
+        "_summarize_execution_evidence",
+    ):
+        assert not hasattr(executor_mod, name), f"{name} should be removed"
 
 
 def test_low_confidence_direct_task_does_not_need_planning():
@@ -546,22 +459,4 @@ async def test_stream_watchdog_cancels_stalled_operation():
     with pytest.raises(OperationStalledError):
         await stream.__anext__()
     assert task.cancelled()
-
-
-def test_continuation_prompt_includes_pending_clarification():
-    """上一轮 executor 调过 clarify_user 留下的 pending 问题应注入 continuation
-    decision 提示词,让 continuation agent 知道用户当前消息很可能是对该追问的回答。"""
-    from openhachimi_agent.service.agent_runtime.router import _continuation_prompt
-
-    session_state = {
-        "_user_clarification": {
-            "question": "请提供发件人邮箱和 SMTP 授权码",
-            "missing_inputs": ["发件人邮箱", "SMTP 授权码"],
-            "raised_at_seq": 12,
-        },
-    }
-    prompt = _continuation_prompt(_ctx(session_state, message="发件人是 me@x.com,授权码 abc"))
-
-    assert "请提供发件人邮箱和 SMTP 授权码" in prompt
-    assert "pending_clarification" in prompt
 

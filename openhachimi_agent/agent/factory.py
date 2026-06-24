@@ -5,6 +5,7 @@ import logging
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.tools import DeferredToolRequests
 
 from openhachimi_agent.content.prompts import load_system_prompt, render_system_prompt
 from openhachimi_agent.content.roles import load_role_content
@@ -12,7 +13,7 @@ from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET, SCHEDULED_EXECUTOR_TOOLSET
-from openhachimi_agent.agent.intent import PlanContinuationDecision, SelfCritiqueDecision, TaskFrame
+from openhachimi_agent.agent.intent import PlanContinuationDecision, TaskFrame
 
 
 logger = logging.getLogger(__name__)
@@ -21,19 +22,17 @@ logger = logging.getLogger(__name__)
 def should_pass_through_validation(signal: dict | None, session_state: dict) -> str | None:
     """检测 final-answer validator 是否应短路放行。返回放行原因(用于日志),否则 None。
 
-    两条放行路径:
-    1. ``_user_clarification`` 标志存在:本 turn 调用过 ``clarify_user``,执行器
-       主动声明在等用户输入,任何"未完成 TODO"都是预期内暂停状态。
-    2. 所有未完成任务都显式标 ``blocked``,且最近无工具失败:模型不是乱标 done
-       而是诚实声明卡点。
+    放行路径:所有未完成任务都显式标 ``blocked``,且最近无工具失败 —— 模型不是
+    乱标 done 而是诚实声明卡点。在 ledger 写入之前判断,避免污染
+    ``_replan_after_execution_signal`` 的连续 blocked 检测。
 
-    两条都在 ledger 写入之前判断,避免污染 ``_replan_after_execution_signal``
-    的连续 blocked 检测。
+    历史上还有一条"_user_clarification 已写入则放行"的分支。该分支随 clarify_user
+    切到 ``CallDeferred`` 机制后已无意义:抛 CallDeferred 后 run 在 graph 层立刻
+    终止,output 是 ``DeferredToolRequests`` 而非 ``str``,validator 整段都不会
+    被触发。
     """
     if not signal:
         return None
-    if session_state.get("_user_clarification"):
-        return "clarify_user invoked this turn"
 
     issues = signal.get("issues", []) if isinstance(signal, dict) else []
     has_latest_failure = any(
@@ -89,6 +88,28 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
 
     mcp_toolsets = mcp_toolsets or []
 
+    # output_type 按 agent 类型分:
+    # - executor:注册了 clarify_user(可能抛 CallDeferred),所以输出域是
+    #   ``[str, DeferredToolRequests]``。
+    # - planner:把 ``create_todos`` 标成 output tool —— 模型调它即视为本次 run 的
+    #   final answer,graph 在工具执行后立刻终止,**不会再发起第 2 步 LLM 调用
+    #   让模型 emit 一段重复的"执行步骤概览"自然语言**。read_file / list_files
+    #   等只读调研工具仍可被普通调用,不影响 planner 先调研后规划的工作流。
+    #   (改造前用 ``output_type=str``,模型必须额外 emit 一段 final text 才能
+    #    结束 run,与刚刚调过的 create_todos 工具卡片内容完全重复。)
+    # - scheduled_executor:无人值守路径,直接 ``str`` fail-fast。
+    if agent_type == "executor":
+        output_type: object = [str, DeferredToolRequests]
+    elif agent_type == "planner":
+        from pydantic_ai.output import ToolOutput
+        from openhachimi_agent.tools.planning import create_todos
+
+        # name="create_todos" 让该 output tool 复用现成函数签名 / docstring。
+        # max_retries 默认沿用 agent.retries,无需再单独指定。
+        output_type = ToolOutput(create_todos, name="create_todos")
+    else:
+        output_type = str
+
     if agent_type == "planner":
         toolsets = [PLANNER_TOOLSET, dynamic_toolset] + mcp_toolsets
         extra_prompt = load_system_prompt("agents/planner")
@@ -114,6 +135,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         instructions=role_content,
         deps_type=AgentDeps,
         toolsets=toolsets,
+        output_type=output_type,
         defer_model_check=True,
         # retries 既覆盖工具调用错误,也覆盖 output_validator 抛出的 ModelRetry。
         # 一次工具偶发失败(1) + 一次 final-answer validator 打回(1) + 一次 schema
@@ -336,14 +358,4 @@ def build_continuation_agent(config: AppConfig) -> Agent:
         _build_router_model(config),
         system_prompt=system_prompt,
         output_type=PlanContinuationDecision,
-    )
-
-
-def build_self_critique_agent(config: AppConfig) -> Agent:
-    """创建用于最终答案自检的轻量级 Agent。"""
-    system_prompt = load_system_prompt("agents/self_critique")
-    return Agent(
-        _build_router_model(config),
-        system_prompt=system_prompt,
-        output_type=SelfCritiqueDecision,
     )

@@ -94,6 +94,25 @@ def test_final_verifier_detects_unfinished_todos(mock_agent_deps):
     assert get_final_verification_signal(mock_agent_deps.session_state) is None
 
 
+def test_final_verifier_treats_blocked_as_terminal(mock_agent_deps):
+    """blocked 是模型诚实声明的合法终止态(缺资源/缺凭据/外部条件不满足),
+    不应被当成"未完成证据"触发"[最终验证未通过]"提示。两个任务一个 done
+    一个 blocked → 应返回 None。"""
+    ctx = MockRunContext(deps=mock_agent_deps)
+    create_todos(ctx, ["fetch", "send mail"])
+    update_todo(ctx, 1, "done", "fetched")
+    update_todo(ctx, 2, "blocked", "no smtp credentials available")
+
+    assert get_final_verification_signal(mock_agent_deps.session_state) is None
+
+
+def test_final_verifier_ignores_blocked_ledger_event(mock_agent_deps):
+    """ledger 里 status=blocked 的事件来自 ExecutionGuardViolation(内部信号),
+    不应被当成"最近一次工具失败"上报给用户。"""
+    mock_agent_deps.session_state["execution_ledger"] = [
+        {"seq": 1, "tool_name": "write_file", "status": "blocked", "violation": "guard"}
+    ]
+    assert get_final_verification_signal(mock_agent_deps.session_state) is None
 
 
 def test_final_verifier_detects_latest_failed_event(mock_agent_deps):

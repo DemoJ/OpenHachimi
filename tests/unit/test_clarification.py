@@ -1,7 +1,8 @@
 # pyrefly: ignore [missing-import]
 import pytest
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+
+from pydantic_ai.exceptions import CallDeferred
 
 from openhachimi_agent.tools.clarification import clarify_user
 from openhachimi_agent.tools.planning import create_todos, update_todo
@@ -9,7 +10,8 @@ from openhachimi_agent.tools.planning import create_todos, update_todo
 
 @dataclass
 class MockRunContext:
-    deps: MagicMock
+    deps: object
+    tool_call_id: str = "call_abc123"
 
 
 @pytest.fixture
@@ -18,43 +20,52 @@ def mock_ctx(mock_agent_deps):
 
 
 def test_clarify_user_rejects_empty_question(mock_ctx):
-    res = clarify_user(mock_ctx, "   ")
-    assert res.startswith("错误")
+    """空 question 抛 ValueError,让 pydantic-ai 的工具校验把它转 ModelRetry,
+    给模型同 run 内补一次合法调用的机会。"""
+    with pytest.raises(ValueError, match="question 不能为空"):
+        clarify_user(mock_ctx, "   ")
     assert "_user_clarification" not in mock_ctx.deps.session_state
 
 
-def test_clarify_user_sets_session_flag_when_no_plan(mock_ctx):
-    """无活动计划时,只设 _user_clarification 标志(没有计划可挂起)。"""
-    res = clarify_user(
-        mock_ctx,
-        question="请提供发件人邮箱与 SMTP 授权码",
-        missing_inputs=["发件人邮箱", "SMTP 授权码"],
-    )
+def test_clarify_user_raises_call_deferred_when_no_plan(mock_ctx):
+    """无活动计划时,clarify_user 抛 CallDeferred 阻断本轮 run,只设
+    ``_user_clarification`` 标志(没有计划可挂起)。"""
+    with pytest.raises(CallDeferred) as exc_info:
+        clarify_user(
+            mock_ctx,
+            question="请提供发件人邮箱与 SMTP 授权码",
+            missing_inputs=["发件人邮箱", "SMTP 授权码"],
+        )
 
     state = mock_ctx.deps.session_state
     flag = state.get("_user_clarification")
     assert isinstance(flag, dict)
     assert flag["question"] == "请提供发件人邮箱与 SMTP 授权码"
     assert flag["missing_inputs"] == ["发件人邮箱", "SMTP 授权码"]
+    assert flag["tool_call_id"] == "call_abc123"
     # 无 plan 时不会写 suspended_plan
     assert "suspended_plan" not in state
-    assert "本轮将结束" in res
+
+    # CallDeferred metadata 传到 pydantic-ai agent_graph,供 DeferredToolRequests.metadata 使用
+    assert exc_info.value.metadata is not None
+    assert exc_info.value.metadata["kind"] == "clarify_user"
+    assert exc_info.value.metadata["question"] == "请提供发件人邮箱与 SMTP 授权码"
+    assert exc_info.value.metadata["missing_inputs"] == ["发件人邮箱", "SMTP 授权码"]
 
 
 def test_clarify_user_suspends_active_plan(mock_ctx):
-    """有活动计划时,应挂起计划并写 suspended_plan。"""
+    """有活动计划时,应同时挂起计划并抛 CallDeferred。"""
     create_todos(mock_ctx, ["task A", "task B"])
     update_todo(mock_ctx, 1, "in-progress")
 
-    state_before = mock_ctx.deps.session_state["todo_state"]
-    assert state_before.is_active is True
+    assert mock_ctx.deps.session_state["todo_state"].is_active is True
 
-    clarify_user(mock_ctx, "需要凭据吗?", missing_inputs=["api_key"])
+    with pytest.raises(CallDeferred):
+        clarify_user(mock_ctx, "需要凭据吗?", missing_inputs=["api_key"])
 
     state = mock_ctx.deps.session_state
     assert state.get("_user_clarification", {}).get("question") == "需要凭据吗?"
 
-    # 计划应已挂起
     suspended = state.get("suspended_plan")
     assert isinstance(suspended, dict)
     assert suspended["reason"] == "awaiting_user_clarification"
@@ -66,39 +77,24 @@ def test_clarify_user_suspends_active_plan(mock_ctx):
     assert mock_ctx.deps.session_state["todo_state"].is_active is False
 
 
-def test_clarify_user_second_call_in_same_turn_is_idempotent(mock_ctx):
-    """同一轮内连续调用 clarify_user 应幂等:第一次正常工作,第二次起拒绝写入并
-    要求模型转向输出文字。这是模型常见的"打磨措辞反复调"行为的兜底。
-    """
-    first = clarify_user(mock_ctx, "请提供 SMTP 凭据")
-    assert "[已记录待澄清" in first
-
-    state = mock_ctx.deps.session_state
-    original = dict(state["_user_clarification"])
-
-    # 第二次:打磨措辞稍变,session_state 不应被改写
-    second = clarify_user(
-        mock_ctx,
-        "请提供 SMTP 服务器地址、端口、发件人邮箱和授权码",
-    )
-
-    assert "本轮已调用过" in second
-    assert "不要" in second
-    # session_state 仍是第一次的内容,不被打磨调用覆盖
-    assert state["_user_clarification"] == original
+def test_clarify_user_accepts_json_string_missing_inputs(mock_ctx):
+    """模型常把 list[str] 输出成 JSON 字符串 ``"[\"a\", \"b\"]"``;工具应该接得住,
+    避免 pydantic-ai schema 校验失败 → ModelRetry → 模型反复重试同一调用。"""
+    with pytest.raises(CallDeferred):
+        clarify_user(
+            mock_ctx,
+            question="请给凭据",
+            missing_inputs='["发件人邮箱", "SMTP 授权码"]',  # 字符串化 list,而非真 list
+        )
+    flag = mock_ctx.deps.session_state["_user_clarification"]
+    assert flag["missing_inputs"] == ["发件人邮箱", "SMTP 授权码"]
 
 
-def test_clarify_user_duplicate_does_not_resuspend(mock_ctx):
-    """有活动计划时,第一次 clarify_user 挂起计划;第二次重复调用不应再次挂起
-    或污染 suspended_plan(避免反复写同一字段、混淆下游 continuation 决策)。"""
-    create_todos(mock_ctx, ["task A"])
-    update_todo(mock_ctx, 1, "in-progress")
-    clarify_user(mock_ctx, "Q1?")
-
-    suspended_before = dict(mock_ctx.deps.session_state["suspended_plan"])
-
-    clarify_user(mock_ctx, "Q1 (refined)?")
-
-    # suspended_plan 内容应不变
-    assert mock_ctx.deps.session_state["suspended_plan"] == suspended_before
-
+def test_clarify_user_accepts_comma_separated_string(mock_ctx):
+    """退化情形:模型把 missing_inputs 直接写成 ``"email, password"``。"""
+    with pytest.raises(CallDeferred):
+        clarify_user(mock_ctx, question="问", missing_inputs="email, password")
+    assert mock_ctx.deps.session_state["_user_clarification"]["missing_inputs"] == [
+        "email",
+        "password",
+    ]

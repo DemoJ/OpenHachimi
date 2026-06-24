@@ -669,7 +669,9 @@ class AgentService:
         )
         if response is None:
             return None
-        return [StreamEventItem(type="system", text=response.output)]
+        # 斜杠命令的输出本身是要给用户看的正文,走 type="text"。
+        # type="system" 现在专表"运行时状态提示",会在 stream_events 出口处被统一过滤掉。
+        return [StreamEventItem(type="text", text=response.output)]
 
     # ------------------------------------------------------------------ 上下文压缩
 
@@ -959,6 +961,11 @@ class AgentService:
             if isinstance(event, StreamEventItem):
                 if event.type == "tool" and not self.config.show_tool_calls:
                     continue
+                # 运行时状态提示(planner heartbeat / replan / 视觉模型 / 最终验证补齐等)
+                # 对最终用户没有帮助,只会让 Telegram / 前端的对话流变得嘈杂。
+                # 统一在 stream 出口屏蔽掉,内部仍走日志可查。
+                if event.type == "system":
+                    continue
                 yield event
 
     async def stream_message(
@@ -969,7 +976,7 @@ class AgentService:
         attachments: Sequence[AttachmentRef] | None = None,
     ) -> AsyncIterator[str]:
         async for event in self.stream_events(message, role, session_id, attachments=attachments):
-            if event.type in {"text", "system"}:
+            if event.type == "text":
                 yield event.text
             elif event.type == "tool":
                 yield f"\n[工具] {event.text}\n"

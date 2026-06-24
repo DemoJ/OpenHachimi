@@ -26,7 +26,6 @@ AllowedAutonomy = Literal["narrow", "bounded", "broad"]
 # 仍带这个值，pydantic extra="ignore" + 自定义 validator 会把它降级到 "direct"。
 ExecutionMode = Literal["direct", "planned"]
 PlanContinuationAction = Literal["continue_active_plan", "resume_suspended_plan", "start_new_task"]
-SelfCritiqueVerdict = Literal["pass", "revise"]
 _URL_PATTERN = re.compile(r"https?://[^\s<>()\"'，。；、]+", re.IGNORECASE)
 
 
@@ -65,16 +64,6 @@ def _coerce_legacy_execution_mode(value: Any) -> Any:
 class PlanContinuationDecision(BaseModel):
     action: PlanContinuationAction = "start_new_task"
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    rationale: str = ""
-
-
-class SelfCritiqueDecision(BaseModel):
-    """Final-answer review result used before returning an executor response."""
-
-    verdict: SelfCritiqueVerdict = "pass"
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    issues: list[str] = Field(default_factory=list)
-    repair_instructions: str = ""
     rationale: str = ""
 
 

@@ -88,6 +88,80 @@ _CTX_DYNAMIC_METADATA_KEY = "openhachimi_ctx_dynamic"
 _CTX_STATIC_HASH_METADATA_KEY = "openhachimi_ctx_static_hash"
 
 
+def _resolve_terminal_stream_text(
+    final_output_text: str,
+    result_holder: dict[str, object],
+    chunk_count: int,
+) -> str:
+    """决定流式轮次末尾还要不要补一次 text 事件,以及补什么内容。
+
+    返回空串表示不需要补。
+
+    两个补发场景:
+    1. **deferred 路径**(``result_holder`` 含 ``clarification_question``):
+       ``clarify_user`` 的 question 文本从来没流过——``streaming.py`` 故意吞掉了
+       ``clarify_user`` 的 ``FunctionToolCallEvent``,期望 turn 末尾把 question 当成
+       本轮 assistant 回复输出。**必须** 无条件补发,否则用户看到一行工具卡片就突然
+       中断,不知道下一步该做什么(过去的 bug:用 ``chunk_count==0`` 兜底,只要模型
+       在调 ``clarify_user`` 前流式吐过任何过渡文字,question 就会被静默丢弃)。
+    2. **整轮零 chunk**:非 deferred 但 ``chunk_count == 0``,说明模型一段文字都没流过,
+       靠 ``result.output`` 字段返回了最终答案——典型于结构化输出或极短回复。
+
+    deferred 场景若前面已有过渡文字,补一个空行让追问从新段落起,避免和前面的解释挤在一起。
+    """
+    is_clarify_deferred = "clarification_question" in result_holder
+    if not (is_clarify_deferred or chunk_count == 0):
+        return ""
+    if not final_output_text:
+        return ""
+    if is_clarify_deferred and chunk_count:
+        return f"\n\n{final_output_text}"
+    return final_output_text
+
+
+def _format_signal_for_user(signal_key: str, signal_value: object) -> str:
+    """把 outcome signal 渲染为给用户看的自然语言提示,而不是把原始 JSON 直接喷
+    出来。signal 是给开发者看的内部诊断字段,模型并不需要、用户更看不懂。
+    """
+    if not isinstance(signal_value, dict):
+        return ""
+    issues = signal_value.get("issues", []) if isinstance(signal_value, dict) else []
+    lines: list[str] = []
+
+    if signal_key == "final_verification_signal":
+        unfinished_items: list[dict] = []
+        latest_failures: list[dict] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            if issue.get("type") == "unfinished_todos":
+                for item in issue.get("items", []):
+                    if isinstance(item, dict):
+                        unfinished_items.append(item)
+            elif issue.get("type") == "latest_execution_not_successful":
+                latest_failures.append(issue)
+
+        if unfinished_items:
+            lines.append("[System] 有 TODO 尚未完成:")
+            for item in unfinished_items[:5]:
+                status = item.get("status", "?")
+                desc = str(item.get("description", "") or "").strip()
+                if len(desc) > 100:
+                    desc = desc[:97] + "..."
+                lines.append(f"  - [{status}] {desc}")
+            if len(unfinished_items) > 5:
+                lines.append(f"  …等 {len(unfinished_items)} 项")
+        if latest_failures:
+            lf = latest_failures[-1]
+            tool_name = lf.get("tool_name", "?")
+            detail = str(lf.get("detail", "") or "").strip()
+            if len(detail) > 200:
+                detail = detail[:197] + "..."
+            lines.append(f"[System] 最近一次工具调用未成功:`{tool_name}` —— {detail}" if detail else f"[System] 最近一次工具调用未成功:`{tool_name}`")
+
+    return "\n".join(lines)
+
+
 def _stamp_turn_metadata(
     new_history: list,
     prev_len: int,
@@ -428,20 +502,55 @@ async def run_turn(
         should_route = await should_route_message(ctx, service._get_agent)
 
         async def run_agent() -> None:
+            from pydantic_ai.tools import DeferredToolRequests
+            from openhachimi_agent.service.agent_runtime.executor import execute_task_resume
+
             mark_turn_started(session_state)
             try:
-                if should_route:
+                # clarify_user 在上一轮抛 CallDeferred 留下了 _user_clarification
+                # 标志:本轮直接走 deferred resume,把用户回复以 tool result 形式
+                # 灌回 graph,而不是当作新任务走 router → planner → executor。
+                outcome = None
+                if session_state.get("_user_clarification"):
                     await refresh_mcp_config()
-                    task_frame = await resolve_task_frame(ctx, service._get_agent)
-                    session_state["task_frame"] = task_frame.model_dump(mode="json")
-                    if needs_planning(task_frame):
-                        await refresh_mcp_config()
-                        await run_planner(ctx, task_frame, service._get_agent)
+                    outcome = await execute_task_resume(ctx, service._get_agent)
+                    # 状态损坏导致无法 resume → outcome=None,fall through 到正常流程。
 
-                await refresh_mcp_config()
-                outcome = await execute_task(ctx, service._get_agent)
+                if outcome is None:
+                    if should_route:
+                        await refresh_mcp_config()
+                        task_frame = await resolve_task_frame(ctx, service._get_agent)
+                        session_state["task_frame"] = task_frame.model_dump(mode="json")
+                        if needs_planning(task_frame):
+                            await refresh_mcp_config()
+                            await run_planner(ctx, task_frame, service._get_agent)
+
+                    # planner 没有 clarify_user 工具,不会产生 DeferredToolRequests。
+                    # deferred 只可能来自 executor 路径,由 execute_task 内部短路返回。
+                    await refresh_mcp_config()
+                    outcome = await execute_task(ctx, service._get_agent)
                 result_holder["result"] = outcome.result
-                if outcome.final_verification_signal:
+
+                # 优先处理 deferred 输出:本轮模型在调 clarify_user 等延迟工具时
+                # pydantic-ai 把 DeferredToolRequests 作为 run output 返回。要把
+                # 待澄清问题(_user_clarification.question)交给用户;计划已在
+                # clarify_user 工具内挂起,这里只补一个 plan_status 兜底,不再调
+                # complete_current_plan(任务确实没完成)。
+                if isinstance(getattr(outcome.result, "output", None), DeferredToolRequests):
+                    pending = session_state.get("_user_clarification") or {}
+                    question_text = pending.get("question") or "需要你提供更多信息以继续。"
+                    result_holder["clarification_question"] = question_text
+                    if not session_state.get("suspended_plan") and has_active_todos(session_state):
+                        # clarify_user 内部 has_active_todos 判定有可能因 todo_state
+                        # 已不再 is_active 而漏挂(例如未启计划的 direct 任务):此处
+                        # 补一次 plan 状态,WebUI 能正确展示"等待用户输入"。
+                        suspend_current_plan(
+                            session_state,
+                            reason="awaiting_user_clarification",
+                            detail={"question": question_text},
+                            deps=deps,
+                        )
+                elif outcome.final_verification_signal:
                     result_holder["final_verification_signal"] = outcome.final_verification_signal
                     if has_active_todos(session_state):
                         suspend_current_plan(
@@ -455,21 +564,6 @@ async def run_turn(
                             session_state,
                             reason="final_verification_failed",
                             detail=outcome.final_verification_signal,
-                        )
-                elif outcome.self_critique_signal:
-                    result_holder["self_critique_signal"] = outcome.self_critique_signal
-                    if has_active_todos(session_state):
-                        suspend_current_plan(
-                            session_state,
-                            reason="self_critique_failed",
-                            detail=outcome.self_critique_signal,
-                            deps=deps,
-                        )
-                    else:
-                        fail_current_plan(
-                            session_state,
-                            reason="self_critique_failed",
-                            detail=outcome.self_critique_signal,
                         )
                 else:
                     complete_current_plan(session_state)
@@ -590,11 +684,11 @@ async def run_turn(
 
                 if error := result_holder.get("error"):
                     raise RuntimeError(f"Agent 调用失败:{_error_message(error)}") from error
-                for signal_key, signal_label in SIGNAL_LABELS:
+                for signal_key, _signal_label in SIGNAL_LABELS:
                     if signal_value := result_holder.get(signal_key):
-                        yield system_stream_event(
-                            f"\n\n{signal_label}{json.dumps(signal_value, ensure_ascii=False)}"
-                        )
+                        rendered = _format_signal_for_user(signal_key, signal_value)
+                        if rendered:
+                            yield system_stream_event(f"\n\n{rendered}\n")
                 turn_artifacts = [
                     artifact for artifact in session_state.get("turn_artifacts", [])
                     if isinstance(artifact, ArtifactRef)
@@ -624,6 +718,18 @@ async def run_turn(
                     raise error
 
             result = result_holder["result"]
+            # 把 result.output 解释为给用户看的文本:
+            # - DeferredToolRequests:clarify_user 阻断本轮,展示 _user_clarification
+            #   里的 question(已在 run_agent 内写入 result_holder["clarification_question"])。
+            # - 其他类型(str / 字段化输出):直接 str() 即可。
+            from pydantic_ai.tools import DeferredToolRequests
+
+            raw_output = getattr(result, "output", "")
+            if isinstance(raw_output, DeferredToolRequests):
+                final_output_text = result_holder.get("clarification_question") or "需要你提供更多信息以继续。"
+            else:
+                final_output_text = str(raw_output or "")
+
             turn_artifacts = [
                 artifact for artifact in session_state.get("turn_artifacts", [])
                 if isinstance(artifact, ArtifactRef)
@@ -699,7 +805,7 @@ async def run_turn(
                 service.config,
                 memory_scope,
                 effective_message,
-                str(result.output),  # type: ignore[attr-defined]
+                final_output_text,
             )
             # turn 来源:scheduled / system 不进 L1 抽取(由 capture_turn_memories 处理)
             if run_mode == "scheduled":
@@ -726,18 +832,23 @@ async def run_turn(
                 await asyncio.to_thread(capture_turn_memories, *capture_args, **capture_kwargs)
 
             if stream:
-                if not stream_stats.chunk_count:
-                    output = str(result.output)  # type: ignore[attr-defined]
-                    if output:
-                        stream_stats.output_chars = len(output)
-                        stream_stats.chunk_count = 1
-                        logger.info(
-                            "chat produced non-streamed output role=%s session_id=%s output_chars=%d",
-                            role,
-                            actual_session_id,
-                            stream_stats.output_chars,
-                        )
-                        yield StreamEventItem(type="text", text=output)
+                # 末尾补发逻辑见 _resolve_terminal_stream_text:覆盖 deferred(clarify_user)
+                # 与整轮零 chunk 两个场景。判定全部封装在 helper 里以便独立测试。
+                terminal_text = _resolve_terminal_stream_text(
+                    final_output_text, result_holder, stream_stats.chunk_count,
+                )
+                if terminal_text:
+                    is_clarify_deferred = "clarification_question" in result_holder
+                    stream_stats.output_chars += len(terminal_text)
+                    stream_stats.chunk_count += 1
+                    logger.info(
+                        "chat produced non-streamed output role=%s session_id=%s output_chars=%d deferred=%s",
+                        role,
+                        actual_session_id,
+                        len(terminal_text),
+                        str(is_clarify_deferred).lower(),
+                    )
+                    yield StreamEventItem(type="text", text=terminal_text)
 
                 logger.info(
                     "chat finished role=%s session_id=%s output_chars=%d chunks=%d first_chunk_ms=%s history_messages=%d duration_ms=%.0f stream=true",
@@ -754,14 +865,16 @@ async def run_turn(
                     "chat finished role=%s session_id=%s output_chars=%d history_messages=%d duration_ms=%.0f stream=false",
                     role,
                     actual_session_id,
-                    len(str(result.output)),  # type: ignore[attr-defined]
+                    len(final_output_text),
                     len(new_history),
                     (time.perf_counter() - start_time) * 1000,
                 )
-                output = result.output  # type: ignore[attr-defined]
-                for signal_key, signal_label in SIGNAL_LABELS:
+                output = final_output_text
+                for signal_key, _signal_label in SIGNAL_LABELS:
                     if signal_value := result_holder.get(signal_key):
-                        output = f"{output}\n\n{signal_label}{json.dumps(signal_value, ensure_ascii=False)}"
+                        rendered = _format_signal_for_user(signal_key, signal_value)
+                        if rendered:
+                            output = f"{output}\n\n{rendered}"
                 yield ChatResponse(
                     output=output,
                     role=role,

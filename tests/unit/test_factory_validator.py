@@ -4,6 +4,11 @@
 直接测 ``should_pass_through_validation`` helper 而非完整 closure,这样无需
 搭建完整的 Agent + RunContext + OpenAI provider。closure 本身仅是把 helper
 返回值转成日志 + 设置 session_state 标志 + return result,无独立逻辑。
+
+历史上还有一条 ``_user_clarification`` 放行路径,在 clarify_user 切到
+``CallDeferred`` 之后该路径已被删除——抛 CallDeferred 让 run 在 graph 层
+立刻终止,output 是 ``DeferredToolRequests`` 而非 ``str``,validator 整段都
+不会被触发。
 """
 
 from openhachimi_agent.agent.factory import should_pass_through_validation
@@ -16,17 +21,6 @@ def _signal(*issues):
 def test_no_signal_returns_none():
     assert should_pass_through_validation(None, {}) is None
     assert should_pass_through_validation({}, {}) is None
-
-
-def test_pass_through_when_clarify_user_invoked():
-    """clarify_user 标志存在 → 放行,无论 signal 内容如何。"""
-    signal = _signal({"type": "unfinished_todos", "items": [
-        {"id": 1, "description": "x", "status": "pending"},
-    ]})
-    session_state = {"_user_clarification": {"question": "?", "missing_inputs": []}}
-    reason = should_pass_through_validation(signal, session_state)
-    assert reason is not None
-    assert "clarify_user" in reason
 
 
 def test_pass_through_when_all_unfinished_blocked():

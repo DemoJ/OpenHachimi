@@ -148,7 +148,7 @@ async def test_stream_events_stop_yields_control_event_without_lock(agent_servic
     finally:
         lock.release()
 
-    assert event.type == "system"
+    assert event.type == "text"
     assert "已成功中断当前任务" in event.text
     assert not task.done() or task.cancelled()
     with pytest.raises(asyncio.CancelledError):

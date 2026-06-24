@@ -16,7 +16,6 @@ from openhachimi_agent.agent.factory import (
     build_planner_agent,
     build_router_agent,
     build_scheduled_executor_agent,
-    build_self_critique_agent,
 )
 from openhachimi_agent.core.config import AppConfig
 
@@ -71,8 +70,6 @@ def build_agent_by_type(
         return build_router_agent(config)
     if agent_type == "continuation":
         return build_continuation_agent(config)
-    if agent_type == "self_critique":
-        return build_self_critique_agent(config)
     if agent_type == "planner":
         return build_planner_agent(config, role_name, mcp_toolsets=mcp_toolsets)
     if agent_type == "scheduled_executor":

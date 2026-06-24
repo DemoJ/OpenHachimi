@@ -32,7 +32,6 @@ STREAM_DONE = object()
 # 与命令机制无关,仅用于流式事件渲染。
 SIGNAL_LABELS: tuple[tuple[str, str], ...] = (
     ("final_verification_signal", "[最终验证未通过] 当前执行结果仍缺少完成证据:"),
-    ("self_critique_signal", "[自检未通过] 当前最终回复可能仍未完全满足用户意图:"),
 )
 
 
@@ -110,24 +109,41 @@ def _value(args: dict[str, object], key: str, default: object = "") -> object:
     return default if value is None else value
 
 
-def _task_description(item: object) -> str:
+def _task_description(item: object) -> tuple[str, str]:
+    """返回 (description, success_criteria) 二元组。
+
+    description 形如 ``1. 探测邮件发送能力``(若有 id);
+    success_criteria 是验收文本(可空)。供 ``_tasks_block`` 渲染成两行/一行。
+    """
     if isinstance(item, str):
-        return _compact(item, 90)
+        return _compact(item, 120), ""
     if isinstance(item, dict):
-        desc = _compact(item.get("description", "Unnamed Task"), 90)
+        desc = _compact(item.get("description", "Unnamed Task"), 120)
         task_id = item.get("id")
         prefix = f"{task_id}. " if task_id not in (None, "") else ""
-        criteria = _compact(item.get("success_criteria", ""), 60)
-        return f"{prefix}{desc}" + (f"（验收：{criteria}）" if criteria else "")
-    return _compact(item, 90)
+        criteria = _compact(item.get("success_criteria", ""), 120)
+        return f"{prefix}{desc}", criteria
+    return _compact(item, 120), ""
 
 
-def _tasks_summary(tasks: object, max_items: int = 4) -> str:
+def _tasks_block(tasks: object, max_items: int = 6) -> str:
+    """把任务列表渲染为**多行**块,每条任务一行(有验收时再缩进一行)。
+
+    用于 create_todos 工具卡片的明细区。TG / WebUI 在 conversation 模式下会把整
+    个工具行原样展示——单行包含 ``\\n`` 时换行渲染,不需要前端额外协议支持。
+    """
     if not isinstance(tasks, list):
-        return _compact(tasks, 160)
-    items = [_task_description(item) for item in tasks[:max_items]]
-    suffix = f" 等 {len(tasks)} 项" if len(tasks) > max_items else ""
-    return "；".join(item for item in items if item) + suffix
+        return _compact(tasks, 200)
+    rendered: list[str] = []
+    for item in tasks[:max_items]:
+        desc, criteria = _task_description(item)
+        rendered.append(f"  {desc}")
+        if criteria:
+            # 验收一行单独缩进,视觉上从属上一条
+            rendered.append(f"     验收：{criteria}")
+    if len(tasks) > max_items:
+        rendered.append(f"  …等 {len(tasks) - max_items} 项")
+    return "\n".join(rendered)
 
 
 def _tool_detail(tool_name: str, args: dict[str, object]) -> str:
@@ -135,17 +151,20 @@ def _tool_detail(tool_name: str, args: dict[str, object]) -> str:
         return ""
 
     if tool_name == "create_todos":
-        # 显示 goal + 前若干个 task 描述,让用户在 telegram / WebUI 上能直接看到
-        # 本次计划干什么(不止"共 N 项任务"的数量)。_tasks_summary 自动限制
-        # 最多 4 项 + "等 N 项"后缀,避免长 plan 刷屏。
-        goal = _compact(args.get("goal", ""), 60)
+        # 多行渲染:目标一行,计划列表每一项一行(有验收再缩进一行)。
+        # 单行包含 ``\n`` 时 TG / WebUI 在 conversation 模式会自然换行,不需要
+        # 前端额外协议。改前是单行 "；" 拼接,长 plan 在 telegram 上会糊成一坨。
+        goal = _compact(args.get("goal", ""), 120)
         tasks = args.get("tasks", [])
-        detail_parts = []
+        lines: list[str] = []
         if goal:
-            detail_parts.append(f"目标：{goal}")
+            lines.append(f"目标：{goal}")
         if isinstance(tasks, list) and tasks:
-            detail_parts.append(f"计划：{_tasks_summary(tasks)}")
-        return "；".join(detail_parts)
+            lines.append(f"计划（共 {len(tasks)} 项）：")
+            block = _tasks_block(tasks)
+            if block:
+                lines.append(block)
+        return "\n".join(lines)
 
     if tool_name == "update_todo":
         task_id = _value(args, "task_id")
@@ -291,7 +310,13 @@ def format_tool_call(tool_name: str, args: dict[str, object]) -> str:
     icon = tool_icon_for_name(tool_name)
     action = _tool_action(tool_name)
     detail = _tool_detail(tool_name, safe_args)
-    return f"{icon} {action}：{detail}" if detail else f"{icon} {action}"
+    if not detail:
+        return f"{icon} {action}"
+    # detail 含换行时(目前只有 create_todos),把它折成块状渲染:标题独占一行,
+    # 明细块换行接下来,避免和 presenter 的 "• " bullet 拼成一坨长串。
+    if "\n" in detail:
+        return f"{icon} {action}：\n{detail}"
+    return f"{icon} {action}：{detail}"
 
 
 def event_item_from_stream_event(event: object) -> StreamEventItem | None:
@@ -307,6 +332,14 @@ def event_item_from_stream_event(event: object) -> StreamEventItem | None:
             tool_name,
             args,
         )
+        # clarify_user 是 deferred 工具:它会抛 CallDeferred 让 run 在 graph 层
+        # 立即终止,question 参数本身就是要发给用户看的完整自然语言追问 ——
+        # turn.run_agent 的 deferred outcome 分支会把它当作本轮 assistant 回复
+        # 完整输出。这里如果再 emit 一条标准"工具卡片"事件,UI 上就会看到一行
+        # 截断的 ``🔧 clarify_user：{"question": "...获取的授权码（不是Q...``
+        # 之后又紧跟一段完整的 question 文本,既丑又重复。所以静默吞掉这条事件。
+        if tool_name == "clarify_user":
+            return None
         return StreamEventItem(
             type="tool",
             text=format_tool_call(tool_name, args_dict),
