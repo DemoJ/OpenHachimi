@@ -431,16 +431,21 @@ class AgentService:
         *,
         with_preview: bool = True,
         channel: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> dict:
-        """列出指定角色的所有历史会话。
+        """列出指定角色的所有历史会话(支持分页)。
 
         ``channel`` 非空时按渠道过滤(SessionStore 内部对未知渠道做 DEFAULT_CHANNEL 兜底)。
-        返回 ``{"role": str, "sessions": [SessionSummary, ...]}``。
+        ``limit/offset`` 是 offset-based 分页,``limit=None`` 时不分页(老调用方兜底)。
+        返回 ``{"role": str, "sessions": [...], "total": int, "limit": int|None, "offset": int}`` —— 前端用
+        ``total`` 判定 ``hasMore``;切渠道 / 切角色时前端重置 offset 重新拉第一页。
         """
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)
         # store 端已经做了渠道过滤;传非法 channel 会被忽略(返回全部),与旧语义一致。
-        raw = self.session_store.list_sessions(role, channel=channel)
+        raw = self.session_store.list_sessions(role, channel=channel, limit=limit, offset=offset)
+        total = self.session_store.count_sessions(role, channel=channel)
 
         sessions: list[dict] = []
         for s in raw:
@@ -477,7 +482,13 @@ class AgentService:
                 "channel": s.get("channel", "webui"),
             })
 
-        return {"role": role, "sessions": sessions}
+        return {
+            "role": role,
+            "sessions": sessions,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
 
     def load_session(self, role_name: str | None = None, session_id: str | None = None, latest_scope: str | None = None) -> CommandResponse:
         """切换到指定会话——只做存在性校验,不再写全局 ``latest``。

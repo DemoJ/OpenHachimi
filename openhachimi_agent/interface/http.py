@@ -11,7 +11,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from openhachimi_agent.app_logging import configure_logging
@@ -605,10 +605,17 @@ def latest_session(role: str | None = None, service: AgentService = Depends(get_
 def list_sessions(
     role: str | None = None,
     channel: str | None = None,
+    limit: int = Query(50, ge=1, le=200, description="单页最大返回会话数"),
+    offset: int = Query(0, ge=0, description="跳过条数,offset-based 分页"),
     service: AgentService = Depends(get_service),
 ) -> SessionListResponse:
-    logger.info("http list sessions request role=%s channel=%s", role, channel)
-    return SessionListResponse(**service.list_sessions(role, channel=channel))
+    logger.info(
+        "http list sessions request role=%s channel=%s limit=%d offset=%d",
+        role, channel, limit, offset,
+    )
+    return SessionListResponse(
+        **service.list_sessions(role, channel=channel, limit=limit, offset=offset)
+    )
 
 
 @app.get("/channels")

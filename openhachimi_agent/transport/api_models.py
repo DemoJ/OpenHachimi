@@ -212,6 +212,11 @@ class SessionSummary(BaseModel):
 class SessionListResponse(BaseModel):
     role: str
     sessions: list[SessionSummary] = Field(default_factory=list)
+    # 分页元信息:前端用 total 决定 hasMore,limit/offset 回显本次请求参数,方便调试。
+    # 老客户端读不到这几个字段也无影响;默认值保证服务端构造时不强制传入。
+    total: int = 0
+    limit: int | None = None
+    offset: int = 0
 
 
 class ChannelListResponse(BaseModel):

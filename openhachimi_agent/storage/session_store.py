@@ -445,43 +445,85 @@ class SessionStore:
 
     # ── 列表 ─────────────────────────────────────────────────────────────
 
-    def list_sessions(self, role: str, *, channel: str | None = None) -> list[dict]:
-        """复刻旧 ``list_sessions`` 的返回 shape:
-        ``[{session_id, mtime, size_bytes, channel}, ...]`` 按 ``mtime`` 倒序。
+    def count_sessions(self, role: str, *, channel: str | None = None) -> int:
+        """统计某 role(可选 channel)下的会话总数,供前端分页判定 ``hasMore``。
 
-        ``mtime`` 从 ``sessions.updated_at`` 转 POSIX timestamp;``size_bytes``
-        从 ``SUM(LENGTH(message_json))`` 估算(比旧的文件 ``st_size`` 少几十字节
-        的 JSON 数组括号/逗号开销,前端展示无阈值,可忽略 —— 见 plan Risks #4)。
+        与 ``list_sessions`` 走同一组索引(``idx_sessions_role_updated`` /
+        ``idx_sessions_role_channel``),只多走一条 COUNT(*) 子查询。
         """
         safe_role = validate_role_name(role)
-        filter_channel: str | None = None
-        if channel is not None and is_known_channel(channel):
-            filter_channel = channel
-
-        query = (
-            "SELECT s.session_id, s.channel, s.updated_at, "
-            "  COALESCE(SUM(LENGTH(m.message_json)), 0) AS size_bytes "
-            "FROM sessions s "
-            "LEFT JOIN session_messages m "
-            "  ON m.role = s.role AND m.session_id = s.session_id "
-            "WHERE s.role = ? "
-        )
+        filter_channel = channel if channel is not None and is_known_channel(channel) else None
+        query = "SELECT COUNT(*) FROM sessions WHERE role = ?"
         params: list[Any] = [safe_role]
         if filter_channel is not None:
-            query += "AND s.channel = ? "
+            query += " AND channel = ?"
             params.append(filter_channel)
-        query += "GROUP BY s.session_id, s.channel, s.updated_at "
-        query += "ORDER BY s.updated_at DESC"
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row[0] or 0)
+
+    def list_sessions(
+        self,
+        role: str,
+        *,
+        channel: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict]:
+        """返回 ``[{session_id, mtime, size_bytes, channel}, ...]`` 按 mtime 倒序。
+
+        分页规则:``limit=None`` 时不分页(老调用方兜底);``limit`` 给定时跳过
+        ``offset`` 条返回 ``limit`` 条。``offset`` 必须 >=0。
+
+        SQL 分两步执行,避免在大表上做完 ``LEFT JOIN + GROUP BY`` 才 LIMIT:
+        1. 先在 ``sessions`` 单表上拿这页的 session_id —— 命中
+           ``idx_sessions_role_updated`` / ``idx_sessions_role_channel``,O(limit)。
+        2. 再用 ``WHERE session_id IN (...)`` 把这些 sid 的
+           ``SUM(LENGTH(message_json))`` 拼上 —— 仅扫本页那些 session 的消息行。
+
+        ``mtime`` 从 ``sessions.updated_at`` 转 POSIX timestamp;``size_bytes``
+        从 ``SUM(LENGTH(message_json))`` 估算(比旧文件 ``st_size`` 少几十字节
+        的 JSON 数组括号/逗号开销,前端无阈值,可忽略)。
+        """
+        safe_role = validate_role_name(role)
+        filter_channel = channel if channel is not None and is_known_channel(channel) else None
+
+        # Step 1:在 sessions 表上拿本页 session_id + channel + updated_at
+        page_query = (
+            "SELECT session_id, channel, updated_at FROM sessions WHERE role = ?"
+        )
+        page_params: list[Any] = [safe_role]
+        if filter_channel is not None:
+            page_query += " AND channel = ?"
+            page_params.append(filter_channel)
+        page_query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            page_query += " LIMIT ? OFFSET ?"
+            page_params.extend([int(limit), max(int(offset), 0)])
 
         with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
+            page_rows = conn.execute(page_query, page_params).fetchall()
+            if not page_rows:
+                return []
+            sids = [row["session_id"] for row in page_rows]
+            # Step 2:仅对本页 sid 算 size_bytes(?,?,...)
+            placeholders = ",".join("?" for _ in sids)
+            size_rows = conn.execute(
+                f"SELECT session_id, COALESCE(SUM(LENGTH(message_json)), 0) AS size_bytes "
+                f"FROM session_messages "
+                f"WHERE role = ? AND session_id IN ({placeholders}) "
+                f"GROUP BY session_id",
+                [safe_role, *sids],
+            ).fetchall()
 
+        size_map = {row["session_id"]: int(row["size_bytes"] or 0) for row in size_rows}
         result: list[dict] = []
-        for row in rows:
+        for row in page_rows:
+            sid = row["session_id"]
             result.append({
-                "session_id": row["session_id"],
+                "session_id": sid,
                 "mtime": _iso_to_epoch(row["updated_at"]),
-                "size_bytes": int(row["size_bytes"] or 0),
+                "size_bytes": size_map.get(sid, 0),
                 "channel": row["channel"] if is_known_channel(row["channel"]) else DEFAULT_CHANNEL,
             })
         return result

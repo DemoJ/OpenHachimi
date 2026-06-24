@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -224,7 +225,7 @@ def test_unknown_channel_falls_back_and_records_raw(store: SessionStore):
     # 暴露面:get_channel 返回兜底值
     assert store.get_channel("default", sid) == DEFAULT_CHANNEL
     # 内部记账:channel_raw 保留原值 —— 直接打开 DB 看
-    with sqlite3.connect(store.db_path) as conn:
+    with closing(sqlite3.connect(store.db_path)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT channel, channel_raw FROM sessions WHERE role=? AND session_id=?",
@@ -282,6 +283,105 @@ def test_list_sessions_empty(store: SessionStore):
     assert store.list_sessions("default") == []
 
 
+# ── 分页 ────────────────────────────────────────────────────────────────────
+
+
+def test_list_sessions_limit_truncates(store: SessionStore):
+    """``limit=N`` 必须只返回前 N 条(按 updated_at DESC)。"""
+    sids = []
+    for i in range(5):
+        sid = _new_sid()
+        store.save_messages("default", sid, _msgs_pair(f"u{i}"))
+        sids.append(sid)
+    # 最后存的在最前
+    expected_order = list(reversed(sids))
+
+    out = store.list_sessions("default", limit=3)
+    assert [s["session_id"] for s in out] == expected_order[:3]
+
+
+def test_list_sessions_offset_skips(store: SessionStore):
+    """``offset=N`` 必须跳过前 N 条;limit+offset 拼出无重叠的连续两页。"""
+    sids = []
+    for i in range(5):
+        sid = _new_sid()
+        store.save_messages("default", sid, _msgs_pair(f"u{i}"))
+        sids.append(sid)
+    expected_order = list(reversed(sids))
+
+    page1 = store.list_sessions("default", limit=2, offset=0)
+    page2 = store.list_sessions("default", limit=2, offset=2)
+    page3 = store.list_sessions("default", limit=2, offset=4)
+    assert [s["session_id"] for s in page1] == expected_order[0:2]
+    assert [s["session_id"] for s in page2] == expected_order[2:4]
+    assert [s["session_id"] for s in page3] == expected_order[4:5]
+
+
+def test_list_sessions_limit_none_means_unbounded(store: SessionStore):
+    """``limit=None``(默认)保留旧行为:不分页全量返回。"""
+    for i in range(7):
+        store.save_messages("default", _new_sid(), _msgs_pair(f"u{i}"))
+    out = store.list_sessions("default")  # limit 不传
+    assert len(out) == 7
+    out2 = store.list_sessions("default", limit=None)
+    assert len(out2) == 7
+
+
+def test_count_sessions_matches_list(store: SessionStore):
+    """``count_sessions`` 与无 limit 的 ``list_sessions`` 长度必须一致。"""
+    assert store.count_sessions("default") == 0
+    for i in range(4):
+        store.save_messages("default", _new_sid(), _msgs_pair(f"u{i}"), channel="webui")
+    for i in range(2):
+        store.save_messages("default", _new_sid(), _msgs_pair(f"t{i}"), channel="telegram")
+
+    assert store.count_sessions("default") == 6
+    assert store.count_sessions("default", channel="webui") == 4
+    assert store.count_sessions("default", channel="telegram") == 2
+    # 未知 channel 等同不过滤(与 list_sessions 行为对齐)
+    assert store.count_sessions("default", channel="bogus") == 6
+
+
+def test_list_sessions_pagination_with_channel_filter(store: SessionStore):
+    """channel 过滤 + 分页:total 和分页基线必须只针对该 channel。"""
+    webui_sids = []
+    for i in range(4):
+        sid = _new_sid()
+        store.save_messages("default", sid, _msgs_pair(f"w{i}"), channel="webui")
+        webui_sids.append(sid)
+    # 中间穿插一些 telegram,验证不串
+    for i in range(3):
+        store.save_messages("default", _new_sid(), _msgs_pair(f"t{i}"), channel="telegram")
+
+    page1 = store.list_sessions("default", channel="webui", limit=2, offset=0)
+    page2 = store.list_sessions("default", channel="webui", limit=2, offset=2)
+    expected = list(reversed(webui_sids))
+    assert [s["session_id"] for s in page1] == expected[0:2]
+    assert [s["session_id"] for s in page2] == expected[2:4]
+    # 全是 webui,不串
+    assert all(s["channel"] == "webui" for s in page1 + page2)
+
+
+def test_list_sessions_size_bytes_only_for_returned_page(store: SessionStore):
+    """size_bytes 必须只针对返回的那几条 sid 算,不应受表外 session 干扰。
+
+    回归:如果实现退回到 LEFT JOIN+GROUP BY+LIMIT(LIMIT 在 GROUP 之后),
+    其它会话的消息也会被 JOIN 进来再丢弃,虽然结果对,但性能差。这条用例
+    侧面通过断言"分页后 size_bytes 仍正确"覆盖正确性,性能由实现守。
+    """
+    sid_target = _new_sid()
+    store.save_messages("default", sid_target, _msgs_pair("only one"))
+    # 多塞几条干扰会话
+    for _ in range(5):
+        store.save_messages("default", _new_sid(), _msgs_pair("x" * 200))
+
+    page = store.list_sessions("default", limit=1, offset=5)
+    # offset=5 拿到的应该是最早那一条 —— 即 sid_target
+    assert len(page) == 1
+    assert page[0]["session_id"] == sid_target
+    assert page[0]["size_bytes"] > 0
+
+
 # ── session_exists ──────────────────────────────────────────────────────────
 
 
@@ -334,7 +434,7 @@ def test_todo_state_missing_returns_empty(store: SessionStore):
 def test_todo_state_corrupt_returns_empty(store: SessionStore):
     """直接往表里塞坏 JSON,load 应兜底返回空 TodoState(不抛)。"""
     sid = _new_sid()
-    with sqlite3.connect(store.db_path) as conn:
+    with closing(sqlite3.connect(store.db_path)) as conn:
         conn.execute(
             "INSERT INTO session_todos (session_id, state_json, updated_at) "
             "VALUES (?, ?, ?)",
@@ -358,7 +458,7 @@ def test_todo_state_overwrites(store: SessionStore):
 def test_schema_creates_all_tables_and_wal(tmp_path: Path):
     db_path = tmp_path / "sessions.sqlite3"
     SessionStore(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         names = {
             row[0]
             for row in conn.execute(
@@ -374,7 +474,7 @@ def test_message_kind_column_records_request_response(store: SessionStore):
     """``session_messages.kind`` 列应正确记录 'request' / 'response'(debug 用)。"""
     sid = _new_sid()
     store.save_messages("default", sid, _msgs_pair())
-    with sqlite3.connect(store.db_path) as conn:
+    with closing(sqlite3.connect(store.db_path)) as conn:
         kinds = [
             row[0]
             for row in conn.execute(
@@ -395,7 +495,7 @@ def test_message_json_round_trip_via_typeadapter(store: SessionStore):
     sid = _new_sid()
     msgs = _msgs_pair()
     store.save_messages("default", sid, msgs)
-    with sqlite3.connect(store.db_path) as conn:
+    with closing(sqlite3.connect(store.db_path)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT message_json FROM session_messages "

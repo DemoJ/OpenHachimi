@@ -59,6 +59,10 @@ export interface SessionSummary {
 export interface SessionListResponse {
   role: string
   sessions: SessionSummary[]
+  // 分页元信息(后端 2026-06 引入)。老服务端不返回这几个字段时,反序列化默认 0。
+  total: number
+  limit: number | null
+  offset: number
 }
 
 export interface ChannelListResponse {
@@ -108,10 +112,16 @@ export function fetchRoles() {
   return get<RolesResponse>('/roles')
 }
 
-export function listSessions(role?: string, channel?: string) {
+export function listSessions(
+  role?: string,
+  channel?: string,
+  opts?: { limit?: number; offset?: number },
+) {
   const params: string[] = []
   if (role) params.push(`role=${encodeURIComponent(role)}`)
   if (channel) params.push(`channel=${encodeURIComponent(channel)}`)
+  if (opts?.limit !== undefined) params.push(`limit=${opts.limit}`)
+  if (opts?.offset !== undefined) params.push(`offset=${opts.offset}`)
   const q = params.length ? `?${params.join('&')}` : ''
   return get<SessionListResponse>(`/sessions${q}`)
 }

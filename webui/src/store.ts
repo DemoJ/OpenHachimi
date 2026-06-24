@@ -10,6 +10,12 @@ interface ChatStoreState {
   currentRole: string
   currentSessionId: string | null
   sessions: SessionSummary[]
+  // sidebar 分页:total 由后端返回的总数,limit 是单页大小,sessions.length 当
+  // 作下一页 offset。loading 防并发触发(IntersectionObserver 可能在加载完成
+  // 之前再次触发)。
+  sessionsTotal: number
+  sessionsLimit: number
+  sessionsLoading: boolean
   // 渠道筛选:WebUI 默认看 webui 渠道自己的会话;切换到 cli/telegram/weixin
   // 时筛选 sidebar 列表,并把发消息时绑定到该渠道。
   channels: string[]
@@ -21,6 +27,8 @@ interface ChatStoreState {
   activity: string | null
 }
 
+const SESSIONS_PAGE_SIZE = 50
+
 export const useChatStore = defineStore('chat', {
   state: (): ChatStoreState => ({
     token: getToken(),
@@ -29,6 +37,9 @@ export const useChatStore = defineStore('chat', {
     currentRole: '',
     currentSessionId: null,
     sessions: [],
+    sessionsTotal: 0,
+    sessionsLimit: SESSIONS_PAGE_SIZE,
+    sessionsLoading: false,
     channels: ['webui', 'cli', 'telegram', 'weixin'],
     currentChannel: 'webui',
     messages: [],
@@ -44,6 +55,8 @@ export const useChatStore = defineStore('chat', {
       }
       return map
     },
+    // Sidebar 用此判定是否还能继续滚加载。
+    hasMoreSessions: (state) => state.sessions.length < state.sessionsTotal,
   },
   actions: {
     setToken(token: string) {
@@ -56,6 +69,8 @@ export const useChatStore = defineStore('chat', {
       this.currentRole = ''
       this.currentSessionId = null
       this.sessions = []
+      this.sessionsTotal = 0
+      this.sessionsLoading = false
       this.channels = ['webui', 'cli', 'telegram', 'weixin']
       this.currentChannel = 'webui'
       this.messages = []
@@ -74,8 +89,9 @@ export const useChatStore = defineStore('chat', {
           this.channels = ch.channels
           this.currentChannel = ch.default || 'webui'
         }
-        const sessionsRes = await listSessions(targetRole, this.currentChannel)
+        const sessionsRes = await listSessions(targetRole, this.currentChannel, { limit: this.sessionsLimit, offset: 0 })
         this.sessions = sessionsRes.sessions
+        this.sessionsTotal = sessionsRes.total ?? sessionsRes.sessions.length
         return r
       } catch {
         // 不清空 token，让上层决定如何处理。
@@ -85,9 +101,34 @@ export const useChatStore = defineStore('chat', {
       }
     },
     async refreshSessions(role?: string) {
+      // 重置为第一页:角色 / 渠道 / 新建会话后都走这里。
       const r = role || this.currentRole
-      const res = await listSessions(r, this.currentChannel)
+      const res = await listSessions(r, this.currentChannel, { limit: this.sessionsLimit, offset: 0 })
       this.sessions = res.sessions
+      this.sessionsTotal = res.total ?? res.sessions.length
+    },
+    async loadMoreSessions() {
+      // IntersectionObserver 触发的"加载下一页"。互斥锁防并发,边界保护防越界。
+      if (this.sessionsLoading) return
+      if (this.sessions.length >= this.sessionsTotal) return
+      this.sessionsLoading = true
+      try {
+        const res = await listSessions(this.currentRole, this.currentChannel, {
+          limit: this.sessionsLimit,
+          offset: this.sessions.length,
+        })
+        // 用 session_id 去重防 offset 漂移时偶发的重叠条(Risks #1)。
+        const seen = new Set(this.sessions.map((s) => s.session_id))
+        for (const s of res.sessions) {
+          if (!seen.has(s.session_id)) this.sessions.push(s)
+        }
+        // 后端 total 是最新真实值,以其为准
+        this.sessionsTotal = res.total ?? this.sessionsTotal
+      } catch (err) {
+        console.warn('[store] failed to load more sessions', err)
+      } finally {
+        this.sessionsLoading = false
+      }
     },
     setCurrentSession(id: string | null) {
       this.currentSessionId = id
@@ -96,12 +137,13 @@ export const useChatStore = defineStore('chat', {
       this.messages = msgs
     },
     async setCurrentChannel(channel: string) {
-      // 切换渠道:重新拉 sidebar 列表,自动选中 mtime 最新一条并加载消息;
+      // 切换渠道:重新拉 sidebar 第一页,自动选中 mtime 最新一条并加载消息;
       // 列表为空时把 currentSessionId 置 null,空白页直发会自动新建一条绑该渠道。
       this.currentChannel = channel
       try {
-        const res = await listSessions(this.currentRole, channel)
+        const res = await listSessions(this.currentRole, channel, { limit: this.sessionsLimit, offset: 0 })
         this.sessions = res.sessions
+        this.sessionsTotal = res.total ?? res.sessions.length
         if (res.sessions.length > 0) {
           const top = res.sessions[0]
           this.currentSessionId = top.session_id
