@@ -299,14 +299,21 @@ def test_skills_index_template_contains_progressive_disclosure_guidance():
 
 
 def test_executor_extra_block_empty_for_idle_chat_no_skills(mock_config):
-    """无 TODO + 无 task_frame + 无 skill:executor 额外块应完全为空。
+    """无 TODO + 无 task_frame + 无 skill:executor 额外块仅含产物落点引导。
 
     mock_config.skills_dirs 默认指向 ``tmp_path / .claude / skills``(conftest 设置),
     那个目录不存在,所以 find_skills 返回空,索引块不注入。
+    产物落点引导(workspace_hint)是常驻块,只要 deps.session_id 非空就出现。
     """
     deps = _make_executor_deps(mock_config, task_frame=None)
     block = build_executor_extra_dynamic_block(deps)
-    assert block == ""
+    # TODO 接力块、direct mode 块、skills index 块都不应出现
+    assert "执行接力规则" not in block
+    assert "直接执行模式" not in block
+    assert "技能索引" not in block
+    # 仅产物落点引导常驻
+    assert "中间产物落点" in block
+    assert ".workspace/" in block
 
 
 def test_executor_extra_block_direct_mode_only(mock_config):
@@ -410,8 +417,11 @@ def test_executor_extra_block_planned_without_active_todos_empty(mock_config):
         },
     )
     block = build_executor_extra_dynamic_block(deps)
-    # planned 模式不触发 direct 块;工作区也没 skill;返回应为空。
-    assert block == ""
+    # planned 模式不触发 direct 块;工作区也没 skill;只保留产物落点常驻引导。
+    assert "执行接力规则" not in block
+    assert "直接执行模式" not in block
+    assert "技能索引" not in block
+    assert "中间产物落点" in block
 
 
 def test_executor_extra_block_none_deps_empty():

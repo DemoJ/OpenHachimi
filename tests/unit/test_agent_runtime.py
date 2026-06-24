@@ -401,6 +401,51 @@ def test_presenter_passes_artifact_events():
     assert actions[0].artifact == artifact
 
 
+def test_presenter_deduplicates_repeated_tool_events_in_conversation():
+    """Planner/Executor retry 或模型一轮里多次输出同一个 tool call 时,
+    presenter 不应把同一行 N 次累积到工具汇总里(否则 Telegram/conversation
+    模式会显示 N 个完全相同的「• ✅ 创建计划...」)。"""
+    presenter = ToolProgressPresenter(mode="conversation")
+
+    tool_event = StreamEventItem(type="tool", text="✅ 创建计划：目标：xxx；共 3 项任务")
+
+    first = presenter.handle_event(tool_event)
+    second = presenter.handle_event(tool_event)
+    third = presenter.handle_event(tool_event)
+
+    # 每次仍会触发一次刷新(让上层及时更新进度),但汇总文本永远只有一行
+    assert first[0].text == "• ✅ 创建计划：目标：xxx；共 3 项任务"
+    assert second[0].text == "• ✅ 创建计划：目标：xxx；共 3 项任务"
+    assert third[0].text == "• ✅ 创建计划：目标：xxx；共 3 项任务"
+
+
+def test_presenter_deduplicates_repeated_tool_events_in_cli():
+    """CLI 流式逐行打印时,完全相同的工具事件直接吞掉,避免刷屏。"""
+    presenter = ToolProgressPresenter(mode="cli")
+
+    tool_event = StreamEventItem(type="tool", text="✅ 创建计划：目标：xxx；共 3 项任务")
+
+    first = presenter.handle_event(tool_event)
+    second = presenter.handle_event(tool_event)
+
+    assert len(first) == 1
+    assert first[0].text == "✅ 创建计划：目标：xxx；共 3 项任务"
+    assert second == []
+
+
+def test_presenter_reset_clears_dedup_state():
+    """工具段被 text/system 事件切断后,reset_tools() 应同时清掉去重集合,
+    后续同一行可以重新展示(对应「轮次切换/新 segment」语义)。"""
+    presenter = ToolProgressPresenter(mode="conversation")
+    tool_event = StreamEventItem(type="tool", text="✅ 创建计划：目标：xxx")
+
+    presenter.handle_event(tool_event)
+    presenter.reset_tools()
+    actions = presenter.handle_event(tool_event)
+
+    assert actions[0].text == "• ✅ 创建计划：目标：xxx"
+
+
 @pytest.mark.asyncio
 async def test_stream_events_filters_tool_events_when_disabled():
     service = AgentService.__new__(AgentService)
@@ -501,3 +546,22 @@ async def test_stream_watchdog_cancels_stalled_operation():
     with pytest.raises(OperationStalledError):
         await stream.__anext__()
     assert task.cancelled()
+
+
+def test_continuation_prompt_includes_pending_clarification():
+    """上一轮 executor 调过 clarify_user 留下的 pending 问题应注入 continuation
+    decision 提示词,让 continuation agent 知道用户当前消息很可能是对该追问的回答。"""
+    from openhachimi_agent.service.agent_runtime.router import _continuation_prompt
+
+    session_state = {
+        "_user_clarification": {
+            "question": "请提供发件人邮箱和 SMTP 授权码",
+            "missing_inputs": ["发件人邮箱", "SMTP 授权码"],
+            "raised_at_seq": 12,
+        },
+    }
+    prompt = _continuation_prompt(_ctx(session_state, message="发件人是 me@x.com,授权码 abc"))
+
+    assert "请提供发件人邮箱和 SMTP 授权码" in prompt
+    assert "pending_clarification" in prompt
+

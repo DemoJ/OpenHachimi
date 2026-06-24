@@ -48,7 +48,11 @@ def test_format_tool_call_redacts_browser_type_text():
     assert REDACTED in text
 
 
-def test_format_tool_call_create_todos_shows_summary_only():
+def test_format_tool_call_create_todos_shows_task_summary():
+    """create_todos 的工具调用展示应包含 goal + 前若干个 task 描述,
+    让用户能在 telegram / WebUI 上直接看到本次计划干什么。
+    _tasks_summary 自动限制最多 4 项,超出附加"等 N 项"。
+    """
     text = format_tool_call(
         "create_todos",
         {
@@ -61,7 +65,22 @@ def test_format_tool_call_create_todos_shows_summary_only():
         },
     )
 
-    assert text == "✅ 创建计划：目标：调查浏览器访问网页无响应的根因，定位问题并提供解决方案；共 3 项任务"
-    assert "；计划：" not in text
-    assert "验收" not in text
-    assert "环境检查" not in text
+    assert text.startswith("✅ 创建计划：")
+    assert "目标：调查浏览器访问网页无响应的根因" in text
+    assert "计划：" in text
+    # 每个 task description 应出现在概要里(3 项 ≤ 4 项上限,全部显示)
+    assert "环境检查" in text
+    assert "浏览器技能详情分析" in text
+    assert "日志与历史记录检查" in text
+
+
+def test_format_tool_call_create_todos_truncates_long_plan():
+    """超过 4 项的 plan 概要应只显示前 4 项 + "等 N 项"后缀,避免刷屏。"""
+    tasks = [{"description": f"步骤 {i}"} for i in range(1, 8)]
+    text = format_tool_call("create_todos", {"goal": "test goal", "tasks": tasks})
+
+    assert "步骤 1" in text
+    assert "步骤 4" in text
+    assert "步骤 5" not in text
+    assert "等 7 项" in text
+

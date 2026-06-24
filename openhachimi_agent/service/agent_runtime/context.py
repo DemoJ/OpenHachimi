@@ -163,6 +163,10 @@ def should_route_new_turn(session_state: dict[str, Any]) -> bool:
 def mark_turn_started(session_state: dict[str, Any]) -> None:
     session_state["last_turn_complete"] = False
     session_state["active_plan_lease"] = {"status": "running"}
+    # 上一轮 clarify_user 留下的 pending 状态在新一轮启动时清理:
+    # router/continuation 决策阶段读完它就会立即清,以免在执行阶段被 validator
+    # 当作"本轮调用过 clarify_user"误判而提前放行(参见 factory._validate_execution_result)。
+    session_state.pop("_user_clarification", None)
 
 
 def mark_turn_finished(session_state: dict[str, Any]) -> None:

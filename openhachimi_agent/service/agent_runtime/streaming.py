@@ -135,14 +135,16 @@ def _tool_detail(tool_name: str, args: dict[str, object]) -> str:
         return ""
 
     if tool_name == "create_todos":
+        # 显示 goal + 前若干个 task 描述,让用户在 telegram / WebUI 上能直接看到
+        # 本次计划干什么(不止"共 N 项任务"的数量)。_tasks_summary 自动限制
+        # 最多 4 项 + "等 N 项"后缀,避免长 plan 刷屏。
         goal = _compact(args.get("goal", ""), 60)
         tasks = args.get("tasks", [])
-        task_count = len(tasks) if isinstance(tasks, list) else 0
         detail_parts = []
         if goal:
             detail_parts.append(f"目标：{goal}")
-        if task_count:
-            detail_parts.append(f"共 {task_count} 项任务")
+        if isinstance(tasks, list) and tasks:
+            detail_parts.append(f"计划：{_tasks_summary(tasks)}")
         return "；".join(detail_parts)
 
     if tool_name == "update_todo":

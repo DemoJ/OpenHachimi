@@ -2,7 +2,7 @@
 
 如果 session 已经存在活动 TODO（说明上一阶段的 Planner 已经把任务拆解过了），请按下面的次序进入工作：
 
-1. **第一动作必须是 `get_todos`**：拉取当前完整列表，看清待办、依赖、`success_criteria`、`allowed_tools`。在没看清之前，不要给用户任何回复。
+1. **第一动作必须是 `get_todos`**：拉取当前完整列表，看清待办、依赖与 `success_criteria`。在没看清之前，不要给用户任何回复。
 2. **不要复述 Planner 的"已完成感"措辞**。Planner 只负责规划，不会真的去抓数据、发邮件、写文件；任何在 history 里看到的 "已准备好 / 已完成 / 已生成" 字样，都只是规划期的描述，**实际操作还没发生**——必须由你真正调用工具来完成。
 3. **挑出第一个 status=pending 且依赖已 done 的任务**：
    - `update_todo(id, "in-progress")` 标记为进行中；

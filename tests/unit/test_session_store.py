@@ -32,6 +32,7 @@ from openhachimi_agent.storage.session_store import (
     SessionStore,
     is_known_channel,
 )
+from openhachimi_agent.core.identifiers import validate_session_id
 from openhachimi_agent.tools.planning import TodoState, TodoTask
 
 
@@ -402,6 +403,7 @@ def test_todo_state_roundtrip(store: SessionStore):
         invariants=["tests must pass", "lint clean"],
         tool_calls_since_update=5,
         is_active=True,
+        created_turn_seq=7,
         tasks={
             1: TodoTask(id=1, description="design", status="done"),
             2: TodoTask(
@@ -409,7 +411,6 @@ def test_todo_state_roundtrip(store: SessionStore):
                 description="impl",
                 status="in-progress",
                 depends_on=[1],
-                allowed_tools=["edit_file", "run_tests"],
                 risk_level="medium",
                 evidence="WIP",
             ),
@@ -421,10 +422,46 @@ def test_todo_state_roundtrip(store: SessionStore):
     assert loaded.invariants == ["tests must pass", "lint clean"]
     assert loaded.tool_calls_since_update == 5
     assert loaded.is_active is True
+    assert loaded.created_turn_seq == 7
     assert set(loaded.tasks.keys()) == {1, 2}
     assert loaded.tasks[2].depends_on == [1]
-    assert loaded.tasks[2].allowed_tools == ["edit_file", "run_tests"]
     assert loaded.tasks[2].risk_level == "medium"
+
+
+def test_todo_state_load_ignores_legacy_allowed_tools(store: SessionStore):
+    """旧库可能仍带 ``allowed_tools`` 字段;现在 TodoTask 已经没有这个字段,
+    反序列化时应静默丢弃,不抛 TypeError(保持向后兼容)。"""
+    sid = _new_sid()
+    # 直接造一条带 legacy 字段的 JSON,模拟 v1 时期遗留状态
+    legacy_payload = json.dumps({
+        "goal": "legacy goal",
+        "invariants": [],
+        "tool_calls_since_update": 0,
+        "is_active": True,
+        "tasks": {
+            "1": {
+                "id": 1,
+                "description": "legacy task",
+                "status": "pending",
+                "allowed_tools": ["write_file", "*"],
+                "risk_level": "low",
+            },
+        },
+    }, ensure_ascii=False)
+    safe_sid = validate_session_id(sid, allow_legacy=False)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO session_todos (session_id, state_json, updated_at) "
+            "VALUES (?, ?, datetime('now'))",
+            (safe_sid, legacy_payload),
+        )
+
+    loaded = store.load_todo_state(sid)
+    assert loaded.goal == "legacy goal"
+    assert set(loaded.tasks.keys()) == {1}
+    assert loaded.tasks[1].description == "legacy task"
+    # 关键:没抛 TypeError,且 TodoTask 实例不再带 allowed_tools 属性
+    assert not hasattr(loaded.tasks[1], "allowed_tools")
 
 
 def test_todo_state_missing_returns_empty(store: SessionStore):

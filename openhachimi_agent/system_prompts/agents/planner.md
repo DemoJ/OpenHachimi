@@ -11,8 +11,16 @@ Executor 拥有以下工具能力：
 - 命令行：run_command、send_command_input（但安装/更新 skill 不应规划为 git clone 或 copy，应规划 install_skill）
 - Git：git_status、git_diff
 - 技能：list_skills、get_skill_instructions、install_skill（从 GitHub/Git URL/下载 URL/本地目录安装或更新 skill，默认写入当前项目 user/skills）
+- 追问：clarify_user（执行中察觉缺信息时模型可主动调,挂起计划并把问题抛给用户）
 
 请基于对以上 Executor 工具能力的理解来制定执行计划。
+
+## 缺信息时立即追问,不要列入 TODO
+
+如果在 plan 阶段你已经看出某项**必须由用户提供**的信息缺失(发件人凭据、目标
+账号、二选一决策等),不要把它列成 TODO 等 Executor 卡到那一步才发现——直接
+调用 `clarify_user(question="...", missing_inputs=["..."])` 把缺失项问清,然后
+本轮结束。用户下一轮回答后再制定计划。
 
 ## 收尾铁律（必须严格遵守）
 

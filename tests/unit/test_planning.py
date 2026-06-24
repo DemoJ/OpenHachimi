@@ -48,10 +48,42 @@ def test_update_todo(mock_ctx):
     res = update_todo(mock_ctx, 1, "in-progress", "working on it")
     assert "[-]" in res
     assert "working on it" in res
-    
+
     res2 = update_todo(mock_ctx, 1, "done", "finished")
     assert "[x]" in res2
     assert "finished" in res2
+
+
+def test_update_todo_accepts_string_task_id(mock_ctx):
+    """GLM / Qwen 等开源模型常生成 task_id="1" 而非 1。
+    update_todo 必须吞掉这种格式差异,不能让 pydantic_ai 的 schema 校验抛
+    ValidationError,否则连续 3 次累计就会撞 max_retries 把整轮报废。"""
+    create_todos(mock_ctx, ["Task 1"])
+    res = update_todo(mock_ctx, "1", "done", "ok")
+    assert "[x] 1." in res
+
+
+def test_update_todo_accepts_status_aliases(mock_ctx):
+    """模型经常使用 "in_progress" / "completed" / "finished" 等同义写法,
+    必须归一化到 Literal 内的 4 个值,避免反复 retry。"""
+    create_todos(mock_ctx, ["Task A", "Task B", "Task C"])
+
+    res_in_progress = update_todo(mock_ctx, 1, "in_progress")
+    assert "[-] 1." in res_in_progress
+
+    res_done = update_todo(mock_ctx, 1, "completed", "ok")
+    assert "[x] 1." in res_done
+
+    res_blocked = update_todo(mock_ctx, 2, "cancelled", notes="external dep missing")
+    assert "external dep missing" in res_blocked
+
+
+def test_update_todo_rejects_unknown_status_softly(mock_ctx):
+    """无法识别的 status 也只返回错误字符串,绝不抛异常——
+    抛异常会被 pydantic_ai 计入 retries,造成 max_retries 熔断。"""
+    create_todos(mock_ctx, ["Task 1"])
+    res = update_todo(mock_ctx, 1, "nonsense-status")
+    assert "未识别" in res
 
 
 def test_create_todos_rejects_missing_dependency(mock_ctx):
@@ -118,39 +150,6 @@ def test_execution_guard_blocks_without_in_progress_task(mock_ctx):
     assert guarded(mock_ctx) == {"ok": True}
 
 
-def test_execution_guard_blocks_non_authorized_tools(mock_ctx):
-    called = False
-
-    def write_file(ctx):
-        nonlocal called
-        called = True
-        return {"ok": True}
-
-    guarded = with_execution_guard(write_file)
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "Task 1", "allowed_tools": ["run_command"]},
-    ])
-    update_todo(mock_ctx, 1, "in-progress")
-
-    with pytest.raises(ModelRetry, match="未授权该工具"):
-        guarded(mock_ctx)
-
-    assert called is False
-
-
-def test_execution_guard_allows_authorized_tool(mock_ctx):
-    def write_file(ctx):
-        return {"ok": True}
-
-    guarded = with_execution_guard(write_file)
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "Task 1", "allowed_tools": ["write_file"]},
-    ])
-    update_todo(mock_ctx, 1, "in-progress")
-
-    assert guarded(mock_ctx) == {"ok": True}
-
-
 def test_execution_guard_blocks_unfinished_dependencies(mock_ctx):
     called = False
 
@@ -204,76 +203,72 @@ async def test_execution_guard_supports_async_tools(mock_ctx):
 
     guarded = with_execution_guard(run_command)
     create_todos(mock_ctx, [
-        {"id": 1, "description": "Task 1", "allowed_tools": ["run_command"]},
+        {"id": 1, "description": "Task 1"},
     ])
     update_todo(mock_ctx, 1, "in-progress")
 
     assert await guarded(mock_ctx) == {"ok": True}
 
 
-def test_update_todo_can_replace_allowed_tools(mock_ctx):
-    """update_todo 支持修改 allowed_tools,让模型能在不重建计划的情况下修正白名单。"""
-    def forget_memory(ctx):
-        return "deleted"
-
-    guarded = with_execution_guard(forget_memory)
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "删除记忆", "allowed_tools": ["delete_path"]},
-    ])
+def test_create_todos_cross_turn_blocks_without_merge(mock_ctx):
+    """跨轮再次 create_todos 时,若未传 merge=True,应拒绝覆盖既有活动计划。"""
+    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 1
+    create_todos(mock_ctx, ["Task A"])
     update_todo(mock_ctx, 1, "in-progress")
 
-    # 守卫拦截 forget_memory,因为只允许 delete_path
-    with pytest.raises(ModelRetry, match="未授权该工具"):
-        guarded(mock_ctx)
+    # 模拟跨轮:新一轮 ledger seq 推进
+    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 10
 
-    # 用 update_todo 修正 allowed_tools
-    update_todo(mock_ctx, 1, "in-progress", allowed_tools=["forget_memory"])
+    with pytest.raises(ModelRetry, match="跨轮活动计划"):
+        create_todos(mock_ctx, ["Brand new task"])
+
     state = _get_state(mock_ctx)
-    assert state.tasks[1].allowed_tools == ["forget_memory"]
-
-    # 守卫现在放行
-    assert guarded(mock_ctx) == "deleted"
+    assert state.tasks[1].description == "Task A"
+    assert state.tasks[1].status == "in-progress"
 
 
-def test_update_todo_clear_allowed_tools_unrestricts(mock_ctx):
-    """传 [] 给 allowed_tools 视为完全解除限制。"""
-    def any_tool(ctx):
-        return "ok"
-
-    guarded = with_execution_guard(any_tool)
+def test_create_todos_cross_turn_merge_keeps_status(mock_ctx):
+    """跨轮 merge=True 时应按 id 合并:更新 description 等可变字段,
+    保留旧任务的 status/evidence/notes。"""
+    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 1
     create_todos(mock_ctx, [
-        {"id": 1, "description": "Task", "allowed_tools": ["only_this"]},
+        {"id": 1, "description": "Original"},
+        {"id": 2, "description": "Will stay"},
     ])
-    update_todo(mock_ctx, 1, "in-progress")
-    update_todo(mock_ctx, 1, "in-progress", allowed_tools=[])
+    update_todo(mock_ctx, 1, "in-progress", notes="halfway", evidence="ev")
+
+    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 10
+    res = create_todos(
+        mock_ctx,
+        [
+            {"id": 1, "description": "Refined"},
+            {"id": 3, "description": "New task"},
+        ],
+        merge=True,
+    )
 
     state = _get_state(mock_ctx)
-    assert state.tasks[1].allowed_tools == []
-    assert guarded(mock_ctx) == "ok"
+    assert state.tasks[1].description == "Refined"
+    assert state.tasks[1].status == "in-progress"
+    assert state.tasks[1].notes == "halfway"
+    assert state.tasks[1].evidence == "ev"
+    # 未在新列表的旧 id 应保留
+    assert 2 in state.tasks
+    assert state.tasks[2].description == "Will stay"
+    # 新 id 应追加
+    assert state.tasks[3].description == "New task"
+    assert "Refined" in res
 
 
-def test_update_todo_wildcard_allowed_tools_unrestricts(mock_ctx):
-    """传 ['*'] 给 allowed_tools 也视为不限制。"""
-    def any_tool(ctx):
-        return "ok"
-
-    guarded = with_execution_guard(any_tool)
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "Task", "allowed_tools": ["nothing"]},
-    ])
-    update_todo(mock_ctx, 1, "in-progress")
-    update_todo(mock_ctx, 1, "in-progress", allowed_tools=["*"])
+def test_create_todos_same_turn_replace_allowed(mock_ctx):
+    """同一轮内重复 create_todos 视作 planner refine,允许全量替换。"""
+    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 5
+    create_todos(mock_ctx, ["Old A", "Old B"])
+    # 同一轮再调一次,无 merge 也应允许覆盖
+    res = create_todos(mock_ctx, ["Fresh"])
 
     state = _get_state(mock_ctx)
-    assert state.tasks[1].allowed_tools == ["*"]
-    assert guarded(mock_ctx) == "ok"
+    assert len(state.tasks) == 1
+    assert state.tasks[1].description == "Fresh"
+    assert "Fresh" in res
 
-
-def test_update_todo_omit_allowed_tools_keeps_existing(mock_ctx):
-    """不传 allowed_tools 时不应改动原值。"""
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "Task", "allowed_tools": ["a", "b"]},
-    ])
-    update_todo(mock_ctx, 1, "in-progress", notes="just a note")
-    state = _get_state(mock_ctx)
-    assert state.tasks[1].allowed_tools == ["a", "b"]

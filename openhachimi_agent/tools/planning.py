@@ -30,7 +30,6 @@ class TodoTaskInput(TypedDict, total=False):
     description: str
     parent_id: int
     depends_on: list[int]
-    allowed_tools: list[str]
     success_criteria: str
     verification: str
     risk_level: Literal["low", "medium", "high"]
@@ -43,7 +42,6 @@ class TodoTask:
     notes: str = ""
     parent_id: int | None = None
     depends_on: list[int] = field(default_factory=list)
-    allowed_tools: list[str] = field(default_factory=list)
     success_criteria: str = ""
     verification: str = ""
     risk_level: Literal["low", "medium", "high"] = "low"
@@ -56,6 +54,10 @@ class TodoState:
     tasks: dict[int, TodoTask] = field(default_factory=dict)
     tool_calls_since_update: int = 0
     is_active: bool = False
+    # 记录 ``create_todos`` 被调时所在的 turn 序号(取自
+    # ``session_state["current_turn_ledger_start_seq"]``)。下次 ``create_todos`` 调用
+    # 判定"同轮 refine vs 跨轮覆盖"用这个字段比较,跨轮覆盖默认拒绝并要求模型显式 merge。
+    created_turn_seq: int = 0
 
 def _load_state(ctx: RunContext[AgentDeps]) -> TodoState:
     """从 SessionStore 加载本会话 TODO 状态。
@@ -157,26 +159,10 @@ def _tool_name_candidates(func) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names or ["unknown_tool"]))
 
 
-def _tool_key(name: str) -> str:
-    return name.strip().lower()
-
-
-def _tool_allowed(task: TodoTask, tool_names: tuple[str, ...]) -> bool:
-    if not task.allowed_tools:
-        return True
-
-    allowed = {_tool_key(name) for name in task.allowed_tools if str(name).strip()}
-    if "*" in allowed or "any" in allowed:
-        return True
-    return bool(allowed.intersection(_tool_key(name) for name in tool_names))
-
-
 def _format_guard_task(task: TodoTask) -> str:
     parts = [f"{task.id}:{task.status}", task.description]
     if task.depends_on:
         parts.append(f"依赖={task.depends_on}")
-    if task.allowed_tools:
-        parts.append(f"允许工具={task.allowed_tools}")
     return " ".join(parts)
 
 
@@ -227,19 +213,24 @@ def create_todos(
     tasks: list[TodoTaskInput | str],
     goal: str = "",
     invariants: list[str] | str | None = None,
+    merge: bool = False,
 ) -> str:
     """
-    创建一个全新的 TODO 任务列表，用于规划复杂的步骤。
-    
+    创建/合并 TODO 任务列表，用于规划复杂的步骤。
+
     当你需要执行一个包含多个步骤的复杂任务时（如搜集多方面信息、写复杂代码、进行深度研究），
     请首先调用此工具将模糊意图拆解为具体的 TODO 列表。
-    
+
     参数说明：
     - goal: 记录本计划要完成的用户目标。
-    - invariants: 记录计划和执行过程不可违反的约束列表（例如 ["不可修改 API 签名", "必须保持向后兼容"]）。如果没有约束，必须省略此参数或传入空数组 []，绝不要传入字符串 'None' 或 'null'。
-    - tasks: 任务列表。可以是简单的字符串列表（代表每个任务的描述），也可以是包含详细配置的字典列表（推荐用于复杂任务）。
-      支持的字段包括 id, description, parent_id, depends_on, allowed_tools, success_criteria, verification, risk_level。
-    
+    - invariants: 计划和执行过程不可违反的约束列表（例如 ["不可修改 API 签名", "必须保持向后兼容"]）。
+      没有约束时省略或传 []。
+    - tasks: 任务列表。可以是简单字符串列表（每个元素代表 description），也可以是字典列表。
+      字典可选字段：id, description, parent_id, depends_on, success_criteria, verification, risk_level。
+    - merge: 默认 False，即"全量替换"语义；当**跨轮**已经存在一个活动计划时，仅在传 merge=True
+      时按 id 合并新旧任务（保留旧任务的 status/evidence/notes，新增 id 追加，未列出的旧 id 保留）。
+      同一轮内重复调用 create_todos 始终视作 planner 的 refine，按全量替换处理，无需手动传 merge。
+
     调用后，请逐一执行工具完成任务，并使用 update_todo 及时更新状态。
     """
     if not tasks:
@@ -293,65 +284,161 @@ def create_todos(
             # 同时兼容整数和字符串形式的依赖 ID
             depends_on = [c for dep in raw_depends if (c := _coerce_int(dep, "depends_on")) is not None]
 
-            allowed_tools = item.get("allowed_tools", [])
-            if not isinstance(allowed_tools, list):
-                allowed_tools = []
             risk_level = item.get("risk_level", "low")
             if risk_level not in {"low", "medium", "high"}:
                 risk_level = "low"
-            
+
             new_tasks[t_id] = TodoTask(
                 id=t_id,
                 description=str(desc),
                 parent_id=parent_id,
                 depends_on=depends_on,
-                allowed_tools=[str(tool) for tool in allowed_tools],
                 success_criteria=str(item.get("success_criteria", "")),
                 verification=str(item.get("verification", "")),
                 risk_level=risk_level,
             )
 
+    state = _get_state(ctx)
+
+    # 同一轮内重复调用 create_todos 视为 planner 自然 refine,允许全量替换不拦截;
+    # 跨轮再次 create_todos 且未传 merge=True 时拒绝,避免静默覆盖既有活动计划。
+    current_turn_seq = int(
+        ctx.deps.session_state.get("current_turn_ledger_start_seq", 0) or 0
+    )
+    if state.is_active and state.tasks:
+        same_turn = state.created_turn_seq == current_turn_seq
+        if not same_turn and not merge:
+            raise ModelRetry(
+                f"已存在跨轮活动计划（{len(state.tasks)} 个任务，"
+                f"goal={state.goal!r}）。三选一：\n"
+                f"(a) 同一目标的细化：用 update_todo 修改具体任务，不要重新 create_todos；\n"
+                f"(b) 跨轮 refine：调 create_todos(merge=True, tasks=[...])，"
+                f"按 id 合并而非覆盖（保留旧任务的 status/evidence/notes）；\n"
+                f"(c) 全新无关任务：先把旧计划所有 pending/in-progress 任务 "
+                f"update_todo(..., status=\"blocked\")，再 create_todos(merge=False, ...) 覆盖。"
+            )
+        if same_turn and not merge:
+            logger.info(
+                "create_todos same-turn replace, prior plan with %d tasks discarded "
+                "for session %s",
+                len(state.tasks),
+                ctx.deps.session_id,
+            )
+
+    if merge and state.tasks:
+        # merge 语义参考 Hermes tools/todo_tool.py:
+        # - 已有 id:用新值更新 description/parent_id/depends_on/success_criteria/
+        #   verification/risk_level,保留 status/evidence/notes/tool_calls_since_update;
+        # - 新增 id:追加;
+        # - 未在新列表的旧 id:保留。
+        merged: dict[int, TodoTask] = dict(state.tasks)
+        for new_id, new_task in new_tasks.items():
+            existing = merged.get(new_id)
+            if existing is None:
+                merged[new_id] = new_task
+                continue
+            existing.description = new_task.description
+            existing.parent_id = new_task.parent_id
+            existing.depends_on = new_task.depends_on
+            existing.success_criteria = new_task.success_criteria
+            existing.verification = new_task.verification
+            existing.risk_level = new_task.risk_level
+        new_tasks = merged
+
     _validate_tasks(new_tasks)
 
-    state = _get_state(ctx)
     task_frame = ctx.deps.session_state.get("task_frame", {})
-    state.goal = goal or str(task_frame.get("goal", ""))
+    state.goal = goal or state.goal or str(task_frame.get("goal", ""))
     inherited_invariants = task_frame.get("invariants", [])
     merged_invariants = _normalize_invariants(invariants)
     if isinstance(inherited_invariants, list):
         merged_invariants.extend(str(item) for item in inherited_invariants if item)
+    if merge and state.invariants:
+        merged_invariants = list(state.invariants) + merged_invariants
     state.invariants = list(dict.fromkeys(merged_invariants))
     state.tasks = new_tasks
     state.tool_calls_since_update = 0
     state.is_active = True
+    state.created_turn_seq = current_turn_seq
     _save_state(ctx, state)
-    logger.info("Created %d TODO tasks for session %s.", len(tasks), ctx.deps.session_id)
+    logger.info(
+        "%s %d TODO tasks for session %s.",
+        "Merged" if merge and state.tasks else "Created",
+        len(tasks),
+        ctx.deps.session_id,
+    )
     return get_todos(ctx)
 
 
 def update_todo(
     ctx: RunContext[AgentDeps],
-    task_id: int,
-    status: Literal["pending", "in-progress", "done", "blocked"],
+    task_id: int | str,
+    status: str,
     notes: str = "",
     evidence: str = "",
-    allowed_tools: list[str] | None = None,
 ) -> str:
     """
-    更新某个 TODO 任务的状态、备注、证据或允许工具。
+    更新某个 TODO 任务的状态、备注或证据。
     当你开始一个任务或完成一个任务时，必须调用此工具更新状态。
 
     参数：
-    - task_id: 任务的数字 ID
-    - status: 必须是 "in-progress" / "done" / "pending" / "blocked"
+    - task_id: 任务的数字 ID（也接受 "1" 这样的字符串形式，会自动转 int）
+    - status: 必须是 "in-progress" / "done" / "pending" / "blocked"。
+      也接受 "in_progress" / "in progress" / "inprogress" 这些常见变体，
+      以及 "completed" / "finished" 等同义词，会自动归一化。
     - notes: 简要记录该任务的进展或结论
     - evidence: 标记 done 时若任务有 success_criteria 必须提供
-    - allowed_tools: 修正该任务允许使用的工具白名单。**当且仅当**你发现 planner
-      给该任务设置的 allowed_tools 错误地排除了真正需要的工具时使用；传入新的完整
-      工具名列表（例如 ["forget_memory", "list_memory"]）会**覆盖**原有列表，
-      传入 ["*"] 解除限制，传入 [] 同样视为不限制。允许工具发生变化时记得更新
-      notes 说明原因。不需要修改时省略此参数。
     """
+    # task_id 接受字符串形式(GLM/Qwen 等开源模型常生成 "1" 而非 1)。
+    # 这里不抛 ValidationError——一旦抛了,pydantic_ai 会把它计入 max_retries,
+    # 累计 3 次就 UnexpectedModelBehavior,把整轮报废。
+    if isinstance(task_id, str):
+        try:
+            task_id = int(task_id.strip())
+        except (TypeError, ValueError):
+            return f"错误：task_id 必须是数字,但收到 {task_id!r}。请检查 TODO 列表 ID 后重试。"
+
+    # status 归一化:模型常写 "in_progress"/"completed"/"finished"/"cancelled" 等。
+    # 用别名表统一映射到 schema 接受的 4 个值,避免每次 LLM 拼写差异都触发 retry。
+    _STATUS_ALIASES = {
+        "pending": "pending",
+        "todo": "pending",
+        "open": "pending",
+        "waiting": "pending",
+        "in-progress": "in-progress",
+        "in_progress": "in-progress",
+        "in progress": "in-progress",
+        "inprogress": "in-progress",
+        "running": "in-progress",
+        "doing": "in-progress",
+        "wip": "in-progress",
+        "started": "in-progress",
+        "done": "done",
+        "completed": "done",
+        "complete": "done",
+        "finished": "done",
+        "success": "done",
+        "ok": "done",
+        "resolved": "done",
+        "closed": "done",
+        "blocked": "blocked",
+        "block": "blocked",
+        "stuck": "blocked",
+        "failed": "blocked",
+        "fail": "blocked",
+        "cancelled": "blocked",
+        "canceled": "blocked",
+        "skipped": "blocked",
+        "abandoned": "blocked",
+    }
+    normalized = _STATUS_ALIASES.get(str(status).strip().lower().replace("　", " "))
+    if normalized is None:
+        return (
+            f"错误：未识别的 status {status!r}。"
+            "请使用以下之一:pending / in-progress / done / blocked。"
+        )
+    status = normalized  # type: ignore[assignment]
+
     state = _get_state(ctx)
     task = state.tasks.get(task_id)
     if not task:
@@ -378,16 +465,6 @@ def update_todo(
         task.notes = notes
     if evidence:
         task.evidence = evidence
-    if allowed_tools is not None:
-        # 接受 list[str];过滤掉空白项;["*"] / ["any"] / [] 均视为"不限制"
-        cleaned = [str(name).strip() for name in allowed_tools if str(name).strip()]
-        task.allowed_tools = cleaned
-        logger.info(
-            "Updated allowed_tools for TODO %d in session %s: %s",
-            task_id,
-            ctx.deps.session_id,
-            cleaned or "<unrestricted>",
-        )
 
     # 重置调用计数器
     state.tool_calls_since_update = 0
@@ -479,20 +556,6 @@ def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str | Itera
             tool_name=display_name,
             reason=f"当前任务 {task.id} 的依赖尚未完成：{missing}。",
             next_step="先完成依赖任务并用 `update_todo(..., 'done')` 记录证据，再继续当前变更操作。",
-        )
-    if not _tool_allowed(task, tool_names):
-        allowed = ", ".join(task.allowed_tools)
-        _raise_guard_violation(
-            state=state,
-            tool_name=display_name,
-            reason=f"当前任务 {task.id} 未授权该工具；允许的工具为：{allowed}。",
-            next_step=(
-                "三选一：(a) 改用当前任务允许的工具；"
-                "(b) 如果当前任务的 allowed_tools 本身错误，调用 "
-                f"`update_todo(task_id={task.id}, status=..., allowed_tools=[...])` "
-                "修正白名单（传 ['*'] 或 [] 解除限制）；"
-                "(c) 如果整个计划方向有误，将任务标记为 blocked，让执行记录触发重规划。"
-            ),
         )
     return task
 

@@ -118,6 +118,47 @@ def _print_access_info(host: str, port: int) -> None:
     print()
 
 
+# 集中维护的命令清单，便于 deploy/start/restart/serve 复用打印。
+# 列表项格式：(命令, 说明)
+_COMMAND_HELP: tuple[tuple[str, str], ...] = (
+    ("hachimi",             "进入 CLI 对话（默认行为）"),
+    ("hachimi status",      "查看后台服务状态"),
+    ("hachimi start",       "启动后台服务"),
+    ("hachimi stop",        "停止后台服务"),
+    ("hachimi restart",     "重启后台服务"),
+    ("hachimi log",         "实时查看服务日志（Ctrl-C 退出，-n N 显示最近 N 行）"),
+    ("hachimi config",      "用编辑器打开配置文件"),
+    ("hachimi serve",       "在前台运行 HTTP 服务（调试用）"),
+    ("hachimi deploy",      "部署并注册后台守护服务"),
+    ("hachimi install",     "安装 Playwright 浏览器驱动（chromium）"),
+    ("hachimi update",      "更新到最新版本（--force 强制重装依赖）"),
+    ("hachimi uninstall",   "卸载后台守护服务（--purge 清虚拟环境）"),
+    ("hachimi schedule",    "管理定时任务（add/list/pause/resume/remove/run/inbox/logs）"),
+    ("hachimi weixin",      "微信原生扫码登录配置"),
+    ("hachimi -V",          "查看当前版本"),
+)
+
+
+def _print_commands_help(title: str = "可用命令") -> None:
+    """打印 hachimi CLI 可用命令清单，供部署/启动完成后提示用户。
+
+    若当前 hachimi 不在 PATH 中（短命令不可直接使用），会额外打印加入 PATH 的提示。
+    """
+    print()
+    print(_c("1", f"== {title} =="))
+    width = max(len(cmd) for cmd, _ in _COMMAND_HELP)
+    for cmd, desc in _COMMAND_HELP:
+        print(f"  {_c('1', cmd.ljust(width))}  {desc}")
+
+    if shutil.which("hachimi") is None:
+        # 用户当前 PATH 没有 hachimi，提示加入 PATH 以使用短命令。
+        print()
+        _info("当前 shell 未检测到 `hachimi` 命令，加入虚拟环境的 bin 目录后即可直接使用上述短命令：")
+        venv_bin = Path(sys.executable).parent
+        print(f"  echo 'export PATH=\"{venv_bin}:$PATH\"' >> ~/.bashrc && source ~/.bashrc")
+    print()
+
+
 # ── 子命令实现 ────────────────────────────────────────────────────────────────
 
 def cmd_status(_args: argparse.Namespace) -> None:
@@ -135,6 +176,7 @@ def cmd_start(_args: argparse.Namespace) -> None:
     host, port = _deployed_endpoint()
     _print_access_info(host, port)
     _info("使用 `hachimi status` 确认运行状态。")
+    _print_commands_help()
 
 
 def cmd_stop(_args: argparse.Namespace) -> None:
@@ -154,6 +196,7 @@ def cmd_restart(_args: argparse.Namespace) -> None:
     host, port = _deployed_endpoint()
     _print_access_info(host, port)
     _info("使用 `hachimi status` 确认运行状态。")
+    _print_commands_help()
 
 
 def cmd_log(args: argparse.Namespace) -> None:
@@ -259,6 +302,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         persist_server_endpoint(config.config_path, raw_config, host, port)
         logger.info("deploy: 命令行参数已写回配置 host=%s port=%s", host, port)
     deploy_daemon()
+    _print_commands_help("部署完成 · 可用命令")
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -279,6 +323,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         _ok(f"访问令牌（HTTP API Token）：{config.http_api_token}")
     else:
         _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
+    # uvicorn.run 进入阻塞前先打印一次可用命令，便于在 serve 调试模式下了解管理入口。
+    _print_commands_help()
     uvicorn.run("openhachimi_agent.interface.http:app", host=host, port=port)
 
 

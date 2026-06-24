@@ -24,13 +24,26 @@ class ToolProgressPresenter:
     def __init__(self, *, mode: Literal["cli", "conversation"]) -> None:
         self.mode = mode
         self._tool_lines: list[str] = []
+        # 已展示过的工具行集合,用于在同一 segment 内对完全相同的工具调用做去重。
+        # 同一个 tool 事件被 pydantic-ai 因 retry/replan 重发,或模型一轮里输出多次
+        # 等价 tool call(常见于 schema 不严格的开源模型),都会重复 yield 一份带相同
+        # text 的 StreamEventItem,累积渲染就会让用户看到「• ✅ 创建计划...」× N。
+        self._seen_lines: set[str] = set()
 
     def handle_event(self, event: StreamEventItem) -> list[PresenterAction]:
         if event.type == "tool":
             line = event.text
             if self.mode == "cli":
+                # CLI 流式逐行打印,重复行直接吞掉避免刷屏。
+                if line in self._seen_lines:
+                    return []
+                self._seen_lines.add(line)
                 return [PresenterAction(type="tool", text=line)]
-            self._tool_lines.append(line)
+            # conversation 模式:同一行不再 append 到累积列表,但仍触发一次刷新
+            # 以便上层及时把"工具进行中"的状态同步到客户端(例如 placeholder)。
+            if line not in self._seen_lines:
+                self._seen_lines.add(line)
+                self._tool_lines.append(line)
             return [PresenterAction(type="tool", text=self.tool_summary())]
 
         actions: list[PresenterAction] = []
@@ -47,10 +60,12 @@ class ToolProgressPresenter:
             return []
         summary = self.tool_summary()
         self._tool_lines = []
+        self._seen_lines.clear()
         return [PresenterAction(type="tool", text=summary, final=True)]
 
     def reset_tools(self) -> None:
         self._tool_lines = []
+        self._seen_lines.clear()
 
     def tool_summary(self) -> str:
         lines = self._tool_lines

@@ -3,6 +3,7 @@
 .tmp-ensurepip/
 tmp_tool_dir/
 .memory/
+.workspace/
 .env
 user/config.yaml
 .logs/

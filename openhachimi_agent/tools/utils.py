@@ -41,6 +41,7 @@ SKIP_DIR_NAMES = {
     ".tmp-ensurepip",
     ".venv",
     ".browser_data",
+    ".workspace",
     "__pycache__",
     "openhachimi_agent.egg-info",
 }
@@ -88,6 +89,19 @@ def resolve_workspace_path(workspace_root: Path, path: str, allowed_roots: list[
         raise ModelRetry(f"路径超出当前工作区及允许的外部目录，不允许访问：{path}")
 
     return resolved
+
+
+def session_workspace_dir(base_dir: Path, session_id: str) -> Path:
+    """会话级临时工作区:模型自产的中间产物(一次性脚本、待发送邮件正文、临时草稿、
+    本地报告)默认落点。
+
+    - 不强制重定向(``write_file``/``run_command`` 默认行为不变),仅通过 system prompt
+      引导模型把"任务过程产物"往这里写,保留"用户让我改源代码"主流用例。
+    - 不自动创建(由调用方按需 ``mkdir``)。
+    - 路径形如 ``<base_dir>/.workspace/<session_id>/``;``.workspace`` 已加入
+      ``SKIP_DIR_NAMES``,搜索类工具不会扫;``.gitignore`` 也忽略整个目录。
+    """
+    return base_dir / ".workspace" / session_id
 
 
 def normalize_relative_path(workspace_root: Path, path: Path) -> str:

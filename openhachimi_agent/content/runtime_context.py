@@ -290,6 +290,20 @@ def _direct_mode_block(deps: AgentDeps) -> str:
         return ""
 
 
+def _workspace_hint_block(deps: AgentDeps) -> str:
+    """注入"会话产物落点"软引导:模型自造的中间产物默认写到 ``.workspace/<sid>/``。
+    不强制重定向 ``write_file``,只是改变模型默认选择,避免任务产物污染仓库根。
+    """
+    sid = getattr(deps, "session_id", "")
+    if not sid:
+        return ""
+    try:
+        return render_system_prompt("runtime/workspace_hint", {"session_id": sid})
+    except Exception:  # noqa: BLE001
+        logger.debug("workspace_hint render failed", exc_info=True)
+        return ""
+
+
 def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
     """构造仅 executor agent 需要的额外动态段,追加在通用动态段之后。
 
@@ -298,8 +312,8 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
     污染 —— 它们各自的角色提示词已经明确了职责。把 executor 专用块单独出口,
     在 ``factory.py`` 中只对 executor agent 注册。
 
-    输出顺序:``[执行接力规则? + 通用底线] [直接执行模式提示?] [技能索引]``。
-    前两块按需,技能索引常驻(只要工作区有可见 skill)。
+    输出顺序:``[执行接力规则? + 通用底线] [直接执行模式提示?] [产物落点引导]
+    [技能索引]``。前两块按需,后两块常驻。
     """
     if deps is None:
         return ""
@@ -310,6 +324,9 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
     direct = _direct_mode_block(deps)
     if direct:
         blocks.append(direct)
+    workspace_hint = _workspace_hint_block(deps)
+    if workspace_hint:
+        blocks.append(workspace_hint)
     skills_index = _skills_index_block(deps)
     if skills_index:
         blocks.append(skills_index)

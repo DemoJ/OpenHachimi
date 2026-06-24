@@ -18,6 +18,43 @@ from openhachimi_agent.agent.intent import PlanContinuationDecision, SelfCritiqu
 logger = logging.getLogger(__name__)
 
 
+def should_pass_through_validation(signal: dict | None, session_state: dict) -> str | None:
+    """检测 final-answer validator 是否应短路放行。返回放行原因(用于日志),否则 None。
+
+    两条放行路径:
+    1. ``_user_clarification`` 标志存在:本 turn 调用过 ``clarify_user``,执行器
+       主动声明在等用户输入,任何"未完成 TODO"都是预期内暂停状态。
+    2. 所有未完成任务都显式标 ``blocked``,且最近无工具失败:模型不是乱标 done
+       而是诚实声明卡点。
+
+    两条都在 ledger 写入之前判断,避免污染 ``_replan_after_execution_signal``
+    的连续 blocked 检测。
+    """
+    if not signal:
+        return None
+    if session_state.get("_user_clarification"):
+        return "clarify_user invoked this turn"
+
+    issues = signal.get("issues", []) if isinstance(signal, dict) else []
+    has_latest_failure = any(
+        isinstance(issue, dict) and issue.get("type") == "latest_execution_not_successful"
+        for issue in issues
+    )
+    unfinished_issues = [
+        issue for issue in issues
+        if isinstance(issue, dict) and issue.get("type") == "unfinished_todos"
+    ]
+    if unfinished_issues and not has_latest_failure:
+        all_items = [
+            item for issue in unfinished_issues
+            for item in issue.get("items", [])
+            if isinstance(item, dict)
+        ]
+        if all_items and all(item.get("status") == "blocked" for item in all_items):
+            return f"all unfinished todos blocked (count={len(all_items)})"
+    return None
+
+
 def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None) -> Agent:
     if not config.openai_api_key:
         raise ValueError("未配置 llm.api_key，请先在 user/config.yaml 中填写 API Key。")
@@ -106,6 +143,20 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                 return result
 
             session_state = ctx.deps.session_state
+
+            # 短路放行:见 should_pass_through_validation 文档(在 ledger 写入之前判断,
+            # 避免污染连续 blocked 检测)。
+            passthrough_reason = should_pass_through_validation(signal, session_state)
+            if passthrough_reason:
+                logger.info(
+                    "validator pass-through: %s (session=%s)",
+                    passthrough_reason,
+                    ctx.deps.session_id,
+                )
+                session_state["_final_validator_yielded"] = True
+                session_state["_final_validator_last_signal"] = signal
+                return result
+
             counter = int(session_state.get(VALIDATOR_RETRY_KEY, 0) or 0)
 
             # 同时把"validator 打回"记入 execution_ledger,让上层 executor.py 的

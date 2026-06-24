@@ -566,6 +566,7 @@ class SessionStore:
             invariants=[str(item) for item in data.get("invariants", []) if item],
             tool_calls_since_update=int(data.get("tool_calls_since_update", 0) or 0),
             is_active=bool(data.get("is_active", False)),
+            created_turn_seq=int(data.get("created_turn_seq", 0) or 0),
         )
 
         raw_tasks = data.get("tasks", {})
@@ -588,11 +589,8 @@ class SessionStore:
                     [int(d) for d in depends_on_raw]
                     if isinstance(depends_on_raw, list) else []
                 )
-                allowed_tools_raw = v.get("allowed_tools", [])
-                allowed_tools = (
-                    [str(t) for t in allowed_tools_raw]
-                    if isinstance(allowed_tools_raw, list) else []
-                )
+                # v.get("allowed_tools", ...) 被有意忽略 ——
+                # 老库可能仍带这个字段,但 TodoTask 已不再有它,丢弃即可保持向后兼容。
                 risk_level = v.get("risk_level", "low")
                 if risk_level not in {"low", "medium", "high"}:
                     risk_level = "low"
@@ -603,7 +601,6 @@ class SessionStore:
                     notes=str(v.get("notes", "")),
                     parent_id=parent_id,
                     depends_on=depends_on,
-                    allowed_tools=allowed_tools,
                     success_criteria=str(v.get("success_criteria", "")),
                     verification=str(v.get("verification", "")),
                     risk_level=risk_level,

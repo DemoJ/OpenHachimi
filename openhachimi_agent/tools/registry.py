@@ -33,6 +33,7 @@ from openhachimi_agent.tools.scheduler import (
     update_scheduled_task_delivery,
 )
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
+from openhachimi_agent.tools.clarification import clarify_user
 from openhachimi_agent.tools.memory import forget_memory, list_memory, memory_stats, remember, search_memory
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
 from openhachimi_agent.agent.execution import with_execution_ledger
@@ -187,19 +188,27 @@ _PLANNER_CONTEXT_TOOLS = [
 ]
 
 PLANNER_TOOLSET = FunctionToolset(
-    tools=_PLANNER_CONTEXT_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS],
+    tools=_PLANNER_CONTEXT_TOOLS
+    + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS]
+    + [with_execution_ledger(clarify_user)],
     max_retries=3,
 )
 
 # ── Executor 专用工具集 ──
 # Executor 拥有所有执行权限、只读权限和更新 TODO 能力
 EXECUTOR_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)],
+    tools=_READ_ONLY_FINAL_TOOLS
+    + _EXECUTION_FINAL_TOOLS
+    + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL]
+    + [with_execution_ledger(get_todos)]
+    + [with_execution_ledger(clarify_user)],
     max_retries=3,
 )
 
 # ── Scheduled Executor 专用工具集 ──
 # 定时任务无人值守执行期间允许普通执行能力和调度只读能力，但不暴露调度写入/触发工具。
+# 注意:scheduled executor 默认无人值守,不应注册 clarify_user(没人回答),由模型在
+# 卡死时改走 update_todo blocked + notes 的路径。
 SCHEDULED_EXECUTOR_TOOLSET = FunctionToolset(
     tools=_READ_ONLY_FINAL_TOOLS + _SCHEDULED_EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)],
     max_retries=3,

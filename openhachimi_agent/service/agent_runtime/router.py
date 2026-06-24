@@ -54,6 +54,10 @@ def _continuation_prompt(ctx: AgentRunContext) -> str:
         "task_frame": ctx.session_state.get("task_frame"),
         "suspended_plan": ctx.session_state.get("suspended_plan"),
         "plan_status": ctx.session_state.get("plan_status"),
+        # 上一轮 executor 调用过 clarify_user 留下的待澄清问题。把它注入
+        # continuation agent 上下文,后者据此应当倾向于 resume_suspended_plan
+        # (用户当前消息很可能就是对这个追问的回答)。
+        "pending_clarification": ctx.session_state.get("_user_clarification"),
     }
     return render_system_prompt(
         "runtime/continuation_decision",
