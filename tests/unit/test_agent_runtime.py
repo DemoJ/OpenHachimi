@@ -292,9 +292,15 @@ def test_low_confidence_direct_task_does_not_need_planning():
 
 
 def test_planned_execution_mode_needs_planning():
-    frame = TaskFrame(confidence=0.9, requires_plan=False, execution_mode="planned")
+    frame = TaskFrame(confidence=0.9, complexity="complex", risk="low", requires_plan=False, execution_mode="planned")
 
     assert needs_planning(frame) is True
+
+
+def test_simple_low_risk_planned_mode_does_not_need_planning():
+    frame = TaskFrame(confidence=0.9, complexity="simple", risk="low", requires_plan=True, execution_mode="planned")
+
+    assert needs_planning(frame) is False
 
 
 def test_presenter_passes_artifact_events():

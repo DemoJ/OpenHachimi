@@ -342,8 +342,16 @@ def coerce_task_frame(value: object, message: str) -> TaskFrame:
     if _is_skill_install_or_update_request(message, detected_urls) and not any("install_skill" in invariant for invariant in frame.invariants):
         frame.invariants.append(_skill_install_update_invariant(detected_urls))
 
-    # 5) execution_mode 与 requires_plan 对齐
-    if frame.requires_plan:
+    # 5) 规划策略归一化。
+    # Router 偶尔会把 simple + low risk 的任务标成 planned,导致简单问答/单步文件
+    # 修改也先跑 planner 并创建 TODO。这里以 complexity/risk 为硬约束:只有复杂或
+    # 非低风险任务才允许进入 planned；低风险简单任务统一走 direct。
+    if frame.complexity == "simple" and frame.risk == "low":
+        frame.requires_plan = False
+        frame.execution_mode = "direct"
+        if not frame.direct_execution_reason:
+            frame.direct_execution_reason = "Simple low-risk task should be executed directly without planner/TODO overhead."
+    elif frame.requires_plan:
         frame.execution_mode = "planned"
 
     return frame

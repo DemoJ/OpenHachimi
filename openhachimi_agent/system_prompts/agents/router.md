@@ -9,12 +9,13 @@
 - **goal**：用一句话陈述用户实际目的；与 user_request 可不同（user_request 是原话）。
 - **task_kind**：`qa`, `code_change`, `file_ops`, `shell`, `browser`, `research`, `unknown`。
 - **complexity**：
-  - `simple`：1-2 步即可完成，且低风险。
-  - `complex`：需要跨文件/多工具/多步骤调研、代码修改、复杂网页操作或系统性分析。
+  - `simple`：1-2 步即可完成，且低风险；包括普通问答、解释概念、按用户给出的明确文件/路径做小修改、创建/改写一个小文件、运行一条明确命令、打开/查看一个明确 URL。
+  - `complex`：需要跨文件/多工具/多步骤调研、较大代码修改、复杂网页操作或系统性分析。
 - **risk**：`high` = 删除、覆盖、部署、发布、涉及密钥、登录态或不可逆操作。
 - **execution_mode**：
   - `direct`：简单或单步任务，可由主模型直接执行；
   - `planned`：仅复杂或高风险任务使用，会触发独立的 Planner Agent 先做计划拆解。
+  - 只要 `complexity=simple` 且 `risk=low`，必须使用 `requires_plan=false` + `execution_mode=direct`，不要因为任务属于 code_change / file_ops / shell 就自动规划。
 - **clarifying_question**：**只在确实需要追问时填写**；不需要追问时**必须输出 JSON null**，禁止填字符串 "None" / "null" / 空串。
 - **target_entities**：用户明确给出的 URL、文件路径、函数名等。**不要把整段用户消息原文塞进 target_entities** —— 那是 user_request 的位置。
   - 简单的显式 URL 访问/打开/查看任务应为 browser + simple + requires_plan=false + allowed_autonomy=narrow。

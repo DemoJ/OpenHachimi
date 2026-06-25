@@ -27,7 +27,7 @@ def test_heuristic_extracts_urls():
 
 
 def test_coerce_task_frame_supplements_url_entities():
-    """coerce_task_frame 只补充 target_entities，不覆盖 LLM 判断。"""
+    """coerce_task_frame 只补充 target_entities，并会压回简单低风险任务的误规划。"""
     frame = coerce_task_frame(
         {
             "user_request": "请打开 https://example.com/a",
@@ -43,7 +43,7 @@ def test_coerce_task_frame_supplements_url_entities():
         "请打开 https://example.com/a",
     )
 
-    # LLM 判断的字段不被覆盖
+    # complex 判断不被覆盖
     assert frame.task_kind == "research"
     assert frame.complexity == "complex"
     assert frame.requires_plan is True
@@ -134,6 +134,29 @@ def test_legacy_skill_direct_execution_mode_downgraded_to_direct():
     )
 
     assert frame.execution_mode == "direct"
+
+
+def test_simple_low_risk_router_plan_is_normalized_to_direct():
+    """Router 误把简单低风险任务标成 planned 时，最后一层防御应压回 direct。"""
+    frame = coerce_task_frame(
+        {
+            "user_request": "帮我改一下 README 里的错别字",
+            "goal": "修正 README 错别字",
+            "task_kind": "file_ops",
+            "complexity": "simple",
+            "risk": "low",
+            "confidence": 0.8,
+            "requires_plan": True,
+            "execution_mode": "planned",
+            "target_entities": [],
+            "invariants": [],
+        },
+        "帮我改一下 README 里的错别字",
+    )
+
+    assert frame.requires_plan is False
+    assert frame.execution_mode == "direct"
+    assert "directly" in frame.direct_execution_reason
 
 
 def test_build_task_frame_no_url_special_handling():
