@@ -28,6 +28,7 @@ from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 from openhachimi_agent.service.agent_runtime.router import should_route_message
 from openhachimi_agent.service.agent_runtime.planner import needs_planning
 from openhachimi_agent.service.agent_runtime.streaming import OperationStalledError, StreamEventItem, StreamStats, consume_stream_queue
+from openhachimi_agent.service.agent_runtime.turn import _cancel_and_drain_task
 from openhachimi_agent.service.agent_service import AgentService
 
 
@@ -363,6 +364,27 @@ def test_presenter_reset_clears_dedup_state():
     actions = presenter.handle_event(tool_event)
 
     assert actions[0].text == "• ✅ 创建计划：目标：xxx"
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_drain_task_waits_for_cancel_cleanup():
+    cleanup_finished = asyncio.Event()
+
+    async def slow_cancel_task():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+            raise
+
+    task = asyncio.create_task(slow_cancel_task())
+    await asyncio.sleep(0)
+
+    await _cancel_and_drain_task(task, reason="unit-test")
+
+    assert task.cancelled()
+    assert cleanup_finished.is_set()
 
 
 @pytest.mark.asyncio

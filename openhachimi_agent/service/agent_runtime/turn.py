@@ -61,6 +61,24 @@ def _error_message(exc: BaseException) -> str:
     return redact_exception(exc)
 
 
+async def _cancel_and_drain_task(task: asyncio.Task, *, reason: str) -> None:
+    """取消后台 agent task 并等待其清理完成。
+
+    仅调用 ``task.cancel()`` 不等待时,流式客户端断开/async generator 被关闭会让
+    pydantic-ai 的模型请求协程在事件循环关闭时仍处于 pending,进而触发
+    "Task was destroyed but it is pending" 和 ContextVar token reset 报错。
+    """
+    if task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.debug("cancelled agent task finished with error reason=%s", reason, exc_info=True)
+
+
 # WebUI 展示历史会话时需要"用户原始输入"，而 UserPromptPart 里实际只承载用户原话
 # （v2 后已不再嵌 volatile 前缀），仍保留 metadata 旁路是为了：
 # 1) 旧会话回放：旧版 UserPromptPart 里拼了 volatile 前缀，仅靠分隔符无法可靠反向
@@ -884,4 +902,4 @@ async def run_turn(
         finally:
             service._running_tasks.pop(actual_session_id, None)
             if not task.done():
-                task.cancel()
+                await _cancel_and_drain_task(task, reason="run_turn_finally")
