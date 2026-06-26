@@ -42,16 +42,16 @@
           <button class="btn" @click="loadConfig">重试</button>
         </div>
 
-        <div v-else-if="currentGroup === 'ai-models' && fields.length" class="settings-content">
-          <!-- 主模型 -->
-          <section class="settings-card">
+        <div v-else-if="fields.length" class="settings-content">
+          <!-- 按 currentGroup 渲染对应卡片组;卡片元数据见 GROUP_CARDS。 -->
+          <section v-for="card in activeCards" :key="card.key" class="settings-card">
             <div class="card-head">
-              <h3>主模型 · LLM</h3>
-              <p class="card-desc">Agent 对话使用的核心模型。改后新会话生效。</p>
+              <h3>{{ card.title }}</h3>
+              <p class="card-desc">{{ card.desc }}</p>
             </div>
             <div class="card-grid">
               <ConfigField
-                v-for="f in fieldsByGroup('llm')"
+                v-for="f in fieldsByGroup(card.key)"
                 :key="f.path"
                 :field="f"
                 :secret-masked="isMasked(f.path)"
@@ -59,45 +59,10 @@
                 @unmask="onUnmask(f.path)"
               />
             </div>
+            <p v-if="card.restartNote" class="card-restart-note">⚠️ {{ card.restartNote }}</p>
           </section>
 
-          <!-- 视觉模型 -->
-          <section class="settings-card">
-            <div class="card-head">
-              <h3>视觉模型 · VISION</h3>
-              <p class="card-desc">主模型不支持图片时,可由辅助视觉模型先识别图片再交给主模型。</p>
-            </div>
-            <div class="card-grid">
-              <ConfigField
-                v-for="f in fieldsByGroup('vision')"
-                :key="f.path"
-                :field="f"
-                :secret-masked="isMasked(f.path)"
-                v-model="form[f.path]"
-                @unmask="onUnmask(f.path)"
-              />
-            </div>
-          </section>
-
-          <!-- 摘要压缩辅助模型 -->
-          <section class="settings-card">
-            <div class="card-head">
-              <h3>摘要压缩辅助模型 · SUMMARY</h3>
-              <p class="card-desc">长对话上下文压缩用的辅助模型;留空则复用主模型。</p>
-            </div>
-            <div class="card-grid">
-              <ConfigField
-                v-for="f in fieldsByGroup('summary')"
-                :key="f.path"
-                :field="f"
-                :secret-masked="isMasked(f.path)"
-                v-model="form[f.path]"
-                @unmask="onUnmask(f.path)"
-              />
-            </div>
-          </section>
-
-          <!-- 保存条 -->
+          <!-- 保存条(所有分组共用) -->
           <div class="settings-actions" :class="{ visible: dirty }">
             <span class="dirty-hint" v-if="dirty">有未保存的修改</span>
             <span class="dirty-hint saved" v-else-if="justSaved">已保存</span>
@@ -128,12 +93,29 @@ import type { ConfigField as ConfigFieldType } from '../api'
 const router = useRouter()
 const route = useRoute()
 
-// 设置分组元信息(左侧导航)。新增分组时在此追加,并扩展下方渲染分支。
+// 设置分组元信息(左侧导航)。新增分组时在此追加,并扩展 GROUP_CARDS。
 const groups = [
   { id: 'ai-models', label: 'AI 模型', icon: '🤖' },
+  { id: 'network', label: '网络与服务', icon: '🌐' },
 ] as const
 
+// 各分组下的卡片定义:key=字段 group(后端字段表里的 group 字段),用于 fieldsByGroup 过滤。
+// restartNote 非空时在卡片底部提示"改后需重启"。
+const GROUP_CARDS: Record<string, { key: string; title: string; desc: string; restartNote?: string }[]> = {
+  'ai-models': [
+    { key: 'llm', title: '主模型 · LLM', desc: 'Agent 对话使用的核心模型。改后新会话生效。' },
+    { key: 'vision', title: '视觉模型 · VISION', desc: '主模型不支持图片时,可由辅助视觉模型先识别图片再交给主模型。' },
+    { key: 'summary', title: '摘要压缩辅助模型 · SUMMARY', desc: '长对话上下文压缩用的辅助模型;留空则复用主模型。' },
+  ],
+  'network': [
+    { key: 'http', title: 'HTTP 服务', desc: 'WebUI / API 的监听地址、端口与访问令牌。改后需重启进程。', restartNote: '改了监听地址/端口/Token 需重启进程,否则不生效;改 Token 后前端需用新 Token 重新登录。' },
+    { key: 'telegram', title: 'Telegram', desc: 'Telegram Bot 接入。改后需重启(bot 在启动期建连)。', restartNote: '改了 Bot Token / 代理需重启进程,bot 才会重新建连。' },
+    { key: 'behavior', title: '消息行为', desc: '工具调用展示、流式心跳、附件上限等即时生效项。' },
+  ],
+}
+
 const activeMeta = computed(() => groups.find((g) => g.id === currentGroup.value))
+const activeCards = computed(() => GROUP_CARDS[currentGroup.value] || [])
 
 const currentGroup = ref<string>((route.params.group as string) || 'ai-models')
 
@@ -327,11 +309,15 @@ loadConfig()
   line-height: 20px;
   transition: background 0.15s, color 0.15s;
 }
-.settings-nav-list li:hover { background: var(--canvas-soft); color: var(--ink); }
+.settings-nav-list li:hover { background: var(--row-hover); color: var(--ink); }
 .settings-nav-list li.active {
   background: var(--canvas-soft);
   color: var(--ink);
   border-left-color: var(--ink);
+}
+/* hover 选中项:保持 active 实色背景,避免 hover 淡背景覆盖选中态(与会话列表一致)。 */
+.settings-nav-list li.active:hover {
+  background: var(--canvas-soft);
 }
 .nav-icon { font-size: 16px; }
 
@@ -385,6 +371,15 @@ loadConfig()
 }
 .card-desc {
   font-size: 13px;
+  line-height: 18px;
+  color: var(--body-mid);
+}
+/* 卡片底部"改后需重启"提示 */
+.card-restart-note {
+  margin-top: var(--sp-md);
+  padding-top: var(--sp-md);
+  border-top: 1px dashed var(--hairline);
+  font-size: 12px;
   line-height: 18px;
   color: var(--body-mid);
 }

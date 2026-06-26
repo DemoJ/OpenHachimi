@@ -760,9 +760,38 @@ AI_MODEL_FIELDS: list[dict[str, Any]] = [
      "label": "失败即中止", "description": "关闭=插入兜底摘要;开启=中止压缩并冻结对话"},
 ]
 
+# 网络与服务接入设置页字段定义。
+# 改 server_host / server_port / http_api_token / telegram_bot_token / telegram_proxy_url
+# 需重启进程才生效(端口/监听地址在启动期绑定,bot 在启动期建连);消息行为三项即时生效。
+# server_host 用 select 限定 127.0.0.1 / 0.0.0.0,防止误下拉成公网监听;
+# 若需绑定特定网卡 IP(如 192.168.1.10),请直接编辑 config.yaml——下拉刻意不提供该入口。
+NETWORK_FIELDS: list[dict[str, Any]] = [
+    # ── HTTP 服务(改后需重启) ──
+    {"path": "app.server_host", "kind": CONFIG_KIND_SELECT, "group": "http",
+     "label": "监听地址", "options": ["127.0.0.1", "0.0.0.0"],
+     "description": "127.0.0.1=仅本机访问(最安全);0.0.0.0=开放局域网/公网,务必配合 token 与防火墙。改后需重启。如需绑定特定网卡 IP 请直接编辑 config.yaml"},
+    {"path": "app.server_port", "kind": CONFIG_KIND_INT, "group": "http",
+     "label": "监听端口", "description": "HTTP 服务监听端口;改后需重启才生效"},
+    {"path": "app.http_api_token", "kind": CONFIG_KIND_SECRET, "group": "http",
+     "label": "HTTP API Token", "description": "除 /health 外所有接口的访问令牌;改后需重启,且前端需用新 token 重新登录"},
+    # ── Telegram(改后需重启) ──
+    {"path": "app.telegram_bot_token", "kind": CONFIG_KIND_SECRET, "group": "telegram",
+     "label": "Bot Token", "description": "通过 @BotFather 申请;留空不启用 Telegram 渠道。改后需重启(bot 启动期建连)"},
+    {"path": "app.telegram_proxy_url", "kind": CONFIG_KIND_STRING, "group": "telegram",
+     "label": "代理地址", "description": "无法直连 Telegram 时配置;支持 HTTP/SOCKS5,如 socks5://127.0.0.1:1080。改后需重启"},
+    # ── 消息行为(即时生效,无需重启) ──
+    {"path": "app.show_tool_calls", "kind": CONFIG_KIND_BOOL, "group": "behavior",
+     "label": "显示工具调用", "description": "在 CLI/HTTP/Telegram 渠道显示工具调用进度"},
+    {"path": "app.stream_idle_timeout_seconds", "kind": CONFIG_KIND_INT, "group": "behavior",
+     "label": "流式空闲检查间隔(秒)", "description": "流式队列无新事件时的进展检查/心跳间隔秒数"},
+    {"path": "app.max_attachment_size_mb", "kind": CONFIG_KIND_INT, "group": "behavior",
+     "label": "附件大小上限 (MB)", "description": "Telegram/HTTP 附件大小上限,单位 MB"},
+]
+
 # 各设置页分组的字段定义注册表。新增分组在此追加 key → 字段列表即可。
 SETTINGS_FIELD_GROUPS: dict[str, list[dict[str, Any]]] = {
     "ai-models": AI_MODEL_FIELDS,
+    "network": NETWORK_FIELDS,
 }
 
 
