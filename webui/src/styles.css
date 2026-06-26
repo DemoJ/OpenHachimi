@@ -7,7 +7,8 @@
 
 :root {
   /* ── 颜色 · Surface ── */
-  --canvas: #0a0a0a;          /* 唯一页面背景：近黑 */
+  --canvas: #0a0a0a;          /* 主区域背景：近黑 */
+  --canvas-sink: #070707;     /* 比主区更深一档：侧栏沉下去,形成空间层次 */
   --canvas-soft: #1a1c20;     /* 略亮的暗色填充：悬停 / 输入框 / 认证卡 */
   --canvas-card: #191919;     /* 卡片填充 */
   --canvas-mid: #363a3f;      /* 嵌套表面 / 内联代码 */
@@ -31,6 +32,10 @@
   /* 描边胶囊的半透明白边（品牌标志性） */
   --pill-border: rgba(255, 255, 255, 0.25);
   --pill-border-hover: rgba(255, 255, 255, 0.45);
+
+  /* 行 hover:极淡半透明白,比 active 的 canvas-soft 实色弱一档,
+     使 hover 与选中态形成层级差——hover 选中项时选中背景仍占主导。 */
+  --row-hover: rgba(255, 255, 255, 0.04);
 
   /* ── 圆角 ── */
   --radius-sm: 8px;           /* 卡片 */
@@ -175,7 +180,7 @@ a:hover { text-decoration: underline; }
 
 .sidebar {
   width: var(--sidebar-width);
-  background: var(--canvas);
+  background: var(--canvas-sink);
   border-right: 1px solid var(--hairline);
   display: flex;
   flex-direction: column;
@@ -209,25 +214,11 @@ a:hover { text-decoration: underline; }
   letter-spacing: -0.2px;
 }
 
-/* model-badge：描边胶囊，mono 小标签 */
-.header .model-badge {
-  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 16px;
-  letter-spacing: 1.2px;
-  text-transform: uppercase;
-  color: var(--body);
-  background: transparent;
-  border: 1px solid var(--pill-border);
-  border-radius: var(--radius-pill);
-  padding: var(--sp-xs) var(--sp-md);
-}
-
-/* ================================================================ 侧栏 */
+/* ================================================================ 侧栏
+   侧栏内部不用发丝线分区(header/footer 均无线),靠留白分隔;整列只有右侧
+   一根脊柱(由 .sidebar border-right 提供),避免窄空间里多条横线叠成"梯子"感。 */
 .sidebar-header {
-  padding: var(--sp-xl);
-  border-bottom: 1px solid var(--hairline);
+  padding: var(--sp-xl) var(--sp-xl) var(--sp-lg);
 }
 
 .sidebar-header h2 {
@@ -259,7 +250,9 @@ a:hover { text-decoration: underline; }
 }
 
 .sidebar-section {
-  padding: var(--sp-lg) var(--sp-xl) var(--sp-sm);
+  /* 左右 padding 与 .sidebar-sessions 对齐(sp-md=12px),使角色行与会话行的
+     选中背景块左右缘齐平——两者内行 padding 同为 sp-md,选中态宽度一致。 */
+  padding: var(--sp-lg) var(--sp-md) var(--sp-sm);
 }
 
 /* 分区标题：Geist Mono 大写 + 正字距 */
@@ -291,13 +284,18 @@ a:hover { text-decoration: underline; }
   white-space: nowrap;
 }
 .sidebar-list li:hover {
-  background: var(--canvas-soft);
+  background: var(--row-hover);
   color: var(--ink);
 }
 .sidebar-list li.active {
   background: var(--canvas-soft);
   color: var(--ink);
   border-left-color: var(--ink);
+}
+/* hover 选中项:保持 active 的实色背景,不被 hover 的淡背景覆盖;
+   仅文字已为 ink,不再变化,避免选中态被 hover "淹没"的闪烁感。 */
+.sidebar-list li.active:hover {
+  background: var(--canvas-soft);
 }
 
 .sidebar-sessions {
@@ -313,10 +311,14 @@ a:hover { text-decoration: underline; }
   cursor: pointer;
   transition: background 0.15s;
 }
-.session-item:hover { background: var(--canvas-soft); }
+.session-item:hover { background: var(--row-hover); }
 .session-item.active {
   background: var(--canvas-soft);
   border-left-color: var(--ink);
+}
+/* hover 选中项:保持 active 实色背景,避免 hover 淡背景覆盖选中态。 */
+.session-item.active:hover {
+  background: var(--canvas-soft);
 }
 .session-item .preview {
   color: var(--body);
@@ -341,6 +343,7 @@ a:hover { text-decoration: underline; }
   flex: 1;
   overflow-y: auto;
   padding: var(--sp-2xl) 0;
+  position: relative;            /* 空状态 hero 绝对定位到此容器中央 */
 }
 
 .messages-list {
@@ -350,6 +353,41 @@ a:hover { text-decoration: underline; }
 }
 
 .message { margin-bottom: var(--sp-xl); }
+
+/* 空状态 hero:绝对定位铺满 messages-container 并垂直水平居中。
+   左右 inset:0 撑满宽度(不受 messages-list 的 max-width 限制),
+   再用 flex 居中内容。有消息时不渲染,不影响滚动。 */
+.empty-hero {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-md);
+  padding: 0 var(--sp-xl);
+  pointer-events: none;
+  text-align: center;
+}
+.empty-hero-icon {
+  font-size: 40px;
+  line-height: 1;
+  color: var(--body-mid);
+  opacity: 0.5;
+  margin-bottom: var(--sp-xs);
+}
+.empty-hero-title {
+  font-size: 22px;
+  font-weight: 400;
+  line-height: 30px;
+  letter-spacing: -0.3px;
+  color: var(--ink);
+}
+.empty-hero-sub {
+  font-size: 14px;
+  line-height: 20px;
+  color: var(--body-mid);
+}
 
 .message-header {
   display: flex;
@@ -580,7 +618,14 @@ a:hover { text-decoration: underline; }
   transition: background 0.15s, border-color 0.15s;
 }
 .btn-send:hover { background: var(--ink-hover); border-color: var(--ink-hover); }
-.btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
+/* disabled:降为描边幽灵态(深色背景上 opacity 白按钮辨识度低,反而像"弱可点")。
+   改成透明底 + 灰描边 + 灰字,与 enabled 的实心白形成明确状态差。 */
+.btn-send:disabled {
+  background: transparent;
+  border-color: var(--canvas-mid);
+  color: var(--body-mid);
+  cursor: not-allowed;
+}
 
 /* 停止：描边胶囊，sunset 橙字 + 半透明橙边 */
 .btn-stop {

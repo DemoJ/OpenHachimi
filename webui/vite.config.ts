@@ -9,6 +9,7 @@ const apiPaths = [
   '/health',
   '/state',
   '/roles',
+  '/config',
   '/chat',
   '/new',
   '/role',

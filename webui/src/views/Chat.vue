@@ -11,7 +11,6 @@
               <option v-for="c in store.channels" :key="c" :value="c">{{ channelLabel(c) }}</option>
             </select>
           </label>
-          <span class="model-badge" v-if="store.state">{{ store.state.model }}</span>
           <button class="btn" @click="onLogout">退出</button>
         </div>
       </header>
@@ -255,24 +254,48 @@ function onLogout() {
 .channel-picker {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--body-mid, #888);
+  gap: var(--sp-sm);
 }
+/* 标签用 mono 大写 eyebrow 风格,融入全局设计语言 */
 .channel-picker-label {
-  font-weight: 500;
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--body-mid);
 }
+/* select 与 .btn 描边胶囊一致:canvas-soft 填充 + 半透明白边,深色画布上清晰可见 */
 .channel-picker select {
-  background: transparent;
-  border: 1px solid var(--border-soft, #444);
-  border-radius: 6px;
-  padding: 4px 8px;
-  color: inherit;
+  background: var(--canvas-soft);
+  border: 1px solid var(--pill-border);
+  border-radius: var(--radius-pill);
+  padding: var(--sp-xs) var(--sp-lg) var(--sp-xs) var(--sp-md);
+  color: var(--ink);
   font-size: 13px;
+  font-family: inherit;
+  font-weight: 400;
+  line-height: 20px;
   cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  /* 自定义下拉箭头(用 --body-mid 颜色,避免系统默认黑箭头在深色背景上看不见) */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M3 5l3 3 3-3' stroke='%237d8187' stroke-width='1.5' fill='none' stroke-linecap='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 30px;
+  transition: border-color 0.15s, background 0.15s;
 }
+.channel-picker select:hover { border-color: var(--pill-border-hover); }
+.channel-picker select:focus { outline: none; border-color: var(--pill-border-hover); }
 .channel-picker select:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+/* 下拉弹层:深色背景 + 白字 + 发丝边。仅 WebKit/Blink 生效,Firefox 用系统原生 */
+.channel-picker select option {
+  background: var(--canvas-soft);
+  color: var(--ink);
 }
 </style>

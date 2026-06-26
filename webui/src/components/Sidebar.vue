@@ -53,16 +53,28 @@
         </div>
       </div>
     </div>
+
+    <!-- 侧栏底部:居中设置入口。纯文字风格,弱化到几乎融入侧栏,
+         默认低对比,仅 hover 时有轻微反馈,不喧宾夺主。 -->
+    <div class="sidebar-footer">
+      <button class="btn-settings" @click="onSettings">设置</button>
+    </div>
   </aside>
 </template>
 
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { useChatStore } from '../store'
 import { newSession, switchRole, loadSession, getSessionMessages } from '../api'
 
 const store = useChatStore()
+const router = useRouter()
 const emit = defineEmits<{ (e: 'role-changed' | 'session-loaded'): void }>()
+
+function onSettings() {
+  router.push('/settings/ai-models')
+}
 
 // 无限滚动:监听 sessionsContainer 滚动区内 loadMoreSentinel 进入视口,
 // 触发 store.loadMoreSessions()。观察器只挂一次;sentinel 的出现/消失
@@ -203,5 +215,36 @@ async function onLoadSession(session_id: string) {
 }
 .session-item.load-more:hover {
   background: transparent;
+}
+
+/* ── 侧栏底部:居中设置入口 ──
+   轻量"幽灵按钮":极淡描边胶囊(比主交互 pill-border 更淡一档),默认低对比
+   文字,hover 时描边+文字一起提亮并轻微填充。有实体形态但不抢主操作视觉。
+   不放发丝顶线——侧栏内部靠留白分区,唯一结构分隔是右侧脊柱。 */
+.sidebar-footer {
+  flex-shrink: 0;
+  padding: var(--sp-lg) var(--sp-xl) var(--sp-xl);
+}
+.btn-settings {
+  display: block;
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-pill);
+  color: var(--body-mid);
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: 0.4px;
+  text-align: center;
+  padding: var(--sp-xs) 0;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.btn-settings:hover {
+  color: var(--ink);
+  border-color: var(--pill-border);
+  background: var(--canvas-soft);
 }
 </style>

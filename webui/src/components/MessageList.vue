@@ -11,8 +11,12 @@
         :tokens="m.tokens"
         :streaming="isStreaming(idx)"
       />
-      <div v-if="messages.length === 0 && !generating" style="text-align: center; color: var(--text-muted); margin-top: 40px;">
-        开始你的第一段对话吧
+      <!-- 空状态:脱离消息流,垂直水平居中于容器中央。
+           hero 主标题 + 副标题,给出明确的起始指引,避免孤字飘在左上角。 -->
+      <div v-if="messages.length === 0 && !generating" class="empty-hero">
+        <div class="empty-hero-icon">✦</div>
+        <h2 class="empty-hero-title">开始你的第一段对话</h2>
+        <p class="empty-hero-sub">在下方输入框输入消息，按 Enter 发送</p>
       </div>
 
       <!-- 思考中气泡：首个正文 chunk 到达前展示。

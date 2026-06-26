@@ -45,6 +45,14 @@ export function post<T>(path: string, body?: unknown): Promise<T> {
   })
 }
 
+export function patch<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+}
+
 // ---------------------------------------------------------------- 首页
 export interface SessionSummary {
   session_id: string
@@ -146,4 +154,40 @@ export function newSession(role?: string) {
 
 export function switchRole(role: string) {
   return post<CommandResponse>('/role', { role })
+}
+
+// ---------------------------------------------------------------- 配置(设置页)
+// 字段定义与后端 config.py 的 SETTINGS_FIELD_GROUPS 对齐。
+export type ConfigFieldKind = 'secret' | 'string' | 'select' | 'bool' | 'int'
+
+export interface ConfigField {
+  path: string
+  kind: ConfigFieldKind
+  group: string
+  label: string
+  description: string
+  options?: string[]
+}
+
+export interface ConfigGroupResponse {
+  group: string
+  fields: ConfigField[]
+  values: Record<string, string | number | boolean>
+  masked: string[]
+}
+
+export interface ConfigUpdateResult {
+  group: string
+  values: Record<string, string | number | boolean>
+  masked: string[]
+  written: string[]
+  skipped: string[]
+}
+
+export function getConfigGroup(group: string) {
+  return get<ConfigGroupResponse>(`/config/${encodeURIComponent(group)}`)
+}
+
+export function updateConfigGroup(group: string, updates: Record<string, string | number | boolean>) {
+  return patch<ConfigUpdateResult>(`/config/${encodeURIComponent(group)}`, { updates })
 }

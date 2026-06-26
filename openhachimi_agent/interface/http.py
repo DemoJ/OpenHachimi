@@ -15,7 +15,13 @@ from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from openhachimi_agent.app_logging import configure_logging
-from openhachimi_agent.core.config import load_config
+from openhachimi_agent.core.config import (
+    SETTINGS_FIELD_GROUPS,
+    apply_config_updates,
+    load_config,
+    load_raw_config,
+    serialize_config_group,
+)
 from openhachimi_agent.core.redaction import safe_error_detail
 from openhachimi_agent.interface.telegram import telegram_lifespan
 from openhachimi_agent.interface.weixin.channel import weixin_lifespan
@@ -36,6 +42,7 @@ from openhachimi_agent.transport.api_models import (
     ChatRequest,
     CommandDispatchRequest,
     CommandDispatchResponse,
+    ConfigUpdateRequest,
     DeliveryPreviewResponse,
     MessageItem,
     RoleSwitchRequest,
@@ -651,6 +658,50 @@ def switch_role(request: RoleSwitchRequest, service: AgentService = Depends(get_
         return service.switch_role(request.role.strip())
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+
+
+# ------------------------------------------------------------------ WebUI 设置页配置
+# GET /config/{group} 读取一个设置分组;PATCH /config/{group} 写回(保留注释)。
+# 直接读写 config.yaml 原始内容,不走 AppConfig,避免单位转换破坏文件语义。
+# secret 字段返回时掩码,提交时若与掩码相同视为未改动(跳过),空串表示清除。
+
+
+@app.get("/config/{group}")
+def get_config_group(group: str, config=Depends(get_config)):
+    fields = SETTINGS_FIELD_GROUPS.get(group)
+    if fields is None:
+        raise HTTPException(status_code=404, detail=f"未知的设置分组: {group}")
+    raw = load_raw_config(config.config_path)
+    values, masked = serialize_config_group(fields, raw)
+    # 同时返回字段定义,前端据此渲染控件(无需在前端硬编码字段表)。
+    return {
+        "group": group,
+        "fields": fields,
+        "values": values,
+        "masked": masked,
+    }
+
+
+@app.patch("/config/{group}")
+def update_config_group(group: str, request: ConfigUpdateRequest, config=Depends(get_config)):
+    fields = SETTINGS_FIELD_GROUPS.get(group)
+    if fields is None:
+        raise HTTPException(status_code=404, detail=f"未知的设置分组: {group}")
+    updates = request.updates
+    if not isinstance(updates, dict):
+        raise HTTPException(status_code=400, detail="updates 必须是对象")
+
+    # 重新读最新原始配置,避免与其他写回并发产生覆盖。
+    raw = load_raw_config(config.config_path)
+    try:
+        result = apply_config_updates(config.config_path, raw, fields, updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+
+    logger.info("http config update group=%s written=%s skipped=%s", group, result["written"], result["skipped"])
+    # 返回最新值(已脱敏),供前端刷新表单 + dirty 复位。
+    values, masked = serialize_config_group(fields, raw)
+    return {"group": group, "values": values, "masked": masked, **result}
 
 
 @app.post("/stop")

@@ -706,3 +706,282 @@ def load_config() -> AppConfig:
         mcp=_load_mcp_config(user_dir),
         context=_load_context_config(raw_config, llm_config),
     )
+
+
+# ================================================================ WebUI 设置页配置读写
+# 直接读写 config.yaml 原始内容(不走 AppConfig),保留注释/缩进/单位语义。
+# 泛化写回函数支持任意 section 路径,与 _replace_or_insert_app_kv 同思路;
+# 失败时回退到 yaml.safe_dump 重写整个文件(丢注释但保证可用)。
+
+CONFIG_KIND_SECRET = "secret"
+CONFIG_KIND_STRING = "string"
+CONFIG_KIND_SELECT = "select"
+CONFIG_KIND_BOOL = "bool"
+CONFIG_KIND_INT = "int"
+
+# AI 模型设置页字段定义。path 为 yaml 中的 dotted 路径;kind 决定控件类型与写回格式;
+# group 用于前端分组渲染;label/description 为 UI 文案。后续新增设置分组时扩展此表即可。
+AI_MODEL_FIELDS: list[dict[str, Any]] = [
+    {"path": "llm.api_key", "kind": CONFIG_KIND_SECRET, "group": "llm",
+     "label": "API Key", "description": "OpenAI 兼容服务的访问密钥"},
+    {"path": "llm.model", "kind": CONFIG_KIND_STRING, "group": "llm",
+     "label": "模型", "description": "主模型名称,如 gpt-5.2 / hachimi"},
+    {"path": "llm.base_url", "kind": CONFIG_KIND_STRING, "group": "llm",
+     "label": "Base URL", "description": "OpenAI 兼容服务地址,如 https://api.openai.com/v1"},
+    {"path": "llm.supports_vision", "kind": CONFIG_KIND_SELECT, "group": "llm",
+     "label": "图片支持", "options": ["auto", "true", "false"],
+     "description": "auto 自动按模型名判断;true 强制直传图片;false 使用视觉辅助模型"},
+    {"path": "vision.enabled", "kind": CONFIG_KIND_BOOL, "group": "vision",
+     "label": "启用图片处理", "description": "是否处理图片附件"},
+    {"path": "vision.fallback_enabled", "kind": CONFIG_KIND_BOOL, "group": "vision",
+     "label": "回退视觉模型", "description": "主模型不支持图片时,调用辅助视觉模型识别后再交给主模型"},
+    {"path": "vision.model", "kind": CONFIG_KIND_STRING, "group": "vision",
+     "label": "视觉模型", "description": "辅助视觉模型名称;留空且主模型不支持图片时不识别"},
+    {"path": "vision.base_url", "kind": CONFIG_KIND_STRING, "group": "vision",
+     "label": "Base URL", "description": "留空则复用主模型 base_url"},
+    {"path": "vision.api_key", "kind": CONFIG_KIND_SECRET, "group": "vision",
+     "label": "API Key", "description": "留空则复用主模型 api_key"},
+    {"path": "vision.detail", "kind": CONFIG_KIND_SELECT, "group": "vision",
+     "label": "图片精度", "options": ["auto", "low", "high"],
+     "description": "OpenAI image_url.detail"},
+    {"path": "vision.max_images_per_message", "kind": CONFIG_KIND_INT, "group": "vision",
+     "label": "单消息最多图片", "description": "单条消息附带图片数量上限"},
+    {"path": "vision.max_image_size_mb", "kind": CONFIG_KIND_INT, "group": "vision",
+     "label": "单图大小上限 (MB)", "description": "单张图片大小上限,单位 MB"},
+    {"path": "context.summary.model", "kind": CONFIG_KIND_STRING, "group": "summary",
+     "label": "摘要模型", "description": "上下文压缩用的辅助模型;留空则使用主模型"},
+    {"path": "context.summary.base_url", "kind": CONFIG_KIND_STRING, "group": "summary",
+     "label": "Base URL", "description": "留空则复用主模型 base_url"},
+    {"path": "context.summary.api_key", "kind": CONFIG_KIND_SECRET, "group": "summary",
+     "label": "API Key", "description": "留空则复用主模型 api_key"},
+    {"path": "context.summary.max_tokens", "kind": CONFIG_KIND_INT, "group": "summary",
+     "label": "摘要 token 上限", "description": "摘要输出 token 上限;结构化摘要通常 1-3K"},
+    {"path": "context.summary.abort_on_failure", "kind": CONFIG_KIND_BOOL, "group": "summary",
+     "label": "失败即中止", "description": "关闭=插入兜底摘要;开启=中止压缩并冻结对话"},
+]
+
+# 各设置页分组的字段定义注册表。新增分组在此追加 key → 字段列表即可。
+SETTINGS_FIELD_GROUPS: dict[str, list[dict[str, Any]]] = {
+    "ai-models": AI_MODEL_FIELDS,
+}
+
+
+def load_raw_config(config_path: Path) -> dict[str, Any]:
+    """读取 config.yaml 原始 dict(不做默认值填充/单位转换/路径解析)。
+
+    WebUI 设置页直接读写原始 yaml,避免 AppConfig 的转换破坏文件语义
+    (如 max_image_size_mb→bytes、相对路径→绝对、空值回退复用主模型)。
+    """
+    if not config_path.exists():
+        return {}
+    with config_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _get_by_path(data: dict[str, Any], path: str) -> Any:
+    cur: Any = data
+    for seg in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(seg)
+        if cur is None:
+            return None
+    return cur
+
+
+def _set_by_path(data: dict[str, Any], path: str, value: Any) -> None:
+    segs = path.split(".")
+    cur: dict[str, Any] = data
+    for seg in segs[:-1]:
+        nxt = cur.get(seg)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[seg] = nxt
+        cur = nxt
+    cur[segs[-1]] = value
+
+
+def mask_secret(value: str) -> str:
+    """敏感字段掩码:保留前3+后4,中间用 •••• 占位。过短则全掩。空值返回空串。"""
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "••••"
+    return f"{value[:3]}••••{value[-4:]}"
+
+
+def serialize_config_value(kind: str, raw: Any) -> Any:
+    """yaml 原始值 → 前端 JSON 值。secret 的脱敏由调用方(mask_secret)处理。
+
+    SELECT 字段(如 supports_vision)在 yaml 里可能写成裸 true/false(被解析成
+    Python bool),需归一为 "true"/"false" 字符串,以匹配 options 白名单。
+    """
+    if kind in (CONFIG_KIND_STRING, CONFIG_KIND_SECRET):
+        return "" if raw is None else str(raw)
+    if kind == CONFIG_KIND_SELECT:
+        if isinstance(raw, bool):
+            return "true" if raw else "false"
+        return "" if raw is None else str(raw)
+    if kind == CONFIG_KIND_BOOL:
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(raw)
+    if kind == CONFIG_KIND_INT:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+    return raw
+
+
+def serialize_config_group(fields: list[dict[str, Any]], raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """返回 (values, masked)。secret 字段非空时用掩码替换并记入 masked。"""
+    values: dict[str, Any] = {}
+    masked: list[str] = []
+    for f in fields:
+        raw_val = _get_by_path(raw, f["path"])
+        val = serialize_config_value(f["kind"], raw_val)
+        if f["kind"] == CONFIG_KIND_SECRET and val:
+            masked.append(f["path"])
+            val = mask_secret(val)
+        values[f["path"]] = val
+    return values, masked
+
+
+def _section_body_range(lines: list[str], idx_sec: int, section_indent: int) -> tuple[int, int]:
+    """section 内容范围 [start, end):从 idx_sec+1 起到遇到缩进 <= section_indent 的非空非注释行止。"""
+    end = len(lines)
+    for idx in range(idx_sec + 1, len(lines)):
+        stripped = lines[idx].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(lines[idx]) - len(lines[idx].lstrip())
+        if indent <= section_indent:
+            end = idx
+            break
+    return idx_sec + 1, end
+
+
+def _locate_section(lines: list[str], section_path: list[str]) -> tuple[int, int, int] | None:
+    """逐级定位 section,返回 (body_start, body_end, section_indent)。任一级缺失返回 None。"""
+    cur_start, cur_end, parent_indent = 0, len(lines), -1
+    for name in section_path:
+        idx_sec = None
+        for idx in range(cur_start, cur_end):
+            stripped = lines[idx].strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(lines[idx]) - len(lines[idx].lstrip())
+            if indent <= parent_indent:
+                break
+            if stripped.startswith(f"{name}:"):
+                idx_sec = idx
+                break
+        if idx_sec is None:
+            return None
+        parent_indent = len(lines[idx_sec]) - len(lines[idx_sec].lstrip())
+        cur_start, cur_end = _section_body_range(lines, idx_sec, parent_indent)
+    return cur_start, cur_end, parent_indent
+
+
+def replace_yaml_section_kv(
+    config_path: Path,
+    section_path: list[str],
+    key: str,
+    value_str: str,
+    raw_config: dict[str, Any],
+    *,
+    quote: bool = True,
+) -> None:
+    """在 yaml 指定 section 内替换或插入一个 key 行,保留注释/缩进/行尾。
+
+    section_path 如 ["vision"] 或 ["context","summary"]。section 不存在或解析失败时,
+    回退到 yaml.safe_dump 重写整个文件(raw_config 应已用 _set_by_path 同步为最新)。
+    """
+    formatted = _quote_yaml_string(value_str) if quote else str(value_str)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        loc = _locate_section(lines, section_path)
+        if loc is None:
+            raise ValueError(f"section {'.'.join(section_path)} 不存在")
+        body_start, body_end, section_indent = loc
+        key_indent = section_indent + 2
+
+        key_idx = None
+        for idx in range(body_start, body_end):
+            if lines[idx].strip().startswith(f"{key}:"):
+                key_idx = idx
+                break
+
+        if key_idx is not None:
+            line = lines[key_idx]
+            line_ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            comment = ""
+            before_comment = line.rstrip("\r\n")
+            if "#" in before_comment:
+                comment = " " + before_comment[before_comment.index("#"):].strip()
+            lines[key_idx] = f"{' ' * key_indent}{key}: {formatted}{comment}{line_ending}"
+        else:
+            lines.insert(body_end, f"{' ' * key_indent}{key}: {formatted}\n")
+        config_path.write_text("".join(lines), encoding="utf-8")
+    except Exception:
+        config_path.write_text(yaml.safe_dump(raw_config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
+def apply_config_updates(
+    config_path: Path,
+    raw_config: dict[str, Any],
+    fields: list[dict[str, Any]],
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    """按 updates(路径→值)写回 yaml,逐字段同步 raw_config。
+
+    - 白名单校验:updates 的 path 必须在 fields 内,否则跳过。
+    - secret:incoming 等于当前掩码(未改动)则跳过;空串代表清除(回退复用主模型)。
+    - select:值必须在 options 内。
+    - 每写一个字段同步 _set_by_path 到 raw_config,供后续字段掩码比对与 fallback 使用。
+    返回 {"written": [...], "skipped": [...]}。校验失败抛 ValueError。
+    """
+    field_map = {f["path"]: f for f in fields}
+    written: list[str] = []
+    skipped: list[str] = []
+    for path, incoming in updates.items():
+        f = field_map.get(path)
+        if f is None:
+            skipped.append(path)
+            continue
+        kind = f["kind"]
+
+        if kind == CONFIG_KIND_SECRET:
+            current = _get_by_path(raw_config, path)
+            current_str = "" if current is None else str(current)
+            if incoming == mask_secret(current_str):
+                skipped.append(path)
+                continue
+            native = "" if incoming is None else str(incoming)
+            value_str, quote = native, True
+        elif kind == CONFIG_KIND_BOOL:
+            native = incoming if isinstance(incoming, bool) else str(incoming).strip().lower() in {"1", "true", "yes", "on"}
+            value_str, quote = ("true" if native else "false"), False
+        elif kind == CONFIG_KIND_INT:
+            try:
+                native = int(incoming)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{path} 必须是整数") from exc
+            value_str, quote = str(native), False
+        else:  # string / select
+            native = "" if incoming is None else str(incoming)
+            if kind == CONFIG_KIND_SELECT and native not in f.get("options", []):
+                raise ValueError(f"{path} 必须是 {f.get('options')} 之一")
+            value_str, quote = native, True
+
+        _set_by_path(raw_config, path, native)
+        section_path = path.split(".")[:-1]
+        key = path.split(".")[-1]
+        replace_yaml_section_kv(config_path, section_path, key, value_str, raw_config, quote=quote)
+        written.append(path)
+    return {"written": written, "skipped": skipped}

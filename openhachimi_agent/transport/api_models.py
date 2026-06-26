@@ -230,6 +230,11 @@ class SessionLoadRequest(BaseModel):
     session_id: str = Field(min_length=1)
 
 
+class ConfigUpdateRequest(BaseModel):
+    """WebUI 设置页写回请求。updates 为 dotted path → 值 的映射,仅含本次改动的字段。"""
+    updates: dict[str, Any] = Field(default_factory=dict)
+
+
 class MessageItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str                          # 用户实际输入（user）或 Agent 回复（assistant）
