@@ -783,6 +783,9 @@ async def run_turn(
             compressor = ctx.context_compressor
             if compressor is not None:
                 try:
+                    # result.usage 在当前 pydantic-ai 是方法(需调用)而非属性(官方 TODO v2 改
+                    # property);这里传 result.usage 本身,交由 update_from_response 解包 callable,
+                    # 避免库升级成 property 时这里跟着炸,也防止漏括号把 token 统计清零。
                     compressor.update_from_response(result.usage)  # type: ignore[attr-defined]
                 except Exception:
                     logger.debug("context usage update failed", exc_info=True)

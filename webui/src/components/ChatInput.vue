@@ -1,22 +1,25 @@
 <template>
   <div class="input-area">
     <div class="input-row">
-      <textarea
-        v-model="text"
-        ref="taRef"
-        :placeholder="generating ? '生成中…' : '说点什么（Enter 发送，Shift+Enter 换行）'"
-        :disabled="generating"
-        @keydown="onKey"
-        rows="1"
-      />
-      <button v-if="!generating" class="btn-send" :disabled="!text.trim()" @click="onSend">发送</button>
-      <button v-else class="btn-stop" @click="onStop">停止</button>
+      <div class="chat-input-shell">
+        <textarea
+          v-model="text"
+          ref="taRef"
+          :placeholder="generating ? '生成中…' : '说点什么（Enter 发送，Shift+Enter 换行）'"
+          :disabled="generating"
+          @keydown="onKey"
+          @input="autoResize"
+          rows="1"
+        />
+        <button v-if="!generating" class="btn-send" :disabled="!text.trim()" @click="onSend" title="发送">发送</button>
+        <button v-else class="btn-stop" @click="onStop" title="停止生成">停止</button>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch, nextTick } from 'vue'
 
 const text = ref('')
 const taRef = ref<HTMLTextAreaElement | null>(null)
@@ -44,4 +47,17 @@ function onKey(e: KeyboardEvent) {
     onSend()
   }
 }
+
+// 自动撑高：随内容调整高度，最高 160px（与 CSS max-height 对应），超出后内部滚动
+function autoResize() {
+  const ta = taRef.value
+  if (!ta) return
+  ta.style.height = 'auto'
+  ta.style.height = `${ta.scrollHeight}px`
+}
+
+watch(text, () => {
+  // 清空发送后回缩到单行
+  nextTick(autoResize)
+})
 </script>

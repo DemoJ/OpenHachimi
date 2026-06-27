@@ -570,22 +570,32 @@ a:hover { text-decoration: underline; }
 /* ================================================================ 输入区 */
 .input-area {
   padding: var(--sp-lg) var(--sp-xl) var(--sp-xl);
-  border-top: 1px solid var(--hairline);
 }
 
 .input-row {
   max-width: 800px;
   margin: 0 auto;
-  display: flex;
-  gap: var(--sp-sm);
 }
 
-/* text-input 风格的 textarea */
-.input-row textarea {
-  flex: 1;
-  padding: var(--sp-md) var(--sp-lg);
+/* Chat-style 输入外壳：textarea 撑高时发送按钮浮在右下角，整体一体 */
+.chat-input-shell {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
   background: var(--canvas-soft);
   border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  transition: border-color 0.15s;
+}
+.chat-input-shell:focus-within { border-color: var(--pill-border-hover); }
+
+/* text-input 风格的 textarea */
+.chat-input-shell textarea {
+  flex: 1;
+  padding: var(--sp-md) var(--sp-lg);
+  padding-right: 88px;
+  background: transparent;
+  border: none;
   border-radius: var(--radius-sm);
   color: var(--ink);
   font-size: 16px;
@@ -593,29 +603,34 @@ a:hover { text-decoration: underline; }
   font-weight: 400;
   resize: none;
   outline: none;
-  min-height: 48px;
-  max-height: 160px;
+  min-height: 64px;
+  max-height: 280px;
   line-height: 24px;
-  transition: border-color 0.15s;
 }
-.input-row textarea:focus { border-color: var(--pill-border-hover); }
-.input-row textarea::placeholder { color: var(--body-mid); }
+.chat-input-shell textarea::placeholder { color: var(--body-mid); }
 
-/* 发送：button-primary — 唯一的白色实心胶囊（主 CTA） */
-.btn-send {
-  padding: 0 var(--sp-xl);
-  border: 1px solid var(--primary);
+/* 发送/停止按钮浮在输入框右下角，避免多行时被撑高得突兀 */
+.btn-send, .btn-stop {
+  position: absolute;
+  right: var(--sp-sm);
+  bottom: var(--sp-sm);
+  height: 34px;
+  padding: 0 var(--sp-lg);
   border-radius: var(--radius-pill);
-  background: var(--primary);
-  color: var(--on-primary);
   font-size: 14px;
   font-family: inherit;
   font-weight: 400;
   line-height: 20px;
-  cursor: pointer;
   white-space: nowrap;
-  height: 48px;
+  cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
+}
+
+/* 发送：button-primary — 唯一的白色实心胶囊（主 CTA） */
+.btn-send {
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: var(--on-primary);
 }
 .btn-send:hover { background: var(--ink-hover); border-color: var(--ink-hover); }
 /* disabled:降为描边幽灵态(深色背景上 opacity 白按钮辨识度低,反而像"弱可点")。
@@ -629,19 +644,9 @@ a:hover { text-decoration: underline; }
 
 /* 停止：描边胶囊，sunset 橙字 + 半透明橙边 */
 .btn-stop {
-  padding: 0 var(--sp-xl);
   border: 1px solid rgba(255, 122, 23, 0.45);
-  border-radius: var(--radius-pill);
   background: transparent;
   color: var(--accent);
-  font-size: 14px;
-  font-family: inherit;
-  font-weight: 400;
-  line-height: 20px;
-  cursor: pointer;
-  white-space: nowrap;
-  height: 48px;
-  transition: background 0.15s, border-color 0.15s;
 }
 .btn-stop:hover { background: rgba(255, 122, 23, 0.08); border-color: var(--accent); }
 

@@ -122,7 +122,16 @@ class ContextCompressor(ContextEngine):
 
     # ── token 追踪 ──────────────────────────────────────────────────────
     def update_from_response(self, usage: Any) -> None:
-        """从 pydantic-ai Usage 更新 token 状态。"""
+        """从 pydantic-ai Usage 更新 token 状态。
+
+        ``usage`` 应为 ``RunUsage`` 对象。但 ``AgentRunResult.usage`` /
+        ``StreamedRunResult.usage`` 在 pydantic-ai 当前版本是**方法**而非属性
+        (官方 ``TODO (v2): Make this a property``),调用方若误传 ``result.usage``
+        (漏括号)会拿到 bound method,所有 token 字段将为 ``None``。此处对 callable
+        做一次解包防御,避免这种误用静默地把 token 统计全部清零。
+        """
+        if callable(usage) and not hasattr(usage, "input_tokens"):
+            usage = usage()
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         # input_tokens 在某些 provider 上含缓存读;优先用 details 里的非缓存输入
         details = getattr(usage, "details", None) or {}

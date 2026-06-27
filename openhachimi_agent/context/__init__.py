@@ -15,7 +15,11 @@ from __future__ import annotations
 
 from openhachimi_agent.context.engine import ContextEngine
 from openhachimi_agent.context.compressor import ContextCompressor
-from openhachimi_agent.context.token_estimate import estimate_messages_tokens, estimate_text_tokens
+from openhachimi_agent.context.token_estimate import (
+    estimate_messages_tokens,
+    estimate_text_tokens,
+    set_model_for_token_estimate,
+)
 from openhachimi_agent.context.pruning import prune_old_tool_results
 
 __all__ = [
@@ -23,5 +27,6 @@ __all__ = [
     "ContextCompressor",
     "estimate_messages_tokens",
     "estimate_text_tokens",
+    "set_model_for_token_estimate",
     "prune_old_tool_results",
 ]

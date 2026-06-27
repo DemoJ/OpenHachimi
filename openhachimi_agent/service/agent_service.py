@@ -772,6 +772,10 @@ class AgentService:
             summarizer=summarizer,
             pre_compress_callback=_rescue,
         )
+        # 让 token 计数用与实际模型匹配的 tiktoken encoding(gpt-4o 系 -> o200k_base,
+        # gpt-4 系 -> cl100k_base;未知第三方模型名回退默认),提升压缩预检/边界精度。
+        from openhachimi_agent.context.token_estimate import set_model_for_token_estimate
+        set_model_for_token_estimate(self.config.model_name)
         self._context_compressors[session_id] = compressor
         return compressor
 

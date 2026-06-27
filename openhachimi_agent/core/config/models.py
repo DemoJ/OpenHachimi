@@ -1,0 +1,240 @@
+"""应用配置数据模型。
+
+集中存放所有 @dataclass 配置类型与模块级常量,是纯数据声明,
+被 loading / persistence / webui_io 及外部调用方引用。不应包含加载或读写逻辑。
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+
+from openhachimi_agent.content.prompts import load_system_prompt
+
+
+USER_DIR_NAME = "user"
+CONFIG_FILE_NAME = "config.yaml"
+DEFAULT_VISION_PROMPT = load_system_prompt("vision/default_user")
+
+
+@dataclass(frozen=True)
+class MemoryEmbeddingConfig:
+    enabled: bool = True
+    model: str = "text-embedding-3-large"
+    base_url: str = ""
+    api_key: str | None = None
+    dimensions: int = 3072
+    batch_size: int = 32
+    timeout_seconds: int = 30
+
+
+@dataclass(frozen=True)
+class MemoryRecallConfig:
+    max_context_tokens: int = 1800
+    bm25_top_k: int = 50
+    vector_top_k: int = 50
+    rrf_k: int = 60
+    rerank_top_k: int = 24
+    final_l1_top_k: int = 10
+    final_l2_top_k: int = 4
+    include_l3_profile: bool = True
+
+
+@dataclass(frozen=True)
+class MemoryCaptureConfig:
+    enabled: bool = True
+    async_enabled: bool = True
+    min_turn_chars: int = 20
+    extract_timeout_seconds: int = 60
+
+
+@dataclass(frozen=True)
+class MemoryPrivacyConfig:
+    pii_redaction: bool = True
+    allow_secret_memory: bool = False
+    raw_turn_retention_days: int = 180
+
+
+@dataclass(frozen=True)
+class MemorySchedulerConfig:
+    enabled: bool = True
+    poll_interval_seconds: int = 2
+    batch_size: int = 10
+    lock_seconds: int = 300
+
+
+@dataclass(frozen=True)
+class MemoryConsolidationConfig:
+    enabled: bool = True
+    atom_limit: int = 200
+    block_limit: int = 50
+    min_atom_confidence: float = 0.55
+    min_block_atoms: int = 2
+
+
+@dataclass(frozen=True)
+class MemoryVectorConfig:
+    backend: str = "shard"
+    shard_top_dims: int = 4
+    candidate_multiplier: int = 20
+    min_bruteforce_rows: int = 200
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    enabled: bool = True
+    db_path: Path | None = None
+    embedding: MemoryEmbeddingConfig = field(default_factory=MemoryEmbeddingConfig)
+    recall: MemoryRecallConfig = field(default_factory=MemoryRecallConfig)
+    capture: MemoryCaptureConfig = field(default_factory=MemoryCaptureConfig)
+    privacy: MemoryPrivacyConfig = field(default_factory=MemoryPrivacyConfig)
+    scheduler: MemorySchedulerConfig = field(default_factory=MemorySchedulerConfig)
+    consolidation: MemoryConsolidationConfig = field(default_factory=MemoryConsolidationConfig)
+    vector: MemoryVectorConfig = field(default_factory=MemoryVectorConfig)
+
+
+@dataclass(frozen=True)
+class SchedulerDeliveryConfig:
+    default_mode: str = "origin"
+    fallback_to_inbox: bool = True
+    home_targets: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SchedulerSecurityConfig:
+    prompt_scan_enabled: bool = True
+    allow_scheduler_mutation_in_scheduled_runs: bool = False
+    allow_interactive_tools_in_scheduled_runs: bool = False
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    enabled: bool = True
+    db_path: Path | None = None
+    poll_interval_seconds: int = 60
+    max_concurrency: int = 2
+    default_timeout_seconds: int = 300
+    claim_lock_seconds: int = 600
+    delivery: SchedulerDeliveryConfig = field(default_factory=SchedulerDeliveryConfig)
+    security: SchedulerSecurityConfig = field(default_factory=SchedulerSecurityConfig)
+
+
+@dataclass(frozen=True)
+class ResearchConfig:
+    enabled_backends: list[str] = field(default_factory=lambda: ["duckduckgo"])
+    brave_api_key: str | None = None
+    tavily_api_key: str | None = None
+    search_timeout_seconds: int = 15
+    max_backend_results: int = 10
+    min_independent_sources: int = 3
+    require_citations: bool = True
+    browser_fallback_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    enabled: bool = True
+    fallback_enabled: bool = True
+    model: str = ""
+    base_url: str = ""
+    api_key: str | None = None
+    detail: Literal["auto", "low", "high"] = "auto"
+    prompt: str = DEFAULT_VISION_PROMPT
+    max_images_per_message: int = 4
+    max_image_size_bytes: int = 10 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    type: Literal["stdio", "http"]
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    url: str | None = None
+    env: dict[str, str] | None = None
+    headers: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class MCPConfig:
+    servers: dict[str, MCPServerConfig] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ContextSummaryConfig:
+    """摘要压缩用的辅助模型配置;留空时使用主模型。"""
+
+    model: str = ""
+    base_url: str = ""
+    api_key: str | None = None
+    # 摘要输出的 token 上限。结构化摘要通常 1-3K token,4096 留足余量。
+    max_tokens: int = 4096
+    # 摘要失败时:False=插入确定性兜底摘要,True=中止压缩(冻结对话)
+    abort_on_failure: bool = False
+
+
+@dataclass(frozen=True)
+class ContextConfig:
+    """对话历史上下文压缩配置。
+
+    阈值均为相对模型上下文窗口的比例:
+      - threshold_percent: 轮后主压缩触发线(真实 input_tokens 用量)
+      - hard_ceiling_percent: 轮内预检触发线(粗略估计,防单轮内爆窗口)
+      - context_length: 模型上下文窗口大小,单位 K(128=128K tokens)
+    """
+
+    enabled: bool = True
+    engine: str = "compressor"  # 预留可插拔引擎
+    threshold_percent: float = 0.75
+    hard_ceiling_percent: float = 0.90
+    protect_first_n: int = 3
+    protect_last_n: int = 20
+    tail_token_budget: int = 20000
+    anti_thrash: bool = True
+    min_savings_pct: int = 10
+    rescue_to_memory: bool = True  # on_pre_compress 抢救丢弃窗口到记忆库
+    # 模型上下文窗口大小,单位 K(128 表示 128K tokens)。用于计算压缩触发阈值。
+    # 0 表示用内置默认(128K)。非 128K 的模型需手动填写真实窗口。
+    context_length: int = 128
+    summary: ContextSummaryConfig = field(default_factory=ContextSummaryConfig)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """集中管理应用运行时配置。"""
+
+    base_dir: Path
+    user_dir: Path
+    config_path: Path
+    roles_dir: Path
+    memory_dir: Path
+    model_name: str
+    openai_base_url: str
+    default_role_name: str
+    openai_api_key: str | None
+    llm_supports_vision: Literal["auto", "true", "false"]
+    log_dir: Path
+    log_level: str
+    log_console: bool
+    skills_dirs: list[Path]
+    browser_headless: bool
+    browser_channel: str | None
+    browser_user_agent: str | None
+    browser_window_size: str | None
+    browser_idle_timeout: int
+    browser_cdp_wait_seconds: int
+    telegram_bot_token: str | None
+    telegram_proxy_url: str | None  # HTTP/SOCKS5 代理地址，例如 socks5://127.0.0.1:1080
+    show_tool_calls: bool
+    attachments_dir: Path
+    max_attachment_size_bytes: int
+    allowed_attachment_mime_types: list[str]
+    agent_timeout_seconds: int
+    stream_idle_timeout_seconds: int
+    memory: MemoryConfig
+    scheduler: SchedulerConfig
+    research: ResearchConfig
+    vision: VisionConfig
+    mcp: MCPConfig = field(default_factory=MCPConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    http_api_token: str | None = None
+    server_host: str = "127.0.0.1"   # HTTP 服务监听地址；127.0.0.1=仅本机，0.0.0.0=开放局域网/公网访问
+    server_port: int = 8765           # HTTP 服务监听端口

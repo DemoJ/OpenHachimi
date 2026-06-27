@@ -18,6 +18,9 @@ dependencies = [
     "mcp>=1.1.2",
     "qrcode>=7.0.0",
     "cryptography>=42.0.0",
+    # tiktoken 用于上下文压缩预检的精确 token 计数(按真实分词器替代字符比例估算,
+    # 避免 preflight 阈值偏差导致过早/过晚触发压缩);encoding 按模型自适应。
+    "tiktoken>=0.7.0",
 ]
 
 [project.optional-dependencies]
