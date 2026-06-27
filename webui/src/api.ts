@@ -158,7 +158,7 @@ export function switchRole(role: string) {
 
 // ---------------------------------------------------------------- 配置(设置页)
 // 字段定义与后端 config.py 的 SETTINGS_FIELD_GROUPS 对齐。
-export type ConfigFieldKind = 'secret' | 'string' | 'select' | 'bool' | 'int'
+export type ConfigFieldKind = 'secret' | 'string' | 'select' | 'bool' | 'int' | 'float' | 'multi'
 
 export interface ConfigField {
   path: string
@@ -167,18 +167,22 @@ export interface ConfigField {
   label: string
   description: string
   options?: string[]
+  // editable=true 的 select 渲染为可选预设、可填任意值的输入(如浏览器通道允许填绝对路径)。
+  editable?: boolean
 }
+
+export type ConfigValue = string | number | boolean | string[]
 
 export interface ConfigGroupResponse {
   group: string
   fields: ConfigField[]
-  values: Record<string, string | number | boolean>
+  values: Record<string, ConfigValue>
   masked: string[]
 }
 
 export interface ConfigUpdateResult {
   group: string
-  values: Record<string, string | number | boolean>
+  values: Record<string, ConfigValue>
   masked: string[]
   written: string[]
   skipped: string[]
@@ -188,6 +192,6 @@ export function getConfigGroup(group: string) {
   return get<ConfigGroupResponse>(`/config/${encodeURIComponent(group)}`)
 }
 
-export function updateConfigGroup(group: string, updates: Record<string, string | number | boolean>) {
+export function updateConfigGroup(group: string, updates: Record<string, ConfigValue>) {
   return patch<ConfigUpdateResult>(`/config/${encodeURIComponent(group)}`, { updates })
 }

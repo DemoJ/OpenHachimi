@@ -48,15 +48,42 @@
       <span class="cfg-toggle-state">{{ modelValue ? '开启' : '关闭' }}</span>
     </div>
 
-    <!-- select:下拉 -->
+    <!-- select:下拉(可选预设、可填任意值,如浏览器通道) -->
     <div v-else-if="field.kind === 'select'" class="cfg-control">
+      <template v-if="field.editable">
+        <input
+          class="cfg-input cfg-select-editable"
+          type="text"
+          :list="datalistId"
+          :value="String(modelValue ?? '')"
+          :placeholder="placeholderText"
+          @input="onInput(($event.target as HTMLInputElement).value)"
+        />
+        <!-- 同分组内多个 editable select 复用一个 datalist 即可,列表里全是预设项。 -->
+        <datalist v-if="datalistId" :id="datalistId">
+          <option v-for="opt in field.options" :key="opt" :value="opt" />
+        </datalist>
+      </template>
       <select
+        v-else
         class="cfg-input cfg-select"
         :value="String(modelValue ?? '')"
         @change="onInput(($event.target as HTMLSelectElement).value)"
       >
         <option v-for="opt in field.options" :key="opt" :value="opt">{{ opt }}</option>
       </select>
+    </div>
+
+    <!-- multi:多选(字符串列表,如研究后端) -->
+    <div v-else-if="field.kind === 'multi'" class="cfg-control cfg-multi">
+      <label v-for="opt in field.options" :key="opt" class="cfg-multi-opt">
+        <input
+          type="checkbox"
+          :checked="multiHas(opt)"
+          @change="onToggleMulti(opt, ($event.target as HTMLInputElement).checked)"
+        />
+        <span>{{ opt }}</span>
+      </label>
     </div>
 
     <!-- int:数字输入 -->
@@ -68,6 +95,19 @@
         :value="modelValue"
         :placeholder="placeholderText"
         @input="onInput(parseInt(($event.target as HTMLInputElement).value, 10) || 0)"
+      />
+    </div>
+
+    <!-- float:浮点输入(如压缩阈值比例),复用 number 但保留小数 -->
+    <div v-else-if="field.kind === 'float'" class="cfg-control">
+      <input
+        class="cfg-input"
+        type="number"
+        inputmode="decimal"
+        step="0.01"
+        :value="modelValue"
+        :placeholder="placeholderText"
+        @input="onInput(parseFloat(($event.target as HTMLInputElement).value) || 0)"
       />
     </div>
 
@@ -92,13 +132,13 @@ import type { ConfigField } from '../api'
 
 const props = defineProps<{
   field: ConfigField
-  modelValue: string | number | boolean
+  modelValue: string | number | boolean | string[]
   secretMasked?: boolean
   showPath?: boolean
 }>()
 
 const emit = defineEmits<{
-  (e: 'update:modelValue', value: string | number | boolean): void
+  (e: 'update:modelValue', value: string | number | boolean | string[]): void
   (e: 'unmask'): void
 }>()
 
@@ -110,8 +150,27 @@ const placeholderText = computed(() => {
   return ''
 })
 
-function onInput(v: string | number | boolean) {
+// editable select 的 datalist 唯一 id:用字段 path 派生,避免分组间 datalist 串台。
+const datalistId = computed(() => `cfg-datalist-${props.field.path.replace(/\./g, '-')}`)
+
+function onInput(v: string | number | boolean | string[]) {
   emit('update:modelValue', v)
+}
+
+// multi:取当前选中的字符串数组(只读安全降级)。
+function multiValue(): string[] {
+  return Array.isArray(props.modelValue) ? props.modelValue : []
+}
+function multiHas(opt: string): boolean {
+  return multiValue().includes(opt)
+}
+function onToggleMulti(opt: string, checked: boolean) {
+  // 按 field.options 顺序重建选中数组,保证与后端写回语义一致。
+  const opts = props.field.options ?? []
+  const cur = new Set(multiValue())
+  if (checked) cur.add(opt)
+  else cur.delete(opt)
+  emit('update:modelValue', opts.filter((o) => cur.has(o)))
 }
 </script>
 
@@ -143,6 +202,23 @@ function onInput(v: string | number | boolean) {
   display: flex;
   align-items: center;
   gap: var(--sp-sm);
+}
+/* multi:多选 checkbox 群 */
+.cfg-multi {
+  flex-wrap: wrap;
+  gap: var(--sp-sm) var(--sp-lg);
+}
+.cfg-multi-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-xs);
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+}
+.cfg-multi-opt input {
+  margin: 0;
+  cursor: pointer;
 }
 .cfg-input {
   flex: 1;

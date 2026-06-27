@@ -44,12 +44,37 @@
 
         <div v-else-if="fields.length" class="settings-content">
           <!-- 按 currentGroup 渲染对应卡片组;卡片元数据见 GROUP_CARDS。 -->
-          <section v-for="card in activeCards" :key="card.key" class="settings-card">
+          <section
+            v-for="card in activeCards"
+            :key="card.key"
+            class="settings-card"
+            :class="{ 'is-collapsed': card.collapsible && isCollapsed(card.key) }"
+          >
             <div class="card-head">
-              <h3>{{ card.title }}</h3>
+              <h3 class="card-title">
+                <button
+                  v-if="card.collapsible"
+                  type="button"
+                  class="card-collapse-btn"
+                  :class="{ collapsed: isCollapsed(card.key) }"
+                  :aria-expanded="!isCollapsed(card.key)"
+                  @click="toggleCard(card.key)"
+                >
+                  <span class="card-chevron">
+                    <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+                      <path d="M4 2.5 L8 6 L4 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </span>
+                  <span class="card-title-text">{{ card.title }}</span>
+                  <span class="card-collapse-label" v-if="isCollapsed(card.key)">展开</span>
+                  <span class="card-collapse-label expanded" v-else>收起</span>
+                </button>
+                <template v-else>{{ card.title }}</template>
+                <span v-if="card.advanced" class="card-advanced-tag">高级</span>
+              </h3>
               <p class="card-desc">{{ card.desc }}</p>
             </div>
-            <div class="card-grid">
+            <div v-show="!card.collapsible || !isCollapsed(card.key)" class="card-grid">
               <ConfigField
                 v-for="f in fieldsByGroup(card.key)"
                 :key="f.path"
@@ -97,11 +122,27 @@ const route = useRoute()
 const groups = [
   { id: 'ai-models', label: 'AI 模型', icon: '🤖' },
   { id: 'network', label: '网络与服务', icon: '🌐' },
+  { id: 'browser', label: '浏览器自动化', icon: '🖥️' },
+  { id: 'memory', label: '记忆系统', icon: '🧠' },
+  { id: 'context', label: '上下文压缩', icon: '✂️' },
+  { id: 'scheduler', label: '任务调度', icon: '⏰' },
+  { id: 'research', label: '联网研究', icon: '🔎' },
+  { id: 'paths-logging', label: '路径与日志', icon: '📁' },
 ] as const
 
 // 各分组下的卡片定义:key=字段 group(后端字段表里的 group 字段),用于 fieldsByGroup 过滤。
 // restartNote 非空时在卡片底部提示"改后需重启"。
-const GROUP_CARDS: Record<string, { key: string; title: string; desc: string; restartNote?: string }[]> = {
+// collapsible=true 的卡片可折叠,defaultCollapsed=true 表示初始收起(recall 高级调参默认折叠)。
+// advanced=true 时标题旁显示"高级"标签,用于标注高级调参组。
+const GROUP_CARDS: Record<string, {
+  key: string
+  title: string
+  desc: string
+  restartNote?: string
+  collapsible?: boolean
+  defaultCollapsed?: boolean
+  advanced?: boolean
+}[]> = {
   'ai-models': [
     { key: 'llm', title: '主模型 · LLM', desc: 'Agent 对话使用的核心模型。改后新会话生效。' },
     { key: 'vision', title: '视觉模型 · VISION', desc: '主模型不支持图片时,可由辅助视觉模型先识别图片再交给主模型。' },
@@ -111,6 +152,31 @@ const GROUP_CARDS: Record<string, { key: string; title: string; desc: string; re
     { key: 'http', title: 'HTTP 服务', desc: 'WebUI / API 的监听地址、端口与访问令牌。改后需重启进程。', restartNote: '改了监听地址/端口/Token 需重启进程,否则不生效;改 Token 后前端需用新 Token 重新登录。' },
     { key: 'telegram', title: 'Telegram', desc: 'Telegram Bot 接入。改后需重启(bot 在启动期建连)。', restartNote: '改了 Bot Token / 代理需重启进程,bot 才会重新建连。' },
     { key: 'behavior', title: '消息行为', desc: '工具调用展示、流式心跳、附件上限等即时生效项。' },
+  ],
+  'browser': [
+    { key: 'instance', title: '浏览器实例', desc: '浏览器启动方式、无头模式、UA、窗口与超时。基本热生效——下次启动浏览器实例时生效,当前会话无需重启进程。' },
+  ],
+  'memory': [
+    { key: 'memory-general', title: '总开关', desc: '记忆系统的启用开关与数据库位置。改后建议重启进程。', restartNote: '改了 总开关 / db_path / Embedding 配置后建议重启进程,后台捕获与向量化客户端才会重新初始化。' },
+    { key: 'memory-embedding', title: 'Embedding 向量化', desc: '向量化模型、密钥与维度。改后建议重启,改维度/模型须重建记忆库。' },
+    { key: 'memory-recall', title: '召回检索 · 高级调参,非必要勿改', desc: 'BM25/向量/RRF/重排各阶段候选数与终筛阈值。影响召回质量与上下文预算,默认值已平衡效果与成本。', collapsible: true, defaultCollapsed: true, advanced: true },
+    { key: 'memory-capture', title: '记忆捕获', desc: '从对话提取记忆的开关、异步模式与阈值。基本热生效——下次捕获生效。' },
+    { key: 'memory-privacy', title: '隐私', desc: 'PII 脱敏、机密记忆与原始轮次保留期。基本热生效——下次捕获/清理生效。' },
+  ],
+  'context': [
+    { key: 'context-advanced', title: '上下文压缩 · 高级调参,调好了就别动', desc: '长会话压缩阈值与保留策略。误调可能导致对话爆窗口或被过度压缩,默认值已平衡。新会话生效。', collapsible: true, defaultCollapsed: true, advanced: true, restartNote: '⚠️ 这是"调好了就别动"的参数:阈值调高更晚压缩、更易爆上下文窗口;调低则更早压缩、可能过度压缩而丢失上下文。非必要勿改。' },
+  ],
+  'scheduler': [
+    { key: 'scheduler-main', title: '调度主参数', desc: '任务调度的启用、数据库、轮询与并发。改后需重启进程才生效。', restartNote: '调度器在启动期初始化 DB 与轮询循环,改这里需重启进程。' },
+    { key: 'scheduler-delivery', title: '投递', desc: '任务结果投递的默认模式与失败回落。改后需重启进程。' },
+    { key: 'scheduler-security', title: '安全', desc: '定时任务执行中的工具权限策略。改后需重启进程。' },
+  ],
+  'research': [
+    { key: 'research-main', title: '联网研究', desc: '搜索后端、API Key 与结果策略。brave/tavily 需对应 Key,勾选后端时记得填写其 Key。', restartNote: '后端选择与对应 API Key 联动:启用 brave/tavily 前请先填好对应 Key,否则该后端会报错。' },
+  ],
+  'paths-logging': [
+    { key: 'paths', title: '路径', desc: '角色/记忆/外部技能/附件目录。改错会导致服务找不到资源,改后需重启进程。', restartNote: '路径改错可能导致服务找不到角色/记忆库/技能/附件,且需重启进程才重新加载;请谨慎修改。' },
+    { key: 'logging', title: '日志', desc: '日志级别、目录与控制台输出。改后需重启进程。', restartNote: '日志配置改后需重启进程才彻底切换。' },
   ],
 }
 
@@ -127,11 +193,14 @@ const justSaved = ref(false)
 const fields = ref<ConfigFieldType[]>([])
 // 原始值快照:保存基准,用于 dirty 比对与"放弃修改"还原。
 // secret 字段保存的是脱敏后的值(来自后端),用户不主动改它时永远等于快照 → 不算 dirty。
-const snapshot = ref<Record<string, string | number | boolean>>({})
+const snapshot = ref<Record<string, string | number | boolean | string[]>>({})
 // 当前编辑表单。
-const form = ref<Record<string, string | number | boolean>>({})
+const form = ref<Record<string, string | number | boolean | string[]>>({})
 // 记录哪些 secret 字段当前是脱敏态(未改动);一旦用户点击"修改",移出该集合。
 const maskedSecrets = ref<Set<string>>(new Set())
+// 折叠态:collapsedKeys 存放当前处于收起态的卡片 key。
+// 初始按当前分组各卡片 defaultCollapsed 推导;切换分组时在 loadConfig 内重建。
+const collapsedCards = ref<Set<string>>(new Set())
 
 const dirty = computed(() => {
   for (const f of fields.value) {
@@ -146,6 +215,28 @@ function fieldsByGroup(g: string): ConfigFieldType[] {
 
 function isMasked(path: string): boolean {
   return maskedSecrets.value.has(path)
+}
+
+// 卡片是否处于收起态。
+function isCollapsed(cardKey: string): boolean {
+  return collapsedCards.value.has(cardKey)
+}
+
+// 切换卡片折叠;首次点击展开后即便切组再回来,按 defaultCollapsed 重置(见 resetCollapsed)。
+function toggleCard(cardKey: string) {
+  const next = new Set(collapsedCards.value)
+  if (next.has(cardKey)) next.delete(cardKey)
+  else next.add(cardKey)
+  collapsedCards.value = next
+}
+
+// 切换分组时按卡片的 defaultCollapsed 重建折叠态。
+function resetCollapsed() {
+  const next = new Set<string>()
+  for (const card of activeCards.value) {
+    if (card.collapsible && card.defaultCollapsed) next.add(card.key)
+  }
+  collapsedCards.value = next
 }
 
 function goBack() {
@@ -170,8 +261,12 @@ function onUnmask(path: string) {
   form.value[path] = ''
 }
 
-// 比较两个值是否相等(区分 bool/number/string,避免 1 === true 误判)。
+// 比较两个值是否相等(区分 bool/number/string/array,避免 1 === true 误判与数组引用误判)。
 function valueEquals(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    return a.every((v, i) => v === b[i])
+  }
   if (typeof a !== typeof b) return false
   return a === b
 }
@@ -187,6 +282,8 @@ async function loadConfig() {
     form.value = { ...res.values }
     maskedSecrets.value = new Set(res.masked)
     justSaved.value = false
+    // 切换分组后按卡片默认折叠态重建(如 recall 高级调参默认收起)。
+    resetCollapsed()
   } catch (e) {
     loadError.value = (e as Error).message || '加载配置失败'
   } finally {
@@ -200,7 +297,7 @@ async function onSave() {
   loadError.value = ''
   try {
     // 只提交发生变化的字段;secret 脱敏态的值(等于快照)自然不会被包含。
-    const updates: Record<string, string | number | boolean> = {}
+    const updates: Record<string, string | number | boolean | string[]> = {}
     for (const f of fields.value) {
       if (!valueEquals(form.value[f.path], snapshot.value[f.path])) {
         updates[f.path] = form.value[f.path]
@@ -361,13 +458,94 @@ loadConfig()
   border-radius: var(--radius-sm);
   padding: var(--sp-xl);
   margin-bottom: var(--sp-xl);
+  transition: border-color 0.15s, background 0.15s;
+}
+/* 收起态:卡片描边淡化、底色微弱化,与展开态产生视觉层次差,暗示"还有内容可展开"。 */
+.settings-card.is-collapsed {
+  border-style: dashed;
+  background: transparent;
 }
 .card-head { margin-bottom: var(--sp-lg); }
+.settings-card.is-collapsed .card-head { margin-bottom: 0; }
 .card-head h3 {
   font-size: 16px;
   font-weight: 400;
   color: var(--ink);
   margin-bottom: var(--sp-xs);
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-sm);
+}
+.card-title {
+  /* h3 自身已是 flex 容器;让标题与"高级"标签同行。 */
+  margin: 0;
+}
+/* 折叠按钮:整行可点击,但箭头做成带边框的方块,hover 时整按钮高亮,
+   让"可展开/收起"的交互足够清晰。 */
+.card-collapse-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  font: inherit;
+  color: var(--body);
+  cursor: pointer;
+  text-align: left;
+  transition: color 0.15s;
+}
+.card-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border: 1px solid var(--canvas-mid);
+  border-radius: var(--radius-sm);
+  background: var(--canvas-soft);
+  color: var(--body-mid);
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.card-collapse-btn:hover { color: var(--ink); }
+.card-collapse-btn:hover .card-chevron {
+  border-color: var(--pill-border-hover);
+  background: var(--canvas);
+  color: var(--ink);
+}
+/* 箭头方块内的 svg 随展开旋转 */
+.card-chevron svg {
+  transition: transform 0.18s ease;
+  transform: rotate(0deg);
+}
+.card-collapse-btn:not(.collapsed) .card-chevron svg {
+  transform: rotate(90deg);
+}
+.card-title-text { font-weight: inherit; }
+/* "展开/收起"小标签:进一步明示当前态与可交互性 */
+.card-collapse-label {
+  flex: 0 0 auto;
+  padding: 1px var(--sp-sm);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  color: var(--body-mid);
+  border: 1px solid var(--pill-border);
+  border-radius: var(--radius-pill);
+  background: var(--canvas-soft);
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.card-collapse-btn:hover .card-collapse-label { color: var(--ink); border-color: var(--pill-border-hover); }
+.card-collapse-label.expanded { color: var(--body-mid); }
+.card-advanced-tag {
+  flex: 0 0 auto;
+  padding: 1px var(--sp-sm);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  color: var(--body-mid);
+  border: 1px solid var(--pill-border);
+  border-radius: var(--radius-pill);
+  background: var(--canvas-soft);
 }
 .card-desc {
   font-size: 13px;
