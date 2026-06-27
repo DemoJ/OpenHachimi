@@ -10,6 +10,7 @@ const apiPaths = [
   '/state',
   '/roles',
   '/config',
+  '/prompts',
   '/chat',
   '/new',
   '/role',

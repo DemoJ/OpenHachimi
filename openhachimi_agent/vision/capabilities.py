@@ -73,7 +73,7 @@ async def probe_model_supports_vision(config: AppConfig, image: VisionImagePaylo
         base_url=config.openai_base_url,
         api_key=config.openai_api_key,
         detail=config.vision.detail,
-        prompt=config.vision.prompt,
+        prompt="",  # 已废弃;probe 用 vision/probe 正文作 user prompt,本字段不被使用
         max_images_per_message=1,
         max_image_size_bytes=config.vision.max_image_size_bytes,
     )

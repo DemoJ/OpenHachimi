@@ -235,6 +235,16 @@ class ConfigUpdateRequest(BaseModel):
     updates: dict[str, Any] = Field(default_factory=dict)
 
 
+class PromptUpdateRequest(BaseModel):
+    """WebUI 提示词编辑页写回请求。
+
+    content 为空串(或纯空白)语义为"恢复内置"——后端删除覆盖文件,加载时回退内置默认。
+    非空则把 content 写入 user/system_prompts/<name>.md。
+    """
+    name: str = Field(min_length=1)
+    content: str = ""
+
+
 class MessageItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str                          # 用户实际输入（user）或 Agent 回复（assistant）

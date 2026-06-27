@@ -9,7 +9,7 @@ from typing import Literal
 
 from pydantic_ai.messages import BinaryContent, UserContent
 
-from openhachimi_agent.content.prompts import render_system_prompt
+from openhachimi_agent.content.prompts import load_system_prompt, render_system_prompt
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.tools.utils import resolve_workspace_path
 from openhachimi_agent.transport.api_models import AttachmentRef
@@ -195,7 +195,8 @@ async def preprocess_vision_attachments(
     if mode == "fallback":
         descriptions: list[str] = []
         statuses: list[VisionAttachmentStatus] = []
-        prompt = config.vision.prompt
+        # 图片识别用户提示词:走覆盖机制(user/system_prompts/vision/default_user.md 优先,回退内置)。
+        prompt = load_system_prompt("vision/default_user")
         if message.strip():
             prompt = f"{prompt}\n\n用户随图提出的问题：{message.strip()}"
         for index, item in enumerate(resolved_images, start=1):

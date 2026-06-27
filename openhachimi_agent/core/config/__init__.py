@@ -16,7 +16,6 @@ from openhachimi_agent.core.config._helpers import logger  # noqa: F401 — 暴�
 from openhachimi_agent.core.config.loading import load_config, load_mcp_config
 from openhachimi_agent.core.config.models import (
     CONFIG_FILE_NAME,
-    DEFAULT_VISION_PROMPT,
     USER_DIR_NAME,
     AppConfig,
     ContextConfig,
@@ -73,7 +72,6 @@ __all__ = [
     # 常量
     "USER_DIR_NAME",
     "CONFIG_FILE_NAME",
-    "DEFAULT_VISION_PROMPT",
     "logger",
     # 数据模型
     "AppConfig",

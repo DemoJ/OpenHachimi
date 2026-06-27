@@ -42,6 +42,24 @@
           <button class="btn" @click="loadConfig">重试</button>
         </div>
 
+        <div v-else-if="currentGroup === 'prompts'" class="settings-content">
+          <!-- 提示词编辑页:独立数据形态(整文件多行文本)。PromptsCard 自管加载,
+               保存/放弃复用全局悬浮保存条(与其他设置页交互一致)。 -->
+          <PromptsCard ref="promptsRef" />
+
+          <!-- 全局保存条(与其它分组共用同一组件类),dirty 时悬浮显示。 -->
+          <div class="settings-actions" :class="{ visible: promptsDirty }">
+            <span class="dirty-hint" v-if="promptsDirty">有未保存的修改</span>
+            <span class="dirty-hint saved" v-else-if="promptsJustSaved">已保存</span>
+            <div class="action-buttons">
+              <button class="btn" :disabled="!promptsDirty || promptsSaving" @click="onResetPrompts">放弃修改</button>
+              <button class="btn btn-primary" :disabled="!promptsDirty || promptsSaving" @click="onSavePrompts">
+                {{ promptsSaving ? '保存中…' : '保存' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
         <div v-else-if="fields.length" class="settings-content">
           <!-- 按 currentGroup 渲染对应卡片组;卡片元数据见 GROUP_CARDS。 -->
           <section
@@ -112,6 +130,7 @@
 import { computed, ref, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import ConfigField from '../components/ConfigField.vue'
+import PromptsCard from '../components/PromptsCard.vue'
 import { getConfigGroup, updateConfigGroup } from '../api'
 import type { ConfigField as ConfigFieldType } from '../api'
 
@@ -121,6 +140,7 @@ const route = useRoute()
 // 设置分组元信息(左侧导航)。新增分组时在此追加,并扩展 GROUP_CARDS。
 const groups = [
   { id: 'ai-models', label: 'AI 模型', icon: '🤖' },
+  { id: 'prompts', label: '提示词', icon: '💬' },
   { id: 'network', label: '网络与服务', icon: '🌐' },
   { id: 'browser', label: '浏览器自动化', icon: '🖥️' },
   { id: 'memory', label: '记忆系统', icon: '🧠' },
@@ -190,6 +210,21 @@ const loadError = ref('')
 const saving = ref(false)
 const justSaved = ref(false)
 
+// 提示词页子组件引用:通过 defineExpose 暴露 dirty/save/reset,让全局保存条复用。
+const promptsRef = ref<InstanceType<typeof PromptsCard> | null>(null)
+// 代理 PromptsCard 的暴露态;非 prompts 分组时各值为 false/undefined,保存条自然不显示。
+// 注:Vue 对 setup 暴露的 ref/computed 在父组件通过 instance ref 访问时自动解包,故直接读值。
+const promptsDirty = computed(() => !!promptsRef.value?.dirty)
+const promptsSaving = computed(() => !!promptsRef.value?.saving)
+const promptsJustSaved = computed(() => !!promptsRef.value?.justSaved)
+
+async function onSavePrompts() {
+  await promptsRef.value?.save()
+}
+function onResetPrompts() {
+  promptsRef.value?.reset()
+}
+
 const fields = ref<ConfigFieldType[]>([])
 // 原始值快照:保存基准,用于 dirty 比对与"放弃修改"还原。
 // secret 字段保存的是脱敏后的值(来自后端),用户不主动改它时永远等于快照 → 不算 dirty。
@@ -203,6 +238,8 @@ const maskedSecrets = ref<Set<string>>(new Set())
 const collapsedCards = ref<Set<string>>(new Set())
 
 const dirty = computed(() => {
+  // prompts 分支:用 PromptsCard 暴露的 dirty;其余分组:比对 config 字段快照。
+  if (currentGroup.value === 'prompts') return promptsDirty.value
   for (const f of fields.value) {
     if (form.value[f.path] !== snapshot.value[f.path]) return true
   }
@@ -272,6 +309,16 @@ function valueEquals(a: unknown, b: unknown): boolean {
 }
 
 async function loadConfig() {
+  // prompts 分支走独立组件 PromptsCard 自管加载,这里跳过避免空 getConfigGroup 调用。
+  if (currentGroup.value === 'prompts') {
+    fields.value = []
+    snapshot.value = {}
+    form.value = {}
+    maskedSecrets.value = new Set()
+    justSaved.value = false
+    resetCollapsed()
+    return
+  }
   loading.value = true
   loadError.value = ''
   try {

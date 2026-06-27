@@ -45,6 +45,7 @@ from openhachimi_agent.transport.api_models import (
     ConfigUpdateRequest,
     DeliveryPreviewResponse,
     MessageItem,
+    PromptUpdateRequest,
     RoleSwitchRequest,
     ScheduleCreateRequest,
     ScheduleDeliveryUpdateRequest,
@@ -702,6 +703,57 @@ def update_config_group(group: str, request: ConfigUpdateRequest, config=Depends
     # 返回最新值(已脱敏),供前端刷新表单 + dirty 复位。
     values, masked = serialize_config_group(fields, raw)
     return {"group": group, "values": values, "masked": masked, **result}
+
+
+# ------------------------------------------------------------------ WebUI 提示词编辑
+# GET /prompts 返回首批可编辑提示词元数据 + 当前生效内容 + 是否已被用户覆盖;
+# PATCH /prompts 写回某个提示词:非空写 user/system_prompts/<name>.md,清空删该文件(回退内置)。
+# 与 /config 不同:提示词数据形态为整文件多行文本,不走 yaml 字段表与写回引擎。
+
+from openhachimi_agent.content.prompt_registry import PROMPTS as _PROMPT_SPECS
+from openhachimi_agent.content.prompts import (
+    delete_override,
+    is_overridden,
+    load_system_prompt,
+    write_override,
+)
+
+
+def _prompt_spec_to_dict(spec):
+    return {
+        "name": spec.name,
+        "title": spec.title,
+        "description": spec.description,
+        "has_template_vars": spec.has_template_vars,
+        "restart_note": spec.restart_note,
+        # content = 当前生效值(覆盖优先,回退内置),前端 textarea 直接显示所见即所得。
+        "content": load_system_prompt(spec.name),
+        "is_overridden": is_overridden(spec.name),
+    }
+
+
+@app.get("/prompts")
+def get_prompts(config=Depends(get_config)):
+    return {"prompts": [_prompt_spec_to_dict(s) for s in _PROMPT_SPECS]}
+
+
+@app.patch("/prompts")
+def update_prompt(request: PromptUpdateRequest, config=Depends(get_config)):
+    from openhachimi_agent.content.prompt_registry import get_prompt_spec
+    spec = get_prompt_spec(request.name)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"未知的提示词: {request.name}")
+    if request.content.strip():
+        write_override(request.name, request.content)
+        logger.info("http prompt override written name=%s", request.name)
+    else:
+        delete_override(request.name)  # 不存在也安全(幂等回退)
+        logger.info("http prompt override deleted(restored builtin) name=%s", request.name)
+    return {
+        "name": request.name,
+        "content": load_system_prompt(request.name),
+        "is_overridden": is_overridden(request.name),
+    }
 
 
 @app.post("/stop")

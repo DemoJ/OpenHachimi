@@ -8,12 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from openhachimi_agent.content.prompts import load_system_prompt
-
 
 USER_DIR_NAME = "user"
 CONFIG_FILE_NAME = "config.yaml"
-DEFAULT_VISION_PROMPT = load_system_prompt("vision/default_user")
 
 
 @dataclass(frozen=True)
@@ -138,7 +135,9 @@ class VisionConfig:
     base_url: str = ""
     api_key: str | None = None
     detail: Literal["auto", "low", "high"] = "auto"
-    prompt: str = DEFAULT_VISION_PROMPT
+    # 已废弃:图片识别提示词改由 user/system_prompts/vision/default_user.md 覆盖。
+    # 保留字段仅为兼容旧 yaml 读取(loading 层做一次性迁移),运行时不再使用其值。
+    prompt: str = ""
     max_images_per_message: int = 4
     max_image_size_bytes: int = 10 * 1024 * 1024
 

@@ -44,6 +44,160 @@ from openhachimi_agent.core.config.models import (
     VisionConfig,
 )
 from openhachimi_agent.core.config.persistence import _ensure_http_api_token
+from openhachimi_agent.content.prompt_registry import PROMPTS as _REGISTRY_PROMPTS
+
+
+# 首次预置到 user/system_prompts/ 的提示词列表;引用 prompt_registry 的 name,避免两处重复定义。
+# 仅当 override 根目录不存在时整体初始化一次,已存在则完全不碰(不补缺、不覆盖),防升级期覆盖改动。
+_DEFAULT_PROMPT_OVERRIDES = tuple(spec.name for spec in _REGISTRY_PROMPTS)
+
+# 迁移旧 vision.prompt 时写入的覆盖文件路径(相对 system_prompts/)。
+_VISION_PROMPT_OVERRIDE_NAME = "vision/default_user"
+
+
+def ensure_default_prompt_overrides(user_dir: Path) -> None:
+    """首次运行时把内置首批提示词复制到 user/system_prompts/,供用户直接编辑。
+
+    幂等且单向:仅当 override 根目录完全不存在时初始化,已存在则跳过(不补缺、不覆盖)。
+    这意味着升级后新增的可覆盖提示词不会自动落进用户目录;用户按需手动从内置复制即可。
+    """
+    from importlib.resources import files
+
+    from openhachimi_agent.content.prompts import SYSTEM_PROMPTS_PACKAGE, _prompt_path_parts
+
+    override_root = user_dir / "system_prompts"
+    if override_root.exists():
+        return  # 用户已接管,绝不覆盖
+
+    override_root.mkdir(parents=True, exist_ok=True)
+    for name in _DEFAULT_PROMPT_OVERRIDES:
+        parts = _prompt_path_parts(name)
+        target = override_root.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = files(SYSTEM_PROMPTS_PACKAGE).joinpath(*parts)
+        content = source.read_text(encoding="utf-8")
+        target.write_text(content, encoding="utf-8")
+    # 随首批文件写入一份用法说明,指明覆盖/回退/模板变量语义。
+    _write_prompts_override_readme(override_root)
+    logger.info("已预置首批可编辑提示词到 %s", override_root)
+
+
+def _write_prompts_override_readme(override_root: Path) -> None:
+    readme = override_root / "README.md"
+    readme.write_text(_PROMPTS_OVERRIDE_README, encoding="utf-8")
+
+
+_PROMPTS_OVERRIDE_README = """\
+# 自定义系统提示词
+
+本目录是哈基米系统提示词的**用户覆盖目录**。要改某个提示词,直接编辑本目录下对应的
+`.md` 文件即可——加载时**本目录优先,留空或删除文件则回退内置默认**。
+
+## 工作机制
+
+- 加载顺序:`user/system_prompts/<路径>.md` > 内置 `system_prompts/<路径>.md`。
+- 路径与内置一一对应,如内置 `agents/router.md` → 本目录 `agents/router.md`。
+- 文件**留空(空白)**会自动回退内置,不会让空提示词进模型。
+- 删除本目录下某个文件 = 回退到该提示词的内置版本。
+- 升级版本时内置 `.md` 会被更新;本目录下的副本**不会被覆盖**(已接管即保留)。
+
+## 含模板变量的提示词
+
+部分提示词含 `{{ 变量名 }}` 占位符。凡经"渲染"加载的提示词(如 executor/repair 等),
+删除占位符会导致渲染报错。**编辑此类文件时保留 `{{ }}` 占位符**。
+本目录预置的 `context/summary.md` 含 `{{ current_date }}`,但该提示词不经渲染加载
+(日期通过对话消息提供),占位符仅作文本提示,删除也无碍——仍建议保留以便对照内置。
+
+## 首批预置(可直接编辑)
+
+| 文件 | 用途 |
+|---|---|
+| `base.md` | 主模型基础人格:角色、核心原则、工具使用规范。改后新会话生效 |
+| `vision/default_user.md` | 图片识别的用户提示词:决定识别产出的详略与重点方向 |
+| `context/summary.md` | 长对话上下文压缩摘要的系统提示词(含 `{{ current_date }}`) |
+
+## 新会话生效
+
+提示词在 agent 构建时读取,改动对**新会话**生效;运行中的旧会话仍用其构建时的提示词。
+"""
+
+
+def migrate_legacy_vision_prompt(
+    user_dir: Path, config_path: Path, raw_config: dict[str, Any]
+) -> None:
+    """把旧 yaml 里的 vision.prompt 一次性迁移到 user/system_prompts/vision/default_user.md。
+
+    单一事实来源改造:废弃 yaml 多行文本配置,改为 .md 覆盖。检测到 legacy 非空时写迁移文件
+    + 清除 yaml 行(下次检测为空即跳过)。用户已接管(.md 已存在)则不覆盖,仅清 yaml 行。
+    """
+    from importlib.resources import files
+
+    from openhachimi_agent.content.prompts import SYSTEM_PROMPTS_PACKAGE, _prompt_path_parts
+    from openhachimi_agent.core.config.webui_io import replace_yaml_section_kv
+
+    vision_config = _as_mapping(raw_config.get("vision"), "vision")
+    legacy_prompt = _config_string(vision_config, "prompt")
+    if not legacy_prompt:
+        return  # 无 legacy,无需迁移
+
+    override_file = user_dir / "system_prompts" / "vision" / "default_user.md"
+    override_exists = override_file.is_file() and override_file.read_text(encoding="utf-8").strip()
+
+    logger.warning(
+        "vision.prompt(yaml)已废弃,改为 user/system_prompts/vision/default_user.md 覆盖。"
+    )
+    if not override_exists:
+        # 用户尚未接管该提示词:把 legacy 内容落成 .md 覆盖文件,行为无感延续。
+        override_file.parent.mkdir(parents=True, exist_ok=True)
+        if not override_file.is_file():
+            override_file.write_text(legacy_prompt, encoding="utf-8")
+        logger.warning("已把旧 vision.prompt 迁移到 %s", override_file)
+    else:
+        # 用户已自行接管,legacy 值让位于 .md,直接丢弃即可。
+        logger.warning("已存在用户自定义 %s,旧 vision.prompt 将被忽略并清除。", override_file)
+
+    # 从 yaml 清除该 key:用内置默认占位写回(空串)会污染文件,改为整段删除更干净。
+    # _replace_or_insert 系函数只插入/替换不删除,故在此按行精确移除 vision 段的 prompt: 行。
+    _remove_yaml_vision_prompt_key(config_path, raw_config)
+    # 同步内存 raw_config,使后续逻辑读到空 prompt 不再触发重复迁移。
+    if isinstance(raw_config.get("vision"), dict):
+        raw_config["vision"].pop("prompt", None)
+
+
+def _remove_yaml_vision_prompt_key(config_path: Path, raw_config: dict[str, Any]) -> None:
+    """从 config.yaml 的 vision 段精确删除 prompt: 行(保留其余键与注释/缩进)。"""
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        vision_idx = next((i for i, l in enumerate(lines) if l.strip() == "vision:"), None)
+        if vision_idx is None:
+            return
+        vision_indent = len(lines[vision_idx]) - len(lines[vision_idx].lstrip())
+        # 找 vision 段内缩进 > vision_indent 的连续行范围
+        end = len(lines)
+        for i in range(vision_idx + 1, len(lines)):
+            s = lines[i].strip()
+            if s and not s.startswith("#"):
+                if len(lines[i]) - len(lines[i].lstrip()) <= vision_indent:
+                    end = i
+                    break
+        # 在段内删 prompt: 行(含其后可能的续行;单行形式直接删该行)
+        target = None
+        for i in range(vision_idx + 1, end):
+            if lines[i].lstrip().startswith("prompt:"):
+                target = i
+                break
+        if target is None:
+            return
+        del lines[target]
+        config_path.write_text("".join(lines), encoding="utf-8")
+    except Exception:
+        # 失败兜底:整体重写(丢注释但保证可用),与 webui_io/persistence 一致策略。
+        if isinstance(raw_config.get("vision"), dict):
+            raw_config["vision"].pop("prompt", None)
+        from openhachimi_agent.core.config._helpers import _yaml_safe_dump_to
+
+        config_path.write_text(_yaml_safe_dump_to(raw_config), encoding="utf-8")
 
 
 def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: dict[str, Any]) -> MemoryConfig:
@@ -159,7 +313,8 @@ def _load_research_config(raw_config: dict[str, Any]) -> ResearchConfig:
 
 def _load_vision_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) -> VisionConfig:
     vision_config = _as_mapping(raw_config.get("vision"), "vision")
-    prompt = _config_string(vision_config, "prompt", VisionConfig.prompt)
+    # vision.prompt 已废弃;legacy 迁移由 migrate_legacy_vision_prompt 在 load_config 末段处理,
+    # 运行时图片识别走 load_system_prompt("vision/default_user")(覆盖→回退内置)。
     return VisionConfig(
         enabled=_config_bool(vision_config, "enabled", True),
         fallback_enabled=_config_bool(vision_config, "fallback_enabled", True),
@@ -167,7 +322,7 @@ def _load_vision_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) 
         base_url=_config_string(vision_config, "base_url") or _config_string(llm_config, "base_url"),
         api_key=_config_string(vision_config, "api_key") or _config_string(llm_config, "api_key") or None,
         detail=_config_literal(vision_config, "detail", {"auto", "low", "high"}, "auto"),  # type: ignore[arg-type]
-        prompt=prompt or VisionConfig.prompt,
+        prompt="",  # 已废弃,运行时无意义
         max_images_per_message=_config_int(vision_config, "max_images_per_message", 4),
         max_image_size_bytes=_config_int(vision_config, "max_image_size_mb", 10) * 1024 * 1024,
     )
@@ -278,7 +433,7 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
     if external_skills_dir:
         skills_dirs.append(_resolve_config_path(base_dir, external_skills_dir, base_dir))
 
-    return AppConfig(
+    cfg = AppConfig(
         base_dir=base_dir,
         user_dir=user_dir,
         config_path=config_path,
@@ -337,3 +492,15 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
         mcp=_load_mcp_config(user_dir),
         context=_load_context_config(raw_config, llm_config),
     )
+
+    # 提示词覆盖机制:启动期注入 user 目录,使 load_system_prompt 优先读 user/system_prompts/。
+    # 必须在所有运行时使用点(agent factory / summary / memory / vision)之前,这里恰为最早。
+    from openhachimi_agent.content.prompts import set_prompts_override_dir
+
+    set_prompts_override_dir(user_dir)
+    # 废弃 vision.prompt 的 legacy 迁移(写迁移文件 + 清 yaml 行),不晚于覆盖机制启用。
+    migrate_legacy_vision_prompt(user_dir, config_path, raw_config)
+    # 首次运行预置首批可编辑 .md 副本(目录已存在则跳过,绝不覆盖用户改动)。
+    ensure_default_prompt_overrides(user_dir)
+
+    return cfg

@@ -195,3 +195,33 @@ export function getConfigGroup(group: string) {
 export function updateConfigGroup(group: string, updates: Record<string, ConfigValue>) {
   return patch<ConfigUpdateResult>(`/config/${encodeURIComponent(group)}`, { updates })
 }
+
+// ---------------------------------------------------------------- 提示词编辑(设置页)
+// 与后端 /prompts 对齐;数据形态为整文件多行文本,不走 ConfigField 字段表。
+export interface PromptSpec {
+  name: string
+  title: string
+  description: string
+  has_template_vars: boolean
+  restart_note: string
+  content: string            // 当前生效值(覆盖优先,回退内置),textarea 直接显示
+  is_overridden: boolean     // 是否已有用户覆盖文件
+}
+
+export interface PromptsResponse {
+  prompts: PromptSpec[]
+}
+
+export interface PromptUpdateResult {
+  name: string
+  content: string
+  is_overridden: boolean
+}
+
+export function getPrompts() {
+  return get<PromptsResponse>('/prompts')
+}
+
+export function updatePrompt(name: string, content: string) {
+  return patch<PromptUpdateResult>('/prompts', { name, content })
+}
