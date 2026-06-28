@@ -18,11 +18,12 @@ build/
 user/config.yaml
 user/mcp-servers.json
 user/roles-config.json
-user/roles/
+user/roles/*
 user/system_prompts/
 # 模板/示例文件仍需跟踪,显式白名单覆盖上面的目录忽略:
 !user/config.example.yaml
 !user/mcp-servers.example.json
+!user/roles/default.md
 
 # 仓库根误生成的运行时副本(代码只读 user/mcp-servers.json,根目录这份是冗余)
 /mcp-servers.json
