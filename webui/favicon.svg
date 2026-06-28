@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- 近黑画布背景 + 半透明白色描边胶囊，呼应 xAI 设计语言 -->
+  <rect width="32" height="32" rx="8" fill="#0a0a0a"/>
+  <rect x="0.5" y="0.5" width="31" height="31" rx="7.5" fill="none" stroke="#ffffff" stroke-opacity="0.25"/>
+
+  <!-- 哈基米 · 猫咪头部：尖耳 + 圆脸，sunset 橙填充 -->
+  <path d="
+    M16 7
+    L11.5 3.5
+    L12.8 9.2
+    C9.2 10.6 7 13.4 7 16.8
+    C7 20.6 10.2 23.6 16 23.6
+    C21.8 23.6 25 20.6 25 16.8
+    C25 13.4 22.8 10.6 19.2 9.2
+    L20.5 3.5
+    Z
+  " fill="#ff7a17"/>
+
+  <!-- 眼睛：画布色镂空 -->
+  <circle cx="12.7" cy="15.4" r="1.5" fill="#0a0a0a"/>
+  <circle cx="19.3" cy="15.4" r="1.5" fill="#0a0a0a"/>
+
+  <!-- 鼻子：小三角 -->
+  <path d="M15.2 18 L16.8 18 L16 19.2 Z" fill="#0a0a0a"/>
+
+  <!-- 嘴：两道短弧 -->
+  <path d="M16 19.2 L16 20.2 M16 20.2 Q14.8 21 14 20.4 M16 20.2 Q17.2 21 18 20.4"
+        fill="none" stroke="#0a0a0a" stroke-width="0.7" stroke-linecap="round"/>
+</svg>
