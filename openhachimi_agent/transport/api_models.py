@@ -259,3 +259,125 @@ class SessionMessagesResponse(BaseModel):
     role: str
     session_id: str
     messages: list[MessageItem] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------------ WebUI Skills 配置(设置页)
+# 数据形态:扫到的技能清单 + 每项开关(disable-model-invocation),写回各 SKILL.md
+# frontmatter,不走 yaml 字段表。同 /prompts 属"特殊设置分组"。
+
+
+class SkillItem(BaseModel):
+    name: str
+    description: str
+    source_path: str                  # SKILL.md 绝对路径,前端作为唯一 key 与回写标识
+    source_dir_key: str               # 所属 skills_dir 标识("user" 或外部目录名)
+    disabled: bool                    # 即 SKILL.md frontmatter 的 disable-model-invocation
+    category: str | None = None
+
+
+class SkillsResponse(BaseModel):
+    skills: list[SkillItem] = Field(default_factory=list)
+
+
+class SkillToggleRequest(BaseModel):
+    """单项开关写回请求。disabled=true 表示禁用模型自动调用该技能。"""
+    source_path: str = Field(min_length=1)
+    disabled: bool
+
+
+class SkillToggleResult(BaseModel):
+    source_path: str
+    disabled: bool
+
+
+class SkillInstallRequest(BaseModel):
+    """从 URL/本地路径安装或更新技能。安装目标固定为 user/skills。"""
+    source_path_or_url: str = Field(min_length=1)
+    allow_http: bool = False
+
+
+class SkillInstallResult(BaseModel):
+    """安装结果——后端把 install_skill_from_source 的结果字符串原样返回。"""
+    message: str
+
+
+class SkillDeleteRequest(BaseModel):
+    """删除 user/skills 下的技能(SKILL.md 所在目录)。"""
+    source_path: str = Field(min_length=1)
+
+
+class SkillDeleteResult(BaseModel):
+    source_path: str
+    message: str
+
+
+# ------------------------------------------------------------------ WebUI MCP 配置(设置页)
+# 数据形态:user/mcp-servers.json 内的动态服务器清单(type=stdio/http 字段不同),
+# 整体覆盖写。同 /prompts 属"特殊设置分组"。
+
+
+class MCPServerItem(BaseModel):
+    name: str
+    type: Literal["stdio", "http"]
+    command: str | None = None        # stdio:可执行命令
+    args: list[str] = Field(default_factory=list)        # stdio:命令参数
+    url: str | None = None            # http:服务器端点
+    env: dict[str, str] | None = None     # stdio:环境变量
+    headers: dict[str, str] | None = None # http:请求头
+
+
+class McpServersResponse(BaseModel):
+    servers: list[MCPServerItem] = Field(default_factory=list)
+
+
+class McpServersUpdateRequest(BaseModel):
+    """整体覆盖写请求。前端提交当前完整的服务器列表;后端校验后原子覆盖 mcp-servers.json。"""
+    servers: list[MCPServerItem] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------------ WebUI 角色管理(设置页)
+# 数据形态:角色提示词(user/roles/*.md)+ 角色级 skills/MCP 绑定(user/roles-config.json)
+# 合并返回。整覆盖写时同步维护角色 .md 文件(增删改)与 roles-config.json。
+# 同 /prompts / /mcp 属"特殊设置分组"。
+
+
+class RoleBindingItem(BaseModel):
+    """单个角色:提示词内容 + skills/MCP 绑定配置。
+
+    selected_skills 引用 SKILL.md 的 config.name;selected_mcp_servers 引用
+    mcp-servers.json 的 server 名。mode=all 时对应 selected 清单忽略。
+    """
+    name: str                              # 角色名(= 文件名 stem,受 validate_role_name 约束)
+    prompt: str                            # 角色提示词正文(.md 全文)
+    skills_mode: Literal["all", "selected"] = "all"
+    selected_skills: list[str] = Field(default_factory=list)
+    mcp_mode: Literal["all", "selected"] = "all"
+    selected_mcp_servers: list[str] = Field(default_factory=list)
+
+
+class RoleOption(BaseModel):
+    """角色管理页多选用:当前系统可勾选的 skill / MCP server 清单(name + 一句话)。
+
+    已 disable-model-invocation 的 skill 不在可勾选集合里(后端 ``_role_available_skills``
+    直接过滤),故本模型无需 disabled 标记——返回的都是可绑定的。
+    """
+    name: str
+    description: str = ""
+
+
+class RolesConfigResponse(BaseModel):
+    """GET /roles-config 返回:全部角色(含提示词+绑定) + 可勾选清单,前端一次拿全。"""
+    roles: list[RoleBindingItem] = Field(default_factory=list)
+    available_skills: list[RoleOption] = Field(default_factory=list)
+    available_mcp_servers: list[RoleOption] = Field(default_factory=list)
+    default_role: str = "default"
+
+
+class RolesConfigUpdateRequest(BaseModel):
+    """PUT /roles-config 整覆盖写请求。
+
+    前端提交当前完整角色列表;后端据此:
+    - 列表里每个角色:写/覆盖 user/roles/<name>.md + 更新 roles-config.json 记录;
+    - 不再出现的既有角色(且非 default_role):删 .md + 删 roles-config 记录。
+    """
+    roles: list[RoleBindingItem] = Field(default_factory=list)

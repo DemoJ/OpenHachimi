@@ -482,6 +482,7 @@ async def run_turn(
             memory_context=memory_context,
             session_store=service.session_store,
             run_mode=run_mode,
+            role_name=role,
             channel_context=channel_context_data,
             scheduler_context=dict(scheduler_context or {}),
         )

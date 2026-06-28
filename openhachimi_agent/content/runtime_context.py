@@ -37,6 +37,7 @@ import logging
 from typing import Any
 
 from openhachimi_agent.content.prompts import render_system_prompt
+from openhachimi_agent.content.role_filters import filter_skills_for_role, get_role_filters_from, load_all_role_bindings
 from openhachimi_agent.content.skills import Skill, find_skills
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.memory.recall import build_memory_context_text
@@ -188,6 +189,20 @@ def _skills_index_block(deps: AgentDeps) -> str:
         return ""
     if not skills:
         return ""
+
+    # 角色级过滤:按 deps.role_name 取该角色可见的 skill 子集。
+    # 与 factory._build_base_agent 的过滤共用同一份 role_filters 逻辑,保证
+    # "索引里列出的 skill"与"实际注册了宏工具的 skill"一致,不会出现索引里
+    # 有但调不动、或调得动但索引里看不见的错位。
+    role_name = getattr(deps, "role_name", "") or ""
+    if role_name:
+        try:
+            all_bindings = load_all_role_bindings(deps.config)
+        except Exception:  # noqa: BLE001
+            logger.debug("load_all_role_bindings failed in skills index", exc_info=True)
+            all_bindings = {}
+        binding = get_role_filters_from(all_bindings, role_name)
+        skills = filter_skills_for_role(binding, skills)
 
     grouped: dict[str, list[Skill]] = {}
     for skill in skills:

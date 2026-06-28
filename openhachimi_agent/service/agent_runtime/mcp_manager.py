@@ -66,14 +66,14 @@ async def load_new_mcp_stack(
     errors: list[str] = []
 
     try:
-        for ts in load_mcp_toolsets(runtime_config):
+        for name, ts in load_mcp_toolsets(runtime_config):
             try:
                 await new_stack.enter_async_context(ts)
             except Exception as exc:
                 errors.append(redact_exception(exc))
                 logger.exception("Failed to start MCP toolset connection")
             else:
-                connected.append(ts)
+                connected.append((name, ts))
     except Exception:
         await new_stack.aclose()
         raise

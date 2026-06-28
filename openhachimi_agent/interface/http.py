@@ -18,11 +18,20 @@ from openhachimi_agent.app_logging import configure_logging
 from openhachimi_agent.core.config import (
     SETTINGS_FIELD_GROUPS,
     apply_config_updates,
+    get_mcp_config,
     load_config,
     load_raw_config,
+    load_roles_config,
     serialize_config_group,
+    write_mcp_config,
+    write_roles_config,
 )
+from openhachimi_agent.core.config.models import MCPServerConfig
+from openhachimi_agent.core.identifiers import safe_role_file_path, validate_role_name
 from openhachimi_agent.core.redaction import safe_error_detail
+from openhachimi_agent.content.roles import list_role_names
+from openhachimi_agent.content.skills import find_skills, set_skill_disable_model_invocation
+from openhachimi_agent.tools.skills import install_skill_from_source, delete_skill_dir
 from openhachimi_agent.interface.telegram import telegram_lifespan
 from openhachimi_agent.interface.weixin.channel import weixin_lifespan
 from openhachimi_agent.scheduler.delivery import (
@@ -45,8 +54,15 @@ from openhachimi_agent.transport.api_models import (
     ConfigUpdateRequest,
     DeliveryPreviewResponse,
     MessageItem,
+    MCPServerItem,
+    McpServersResponse,
+    McpServersUpdateRequest,
     PromptUpdateRequest,
     RoleSwitchRequest,
+    RoleBindingItem,
+    RoleOption,
+    RolesConfigResponse,
+    RolesConfigUpdateRequest,
     ScheduleCreateRequest,
     ScheduleDeliveryUpdateRequest,
     ScheduleResponse,
@@ -56,6 +72,14 @@ from openhachimi_agent.transport.api_models import (
     SessionLoadRequest,
     SessionMessagesResponse,
     SessionSummary,
+    SkillDeleteRequest,
+    SkillDeleteResult,
+    SkillInstallRequest,
+    SkillInstallResult,
+    SkillItem,
+    SkillsResponse,
+    SkillToggleRequest,
+    SkillToggleResult,
     StopRequest,
 )
 from openhachimi_agent.tools.utils import resolve_workspace_path
@@ -754,6 +778,333 @@ def update_prompt(request: PromptUpdateRequest, config=Depends(get_config)):
         "content": load_system_prompt(request.name),
         "is_overridden": is_overridden(request.name),
     }
+
+
+# ------------------------------------------------------------------ WebUI Skills 配置
+# GET /skills 返回扫到的技能清单(含单项 disabled 态);PATCH /skills/toggle 写回
+# 对应 SKILL.md 的 frontmatter 的 disable-model-invocation。同 /prompts 属"特殊分组",
+# 不走 yaml 字段表。find_skills 按 mtime 缓存,文件写回后自动失效重读。
+
+
+def _is_subpath(path: Path, base: Path) -> bool:
+    """判断 path 是否位于 base 之下(含自身)。用于防止 source_path 越权写任意文件。"""
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _skill_dir_key(skill_path: Path, skills_dirs: list[Path]) -> str:
+    """该 SKILL.md 所属的 skills_dir 标识:首个目录标 "user",其余取目录 basename。"""
+    for idx, d in enumerate(skills_dirs):
+        try:
+            d_resolved = d.resolve()
+            if _is_subpath(skill_path.resolve(), d_resolved):
+                return "user" if idx == 0 else d.name
+        except OSError:
+            continue
+    return "user"
+
+
+@app.get("/skills")
+def get_skills(config=Depends(get_config)):
+    skills = find_skills(config.skills_dirs)
+    items = [
+        SkillItem(
+            name=s.config.name,
+            description=s.config.description,
+            source_path=str(s.path),
+            source_dir_key=_skill_dir_key(s.path, config.skills_dirs),
+            disabled=s.config.disable_model_invocation,
+            category=s.config.category,
+        )
+        for s in skills
+    ]
+    return SkillsResponse(skills=items)
+
+
+@app.patch("/skills/toggle")
+def toggle_skill(request: SkillToggleRequest, config=Depends(get_config)):
+    # 安全校验:source_path 必须落在某个受管 skills_dir 下,防越权改任意文件。
+    try:
+        p = Path(request.source_path).resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+    if not any(_is_subpath(p, d.resolve()) for d in config.skills_dirs):
+        raise HTTPException(status_code=400, detail="技能路径不在受管目录内")
+    try:
+        set_skill_disable_model_invocation(p, request.disabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+    logger.info("http skill toggle path=%s disabled=%s", p, request.disabled)
+    return SkillToggleResult(source_path=str(p), disabled=request.disabled)
+
+
+@app.post("/skills/install")
+def install_skill(request: SkillInstallRequest, config=Depends(get_config)):
+    """从 Git URL / zip-tar 下载 URL / 本地目录 安装或更新技能到 user/skills。
+
+    网络操作可能耗时,同步 handler 跑在 threadpool。复用 tools.skills 的纯逻辑函数,
+    含 SSRF 防护、大小/数量限制、staging+backup 回滚。返回结果字符串。
+    """
+    user_skills_dir = config.user_dir / "skills"
+    logger.info("http skill install source=%s allow_http=%s", request.source_path_or_url, request.allow_http)
+    message = install_skill_from_source(
+        user_skills_dir,
+        request.source_path_or_url,
+        allow_http=request.allow_http,
+    )
+    return SkillInstallResult(message=message)
+
+
+@app.delete("/skills")
+def delete_skill(request: SkillDeleteRequest, config=Depends(get_config)):
+    """删除 user/skills 下的某个技能目录。仅允许删 user 源技能;外部目录只读。
+
+    通过 source_path(SKILL.md 路径)定位,delete_skill_dir 内部做越权校验。
+    """
+    try:
+        p = Path(request.source_path).resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+    # 仅允许删 user/skills 下的技能:source_path 必须落在首个 skills_dir(user)内。
+    user_dir = config.skills_dirs[0].resolve()
+    try:
+        p.relative_to(user_dir)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="仅可删除 user 源技能(外部目录为只读)")
+    try:
+        message = delete_skill_dir(user_dir, p)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+    logger.info("http skill delete path=%s", p)
+    return SkillDeleteResult(source_path=str(p), message=message)
+
+
+# ------------------------------------------------------------------ WebUI MCP 配置
+# GET /mcp 返回 mcp-servers.json 的服务器清单;PUT /mcp 整体覆盖写回(json 无注释,
+# 原子写防中途损坏)。type 由 command/url 派生。改后需重启进程(mcp_manager 启动期建连)。
+
+
+@app.get("/mcp")
+def get_mcp_servers(config=Depends(get_config)):
+    cfg = get_mcp_config(config.user_dir)
+    items = [
+        MCPServerItem(
+            name=name,
+            type=srv.type,
+            command=srv.command,
+            args=list(srv.args),
+            url=srv.url,
+            env=srv.env,
+            headers=srv.headers,
+        )
+        for name, srv in cfg.servers.items()
+    ]
+    return McpServersResponse(servers=items)
+
+
+@app.put("/mcp")
+def update_mcp_servers(request: McpServersUpdateRequest, config=Depends(get_config)):
+    servers: dict[str, MCPServerConfig] = {}
+    seen: set[str] = set()
+    for it in request.servers:
+        name = it.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="存在空名称的 MCP 服务器")
+        if name in seen:
+            raise HTTPException(status_code=400, detail=f"MCP 服务器名称重复: {name}")
+        seen.add(name)
+        if it.type == "stdio":
+            if not it.command or not it.command.strip():
+                raise HTTPException(status_code=400, detail=f"stdio 服务器 {name} 缺少 command")
+            servers[name] = MCPServerConfig(
+                type="stdio", command=it.command, args=list(it.args), env=it.env
+            )
+        else:
+            if not it.url or not it.url.strip():
+                raise HTTPException(status_code=400, detail=f"http 服务器 {name} 缺少 url")
+            servers[name] = MCPServerConfig(type="http", url=it.url, headers=it.headers)
+    try:
+        write_mcp_config(config.user_dir, servers)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+    logger.info("http mcp servers rewritten count=%d", len(servers))
+    # 回读返回最新态,供前端刷新表单与 dirty 复位。
+    cfg = get_mcp_config(config.user_dir)
+    items = [
+        MCPServerItem(
+            name=name, type=srv.type, command=srv.command, args=list(srv.args),
+            url=srv.url, env=srv.env, headers=srv.headers,
+        )
+        for name, srv in cfg.servers.items()
+    ]
+    return McpServersResponse(servers=items)
+
+
+# ------------------------------------------------------------------ WebUI 角色管理
+# GET /roles-config 返回全部角色(提示词 .md + 绑定 roles-config.json 合并) + 可勾选的
+# skills/mcp 清单,前端一次拿全。PUT /roles-config 整覆盖写:同步维护角色 .md 文件
+# (增删改,复用 safe_role_file_path 防越权)与 roles-config.json。同 /mcp 属"特殊分组"。
+
+
+def _role_available_skills(config) -> list[RoleOption]:
+    """当前系统**可绑定**的 skill 清单(name + description),供前端多选。
+
+    已 disable-model-invocation 的 skill 直接不返回——运行期它们本就不注入
+    (宏工具不注册、不进技能索引、get_skill_instructions 也拦),所以在设置层
+    也不该作为可勾选项出现,避免"看到能勾却绑了无效"的死绑定体验。
+    """
+    try:
+        skills = find_skills(config.skills_dirs)
+    except Exception:  # noqa: BLE001  扫描失败不应阻断角色管理页
+        logger.debug("find_skills failed in roles-config endpoint", exc_info=True)
+        return []
+    seen: set[str] = set()
+    out: list[RoleOption] = []
+    for s in skills:
+        name = s.config.name
+        if name in seen:
+            continue
+        if getattr(s.config, "disable_model_invocation", False):
+            continue
+        seen.add(name)
+        out.append(RoleOption(name=name, description=(s.config.description or "").strip()))
+    return out
+
+
+def _role_available_mcp_servers(config) -> list[RoleOption]:
+    """当前 mcp-servers.json 的 server 名清单,供前端多选。"""
+    cfg = get_mcp_config(config.user_dir)
+    return [RoleOption(name=name, description="") for name in cfg.servers]
+
+
+def _disabled_skill_names(config) -> set[str]:
+    """当前被 disable-model-invocation 的 skill 名集合。
+
+    供构造角色绑定时剔除"死绑定"——已禁用的 skill 不应留在任何角色的
+    selected_skills 里(运行期它们本就不注入,留着只会让用户误以为绑了)。
+
+    直接扫 find_skills 取禁用名,而非复用 _role_available_skills——后者
+    已过滤掉禁用项,这里要的恰恰是禁用项本身。
+    """
+    try:
+        skills = find_skills(config.skills_dirs)
+    except Exception:  # noqa: BLE001
+        return set()
+    return {
+        s.config.name for s in skills
+        if getattr(s.config, "disable_model_invocation", False)
+    }
+
+
+def _build_roles_config_response(config, *, lenient_prompt: bool) -> RolesConfigResponse:
+    """构造 GET /roles-config 与 PUT 回读的统一响应。
+
+    两处读盘 + 组装 items 的逻辑本就重复,抽此共用;同时在此集中剔除
+    selected_skills 中已 disabled 的项(死绑定),避免两处各漏。PUT 路径
+    刚写完角色 .md、prompt 必可读,故 lenient_prompt=False 直接抛 500;
+    GET 路径对读取失败给 500(原行为)。
+    """
+    roles_config = load_roles_config(config.user_dir)
+    role_names = list_role_names(config.roles_dir)
+    disabled = _disabled_skill_names(config)
+    items: list[RoleBindingItem] = []
+    for name in role_names:
+        path = safe_role_file_path(config.roles_dir, name)
+        try:
+            prompt = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            if not lenient_prompt:
+                raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+            logger.warning("role prompt read failed in lenient path: %s", name, exc_info=True)
+            continue
+        b = roles_config.get(name)
+        # 剔除已禁用 skill 的死绑定:运行期它们不注入,绑定里留着是误导。
+        raw_selected = list(b.selected_skills) if b else []
+        selected_skills = [s for s in raw_selected if s not in disabled]
+        items.append(
+            RoleBindingItem(
+                name=name,
+                prompt=prompt,
+                skills_mode=b.skills_mode if b else "all",
+                selected_skills=selected_skills,
+                mcp_mode=b.mcp_mode if b else "all",
+                selected_mcp_servers=list(b.selected_mcp_servers) if b else [],
+            )
+        )
+    return RolesConfigResponse(
+        roles=items,
+        available_skills=_role_available_skills(config),
+        available_mcp_servers=_role_available_mcp_servers(config),
+        default_role=config.default_role_name,
+    )
+
+
+@app.get("/roles-config")
+def get_roles_config(config=Depends(get_config)):
+    return _build_roles_config_response(config, lenient_prompt=False)
+
+
+@app.put("/roles-config")
+def update_roles_config(request: RolesConfigUpdateRequest, config=Depends(get_config)):
+    # 前端校验:名称合法且唯一、提示词非空。
+    seen: set[str] = set()
+    for it in request.roles:
+        try:
+            name = validate_role_name(it.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+        if name in seen:
+            raise HTTPException(status_code=400, detail=f"角色名称重复: {name}")
+        seen.add(name)
+        if not it.prompt.strip():
+            raise HTTPException(status_code=400, detail=f"角色 {name} 的提示词不能为空")
+
+    # 删除:既有但本次不再出现的角色(保护 default_role,不删)。
+    existing = set(list_role_names(config.roles_dir))
+    to_delete = existing - seen
+    for name in to_delete:
+        if name == config.default_role_name:
+            continue
+        path = safe_role_file_path(config.roles_dir, name)
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+
+    # 写/覆盖角色 .md + 收集绑定记录。
+    # 写前剔除已 disabled 的 skill 绑定(双保险):前端虽置灰禁止勾选,
+    # 仍防绕过——禁用的 skill 不该进 roles-config.json 造成死绑定。
+    disabled = _disabled_skill_names(config)
+    bindings: dict = {}
+    for it in request.roles:
+        name = validate_role_name(it.name)
+        path = safe_role_file_path(config.roles_dir, name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(it.prompt.strip() + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+        from openhachimi_agent.core.config import RoleBindingConfig
+        bindings[name] = RoleBindingConfig(
+            skills_mode=it.skills_mode,
+            selected_skills=[s for s in it.selected_skills if s not in disabled],
+            mcp_mode=it.mcp_mode,
+            selected_mcp_servers=list(it.selected_mcp_servers),
+        )
+
+    try:
+        write_roles_config(config.user_dir, bindings)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+    logger.info("http roles-config rewritten count=%d deleted=%d", len(bindings), len(to_delete))
+
+    # 回读最新态返回,供前端刷新表单与 dirty 复位(共用 _build_roles_config_response,
+    # 已含读后剔除死绑定)。
+    return _build_roles_config_response(config, lenient_prompt=False)
 
 
 @app.post("/stop")

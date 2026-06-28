@@ -5,7 +5,6 @@ tmp_tool_dir/
 .memory/
 .workspace/
 .env
-user/config.yaml
 .logs/
 __pycache__/
 *.pyc
@@ -13,6 +12,21 @@ __pycache__/
 .claude
 build/
 .scheduler
+
+# 用户运行时数据(user/ 内由 WebUI 写入或运行时生成的个人配置,
+# 含 API key / 个人角色绑定 / 个人覆盖提示词,不应进版本管理)
+user/config.yaml
+user/mcp-servers.json
+user/roles-config.json
+user/roles/
+user/system_prompts/
+# 模板/示例文件仍需跟踪,显式白名单覆盖上面的目录忽略:
+!user/config.example.yaml
+!user/mcp-servers.example.json
+
+# 仓库根误生成的运行时副本(代码只读 user/mcp-servers.json,根目录这份是冗余)
+/mcp-servers.json
+/roles-config.json
 
 # Ignore all user skills
 user/skills/*

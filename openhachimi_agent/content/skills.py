@@ -155,3 +155,53 @@ def find_skills(skills_dirs: list[Path]) -> list[Skill]:
     with _SKILLS_CACHE_LOCK:
         _SKILLS_CACHE[cache_key] = (current_mtime, list(skills))
     return skills
+
+
+_SKILL_FM_KEY = "disable-model-invocation"
+
+
+def set_skill_disable_model_invocation(skill_path: Path, disabled: bool) -> None:
+    """改写指定 SKILL.md 的 frontmatter 的 ``disable-model-invocation`` 字段,保留 body 不变。
+
+    与 prompts 范式一致——单一事实来源写回文件本身,而不是在 config.yaml 维护
+    禁用清单(后者会因 first-wins 去重后 name↔path 漂移而腐烂)。frontmatter 无
+    注释,整体重写零信息损失。find_skills 按 mtime 缓存,写文件后自动失效重读。
+
+    幂等:key 与当前值相同则不写。失败抛 ValueError(由上层转 400)。
+    """
+    try:
+        text = skill_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"读取技能文件失败: {exc}") from exc
+
+    stripped = text.lstrip()
+    if not stripped.startswith("---\n"):
+        raise ValueError("技能文件缺少有效的 YAML frontmatter(必须以 --- 开头)")
+    parts = stripped.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError("技能文件的 YAML frontmatter 未闭合")
+
+    fm_text = parts[1]
+    body_str = parts[2]
+    fm = yaml.safe_load(fm_text) or {}
+    if not isinstance(fm, dict):
+        raise ValueError("技能文件的 frontmatter 必须是 YAML 映射")
+
+    current = fm.get(_SKILL_FM_KEY)
+    # YAML 把裸 true/false 解析成 Python bool,统一以 bool 比对。
+    current_bool = bool(current)
+    if current_bool == disabled:
+        return  # 幂等,无需写
+
+    if disabled:
+        fm[_SKILL_FM_KEY] = True
+    else:
+        # 关闭时移除该键,回退到"未声明"语义(同样表示不禁用)。
+        fm.pop(_SKILL_FM_KEY, None)
+
+    new_fm = yaml.safe_dump(fm, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    new_content = f"---\n{new_fm}---\n{body_str}"
+    try:
+        skill_path.write_text(new_content, encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"写入技能文件失败: {exc}") from exc

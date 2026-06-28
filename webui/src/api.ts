@@ -53,6 +53,14 @@ export function patch<T>(path: string, body?: unknown): Promise<T> {
   })
 }
 
+export function put<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+}
+
 // ---------------------------------------------------------------- 首页
 export interface SessionSummary {
   session_id: string
@@ -224,4 +232,111 @@ export function getPrompts() {
 
 export function updatePrompt(name: string, content: string) {
   return patch<PromptUpdateResult>('/prompts', { name, content })
+}
+
+// ---------------------------------------------------------------- Skills 配置(设置页)
+// 数据形态:扫到的技能清单 + 每项开关(disable-model-invocation),写回各 SKILL.md,
+// 不走 yaml 字段表。同 /prompts 属"特殊设置分组"。
+export interface SkillItem {
+  name: string
+  description: string
+  source_path: string          // SKILL.md 绝对路径,前端唯一 key 与回写标识
+  source_dir_key: string       // 所属 skills_dir 标识("user" 或外部目录名)
+  disabled: boolean            // 即 SKILL.md frontmatter 的 disable-model-invocation
+  category: string | null
+}
+
+export interface SkillsResponse {
+  skills: SkillItem[]
+}
+
+export interface SkillToggleResult {
+  source_path: string
+  disabled: boolean
+}
+
+export function getSkills() {
+  return get<SkillsResponse>('/skills')
+}
+
+export function toggleSkill(source_path: string, disabled: boolean) {
+  return patch<SkillToggleResult>('/skills/toggle', { source_path, disabled })
+}
+
+export interface SkillInstallResult {
+  message: string
+}
+
+export function installSkill(source_path_or_url: string, allow_http = false) {
+  return post<SkillInstallResult>('/skills/install', { source_path_or_url, allow_http })
+}
+
+export interface SkillDeleteResult {
+  source_path: string
+  message: string
+}
+
+export function deleteSkill(source_path: string) {
+  return request<SkillDeleteResult>('/skills', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_path }),
+  })
+}
+
+// ---------------------------------------------------------------- MCP 配置(设置页)
+// 数据形态:user/mcp-servers.json 的动态服务器清单,type=stdio/http 字段不同,
+// 整体覆盖写。同 /prompts 属"特殊设置分组"。
+export interface MCPServerItem {
+  name: string
+  type: 'stdio' | 'http'
+  command: string | null
+  args: string[]
+  url: string | null
+  env: Record<string, string> | null
+  headers: Record<string, string> | null
+}
+
+export interface McpServersResponse {
+  servers: MCPServerItem[]
+}
+
+export function getMcpServers() {
+  return get<McpServersResponse>('/mcp')
+}
+
+export function putMcpServers(servers: MCPServerItem[]) {
+  return put<McpServersResponse>('/mcp', { servers })
+}
+
+// ---------------------------------------------------------------- 角色管理(设置页)
+// 数据形态:角色提示词(user/roles/*.md)+ 角色级 skills/MCP 绑定(user/roles-config.json)
+// 合并返回。整覆盖写时后端同步维护角色 .md 文件(增删改)与 roles-config.json。
+export interface RoleOption {
+  name: string
+  description: string
+}
+
+export interface RoleBindingItem {
+  name: string
+  prompt: string
+  skills_mode: 'all' | 'selected'
+  selected_skills: string[]
+  mcp_mode: 'all' | 'selected'
+  selected_mcp_servers: string[]
+}
+
+export interface RolesConfigResponse {
+  roles: RoleBindingItem[]
+  available_skills: RoleOption[]
+  available_mcp_servers: RoleOption[]
+  default_role: string
+}
+
+export function getRolesConfig() {
+  return get<RolesConfigResponse>('/roles-config')
+}
+
+export function putRolesConfig(roles: RoleBindingItem[]) {
+  return put<RolesConfigResponse>('/roles-config', { roles })
 }

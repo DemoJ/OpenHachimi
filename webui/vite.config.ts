@@ -11,6 +11,8 @@ const apiPaths = [
   '/roles',
   '/config',
   '/prompts',
+  '/skills',
+  '/mcp',
   '/chat',
   '/new',
   '/role',

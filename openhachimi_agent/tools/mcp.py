@@ -37,13 +37,16 @@ def _load_mcp_http_class() -> Any:
     return MCPServerStreamableHTTP
 
 
-def load_mcp_toolsets(config: AppConfig) -> list:
+def load_mcp_toolsets(config: AppConfig) -> list[tuple[str, Any]]:
     """根据应用配置加载 MCP 服务器/工具集。
-    
+
+    返回 ``[(server_name, server_instance), ...]``——带名字映射,让下游
+    (factory / role_filters)能按角色绑定配置按 server 名过滤。
+
     返回的实例需要在上下文中运行连接才能正常工作，
     即使用 `async with server.run_connection():`。
     """
-    servers = []
+    servers: list[tuple[str, Any]] = []
 
     for name, server_cfg in config.mcp.servers.items():
         try:
@@ -55,7 +58,7 @@ def load_mcp_toolsets(config: AppConfig) -> list:
                 logger.info("Loading MCP server '%s' (stdio): %s %s", name, server_cfg.command, " ".join(args))
                 stdio_cls = _load_mcp_stdio_class()
                 server = stdio_cls(command=server_cfg.command, args=args, env=server_cfg.env)
-                servers.append(server)
+                servers.append((name, server))
             elif server_cfg.type == "http":
                 if not server_cfg.url:
                     logger.warning("MCP server '%s' 配置为 http/sse 模式，但未指定 url。", name)
@@ -68,7 +71,7 @@ def load_mcp_toolsets(config: AppConfig) -> list:
                 )
                 http_cls = _load_mcp_http_class()
                 server = http_cls(server_cfg.url, headers=server_cfg.headers)
-                servers.append(server)
+                servers.append((name, server))
             else:
                 logger.warning("未知的 MCP server '%s' 类型: %s", name, server_cfg.type)
         except Exception as exc:

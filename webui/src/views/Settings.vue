@@ -60,6 +60,46 @@
           </div>
         </div>
 
+        <div v-else-if="currentGroup === 'skills'" class="settings-content">
+          <!-- Skills 配置:扫到的技能清单 + 单项开关,写回各 SKILL.md。SkillsCard 自管加载,
+               保存/放弃复用全局悬浮保存条(与 prompts 一致)。 -->
+          <SkillsCard ref="skillsRef" />
+
+          <div class="settings-actions" :class="{ visible: skillsDirty }">
+            <span class="dirty-hint" v-if="skillsDirty">有未保存的修改</span>
+            <span class="dirty-hint saved" v-else-if="skillsJustSaved">已保存</span>
+            <div class="action-buttons">
+              <button class="btn" :disabled="!skillsDirty || skillsSaving" @click="onResetSkills">放弃修改</button>
+              <button class="btn btn-primary" :disabled="!skillsDirty || skillsSaving" @click="onSaveSkills">
+                {{ skillsSaving ? '保存中…' : '保存' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div v-else-if="currentGroup === 'roles'" class="settings-content">
+          <!-- 角色管理:小卡片列表 + 编辑弹窗。RolesCard 自管加载与保存(弹窗内直接落盘,
+               无全局 dirty/保存条),与 prompts/skills/mcp 的"顶部保存条"模型不同。 -->
+          <RolesCard ref="rolesRef" />
+        </div>
+
+        <div v-else-if="currentGroup === 'mcp'" class="settings-content">
+          <!-- MCP 配置:动态服务器清单(增删改),整体覆盖写 mcp-servers.json。McpServersCard 自管加载,
+               保存/放弃复用全局悬浮保存条(与 prompts 一致)。 -->
+          <McpServersCard ref="mcpRef" />
+
+          <div class="settings-actions" :class="{ visible: mcpDirty }">
+            <span class="dirty-hint" v-if="mcpDirty">有未保存的修改</span>
+            <span class="dirty-hint saved" v-else-if="mcpJustSaved">已保存</span>
+            <div class="action-buttons">
+              <button class="btn" :disabled="!mcpDirty || mcpSaving" @click="onResetMcp">放弃修改</button>
+              <button class="btn btn-primary" :disabled="!mcpDirty || mcpSaving" @click="onSaveMcp">
+                {{ mcpSaving ? '保存中…' : '保存' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
         <div v-else-if="fields.length" class="settings-content">
           <!-- 按 currentGroup 渲染对应卡片组;卡片元数据见 GROUP_CARDS。 -->
           <section
@@ -131,6 +171,9 @@ import { computed, ref, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import ConfigField from '../components/ConfigField.vue'
 import PromptsCard from '../components/PromptsCard.vue'
+import RolesCard from '../components/RolesCard.vue'
+import SkillsCard from '../components/SkillsCard.vue'
+import McpServersCard from '../components/McpServersCard.vue'
 import { getConfigGroup, updateConfigGroup } from '../api'
 import type { ConfigField as ConfigFieldType } from '../api'
 
@@ -140,7 +183,10 @@ const route = useRoute()
 // 设置分组元信息(左侧导航)。新增分组时在此追加,并扩展 GROUP_CARDS。
 const groups = [
   { id: 'ai-models', label: 'AI 模型', icon: '🤖' },
+  { id: 'roles', label: '角色管理', icon: '🎭' },
   { id: 'prompts', label: '提示词', icon: '💬' },
+  { id: 'skills', label: 'Skills', icon: '🧩' },
+  { id: 'mcp', label: 'MCP 服务器', icon: '🔌' },
   { id: 'network', label: '网络与服务', icon: '🌐' },
   { id: 'browser', label: '浏览器自动化', icon: '🖥️' },
   { id: 'memory', label: '记忆系统', icon: '🧠' },
@@ -212,17 +258,40 @@ const justSaved = ref(false)
 
 // 提示词页子组件引用:通过 defineExpose 暴露 dirty/save/reset,让全局保存条复用。
 const promptsRef = ref<InstanceType<typeof PromptsCard> | null>(null)
-// 代理 PromptsCard 的暴露态;非 prompts 分组时各值为 false/undefined,保存条自然不显示。
+// Skills / MCP 子组件引用:同 PromptsCard,各自 defineExpose 暴露 dirty/saving/justSaved/save/reset。
+const skillsRef = ref<InstanceType<typeof SkillsCard> | null>(null)
+const mcpRef = ref<InstanceType<typeof McpServersCard> | null>(null)
+const rolesRef = ref<InstanceType<typeof RolesCard> | null>(null)
+// 代理各子组件的暴露态;非对应分组时各值为 false/undefined,保存条自然不显示。
 // 注:Vue 对 setup 暴露的 ref/computed 在父组件通过 instance ref 访问时自动解包,故直接读值。
 const promptsDirty = computed(() => !!promptsRef.value?.dirty)
 const promptsSaving = computed(() => !!promptsRef.value?.saving)
 const promptsJustSaved = computed(() => !!promptsRef.value?.justSaved)
+const skillsDirty = computed(() => !!skillsRef.value?.dirty)
+const skillsSaving = computed(() => !!skillsRef.value?.saving)
+const skillsJustSaved = computed(() => !!skillsRef.value?.justSaved)
+const mcpDirty = computed(() => !!mcpRef.value?.dirty)
+const mcpSaving = computed(() => !!mcpRef.value?.saving)
+const mcpJustSaved = computed(() => !!mcpRef.value?.justSaved)
+// 注:roles 不在此列——它走"弹窗内直接保存"模型,无全局 dirty,故不接入顶部保存条。
 
 async function onSavePrompts() {
   await promptsRef.value?.save()
 }
 function onResetPrompts() {
   promptsRef.value?.reset()
+}
+async function onSaveSkills() {
+  await skillsRef.value?.save()
+}
+function onResetSkills() {
+  skillsRef.value?.reset()
+}
+async function onSaveMcp() {
+  await mcpRef.value?.save()
+}
+function onResetMcp() {
+  mcpRef.value?.reset()
 }
 
 const fields = ref<ConfigFieldType[]>([])
@@ -238,8 +307,12 @@ const maskedSecrets = ref<Set<string>>(new Set())
 const collapsedCards = ref<Set<string>>(new Set())
 
 const dirty = computed(() => {
-  // prompts 分支:用 PromptsCard 暴露的 dirty;其余分组:比对 config 字段快照。
+  // 特殊分组分支:用各子组件暴露的 dirty;其余分组:比对 config 字段快照。
+  // roles 走弹窗内直接保存、无全局 dirty,故不在此分支——落到下方字段快照比对时,
+  // fields 为空、snapshot 为空,dirty 自然为 false(切组/返回不会被未保存态拦截)。
   if (currentGroup.value === 'prompts') return promptsDirty.value
+  if (currentGroup.value === 'skills') return skillsDirty.value
+  if (currentGroup.value === 'mcp') return mcpDirty.value
   for (const f of fields.value) {
     if (form.value[f.path] !== snapshot.value[f.path]) return true
   }
@@ -309,8 +382,10 @@ function valueEquals(a: unknown, b: unknown): boolean {
 }
 
 async function loadConfig() {
-  // prompts 分支走独立组件 PromptsCard 自管加载,这里跳过避免空 getConfigGroup 调用。
-  if (currentGroup.value === 'prompts') {
+  // 特殊分组分支走各自子组件自管加载,这里跳过避免空 getConfigGroup 调用。
+  // roles 同属特殊分组(数据走 /roles-config,不在 yaml 字段表),漏判会 fallthrough
+  // 到 getConfigGroup('roles') → 后端 /config/{group} 查不到该组返回 404。
+  if (currentGroup.value === 'prompts' || currentGroup.value === 'skills' || currentGroup.value === 'mcp' || currentGroup.value === 'roles') {
     fields.value = []
     snapshot.value = {}
     form.value = {}

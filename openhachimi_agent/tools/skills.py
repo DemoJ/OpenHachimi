@@ -346,6 +346,25 @@ def install_skill(
         A success message with the installation result, or an error message if it fails.
     """
     user_skills_dir = ctx.deps.base_dir / "user" / "skills"
+    return install_skill_from_source(
+        user_skills_dir, source_path_or_url,
+        expected_sha256=expected_sha256, allow_http=allow_http,
+    )
+
+
+def install_skill_from_source(
+    user_skills_dir: Path,
+    source_path_or_url: str,
+    *,
+    expected_sha256: str | None = None,
+    allow_http: bool = False,
+) -> str:
+    """安装/更新技能到指定 user/skills 目录(纯逻辑,不依赖 RunContext)。
+
+    与 install_skill 工具共享同一套拉取/校验/写回逻辑,抽出供 HTTP 层复用。
+    支持 Git URL、zip/tar 下载 URL、本地目录三种来源;含 SSRF 防护、大小/数量
+    限制、技能名校验与 staging+backup 回滚。返回人类可读的结果字符串。
+    """
     user_skills_dir.mkdir(parents=True, exist_ok=True)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="openhachimi_skill_"))
@@ -443,6 +462,35 @@ def install_skill(
         return f"Unexpected error during skill installation: {e}"
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def delete_skill_dir(user_skills_dir: Path, source_path: Path) -> str:
+    """删除 user/skills 下的某个技能目录(整个子目录)。
+
+    供 HTTP 层复用,不依赖 RunContext。仅允许删除位于 user_skills_dir 内的技能——
+    external_skills_dir 是只读扫描目录不在此删。find_skills 按 mtime 缓存,
+    目录删除后下次扫描自动失效重读,无需手动清缓存。
+
+    传入的是 SKILL.md 的绝对路径(source_path),删除其所在目录。返回结果字符串。
+    越权(不在 user_skills_dir 内)或路径不合法时抛 ValueError。
+    """
+    base = user_skills_dir.resolve()
+    try:
+        skill_md = source_path.resolve()
+    except OSError as exc:
+        raise ValueError(f"无效的技能路径: {exc}") from exc
+    if not skill_md.is_relative_to(base):
+        raise ValueError("技能路径不在 user/skills 目录内,无法删除(外部目录为只读)")
+    if not skill_md.exists():
+        raise ValueError(f"技能文件不存在: {source_path}")
+    if not skill_md.name.lower().endswith("skill.md"):
+        raise ValueError("目标路径不是 SKILL.md")
+    skill_dir = skill_md.parent
+    if not skill_dir.is_relative_to(base) or skill_dir == base:
+        # 不允许直接删 user/skills 本身
+        raise ValueError("无法删除 user/skills 根目录")
+    shutil.rmtree(skill_dir, ignore_errors=False)
+    return f"技能目录已删除: {skill_dir}"
 
 
 def list_skills(ctx: RunContext[AgentDeps]) -> str:

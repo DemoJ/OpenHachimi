@@ -223,11 +223,11 @@ async def test_reload_mcp_toolsets_keeps_only_connected_toolsets(agent_service, 
     ok = FakeMCPToolset("ok")
     failed = FakeMCPToolset("failed", fail=True)
 
-    monkeypatch.setattr(mcp_module, "load_mcp_toolsets", lambda config: [ok, failed])
+    monkeypatch.setattr(mcp_module, "load_mcp_toolsets", lambda config: [("ok", ok), ("failed", failed)])
 
     await agent_service.start()
 
-    assert agent_service._mcp_toolsets == [ok]
+    assert agent_service._mcp_toolsets == [("ok", ok)]
     assert ok.entered is True
     assert failed.entered is False
     assert len(agent_service._mcp_errors) == 1
@@ -245,7 +245,7 @@ async def test_maybe_reload_mcp_toolsets_reloads_only_when_mcp_file_changes(agen
 
     def fake_load_mcp_toolsets(config):
         calls.append(config.mcp)
-        return [first] if len(calls) == 1 else [second]
+        return [("first", first)] if len(calls) == 1 else [("second", second)]
 
     monkeypatch.setattr(mcp_module, "load_mcp_toolsets", fake_load_mcp_toolsets)
 
@@ -254,13 +254,13 @@ async def test_maybe_reload_mcp_toolsets_reloads_only_when_mcp_file_changes(agen
     await agent_service._maybe_reload_mcp_toolsets()
 
     assert len(calls) == 1
-    assert agent_service._mcp_toolsets == [first]
+    assert agent_service._mcp_toolsets == [("first", first)]
     assert agent_service._agents
 
     mcp_file.write_text('{"mcpServers": {"remote": {"url": "https://example.test/mcp"}}}', encoding="utf-8")
     await agent_service._maybe_reload_mcp_toolsets()
 
     assert len(calls) == 2
-    assert agent_service._mcp_toolsets == [second]
+    assert agent_service._mcp_toolsets == [("second", second)]
     assert first.exited is True
     assert agent_service._agents == {}

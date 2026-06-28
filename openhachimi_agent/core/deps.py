@@ -19,8 +19,15 @@ class AgentDeps:
     # 通过 ctx.deps.session_store 访问会话级 SQLite 库。
     session_store: Any = None
     run_mode: str = "interactive"
+    # 当前角色名:供 runtime_context 的技能索引块按角色过滤可见 skills。
+    # 默认空串=不按角色过滤(全用),与历史行为一致。
+    role_name: str = ""
     channel_context: dict[str, Any] = field(default_factory=dict)
     scheduler_context: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def role_or_default(self) -> str:
+        return self.role_name or self.config.default_role_name
 
     @property
     def channel(self) -> str:

@@ -17,7 +17,7 @@ from openhachimi_agent.agent.factory import (
     build_router_agent,
     build_scheduled_executor_agent,
 )
-from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.core.config import ROLES_CONFIG_FILE_NAME, AppConfig
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,12 @@ def compute_dependency_mtime(
             return cached_mtime, cache
 
     current_mtime = 0.0
-    paths_to_check = [config.roles_dir / f"{role_name}.md"]
+    paths_to_check = [
+        config.roles_dir / f"{role_name}.md",
+        # roles-config.json 改动也要让 agent 缓存失效——它决定该角色的 skills/MCP
+        # 可见集,改了不重建会用到旧绑定。
+        config.user_dir / ROLES_CONFIG_FILE_NAME,
+    ]
     try:
         for path in paths_to_check:
             if path.exists() and path.is_file():

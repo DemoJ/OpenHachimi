@@ -14,6 +14,14 @@
 
 from openhachimi_agent.core.config._helpers import logger  # noqa: F401 — 暴露给上层共享
 from openhachimi_agent.core.config.loading import load_config, load_mcp_config
+from openhachimi_agent.core.config.mcp_store import get_mcp_config, write_mcp_config
+from openhachimi_agent.core.config.roles_store import (
+    ROLES_CONFIG_FILE_NAME,
+    RoleBindingConfig,
+    get_role_binding,
+    load_roles_config,
+    write_roles_config,
+)
 from openhachimi_agent.core.config.models import (
     CONFIG_FILE_NAME,
     USER_DIR_NAME,
@@ -95,6 +103,13 @@ __all__ = [
     # 加载 / 持久化 / WebUI 读写
     "load_config",
     "load_mcp_config",
+    "get_mcp_config",
+    "write_mcp_config",
+    "load_roles_config",
+    "write_roles_config",
+    "get_role_binding",
+    "RoleBindingConfig",
+    "ROLES_CONFIG_FILE_NAME",
     "load_raw_config",
     "persist_server_endpoint",
     "_ensure_http_api_token",

@@ -8,6 +8,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.tools import DeferredToolRequests
 
 from openhachimi_agent.content.prompts import load_system_prompt, render_system_prompt
+from openhachimi_agent.content.role_filters import filter_mcp_toolsets_for_role, filter_skills_for_role, get_role_filters
 from openhachimi_agent.content.roles import load_role_content
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
@@ -68,25 +69,33 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
 
     system_prompt = load_system_prompt()
     role_content = load_role_content(config.roles_dir, role_name)
+    # 角色级 skills/MCP 绑定:未配置的角色 get_role_filters 返回全 all(= 历史全局行为)。
+    role_filters = get_role_filters(config, role_name)
 
     provider = OpenAIProvider(
         base_url=config.openai_base_url or None,
         api_key=config.openai_api_key,
     )
-    
+
     from pydantic_ai import FunctionToolset
     from openhachimi_agent.tools.skills import build_skill_tool, format_skill_prompt
-    
-    # 动态扫描带 arguments 的技能并注册为宏工具
+
+    # 动态扫描带 arguments 的技能并注册为宏工具;先按角色绑定过滤可见 skill 集。
+    # (与 runtime_context._skills_index_block 的过滤一致,两处共用 role_filters 逻辑。)
     dynamic_skill_tools = []
-    skills = find_skills(config.skills_dirs)
+    skills = filter_skills_for_role(role_filters, find_skills(config.skills_dirs))
     for skill in skills:
         if skill.config.arguments and not skill.config.disable_model_invocation:
             dynamic_skill_tools.append(build_skill_tool(skill))
-            
+
     dynamic_toolset = FunctionToolset(tools=dynamic_skill_tools)
 
+    # mcp_toolsets 由 service 传入为带名列表 [(server_name, ts), ...];
+    # 按角色绑定过滤后只取实例加入 toolsets。未选中的 server 仍保持连接,
+    # 只是不对该角色暴露。
     mcp_toolsets = mcp_toolsets or []
+    filtered_mcp = filter_mcp_toolsets_for_role(role_filters, mcp_toolsets)
+    mcp_instances = [ts for _name, ts in filtered_mcp]
 
     # output_type 按 agent 类型分:
     # - executor:注册了 clarify_user(可能抛 CallDeferred),所以输出域是
@@ -111,7 +120,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         output_type = str
 
     if agent_type == "planner":
-        toolsets = [PLANNER_TOOLSET, dynamic_toolset] + mcp_toolsets
+        toolsets = [PLANNER_TOOLSET, dynamic_toolset] + mcp_instances
         extra_prompt = load_system_prompt("agents/planner")
     else:
         base_executor_toolset = SCHEDULED_EXECUTOR_TOOLSET if agent_type == "scheduled_executor" else EXECUTOR_TOOLSET
@@ -123,7 +132,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             ]
             filtered_executor_toolset = FunctionToolset(tools=filtered_tools)
 
-        toolsets = [filtered_executor_toolset, dynamic_toolset] + mcp_toolsets
+        toolsets = [filtered_executor_toolset, dynamic_toolset] + mcp_instances
         if agent_type == "scheduled_executor":
             extra_prompt = load_system_prompt("agents/scheduled_executor")
         else:
