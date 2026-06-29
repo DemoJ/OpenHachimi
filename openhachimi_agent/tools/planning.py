@@ -135,6 +135,43 @@ def _all_dependencies_done(state: TodoState, task: TodoTask) -> bool:
     return all(state.tasks[dep_id].status == "done" for dep_id in task.depends_on)
 
 
+def _format_status_box(status: str) -> str:
+    """Return display box marker for a task status."""
+    if status == "in-progress":
+        return "[-]"
+    if status == "done":
+        return "[x]"
+    return "[ ]"
+
+
+def _render_task_lines(state: TodoState) -> str:
+    """Render all top-level tasks (and their children) into formatted lines.
+
+    Excludes the \"## 当前 TODO 列表：\" header — callers may want
+    different prefixes (create summary, update summary, etc.).
+    """
+    lines: list[str] = []
+    valid_ids = set(state.tasks.keys())
+
+    def render(task: TodoTask, depth: int) -> None:
+        indent = "  " * depth
+        box = _format_status_box(task.status)
+        deps_str = f" [依赖: {', '.join(map(str, task.depends_on))}]" if task.depends_on else ""
+        note_str = f" (备注: {task.notes})" if task.notes else ""
+        criteria_str = f" [验收: {task.success_criteria}]" if task.success_criteria else ""
+        evidence_str = f" [证据: {task.evidence}]" if task.evidence else ""
+        lines.append(f"{indent}{box} {task.id}. {task.description}{deps_str}{criteria_str}{note_str}{evidence_str}")
+        for child in state.tasks.values():
+            if child.parent_id == task.id:
+                render(child, depth + 1)
+
+    for task in state.tasks.values():
+        if task.parent_id is None or task.parent_id not in valid_ids:
+            render(task, 0)
+
+    return "\n".join(lines)
+
+
 def _refresh_active_flag(state: TodoState) -> None:
     if state.tasks and all(t.status == "done" for t in state.tasks.values()):
         state.is_active = False
@@ -367,10 +404,19 @@ def create_todos(
         len(tasks),
         ctx.deps.session_id,
     )
-    # 不再返回 get_todos 的完整列表（避免 history 中提前塞入 TODO 全文，
-    # 导致 executor 首步 get_todos 冗余展示同一份信息）。
-    goal_str = f"。目标：{state.goal}" if state.goal else ""
-    return f"已创建 {len(state.tasks)} 个 TODO 任务{goal_str}。\n使用 `get_todos` 可查看完整列表和状态。"
+    # 返回格式化后的 TODO 列表。虽然可能比纯摘要多占 tokens,
+    # 但 LLM 调用方依赖这些格式(状态标记、描述、备注)来推理,
+    # 纯摘要会导致断言失败。各轮次之间由工具调用 history 中的
+    # 完整输出 snapshot 保证模型仍有上下文。
+    lines: list[str] = []
+    if state.goal:
+        lines.append(f"目标：{state.goal}")
+    if state.invariants:
+        lines.append("不可变约束：")
+        for inv in state.invariants:
+            lines.append(f"- {inv}")
+    lines.append(_render_task_lines(state))
+    return f"已创建 {len(state.tasks)} 个 TODO 任务。\n" + "\n".join(lines)
 
 
 def update_todo(
@@ -485,10 +531,11 @@ def update_todo(
     remaining = [t for t in state.tasks.values() if t.status not in {"done", "blocked"}]
     summary = f"已更新任务 {task_id} → {status}。"
     if remaining:
-        summary += f" 剩余 {len(remaining)} 项待办。使用 `get_todos` 可查看完整列表。"
+        summary += f" 剩余 {len(remaining)} 项待办。"
     else:
         summary += " 所有 TODO 已完成！"
-    return summary
+    task_list = _render_task_lines(state)
+    return f"{summary}\n\n{task_list}"
 
 
 def get_todos(ctx: RunContext[AgentDeps]) -> str:
