@@ -117,8 +117,9 @@
                 <p>{{ searchText || roleFilter !== '__all__' || levelFilter || typeFilter ? '没有匹配的记忆。' : '暂无记忆。与 Agent 对话后会自动捕获并写入长期记忆。' }}</p>
               </div>
 
-              <!-- 加载更多:limit 递增式(后端无 offset 分页),上限 200。 -->
-              <div v-if="items.length && items.length < 200" class="mem-load-more">
+              <!-- 加载更多:limit 递增式(后端无 offset 分页),上限 200。
+                    当返回条数 < currentLimit 时说明已无更多数据,隐藏按钮。 -->
+              <div v-if="items.length && items.length >= currentLimit && currentLimit < 200" class="mem-load-more">
                 <button type="button" class="btn mem-load-more-btn" :disabled="loading" @click="loadMore">
                   {{ loading ? '加载中…' : '加载更多' }}
                 </button>
