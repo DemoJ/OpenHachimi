@@ -62,9 +62,10 @@ def apply_recall_decay(result: MemorySearchResult, *, now: str | None = None) ->
     return result
 
 
-# v2: 这些 memory_type 不应从 L1 召回,避免历史问句/模型回答/定时调度 payload
-# 被当成长期事实注入 system prompt
-_EXCLUDED_L1_TYPES = {"conversation_context", "scheduler_payload"}
+# v2: scheduler_payload 不应从 L1 召回,避免定时调度 payload 被当成长期事实
+# 注入 system prompt。历史上还有 conversation_context(compressed window 抢救)
+# 类型,但该机制已移除,旧数据清理后该排除项无意义,仅保留 scheduler_payload。
+_EXCLUDED_L1_TYPES = {"scheduler_payload"}
 
 
 def select_by_level_budget(

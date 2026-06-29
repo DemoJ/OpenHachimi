@@ -191,8 +191,6 @@ CONTEXT_FIELDS: list[dict[str, Any]] = [
      "label": "反抖动", "description": "开启则连续两次压缩节省不足 min_savings_pct% 时停止压缩,避免反复压缩无收益。新会话生效"},
     {"path": "context.min_savings_pct", "kind": CONFIG_KIND_INT, "group": "context-advanced",
      "label": "最小节省百分比", "description": "单次压缩应达到的最低节省百分比(配合反抖动)。新会话生效"},
-    {"path": "context.rescue_to_memory", "kind": CONFIG_KIND_BOOL, "group": "context-advanced",
-     "label": "丢弃窗口抢救记忆", "description": "压缩时把将被丢弃的窗口抢救写入记忆库,后续可召回找回。新会话生效"},
     {"path": "context.context_length", "kind": CONFIG_KIND_INT, "group": "context-advanced",
      "label": "上下文窗口(K)", "description": "模型上下文窗口大小,单位 K(128=128K tokens)。非 128K 模型需按实际填写(如 32K 填 32);0 用内置默认。必须与模型真实窗口一致,否则压缩阈值计算偏差"},
 ]

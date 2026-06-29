@@ -453,7 +453,7 @@ logging:
 
 | 层 | 模块 | 职责 |
 |------|------|------|
-| 引擎抽象 | `context/engine.py` | `ContextEngine` ABC：`should_compress`/`compress`/`update_from_response`/`on_pre_compress`，可插拔第三方引擎 |
+| 引擎抽象 | `context/engine.py` | `ContextEngine` ABC：`should_compress`/`compress`/`update_from_response`，可插拔第三方引擎 |
 | 默认实现 | `context/compressor.py` | `ContextCompressor` 四阶段压缩，操作原生 `ModelMessage` |
 | 廉价剪枝 | `context/pruning.py` | 旧工具结果换一行摘要 + 去重（无 LLM） |
 | token 估计 | `context/token_estimate.py` | CJK 感知的粗略 char→token 估计（预检用） |
@@ -475,12 +475,12 @@ logging:
 - **轮后主压缩**（`agent_service.py`）：用本轮真实 `result.usage` 判定，触发则在 `save_message_history` 前压缩并保存。轮边界最安全，不打断工具序列。
 - **轮内预检安全网**（`executor.py: preflight_compress_history`）：每次 `agent.run` 前粗略估计达 `hard_ceiling_percent`（0.90）时，对内存 history 先做廉价压缩（`allow_llm_summary=False` 走确定性兜底，避免中途中断调 LLM），防止单轮内撑爆模型窗口。
 
-### 召回解耦闭环
+### 消息历史 append-only
 
-OpenHachimi 的记忆系统（BM25+向量+RRF+三级分层）独立于 live context，且 turn store 与消息历史 JSON 解耦。因此压缩时**不是纯丢弃**：
+OpenHachimi 的记忆系统（BM25+向量+RRF+三级分层）独立于 live context，且 turn store 与消息历史 JSON 解耦。压缩**只记元数据、绝不删原始消息**：
 
-- `on_pre_compress` 钩子调用 `memory/capture.py: capture_compressed_window`，把待丢弃的中间窗口序列化为可向量检索的 L1 atom（带 embedding）。
-- 丢弃的工具调用细节仍可通过 `recall_memories` 召回找回——"压缩丢旧 + 召回找旧"闭环，无需 Hermes 的 DAG/LCM 或服务端 compaction。
+- 原始消息（含工具调用参数与返回）以 append-only 形式完整保留于 `session_messages`；`session_compressions` 仅记录每次压缩的折叠区间（`head_end`/`tail_start`）与摘要。
+- 运行时 `load_context` 据折叠元数据重新组装视图喂模型，前端可按需展开折叠区间查看原始消息。被折叠的细节随时可从原始历史中取回，无需额外抢救副本。
 
 ### prompt 缓存稳定性
 
@@ -495,7 +495,7 @@ OpenHachimi 的记忆系统（BM25+向量+RRF+三级分层）独立于 live cont
 
 ### 配置
 
-见 `user/config.example.yaml` 的 `context:` 段：`threshold_percent` / `hard_ceiling_percent` / `protect_first_n` / `protect_last_n` / `tail_token_budget` / `anti_thrash` / `rescue_to_memory` / `context_length` / `summary.*`（辅助摘要模型，留空用主模型）。
+见 `user/config.example.yaml` 的 `context:` 段：`threshold_percent` / `hard_ceiling_percent` / `protect_first_n` / `protect_last_n` / `tail_token_budget` / `anti_thrash` / `context_length` / `summary.*`（辅助摘要模型，留空用主模型）。
 
 ---
 

@@ -323,27 +323,6 @@ def test_allow_llm_summary_false_skips_summarizer():
     assert comp._last_summary_fallback_used is True  # noqa: SLF001
 
 
-# ── on_pre_compress 抢救钩子 ────────────────────────────────────────────────
-def test_pre_compress_callback_invoked_with_window():
-    captured: list = []
-
-    def rescue(full, window):
-        captured.append(len(window))
-
-    comp = ContextCompressor(
-        context_length=8000,
-        threshold_percent=0.75,
-        protect_first_n=2,
-        protect_last_n=3,
-        tail_token_budget=500,
-        pre_compress_callback=rescue,
-    )
-    msgs = _make_tool_turns(10)
-    comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
-    assert len(captured) == 1
-    assert captured[0] > 0  # 丢弃窗口非空
-
-
 # ── 会话重置 ───────────────────────────────────────────────────────────────
 def test_on_session_reset_clears_state():
     comp = ContextCompressor(context_length=10000)

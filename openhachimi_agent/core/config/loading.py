@@ -405,7 +405,6 @@ def _load_context_config(raw_config: dict[str, Any], llm_config: dict[str, Any])
         tail_token_budget=_config_int(context_config, "tail_token_budget", 20000, minimum=0),
         anti_thrash=_config_bool(context_config, "anti_thrash", True),
         min_savings_pct=_config_int(context_config, "min_savings_pct", 10, minimum=0),
-        rescue_to_memory=_config_bool(context_config, "rescue_to_memory", True),
         context_length=_config_int(context_config, "context_length", 128, minimum=0),
         summary=ContextSummaryConfig(
             model=_config_string(summary_config, "model"),

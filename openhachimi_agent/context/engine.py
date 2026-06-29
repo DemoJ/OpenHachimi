@@ -91,12 +91,6 @@ class ContextEngine(ABC):
         self.last_total_tokens = 0
         self.compression_count = 0
 
-    def on_pre_compress(self, messages: list[ModelMessage], window: list[ModelMessage]) -> None:
-        """压缩丢弃中间窗口前的钩子(默认空实现)。
-
-        子类可覆盖以把待丢弃的 ``window`` 抢救到记忆库,使其可召回找回。
-        """
-
     # ── 可选:状态展示 ───────────────────────────────────────────────────
     def get_status(self) -> dict[str, Any]:
         return {

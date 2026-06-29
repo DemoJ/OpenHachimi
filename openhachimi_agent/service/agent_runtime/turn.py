@@ -522,7 +522,7 @@ async def run_turn(
             stream_queue=stream_queue,
         )
         ctx.stream_event_handler = build_stream_event_handler(stream_queue, ctx.operation_state)
-        ctx.context_compressor = service._get_context_compressor(actual_session_id, memory_scope)
+        ctx.context_compressor = service._get_context_compressor(actual_session_id)
 
         # MCP 配置在单轮内只刷新一次:router/planner/executor 三段编排原本各自调用一次,
         # 实际同一轮内文件 mtime 不会变,重复 stat + signature compare 是浪费。

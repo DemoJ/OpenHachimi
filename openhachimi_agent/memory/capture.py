@@ -6,10 +6,7 @@ import json
 import logging
 from typing import Any
 
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart
-
 from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.core.redaction import redact_text
 from openhachimi_agent.memory.conflicts import resolve_atom_conflict
 from openhachimi_agent.memory.embeddings import EmbeddingProvider
 from openhachimi_agent.memory.models import MemoryAtom, MemoryScope, MemoryStability, MemoryTurn
@@ -231,93 +228,3 @@ def capture_turn_memories(
 
     logger.info("memory turn captured role=%s session_id=%s turn_id=%s", scope.role_name, scope.session_id, turn_id)
     return turn_id
-
-
-def _serialize_window_for_rescue(messages: list[ModelMessage], *, max_chars: int = 8000) -> str:
-    """把压缩丢弃的窗口序列化为可检索文本(脱敏)。"""
-    lines: list[str] = []
-    for msg in messages:
-        if isinstance(msg, ModelRequest):
-            for part in getattr(msg, "parts", None) or []:
-                text = getattr(part, "content", None)
-                if isinstance(text, str) and text.strip():
-                    lines.append(redact_text(text.strip()))
-                elif text is not None:
-                    try:
-                        lines.append(redact_text(json.dumps(text, ensure_ascii=False, default=str)))
-                    except (TypeError, ValueError):
-                        pass
-        elif isinstance(msg, ModelResponse):
-            for part in getattr(msg, "parts", None) or []:
-                if isinstance(part, ToolCallPart):
-                    args = part.args
-                    args_text = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False, default=str)
-                    lines.append(redact_text(f"[{part.tool_name}] {args_text}"))
-                else:
-                    text = getattr(part, "content", "")
-                    if isinstance(text, str) and text.strip():
-                        lines.append(redact_text(text.strip()))
-    text = "\n".join(lines)
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n...[已截断]"
-    return text
-
-
-def capture_compressed_window(
-    config: AppConfig,
-    scope: MemoryScope,
-    messages: list[ModelMessage],
-    window: list[ModelMessage],
-) -> str | None:
-    """压缩丢弃中间窗口前的抢救钩子:把待丢弃窗口存为可向量检索的 L1 atom。
-
-    这样被压缩掉的工具调用细节仍可通过 :func:`recall_memories` 召回找回,
-    形成"压缩丢旧 + 召回找旧"闭环。失败不影响压缩主流程。
-    """
-    if not config.context.rescue_to_memory or not window:
-        return None
-    if not config.memory.enabled:
-        return None
-    try:
-        store = get_memory_store(config)
-        content = _serialize_window_for_rescue(window)
-        if len(content.strip()) < 50:
-            return None
-        atom = MemoryAtom(
-            memory_type="conversation_context",
-            content=content,
-            scope=scope,
-            subject="session",
-            predicate="compressed",
-            object="context window rescued before compression",
-            source_quote=content[:500],
-            keywords=_keywords(content),
-            tags=["compressed", "rescued"],
-            confidence=0.6,
-            stability=MemoryStability.EPHEMERAL,
-        )
-        embedding = None
-        if config.memory.embedding.enabled:
-            embedding = EmbeddingProvider(config.memory.embedding).embed_sync(atom.content)
-        decision = resolve_atom_conflict(
-            store,
-            atom,
-            embedding_vector=embedding.vector if embedding and not embedding.degraded else None,
-            embedding_model=config.memory.embedding.model if embedding and not embedding.degraded else None,
-        )
-        atom_id = decision.winner_id or atom.id
-        if decision.action != "dedupe":
-            atom_id = store.add_atom(atom)
-        if config.memory.embedding.enabled and decision.action != "dedupe" and embedding and not embedding.degraded:
-            store.save_vector(atom_id, "L1", config.memory.embedding.model, embedding.vector)
-        logger.info(
-            "compressed window rescued to memory role=%s session_id=%s atom_id=%s chars=%d",
-            scope.role_name,
-            scope.session_id,
-            atom_id,
-            len(content),
-        )
-        return atom_id
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("capture_compressed_window failed role=%s session_id=%s: %s", scope.role_name, scope.session_id, exc)
-        return None

@@ -858,7 +858,6 @@ context:
   enabled: true
   threshold_percent: 0.75    # 用量达 75% 时自动压缩
   hard_ceiling_percent: 0.90 # 90% 时轮内预检压缩（防单轮内爆窗口）
-  rescue_to_memory: true     # 丢弃内容抢救到记忆库（可召回找回）
   summary:
     model: ""                # 留空用主模型；也可指定更便宜的小模型做摘要
     abort_on_failure: false  # 摘要失败时插兜底摘要而非冻结对话

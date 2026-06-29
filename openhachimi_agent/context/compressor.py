@@ -45,8 +45,6 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 45.0
 
 # 摘要器签名:(turns: list[ModelMessage], focus_topic: str | None, previous_summary: str | None) -> str | None
 SummaryFn = Callable[[list[ModelMessage], str | None, str | None], str | None]
-# 抢救钩子签名:(full_messages: list[ModelMessage], dropped_window: list[ModelMessage]) -> None
-PreCompressFn = Callable[[list[ModelMessage], list[ModelMessage]], None]
 
 
 @dataclass
@@ -84,7 +82,6 @@ class ContextCompressor(ContextEngine):
         context_length: int = 0,
         abort_on_summary_failure: bool = False,
         summarizer: SummaryFn | None = None,
-        pre_compress_callback: PreCompressFn | None = None,
     ) -> None:
         self.threshold_percent = threshold_percent
         self.hard_ceiling_percent = hard_ceiling_percent
@@ -95,7 +92,6 @@ class ContextCompressor(ContextEngine):
         self.min_savings_pct = min_savings_pct
         self.abort_on_summary_failure = abort_on_summary_failure
         self._summarizer = summarizer
-        self._pre_compress_callback = pre_compress_callback
 
         self.context_length = context_length or _DEFAULT_CONTEXT_LENGTH
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
@@ -264,9 +260,6 @@ class ContextCompressor(ContextEngine):
         window = messages[head_end:tail_start]
         head = messages[:head_end]
         tail = messages[tail_start:]
-
-        # 记忆抢救钩子:丢弃窗口前抢救到记忆库
-        self.on_pre_compress(messages, window)
 
         # 阶段 3:结构化摘要
         summary = self._generate_summary(window, focus_topic=focus_topic, allow_llm=allow_llm_summary)
@@ -515,16 +508,6 @@ class ContextCompressor(ContextEngine):
                     new_parts.append(part)
             result.append(replace(msg, parts=new_parts) if changed else msg)
         return result
-
-    # ── 抢救钩子 ────────────────────────────────────────────────────────
-    def on_pre_compress(self, messages: list[ModelMessage], window: list[ModelMessage]) -> None:
-        if self._pre_compress_callback is not None:
-            try:
-                self._pre_compress_callback(messages, window)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("on_pre_compress 抢救钩子失败:%s", exc)
-
-
 # ── 模块级辅助 ──────────────────────────────────────────────────────────
 def _message_text(msg: ModelMessage) -> str:
     chunks: list[str] = []
@@ -577,4 +560,4 @@ def _orphan_call_note(part: ToolCallPart) -> Any:
     return TextPart(content=f"[已折叠的工具调用:{part.tool_name} {args_text[:120]}]")
 
 
-__all__ = ["ContextCompressor", "SummaryFn", "PreCompressFn"]
+__all__ = ["ContextCompressor", "SummaryFn"]

@@ -793,7 +793,7 @@ class AgentService:
             session_id=actual_session_id,
             channel="local",
         )
-        compressor = self._get_context_compressor(actual_session_id, memory_scope)
+        compressor = self._get_context_compressor(actual_session_id)
         if compressor is None:
             return ChatResponse(output="上下文压缩未启用。", role=role, session_id=actual_session_id)
         if not compressor.has_content_to_compress(history):
@@ -837,8 +837,8 @@ class AgentService:
             session_id=actual_session_id,
         )
 
-    def _get_context_compressor(self, session_id: str, memory_scope: MemoryScope) -> Any:
-        """获取或构建会话级上下文压缩器(含 LLM 摘要器与记忆抢救钩子)。"""
+    def _get_context_compressor(self, session_id: str) -> Any:
+        """获取或构建会话级上下文压缩器(含 LLM 摘要器)。"""
         cached = self._context_compressors.get(session_id)
         if cached is not None:
             return cached
@@ -847,12 +847,8 @@ class AgentService:
             return None
         from openhachimi_agent.context.compressor import ContextCompressor
         from openhachimi_agent.context.summary import build_summarizer
-        from openhachimi_agent.memory.capture import capture_compressed_window
 
         summarizer = build_summarizer(self.config)
-
-        def _rescue(full_messages: list, window: list) -> None:
-            capture_compressed_window(self.config, memory_scope, full_messages, window)
 
         compressor = ContextCompressor(
             threshold_percent=cfg.threshold_percent,
@@ -866,7 +862,6 @@ class AgentService:
             context_length=cfg.context_length * 1000 if cfg.context_length else 0,
             abort_on_summary_failure=cfg.summary.abort_on_failure,
             summarizer=summarizer,
-            pre_compress_callback=_rescue,
         )
         # 让 token 计数用与实际模型匹配的 tiktoken encoding(gpt-4o 系 -> o200k_base,
         # gpt-4 系 -> cl100k_base;未知第三方模型名回退默认),提升压缩预检/边界精度。

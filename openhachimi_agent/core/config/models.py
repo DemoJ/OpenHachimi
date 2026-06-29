@@ -207,7 +207,6 @@ class ContextConfig:
     tail_token_budget: int = 20000
     anti_thrash: bool = True
     min_savings_pct: int = 10
-    rescue_to_memory: bool = True  # on_pre_compress 抢救丢弃窗口到记忆库
     # 模型上下文窗口大小,单位 K(128 表示 128K tokens)。用于计算压缩触发阈值。
     # 0 表示用内置默认(128K)。非 128K 的模型需手动填写真实窗口。
     context_length: int = 128

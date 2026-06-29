@@ -536,7 +536,6 @@ context:
   tail_token_budget: 20000
   anti_thrash: true
   min_savings_pct: 10
-  rescue_to_memory: true
   context_length: 128
 """
 
@@ -550,7 +549,7 @@ def _write_context_config(tmp_path, text=_CONTEXT_SAMPLE_YAML):
 def test_context_group_registered():
     assert "context" in SETTINGS_FIELD_GROUPS
     assert SETTINGS_FIELD_GROUPS["context"] is CONTEXT_FIELDS
-    assert len(CONTEXT_FIELDS) == 11  # enabled/engine/threshold/hard_ceiling/protect_first/protect_last/tail/anti_thrash/min_savings/rescue/length
+    assert len(CONTEXT_FIELDS) == 10  # enabled/engine/threshold/hard_ceiling/protect_first/protect_last/tail/anti_thrash/min_savings/length
 
 
 def test_context_threshold_is_float():
