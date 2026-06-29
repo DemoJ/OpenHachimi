@@ -111,6 +111,15 @@ export interface MessageItem {
   timestamp: string | null              // ISO-8601；user=收到时间，assistant=模型回复时间
   // 仅 assistant：本轮请求的 token 用量；旧会话 / 流式中尚未拿到 usage 时为 null
   tokens?: { input: number; output: number; total: number; cache_read?: number } | null
+  // 折叠占位条：非空时本条是「折叠条」而非真实消息。点击展开调
+  // fetchFoldedMessages 取回被压缩的原始消息。
+  fold?: {
+    compression_id: number
+    dropped_count: number
+    summary_excerpt: string
+    head_end_turn: number
+    tail_start_turn: number
+  } | null
 }
 
 export interface SessionMessagesResponse {
@@ -153,6 +162,16 @@ export function loadSession(role: string | null, session_id: string) {
 export function getSessionMessages(session_id: string, role?: string) {
   const q = role ? `?role=${encodeURIComponent(role)}` : ''
   return get<SessionMessagesResponse>(`/sessions/${encodeURIComponent(session_id)}/messages${q}`)
+}
+
+// 展开折叠占位条：取回某次压缩被折叠的原始消息（供前端内联渲染）。
+export function fetchFoldedMessages(session_id: string, compression_id: number, role?: string) {
+  const params: string[] = []
+  if (role) params.push(`role=${encodeURIComponent(role)}`)
+  const q = params.length ? `?${params.join('&')}` : ''
+  return get<SessionMessagesResponse>(
+    `/sessions/${encodeURIComponent(session_id)}/messages/folded/${compression_id}${q}`,
+  )
 }
 
 export function newSession(role?: string) {

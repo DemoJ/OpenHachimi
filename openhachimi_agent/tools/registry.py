@@ -16,7 +16,7 @@ from openhachimi_agent.tools.filesystem import find_files, list_files, read_file
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.skills import get_skill_instructions, list_skills, install_skill
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
-from openhachimi_agent.tools.research import research_next_queries, research_sources, web_search
+from openhachimi_agent.tools.research import web_search
 from openhachimi_agent.tools.scheduler import (
     create_delayed_task,
     create_scheduled_task,
@@ -36,6 +36,7 @@ from openhachimi_agent.tools.planning import create_todos, update_todo, get_todo
 from openhachimi_agent.tools.clarification import clarify_user
 from openhachimi_agent.tools.memory import forget_memory, list_memory, memory_stats, remember, search_memory
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
+from openhachimi_agent.tools.delegation import DELEGATE_TASK_TOOL
 from openhachimi_agent.agent.execution import with_execution_ledger
 
 _COMMAND_TOOLS = [
@@ -82,8 +83,6 @@ _OTHER_TOOLS = [
     web_fetch,
     discover_web_resources,
     web_search,
-    research_sources,
-    research_next_queries,
 ]
 
 _MEMORY_READ_TOOLS = [
@@ -216,7 +215,8 @@ EXECUTOR_TOOLSET = FunctionToolset(
     + _EXECUTION_FINAL_TOOLS
     + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL]
     + [with_execution_ledger(get_todos)]
-    + [with_execution_ledger(clarify_user)],
+    + [with_execution_ledger(clarify_user)]
+    + [DELEGATE_TASK_TOOL],  # 已在 delegation.py 包过 with_execution_ledger
     max_retries=3,
 )
 

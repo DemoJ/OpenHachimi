@@ -218,7 +218,7 @@ def asyncio_run(coro):
     return asyncio.run(coro)
 
 
-def test_rank_sources_merges_duplicate_urls_and_assigns_citations():
+def test_rank_sources_merges_duplicate_urls():
     results = [
         research_module.SearchResult("Docs", "https://docs.example.com/a?utm_source=x", "official docs", "duckduckgo", 1),
         research_module.SearchResult("Docs mirror", "https://docs.example.com/a", "same", "brave", 2),
@@ -227,7 +227,7 @@ def test_rank_sources_merges_duplicate_urls_and_assigns_citations():
 
     ranked = research_module._rank_sources("example docs", results, "tech", ResearchConfig())
 
-    assert ranked[0].citation_id == "S1"
+    # 去重:utm_source 被剥离后两条 docs URL 合并为一条,backends 含两个后端
     assert ranked[0].url.startswith("https://docs.example.com/a")
     assert set(ranked[0].backends) == {"duckduckgo", "brave"}
     assert any("搜索后端" in reason for reason in ranked[0].reasons)
@@ -240,6 +240,7 @@ async def test_web_search_formats_results_and_clamps_max_results(monkeypatch, tm
     async def fake_search_all(query, max_results, source_type, config):
         captured["query"] = query
         captured["max_results"] = max_results
+        captured["source_type"] = source_type
         return research_module.SearchRunResult(
             query=query,
             results=[research_module.SearchResult("Title", "https://example.com", "Snippet", "duckduckgo", 1)],
@@ -254,58 +255,25 @@ async def test_web_search_formats_results_and_clamps_max_results(monkeypatch, tm
     assert captured["max_results"] == 10
     assert "搜索 'hello' 共返回 1 条去重结果" in output
     assert "Title" in output
-    assert "research_sources" in output
+    # 原子搜索:不再输出引用编号/工作流包装
+    assert "[S1]" not in output
+    assert "Citation requirement" not in output
 
 
 @pytest.mark.asyncio
-async def test_research_sources_warns_when_independent_sources_are_insufficient(monkeypatch, tmp_path):
+async def test_web_search_supports_academic_source_type(monkeypatch, tmp_path):
+    """合并后 web_search 支持 academic source_type(原 research_sources 的能力)。"""
+    captured = {}
+
     async def fake_search_all(query, max_results, source_type, config):
+        captured["source_type"] = source_type
+        captured["query"] = query
         return research_module.SearchRunResult(
-            query=query,
-            results=[research_module.SearchResult("Only", "https://example.com/a", "Snippet", "duckduckgo", 1)],
-            backend_errors={"brave": "missing key"},
-            attempted_backends=["duckduckgo", "brave"],
+            query=query, results=[], backend_errors={}, attempted_backends=["duckduckgo"],
         )
 
     monkeypatch.setattr(research_module, "_search_all_backends", fake_search_all)
-    ctx = _ctx(tmp_path, ResearchConfig(enabled_backends=["duckduckgo", "brave"], min_independent_sources=3))
+    await research_module.web_search(_ctx(tmp_path), "transformer architecture", source_type="academic")
 
-    output = await research_module.research_sources(ctx, "topic", require_independent_sources=3)
-
-    assert "[S1]" in output
-    assert "Backends failed" in output
-    assert "[信息不足]" in output
-    assert "Citation requirement" in output
-
-
-@pytest.mark.asyncio
-async def test_research_next_queries_generates_followup_queries(tmp_path):
-    output = await research_module.research_next_queries(
-        _ctx(tmp_path),
-        "Python library API pricing news",
-        known_findings="",
-        cited_sources="[S1]",
-        max_queries=5,
-    )
-
-    assert "official" in output
-    assert "latest" in output
-    assert str(research_module.datetime.datetime.now().year) in output
-    assert "GitHub" in output or "github" in output
-    assert "独立来源" in output
-
-
-@pytest.mark.asyncio
-async def test_research_next_queries_uses_chinese_terms_for_chinese_question(tmp_path):
-    output = await research_module.research_next_queries(
-        _ctx(tmp_path),
-        "国内大模型价格 政策 新闻",
-        known_findings="",
-        cited_sources="",
-        max_queries=4,
-    )
-
-    assert "官方 原始来源" in output
-    assert "最新" in output
-    assert "数据 统计" in output
-    assert "批评 限制 风险" in output
+    assert captured["source_type"] == "academic"
+    assert "arxiv.org" in captured["query"] or "scholar.google.com" in captured["query"]

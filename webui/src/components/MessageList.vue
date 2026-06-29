@@ -1,16 +1,25 @@
 <template>
   <div class="messages-container" ref="containerRef">
     <div class="messages-list">
-      <MessageBubble
-        v-for="(m, idx) in messages"
-        :key="idx"
-        :role="m.role"
-        :content="m.content"
-        :prefix="m.prefix"
-        :timestamp="m.timestamp"
-        :tokens="m.tokens"
-        :streaming="isStreaming(idx)"
-      />
+      <template v-for="(m, idx) in messages" :key="idx">
+        <!-- 折叠占位条：压缩过的中间段不直接渲染原始消息，而是显示一张可展开卡片。
+             点击展开调 fetchFoldedMessages 取回被折叠的原始消息内联渲染。 -->
+        <FoldCard
+          v-if="m.fold"
+          :fold="m.fold"
+          :session-id="store.currentSessionId"
+          :role="store.currentRole"
+        />
+        <MessageBubble
+          v-else
+          :role="m.role"
+          :content="m.content"
+          :prefix="m.prefix"
+          :timestamp="m.timestamp"
+          :tokens="m.tokens"
+          :streaming="isStreaming(idx)"
+        />
+      </template>
       <!-- 空状态:脱离消息流,垂直水平居中于容器中央。
            hero 主标题 + 副标题,给出明确的起始指引,避免孤字飘在左上角。 -->
       <div v-if="messages.length === 0 && !generating" class="empty-hero">
@@ -38,6 +47,7 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, computed } from 'vue'
 import MessageBubble from './MessageBubble.vue'
+import FoldCard from './FoldCard.vue'
 import type { MessageItem } from '../api'
 import { useChatStore } from '../store'
 

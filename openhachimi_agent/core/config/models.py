@@ -132,6 +132,20 @@ class ResearchConfig:
 
 
 @dataclass(frozen=True)
+class DelegationConfig:
+    """子 agent 委派(delegate_task)的运行时约束。对齐 hermes delegation 配置语义。
+
+    所有字段都有默认值:旧 config.yaml 无 ``delegation:`` 段时不报错,沿用默认。
+    """
+
+    max_concurrent_children: int = 3       # 单次 delegate_task 并发子 agent 上限
+    max_spawn_depth: int = 1               # 委派树深度上限(1=扁平,leaf 不可再委派)
+    orchestrator_enabled: bool = True      # 全局开关;False 时 role=orchestrator 强制降为 leaf
+    max_iterations: int = 50               # 单个子 agent 的工具调用轮次上限
+    child_timeout_seconds: float = 0.0     # 单个子 agent 挂钟超时(0=不超时)
+
+
+@dataclass(frozen=True)
 class VisionConfig:
     enabled: bool = True
     fallback_enabled: bool = True
@@ -238,6 +252,7 @@ class AppConfig:
     vision: VisionConfig
     mcp: MCPConfig = field(default_factory=MCPConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    delegation: DelegationConfig = field(default_factory=DelegationConfig)
     http_api_token: str | None = None
     server_host: str = "127.0.0.1"   # HTTP 服务监听地址；127.0.0.1=仅本机，0.0.0.0=开放局域网/公网访问
     server_port: int = 8765           # HTTP 服务监听端口

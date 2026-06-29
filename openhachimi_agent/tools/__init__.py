@@ -10,7 +10,7 @@ from openhachimi_agent.tools.filesystem import find_files, list_files, read_file
 from openhachimi_agent.tools.git import git_diff, git_status
 from openhachimi_agent.tools.registry import WORKSPACE_TOOLSET, PLANNER_TOOLSET, EXECUTOR_TOOLSET, SCHEDULED_EXECUTOR_TOOLSET
 from openhachimi_agent.tools.web import discover_web_resources, web_fetch
-from openhachimi_agent.tools.research import research_next_queries, research_sources, web_search
+from openhachimi_agent.tools.research import web_search
 from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos
 from openhachimi_agent.tools.scheduler import (
     create_delayed_task,
@@ -47,8 +47,6 @@ __all__ = [
     "discover_web_resources",
     "web_fetch",
     "web_search",
-    "research_sources",
-    "research_next_queries",
     "browser_navigate",
     "browser_get_state",
     "browser_extract_content",

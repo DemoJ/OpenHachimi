@@ -172,6 +172,25 @@ class SessionStore:
                     state_json   TEXT NOT NULL,
                     updated_at   TEXT NOT NULL
                 );
+
+                -- 压缩元数据:原始消息永不删(session_messages append-only),压缩只记边界+摘要,
+                -- AI 运行时上下文(load_context)与前端展示按此表组装/折叠出视图。
+                -- 不变式:同一 session 内 compression_id 单调递增,load_context 只取最大一代。
+                CREATE TABLE IF NOT EXISTS session_compressions (
+                    role            TEXT NOT NULL,
+                    session_id      TEXT NOT NULL,
+                    compression_id  INTEGER NOT NULL,   -- 该会话内第几代压缩,从 1 递增
+                    created_at      TEXT NOT NULL,
+                    head_end_turn   INTEGER NOT NULL,   -- head 末尾(含)对应的 turn_index
+                    tail_start_turn INTEGER NOT NULL,   -- tail 起始(含)对应的 turn_index
+                    summary_turn    INTEGER NOT NULL,   -- summary 占位条插入位置的 turn_index
+                    summary_text    TEXT NOT NULL,      -- 结构化摘要全文
+                    PRIMARY KEY (role, session_id, compression_id),
+                    FOREIGN KEY (role, session_id)
+                        REFERENCES sessions(role, session_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_compressions_session
+                    ON session_compressions(role, session_id, compression_id DESC);
                 """
             )
 
@@ -350,6 +369,33 @@ class SessionStore:
         )
         return resolved_sid, messages
 
+    def _load_message_rows(
+        self, role: str, session_id: str
+    ) -> list[tuple[int, ModelMessage]]:
+        """按 turn_index 升序返回 ``[(turn_index, ModelMessage), ...]``。
+
+        供展示层折叠渲染用 —— 需要逐条的 turn_index 来判定是否落入某次压缩的折叠区间,
+        ``load_messages`` 丢弃了 turn_index,故单列此方法。每条独立 validate(展示路径,
+        条数通常有限,可接受)。
+        """
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT turn_index, message_json FROM session_messages "
+                "WHERE role=? AND session_id=? ORDER BY turn_index",
+                (safe_role, safe_sid),
+            ).fetchall()
+        result: list[tuple[int, ModelMessage]] = []
+        for r in rows:
+            msg = ModelMessagesTypeAdapter.validate_json(
+                b"[" + r["message_json"].encode("utf-8") + b"]"
+            )
+            if msg:
+                result.append((int(r["turn_index"]), msg[0]))
+        return result
+
+
     def save_messages(
         self,
         role: str,
@@ -359,12 +405,18 @@ class SessionStore:
         scope: str | None = None,
         channel: str | None = None,
         scope_key: str | None = None,
-    ) -> None:
-        """全量重写一段会话的消息历史 + 更新指针 / 渠道元数据。
+        append: bool = True,
+    ) -> int:
+        """追加写入会话消息历史 + 更新指针 / 渠道元数据,返回本次写入的起始 turn_index。
 
-        实现采用 ``DELETE + INSERT`` —— 与"每轮把整段 history 写盘"的旧语义
-        逐字节对齐,且 SQLite 端 ``BEGIN IMMEDIATE`` 防止与 ``compress_session``
-        竞写。渠道列首写定终身(``INSERT OR IGNORE``),后续调用不覆盖。
+        实现采用 ``append-only`` —— 原始消息一旦写入永不删除。turn_index 从
+        ``MAX(turn_index)+1`` 起续编(空表从 0 起),用 ``INSERT OR IGNORE`` 按主键
+        ``(role, session_id, turn_index)`` 去重,保证幂等可重入。``append=False``
+        兼容旧的「全量覆盖」语义(DELETE+从 0 重编),仅压缩链重建等极端路径用,
+        正常 turn/压缩均走 append。
+
+        与 ``compress_session`` 竞写由应用层 per-session asyncio.Lock 保证;SQLite 端
+        ``BEGIN IMMEDIATE`` 兜底。渠道列首写定终身(``INSERT OR IGNORE``),后续不覆盖。
         """
         safe_role = validate_role_name(role)
         safe_sid = validate_session_id(session_id, allow_legacy=False)
@@ -406,20 +458,31 @@ class SessionStore:
                 "UPDATE sessions SET updated_at=? WHERE role=? AND session_id=?",
                 (now, safe_role, safe_sid),
             )
-            conn.execute(
-                "DELETE FROM session_messages WHERE role=? AND session_id=?",
-                (safe_role, safe_sid),
-            )
+            if not append:
+                # 兼容旧「全量覆盖」语义:先清空,从 0 重编。仅极端路径用。
+                conn.execute(
+                    "DELETE FROM session_messages WHERE role=? AND session_id=?",
+                    (safe_role, safe_sid),
+                )
+                base_turn = 0
+            else:
+                # append-only:续编。MAX(turn_index) 为空(NULL)时取 -1,首条从 0 起。
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(turn_index), -1) FROM session_messages "
+                    "WHERE role=? AND session_id=?",
+                    (safe_role, safe_sid),
+                ).fetchone()
+                base_turn = int(row[0]) + 1
             if arr:
                 conn.executemany(
-                    "INSERT INTO session_messages "
+                    "INSERT OR IGNORE INTO session_messages "
                     "(role, session_id, turn_index, kind, message_json, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     [
                         (
                             safe_role,
                             safe_sid,
-                            idx,
+                            base_turn + idx,
                             str(msg_obj.get("kind", "")) if isinstance(msg_obj, dict) else "",
                             json.dumps(msg_obj, ensure_ascii=False),
                             now,
@@ -439,9 +502,207 @@ class SessionStore:
             )
 
         logger.debug(
-            "message history saved role=%s session_id=%s messages=%d scope=%s channel=%s",
-            safe_role, safe_sid, len(arr), safe_scope or None, channel,
+            "message history saved role=%s session_id=%s messages=%d start_turn=%d append=%s scope=%s channel=%s",
+            safe_role, safe_sid, len(arr), base_turn, append, safe_scope or None, channel,
         )
+        return base_turn
+
+    def current_turn_count(self, role: str, session_id: str) -> int:
+        """返回当前已落库消息条数(``MAX(turn_index)+1``),供调用方推导「本轮新增起点」。
+
+        append-only 语义下,这是判定「下一轮 save 从哪个 turn_index 起编」、以及
+        ``_stamp_turn_metadata`` 的 prev_len 的权威来源 —— 避免误用压缩视图长度
+        (视图因折叠中间窗口而短于落库行数)。
+        """
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(turn_index), -1) FROM session_messages "
+                "WHERE role=? AND session_id=?",
+                (safe_role, safe_sid),
+            ).fetchone()
+        return int(row[0]) + 1
+
+    # ── 压缩元数据 ────────────────────────────────────────────────────────
+    # 原始消息永不删(session_messages append-only),压缩只在此表记边界+摘要。
+    # load_context 据此组装 head+summary+tail 视图喂模型;get_session_messages
+    # 据此在前端折叠出占位条。详见 plans/fancy-watching-taco.md 方案 A。
+
+    def _latest_compression(
+        self, conn: sqlite3.Connection, role: str, session_id: str
+    ) -> sqlite3.Row | None:
+        """取该会话最新一代压缩元数据(compression_id 最大)。无则 None。"""
+        return conn.execute(
+            "SELECT * FROM session_compressions "
+            "WHERE role=? AND session_id=? "
+            "ORDER BY compression_id DESC LIMIT 1",
+            (role, session_id),
+        ).fetchone()
+
+    def list_compressions(
+        self, role: str, session_id: str
+    ) -> list[dict]:
+        """列出某会话的全部压缩元数据(按 compression_id 升序),供前端折叠渲染。"""
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT compression_id, created_at, head_end_turn, tail_start_turn, "
+                "       summary_turn, summary_text "
+                "FROM session_compressions WHERE role=? AND session_id=? "
+                "ORDER BY compression_id",
+                (safe_role, safe_sid),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_compression(
+        self,
+        role: str,
+        session_id: str,
+        head_end_turn: int,
+        tail_start_turn: int,
+        summary: str,
+        *,
+        total_len: int,
+    ) -> int:
+        """记录一次压缩的边界与摘要,返回本次 compression_id。
+
+        ``head_end_turn`` / ``tail_start_turn`` 是 ``session_messages`` 的全局
+        turn_index(含),由调用方保证:compress 作用于「按 turn_index 升序的完整原始
+        序列」时,内存下标即 turn_index。``summary_turn = head_end_turn + 1``。
+        ``total_len`` 是该完整序列长度,用于 sanity 校验 tail_start_turn 不越界。
+        """
+        if not summary:
+            raise ValueError("record_compression 要求非空 summary")
+        if not (0 <= head_end_turn < tail_start_turn <= total_len):
+            raise ValueError(
+                f"压缩边界非法 head_end_turn={head_end_turn} tail_start_turn={tail_start_turn} "
+                f"total_len={total_len}"
+            )
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(compression_id), 0) FROM session_compressions "
+                "WHERE role=? AND session_id=?",
+                (safe_role, safe_sid),
+            ).fetchone()
+            next_id = int(row[0]) + 1
+            conn.execute(
+                "INSERT INTO session_compressions "
+                "(role, session_id, compression_id, created_at, "
+                " head_end_turn, tail_start_turn, summary_turn, summary_text) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    safe_role, safe_sid, next_id, now,
+                    head_end_turn, tail_start_turn, head_end_turn + 1, summary,
+                ),
+            )
+        logger.info(
+            "compression recorded role=%s session_id=%s compression_id=%d head_end=%d tail_start=%d",
+            safe_role, safe_sid, next_id, head_end_turn, tail_start_turn,
+        )
+        return next_id
+
+    def get_folded_messages(
+        self, role: str, session_id: str, compression_id: int
+    ) -> list[ModelMessage]:
+        """取某次压缩被折叠的原始消息(head_end_turn+1 .. tail_start_turn-1),供前端展开。"""
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        with self._connect() as conn:
+            comp = conn.execute(
+                "SELECT head_end_turn, tail_start_turn FROM session_compressions "
+                "WHERE role=? AND session_id=? AND compression_id=?",
+                (safe_role, safe_sid, compression_id),
+            ).fetchone()
+            if comp is None:
+                return []
+            rows = conn.execute(
+                "SELECT message_json FROM session_messages "
+                "WHERE role=? AND session_id=? "
+                "  AND turn_index > ? AND turn_index < ? "
+                "ORDER BY turn_index",
+                (safe_role, safe_sid, comp["head_end_turn"], comp["tail_start_turn"]),
+            ).fetchall()
+        if not rows:
+            return []
+        arr_json = b"[" + b",".join(
+            r["message_json"].encode("utf-8") for r in rows
+        ) + b"]"
+        return list(ModelMessagesTypeAdapter.validate_json(arr_json))
+
+    def load_context(
+        self,
+        role: str,
+        session_id: str | None = None,
+        scope: str | None = None,
+    ) -> tuple[str, list[ModelMessage]]:
+        """加载 AI 运行时上下文视图:head + summary + tail。
+
+        若无压缩元数据,等价于 ``load_messages``。有则按最新一代的边界取 head/tail 两段,
+        中间用 summary 占位(运行时组装,不落库)。具体组装逻辑在
+        ``context.context_view.assemble_runtime_context``。
+
+        **append-only 不变式**:返回的视图长度 ≤ 完整原始序列长度(中间折叠区间不进视图)。
+        调用方(如 ``turn.py`` 的元数据盖章)若需"本轮新增消息起点",应直接从
+        ``session_messages.MAX(turn_index)+1`` 推导(见 ``current_turn_count``),
+        而非用 ``len(view)``,否则多代压缩下视图长度会小于落库行数导致差量误判。
+        """
+        from openhachimi_agent.context.context_view import assemble_runtime_context
+
+        safe_role = validate_role_name(role)
+        if session_id:
+            resolved_sid = validate_session_id(session_id, allow_legacy=False)
+        else:
+            resolved_sid = self.get_latest_session_id(safe_role, scope) or _new_session_id()
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT message_json FROM session_messages "
+                "WHERE role=? AND session_id=? ORDER BY turn_index",
+                (safe_role, resolved_sid),
+            ).fetchall()
+            comp = self._latest_compression(conn, safe_role, resolved_sid) if rows else None
+
+        if not rows:
+            logger.info(
+                "message history empty role=%s session_id=%s", safe_role, resolved_sid
+            )
+            return resolved_sid, []
+        if comp is None:
+            arr_json = b"[" + b",".join(
+                r["message_json"].encode("utf-8") for r in rows
+            ) + b"]"
+            messages = list(ModelMessagesTypeAdapter.validate_json(arr_json))
+            logger.info(
+                "context loaded(no compression) role=%s session_id=%s messages=%d",
+                safe_role, resolved_sid, len(messages),
+            )
+            return resolved_sid, messages
+
+        # 有压缩:取 head[0..head_end_turn] + tail[tail_start_turn..],中间折叠。
+        head_rows = rows[: comp["head_end_turn"] + 1]
+        tail_rows = rows[comp["tail_start_turn"]:]
+        head_json = b"[" + b",".join(
+            r["message_json"].encode("utf-8") for r in head_rows
+        ) + b"]"
+        tail_json = b"[" + b",".join(
+            r["message_json"].encode("utf-8") for r in tail_rows
+        ) + b"]"
+        head = list(ModelMessagesTypeAdapter.validate_json(head_json)) if head_rows else []
+        tail = list(ModelMessagesTypeAdapter.validate_json(tail_json)) if tail_rows else []
+        context = assemble_runtime_context(head, tail, comp["summary_text"])
+        logger.info(
+            "context loaded(compressed id=%d) role=%s session_id=%s head=%d tail=%d view=%d",
+            comp["compression_id"], safe_role, resolved_sid, len(head), len(tail), len(context),
+        )
+        return resolved_sid, context
+
+
 
     # ── 列表 ─────────────────────────────────────────────────────────────
 

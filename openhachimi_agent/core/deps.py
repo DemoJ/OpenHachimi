@@ -24,6 +24,17 @@ class AgentDeps:
     role_name: str = ""
     channel_context: dict[str, Any] = field(default_factory=dict)
     scheduler_context: dict[str, Any] = field(default_factory=dict)
+    # 子 agent 委派(delegate_task)所需的运行时挂载点,由 turn.py 注入。
+    # 哲学对齐 hermes:子 agent 全新会话、零记忆、独立预算(见 agent/subagents.py)。
+    # - subagent_agent:复用的子 agent 实例(走 service._get_agent 的 mtime 热重载缓存),
+    #   运行时按 toolsets 参数临时裁剪工具集传入 child.run(..., toolsets=[...])。
+    # - subagent_registry:SubagentRegistry,记录运行中的子 agent task 供中断传播。
+    # - delegate_depth:当前 agent 在委派树中的深度;根 agent 为 0,每次委派 +1,
+    #   超 config.delegation.max_spawn_depth 时拒绝再委派。
+    # 三者默认 None/0:不注入时(scheduled_executor / 单测)无委派能力,但向后兼容。
+    subagent_agent: Any = None
+    subagent_registry: Any = None
+    delegate_depth: int = 0
 
     @property
     def role_or_default(self) -> str:

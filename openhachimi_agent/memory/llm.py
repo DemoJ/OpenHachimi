@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -67,7 +68,16 @@ def run_memory_extraction(
     system_prompt: str,
     payload: dict[str, Any],
 ) -> MemoryExtractionOutput | None:
-    """Run structured long-term memory extraction through pydantic_ai."""
+    """Run structured long-term memory extraction through pydantic_ai.
+
+    本函数是**同步**接口,由 ``turn.py`` 经 ``asyncio.to_thread`` 放到工作线程
+    里调用。用 ``asyncio.run`` 而非 ``agent.run_sync``:后者内部用
+    ``get_event_loop().run_until_complete(...)``,在工作线程里会创建并 ``set``
+    一个**不关闭**的事件循环,跨 ``to_thread`` 调用残留,导致退出时
+    Windows Proactor pipe transport 未清理(``OverlappedFuture 句柄无效``)
+    及 ``coroutine 'AbstractAgent.run' was never awaited``。``asyncio.run``
+    每次创建并**关闭**临时循环,彻底清理 transport,杜绝泄漏。
+    """
     if not _memory_llm_available(config):
         return None
     assert config is not None
@@ -79,7 +89,7 @@ def run_memory_extraction(
         retries=3,
     )
     try:
-        result = agent.run_sync(json.dumps(payload, ensure_ascii=False))
+        result = asyncio.run(agent.run(json.dumps(payload, ensure_ascii=False)))
         return result.output
     except Exception as exc:
         logger.debug("memory llm extraction agent degraded: %s", exc)
@@ -104,7 +114,7 @@ def run_memory_summary(
         retries=3,
     )
     try:
-        result = agent.run_sync(json.dumps(payload, ensure_ascii=False))
+        result = asyncio.run(agent.run(json.dumps(payload, ensure_ascii=False)))
         return result.output
     except Exception as exc:
         logger.debug("memory llm summary agent degraded: %s", exc)

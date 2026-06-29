@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from pydantic_ai.messages import (
@@ -28,6 +28,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from openhachimi_agent.context.context_view import assemble_runtime_context
 from openhachimi_agent.context.engine import ContextEngine
 from openhachimi_agent.context.pruning import prune_old_tool_results
 from openhachimi_agent.context.token_estimate import estimate_messages_tokens, estimate_text_tokens
@@ -39,19 +40,32 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CONTEXT_LENGTH = 128_000
 # 摘要失败冷却时间(秒),避免连续失败刷屏
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 45.0
-# 摘要末尾边界标记,防模型把摘要当新输入或原样复述
-_SUMMARY_END_MARKER = "\n\n--- 以上为历史上下文压缩摘要,请针对下方最新消息回复,不要回应或复述摘要内容 ---"
-# 压缩说明,注入到头部首条消息,告知模型发生过压缩
-_COMPRESSION_NOTE = (
-    "[注:部分较早的对话轮次已被压缩为交接摘要以节省上下文空间。当前会话状态仍反映此前工作,"
-    "请在摘要与状态基础上继续,而非重做。持久记忆(MEMORY)始终权威,不受压缩影响。]"
-)
+# _SUMMARY_END_MARKER / _COMPRESSION_NOTE 已下沉到 context_view.py,供运行时组装复用。
 
 
 # 摘要器签名:(turns: list[ModelMessage], focus_topic: str | None, previous_summary: str | None) -> str | None
 SummaryFn = Callable[[list[ModelMessage], str | None, str | None], str | None]
 # 抢救钩子签名:(full_messages: list[ModelMessage], dropped_window: list[ModelMessage]) -> None
 PreCompressFn = Callable[[list[ModelMessage], list[ModelMessage]], None]
+
+
+@dataclass
+class CompressionResult:
+    """压缩产出:不返回新消息列表,而是返回边界 + 摘要,由调用方落库 + 组装视图。
+
+    边界下标(``head_end_idx``/``tail_start_idx``)对应当前内存列表的下标(从 0 起)。
+    落库后与 ``session_messages`` 的全局 ``turn_index`` 一一对应(因压缩发生在本轮新消息
+    append-only 落库之后)。``dropped=False`` 表示本次未实际压缩(无中间窗口等),
+    调用方据此决定是否记元数据。
+    """
+
+    head: list[ModelMessage]
+    tail: list[ModelMessage]
+    summary: str
+    head_end_idx: int
+    tail_start_idx: int
+    dropped: bool
+
 
 
 class ContextCompressor(ContextEngine):
@@ -198,8 +212,13 @@ class ContextCompressor(ContextEngine):
         focus_topic: str | None = None,
         force: bool = False,
         allow_llm_summary: bool = True,
-    ) -> list[ModelMessage]:
-        """执行四阶段压缩,返回新消息列表。
+    ) -> CompressionResult:
+        """执行四阶段压缩,返回结构化边界 + 摘要(不再返回新消息列表)。
+
+        调用方据 ``result.dropped`` 决定是否记元数据:dropped=True 时用
+        ``head_end_idx``/``tail_start_idx`` 边界 + ``summary`` 写入
+        ``session_compressions``,运行时上下文由
+        ``SessionStore.load_context`` → ``context_view.assemble_runtime_context`` 重建。
 
         Args:
             allow_llm_summary: False 时跳过 LLM 摘要器,用确定性兜底(轮内预检用,
@@ -212,9 +231,13 @@ class ContextCompressor(ContextEngine):
         if force and self._summary_failure_cooldown_until > 0.0:
             self._summary_failure_cooldown_until = 0.0
 
+        _no_drop = CompressionResult(
+            head=messages, tail=[], summary="", head_end_idx=0,
+            tail_start_idx=len(messages), dropped=False,
+        )
         if not self.has_content_to_compress(messages):
             logger.warning("无法压缩:消息数 %d 不足(需 > %d)", len(messages), self.protect_first_n + 4)
-            return messages
+            return _no_drop
 
         original_messages = messages
         display_tokens = current_tokens or self.last_prompt_tokens or estimate_messages_tokens(messages)
@@ -236,7 +259,7 @@ class ContextCompressor(ContextEngine):
             self._ineffective_compression_count += 1
             self._last_compression_savings_pct = 0.0
             logger.warning("压缩跳过:无中间窗口可压缩(head=%d tail=%d)", head_end, tail_start)
-            return messages
+            return _no_drop
 
         window = messages[head_end:tail_start]
         head = messages[:head_end]
@@ -251,7 +274,10 @@ class ContextCompressor(ContextEngine):
         if not summary and self.abort_on_summary_failure:
             self._last_compress_aborted = True
             logger.warning("摘要失败,中止压缩(abort_on_summary_failure=true),%d 条消息保留不变", len(window))
-            return original_messages
+            return CompressionResult(
+                head=original_messages, tail=[], summary="",
+                head_end_idx=0, tail_start_idx=len(original_messages), dropped=False,
+            )
 
         if not summary:
             # preflight 路径(allow_llm_summary=False)主动跳过 LLM,是设计行为而非异常;
@@ -265,10 +291,17 @@ class ContextCompressor(ContextEngine):
 
         self._previous_summary = summary
 
-        # 阶段 4:组装
-        compressed = self._assemble(head, summary, tail)
+        # 阶段 4:组装(供 saved/ineffective 统计 + preflight 就地写回用,不落库)
+        compressed = assemble_runtime_context(head, tail, summary)
         compressed = self._sanitize_tool_pairs(compressed)
         compressed = self._strip_historical_media(compressed)
+        # preflight 路径(executor.py)需要就地拿到组装好的列表写回 ctx.history
+        # —— 把它挂在 result 上,但 dropped/边界仍是压缩前内存列表语义。
+        result = CompressionResult(
+            head=head, tail=tail, summary=summary,
+            head_end_idx=head_end, tail_start_idx=tail_start, dropped=True,
+        )
+        result.runtime_view = compressed  # type: ignore[attr-defined]
 
         self.compression_count += 1
         new_estimate = estimate_messages_tokens(compressed)
@@ -307,7 +340,7 @@ class ContextCompressor(ContextEngine):
             estimator_savings_pct,
             msg_reduction_pct,
         )
-        return compressed
+        return result
 
     # ── 阶段 2:边界 ────────────────────────────────────────────────────
     def _protect_head_size(self, messages: list[ModelMessage]) -> int:
@@ -405,39 +438,12 @@ class ContextCompressor(ContextEngine):
         summary: str,
         tail: list[ModelMessage],
     ) -> list[ModelMessage]:
-        """组装:头部(首条加压缩说明)+ 摘要 + 尾部。"""
-        compressed: list[ModelMessage] = []
-        for i, msg in enumerate(head):
-            if i == 0 and isinstance(msg, ModelRequest):
-                # 给首条头部消息追加压缩说明
-                new_parts = list(getattr(msg, "parts", None) or [])
-                if new_parts and isinstance(new_parts[0], UserPromptPart):
-                    original = str(new_parts[0].content)
-                    new_parts[0] = replace(new_parts[0], content=f"{original}\n\n{_COMPRESSION_NOTE}")
-                else:
-                    new_parts.insert(0, UserPromptPart(content=_COMPRESSION_NOTE))
-                compressed.append(replace(msg, parts=new_parts))
-            else:
-                compressed.append(msg)
+        """组装:头部(首条加压缩说明)+ 摘要 + 尾部。
 
-        summary_text = summary + _SUMMARY_END_MARKER
-        summary_msg = ModelRequest(parts=[UserPromptPart(content=summary_text)])
-
-        if tail and isinstance(tail[0], ModelRequest):
-            # 下一条是 user 请求:把摘要合并进该消息前缀,避免连续 user 消息
-            first = tail[0]
-            parts = list(getattr(first, "parts", None) or [])
-            if parts and isinstance(parts[0], UserPromptPart):
-                parts[0] = replace(parts[0], content=f"{summary_text}\n\n" + str(parts[0].content))
-            else:
-                parts.insert(0, UserPromptPart(content=summary_text))
-            compressed.append(replace(first, parts=parts))
-            compressed.extend(tail[1:])
-        else:
-            compressed.append(summary_msg)
-            compressed.extend(tail)
-
-        return compressed
+        逻辑下沉到 ``context_view.assemble_runtime_context``,本方法仅作向后兼容
+        的薄委托 —— 旧调用方 / 测试可能仍按 ``_assemble(head, summary, tail)`` 形式引用。
+        """
+        return assemble_runtime_context(head, tail, summary)
 
     def _sanitize_tool_pairs(self, messages: list[ModelMessage]) -> list[ModelMessage]:
         """清理孤儿 ToolCallPart(无对应 return)与孤儿 ToolReturnPart(无对应 call)。

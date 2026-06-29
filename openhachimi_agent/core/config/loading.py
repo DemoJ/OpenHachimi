@@ -27,6 +27,7 @@ from openhachimi_agent.core.config.models import (
     USER_DIR_NAME,
     ContextConfig,
     ContextSummaryConfig,
+    DelegationConfig,
     MCPConfig,
     MCPServerConfig,
     MemoryCaptureConfig,
@@ -312,6 +313,19 @@ def _load_research_config(raw_config: dict[str, Any]) -> ResearchConfig:
     )
 
 
+def _load_delegation_config(raw_config: dict[str, Any]) -> DelegationConfig:
+    """从 ``delegation:`` 段读取子 agent 委派约束;缺段时全默认。"""
+    delegation_config = _as_mapping(raw_config.get("delegation"), "delegation")
+    return DelegationConfig(
+        max_concurrent_children=max(1, _config_int(delegation_config, "max_concurrent_children", 3)),
+        # depth 1=扁平(leaf 不可再委派);允许 1~3,低于 1 强制 1。
+        max_spawn_depth=min(3, max(1, _config_int(delegation_config, "max_spawn_depth", 1))),
+        orchestrator_enabled=_config_bool(delegation_config, "orchestrator_enabled", True),
+        max_iterations=max(1, _config_int(delegation_config, "max_iterations", 50)),
+        child_timeout_seconds=max(0.0, float(_config_int(delegation_config, "child_timeout_seconds", 0) or 0)),
+    )
+
+
 def _load_vision_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) -> VisionConfig:
     vision_config = _as_mapping(raw_config.get("vision"), "vision")
     # vision.prompt 已废弃;legacy 迁移由 migrate_legacy_vision_prompt 在 load_config 末段处理,
@@ -492,6 +506,7 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
         vision=_load_vision_config(raw_config, llm_config),
         mcp=_load_mcp_config(user_dir),
         context=_load_context_config(raw_config, llm_config),
+        delegation=_load_delegation_config(raw_config),
     )
 
     # 提示词覆盖机制:启动期注入 user 目录,使 load_system_prompt 优先读 user/system_prompts/。

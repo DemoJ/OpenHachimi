@@ -5,8 +5,6 @@ def test_heuristic_is_conservative_fallback():
     """Heuristic 兜底不做精确分类，只做风险识别。"""
     decision = classify_intent_heuristic("帮我重构这个项目的执行模块并补测试")
 
-    # 兜底模式不精确分类 task_kind
-    assert decision.task_kind == "unknown"
     # 兜底默认 simple + 不需要规划，让 Executor 自主决策
     assert decision.requires_plan is False
 
@@ -32,7 +30,6 @@ def test_coerce_task_frame_supplements_url_entities():
         {
             "user_request": "请打开 https://example.com/a",
             "goal": "搜索 example 相关页面",
-            "task_kind": "research",
             "complexity": "complex",
             "risk": "low",
             "confidence": 0.9,
@@ -44,7 +41,6 @@ def test_coerce_task_frame_supplements_url_entities():
     )
 
     # complex 判断不被覆盖
-    assert frame.task_kind == "research"
     assert frame.complexity == "complex"
     assert frame.requires_plan is True
     # 但 URL 仍然被补充到 target_entities 中
@@ -57,7 +53,6 @@ def test_coerce_task_frame_does_not_duplicate_existing_urls():
         {
             "user_request": "请打开 https://example.com/a",
             "goal": "打开页面",
-            "task_kind": "browser",
             "complexity": "simple",
             "risk": "low",
             "confidence": 0.9,
@@ -96,7 +91,6 @@ def test_relevant_skills_field_is_dropped_from_legacy_payload():
         {
             "user_request": "用 demo skill 处理",
             "goal": "用 demo skill 处理",
-            "task_kind": "file_ops",
             "complexity": "simple",
             "risk": "low",
             "confidence": 0.8,
@@ -121,7 +115,6 @@ def test_legacy_skill_direct_execution_mode_downgraded_to_direct():
         {
             "user_request": "demo",
             "goal": "demo",
-            "task_kind": "qa",
             "complexity": "simple",
             "risk": "low",
             "confidence": 0.8,
@@ -142,7 +135,6 @@ def test_simple_low_risk_router_plan_is_normalized_to_direct():
         {
             "user_request": "帮我改一下 README 里的错别字",
             "goal": "修正 README 错别字",
-            "task_kind": "file_ops",
             "complexity": "simple",
             "risk": "low",
             "confidence": 0.8,
@@ -174,7 +166,6 @@ def test_coerce_task_frame_adds_install_skill_invariant_for_skill_update_url():
         {
             "user_request": f"请更新我本地已安装的 product-manager-suite skill 到最新版本，仓库地址是：{url}",
             "goal": "更新 product-manager-suite skill",
-            "task_kind": "unknown",
             "complexity": "simple",
             "risk": "low",
             "confidence": 0.8,
@@ -197,7 +188,6 @@ def test_coerce_task_frame_does_not_add_skill_invariant_for_regular_npx_command(
         {
             "user_request": "用 npx vite build 打包项目",
             "goal": "打包项目",
-            "task_kind": "shell",
             "complexity": "simple",
             "risk": "low",
             "confidence": 0.8,

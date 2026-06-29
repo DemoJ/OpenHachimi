@@ -2,8 +2,6 @@
 的按需注入回归测试。
 
 重点覆盖:
-- "信息检索原则" 块:闲聊不注入,research task_kind 命中时注入;工作区是否装了
-  网搜/研究类 skill **不**再影响这块(skill 自身的 SKILL.md 去承载相关约束)。
 - executor 专用动态段:TODO 接力 / direct-mode / 技能索引按本轮 session 状态触发。
 """
 
@@ -23,7 +21,6 @@ from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.planning import TodoState, TodoTask
 
 
-_WEB_SEARCH_HEADING = "信息检索原则"
 _TODO_HANDOFF_HEADING = "执行接力规则"
 _DIRECT_MODE_HEADING = "直接执行模式"
 _SKILLS_INDEX_HEADING = "Skills（可用技能索引）"
@@ -84,19 +81,7 @@ def _config_with_skills_dir(mock_config, skills_dir: Path):
     return dataclasses.replace(mock_config, skills_dirs=[skills_dir])
 
 
-# ── base.md / web_search_rules.md 模板存在性 ─────────────────────────────────
-
-
-def test_base_prompt_no_longer_contains_retrieval_section():
-    """base.md 不应再包含'信息检索原则'——已迁到 runtime/web_search_rules。"""
-    base_text = load_system_prompt("base")
-    assert _WEB_SEARCH_HEADING not in base_text
-
-
-def test_web_search_rules_template_loads():
-    """运行时模板必须存在,渲染后含完整标题。"""
-    text = load_system_prompt("runtime/web_search_rules")
-    assert _WEB_SEARCH_HEADING in text
+# ── 模板存在性 ─────────────────────────────────
 
 
 def test_skills_index_template_loads():
@@ -104,150 +89,6 @@ def test_skills_index_template_loads():
     text = load_system_prompt("runtime/skills_index")
     assert _SKILLS_INDEX_HEADING in text
     assert "{{ skills_catalog }}" in text
-
-
-# ── 信息检索原则:渐进披露后由 task_kind + 工作区是否有网搜技能驱动 ───────
-
-
-def test_idle_chat_does_not_inject_web_search_rules(mock_config):
-    """闲聊('你好'之类):task_kind=unknown 且工作区无 skill → 不注入。"""
-    deps = _make_deps(
-        mock_config,
-        task_frame={
-            "task_kind": "unknown",
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
-    )
-    block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING not in block
-
-
-def test_qa_simple_does_not_inject_web_search_rules(mock_config):
-    """简单 QA('今天几号'):普通 qa 也不应注入。"""
-    deps = _make_deps(
-        mock_config,
-        task_frame={
-            "task_kind": "qa",
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
-    )
-    block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING not in block
-
-
-def test_research_task_kind_injects_web_search_rules(mock_config):
-    """task_kind=research 必须注入(即使工作区无 skill)。"""
-    deps = _make_deps(
-        mock_config,
-        task_frame={
-            "task_kind": "research",
-            "complexity": "complex",
-            "risk": "low",
-            "requires_plan": True,
-            "execution_mode": "planned",
-        },
-    )
-    block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING in block
-
-
-def test_investigation_task_kind_injects_web_search_rules(mock_config):
-    """router 偶发输出 'investigation' 也应触发(兼容兜底)。"""
-    deps = _make_deps(
-        mock_config,
-        task_frame={
-            "task_kind": "investigation",
-            "complexity": "complex",
-            "risk": "low",
-            "requires_plan": True,
-            "execution_mode": "planned",
-        },
-    )
-    block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING in block
-
-
-def test_workspace_web_search_skill_does_not_inject_rules(mock_config, tmp_path):
-    """工作区装了网搜类技能但本轮 task_kind != research → **不**应注入。
-
-    历史回归:旧实现会扫 SKILL.md 的 name/description/when_to_use,只要装了
-    deep-research 之类的 skill 就强制注入"信息检索原则",导致"你好"这类闲聊
-    也被污染。现在只看本轮意图,skill 自身的 SKILL.md 内部去承载相应约束。
-    """
-    skills_dir = tmp_path / "skills_root"
-    _write_skill(
-        skills_dir,
-        name="deep-research",
-        description="Multi-source web research with adversarial verification.",
-        when_to_use="When the user wants a fact-checked research report.",
-    )
-    cfg = _config_with_skills_dir(mock_config, skills_dir)
-    deps = _make_deps(
-        cfg,
-        task_frame={
-            "task_kind": "qa",
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
-    )
-    block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING not in block
-
-
-def test_workspace_chinese_search_skill_does_not_inject_rules(mock_config, tmp_path):
-    """中文描述含'搜索/检索'的技能在闲聊场景下也**不**应触发(回归用例)。"""
-    skills_dir = tmp_path / "skills_root"
-    _write_skill(
-        skills_dir,
-        name="zh-search",
-        description="对外网内容做信息检索与摘要。",
-        when_to_use="用户需要查询外部资料或最新资讯时使用。",
-    )
-    cfg = _config_with_skills_dir(mock_config, skills_dir)
-    deps = _make_deps(
-        cfg,
-        task_frame={
-            "task_kind": "qa",
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
-    )
-    block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING not in block
-
-
-def test_workspace_irrelevant_skill_does_not_inject_rules(mock_config, tmp_path):
-    """工作区里只有本地代码类技能,task_kind 又不是研究 → 不注入。"""
-    skills_dir = tmp_path / "skills_root"
-    _write_skill(
-        skills_dir,
-        name="code-formatter",
-        description="格式化本地源码文件,统一缩进与引号。",
-        when_to_use="用户希望对本地代码进行格式化或风格统一时使用。",
-    )
-    cfg = _config_with_skills_dir(mock_config, skills_dir)
-    deps = _make_deps(
-        cfg,
-        task_frame={
-            "task_kind": "code_change",
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
-    )
-    block = build_system_dynamic_block(deps)
-    assert _WEB_SEARCH_HEADING not in block
 
 
 # ── build_system_dynamic_block 兜底 ─────────────────────────────────────────
@@ -275,7 +116,9 @@ def test_executor_md_core_keeps_tool_specific_rules():
     assert "install_skill" in text
     assert "create_delayed_task" in text
     assert "publish_artifact" in text
-    assert "research_sources" in text
+    assert "delegate_task" in text
+    # research_sources 已合并删除,executor.md 不再提它
+    assert "research_sources" not in text
 
 
 def test_executor_md_does_not_duplicate_skills_index_guidance():
@@ -321,7 +164,6 @@ def test_executor_extra_block_direct_mode_only(mock_config):
     deps = _make_executor_deps(
         mock_config,
         task_frame={
-            "task_kind": "qa",
             "complexity": "simple",
             "risk": "low",
             "requires_plan": False,
@@ -345,7 +187,6 @@ def test_executor_extra_block_active_todos_only_handoff(mock_config):
     deps = _make_executor_deps(
         mock_config,
         task_frame={
-            "task_kind": "code_change",
             "complexity": "complex",
             "risk": "low",
             "requires_plan": True,
@@ -368,7 +209,6 @@ def test_executor_extra_block_all_todos_done_treated_as_inactive(mock_config):
     deps = _make_executor_deps(
         mock_config,
         task_frame={
-            "task_kind": "qa",
             "complexity": "simple",
             "risk": "low",
             "requires_plan": False,
@@ -391,7 +231,6 @@ def test_executor_extra_block_inactive_todo_state_not_handoff(mock_config):
     deps = _make_executor_deps(
         mock_config,
         task_frame={
-            "task_kind": "qa",
             "complexity": "simple",
             "risk": "low",
             "requires_plan": False,
@@ -409,7 +248,6 @@ def test_executor_extra_block_planned_without_active_todos_empty(mock_config):
     deps = _make_executor_deps(
         mock_config,
         task_frame={
-            "task_kind": "code_change",
             "complexity": "complex",
             "risk": "medium",
             "requires_plan": True,

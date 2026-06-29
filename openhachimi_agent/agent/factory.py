@@ -117,11 +117,24 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         # max_retries 默认沿用 agent.retries,无需再单独指定。
         output_type = ToolOutput(create_todos, name="create_todos")
     else:
+        # subagent / scheduled_executor:直接 str 输出。
+        # subagent 是"黑盒调用→返回文本",用 str 最简;其内部消息不回灌 history。
+        # 主工具集不在此固定——运行时由 delegate_task 经 resolve_child_toolsets
+        # 裁剪后通过 child.run(..., toolsets=[...]) 注入(见 agent/subagents.py)。
         output_type = str
 
     if agent_type == "planner":
         toolsets = [PLANNER_TOOLSET, dynamic_toolset] + mcp_instances
         extra_prompt = load_system_prompt("agents/planner")
+    elif agent_type == "subagent":
+        # 通用子 agent(对齐 hermes delegate_task 委派的 child)。
+        # 构建时只挂骨架工具集(dynamic_toolset 角色技能 + mcp),主工具集(read/file/web/
+        # browser/terminal 等)不在此固定——运行时由 delegate_task 经 resolve_child_toolsets
+        # 按 toolsets 参数裁剪后,通过 child.run(..., toolsets=[resolved]) 注入。
+        # 隔离哲学:子 agent 全新会话、零记忆、独立预算(见 agent/subagents.py)。
+        # 不注册 output_validator(subagent 走 str fail-fast,不像 executor 那样校验 TODO)。
+        toolsets = [dynamic_toolset] + mcp_instances
+        extra_prompt = load_system_prompt("agents/subagent")
     else:
         base_executor_toolset = SCHEDULED_EXECUTOR_TOOLSET if agent_type == "scheduled_executor" else EXECUTOR_TOOLSET
         filtered_executor_toolset = base_executor_toolset
@@ -266,7 +279,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                     "请按以下顺序操作，**不要给用户回复任何文字**：\n"
                     "1. 挑出第一个 status=pending 且依赖已 done 的任务，"
                     "用 `update_todo(id, \"in-progress\")` 标记（如果已有 in-progress 任务则跳过此步）；\n"
-                    "2. 调用相应执行工具（write_file/run_command/web_fetch/research_sources 等）真正完成它；\n"
+                    "2. 调用相应执行工具（write_file/run_command/web_fetch/web_search 等）真正完成它；\n"
                     "3. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
                     "4. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），"
                     "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
@@ -279,7 +292,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                     "1. 调用 `get_todos` 查看完整列表；\n"
                     "2. 挑出第一个 status=pending 且依赖已 done 的任务，"
                     "用 `update_todo(id, \"in-progress\")` 标记；\n"
-                    "3. 调用相应执行工具（write_file/run_command/web_fetch/research_sources 等）真正完成它；\n"
+                    "3. 调用相应执行工具（write_file/run_command/web_fetch/web_search 等）真正完成它；\n"
                     "4. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
                     "5. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），\n"
                     "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
@@ -353,6 +366,17 @@ def build_scheduled_executor_agent(config: AppConfig, role_name: str, allowed_to
     return _build_base_agent(config, role_name, "scheduled_executor", allowed_tools=allowed_tools, mcp_toolsets=mcp_toolsets)
 
 
+def build_subagent_agent(config: AppConfig, role_name: str, mcp_toolsets: list | None = None) -> Agent:
+    """创建通用子 Agent(对齐 hermes delegate_task 委派的 child)。
+
+    供 Executor 通过 ``delegate_task`` 工具委派(pydantic-ai 多 agent 模式① +
+    hermes 隔离哲学)。子 agent 全新会话、零长期记忆、独立预算;主工具集运行时
+    由 :func:`openhachimi_agent.agent.subagents.resolve_child_toolsets` 裁剪注入,
+    构建时不固定(只挂 dynamic_toolset + mcp 骨架)。
+    """
+    return _build_base_agent(config, role_name, "subagent", mcp_toolsets=mcp_toolsets)
+
+
 def _build_router_model(config: AppConfig) -> OpenAIChatModel:
     provider = OpenAIProvider(
         base_url=config.openai_base_url or None,
@@ -365,8 +389,8 @@ def build_router_agent(config: AppConfig) -> Agent:
     """创建用于路由决策的轻量级 Agent。
 
     渐进披露改造后 router 不再做 skill 召回 —— skill 选择已下放给主模型在 executor
-    阶段通过 ``get_skill_instructions`` 自助决定。router 只负责产出 task_kind /
-    complexity / risk / requires_plan / execution_mode 等 TaskFrame 元字段。
+    阶段通过 ``get_skill_instructions`` 自助决定。router 只负责产出 complexity /
+    risk / requires_plan / execution_mode 等 TaskFrame 元字段。
     """
     model = _build_router_model(config)
     system_prompt = load_system_prompt("agents/router")

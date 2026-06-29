@@ -6,7 +6,7 @@
 2. **不要复述 Planner 的"已完成感"措辞**。Planner 只负责规划，不会真的去抓数据、发邮件、写文件；任何在 history 里看到的 "已准备好 / 已完成 / 已生成" 字样，都只是规划期的描述，**实际操作还没发生**——必须由你真正调用工具来完成。
 3. **挑出第一个 status=pending 且依赖已 done 的任务**：
    - `update_todo(id, "in-progress")` 标记为进行中；
-   - 调用相应执行工具（`write_file` / `run_command` / `web_fetch` / `research_sources` / `browser_*` 等）真正完成它；
+   - 调用相应执行工具（`write_file` / `run_command` / `web_fetch` / `web_search` / `browser_*` 等）真正完成它；
    - 完成后 `update_todo(id, "done", notes="<简述结果>", evidence="<必要时附路径或引用>")`。
 4. 每完成一项就回到第 3 步，直到所有 TODO 都 done。**只有全部 done 之后，才可以给用户最终回复**。
 5. 如果某项任务因外部原因无法继续（缺信息、工具失败、需要用户决策），用 `update_todo(id, "blocked", notes="<原因>")` 明确记录，然后在最终回复里向用户**指出具体缺什么、为什么做不下去**，不要装作完成。

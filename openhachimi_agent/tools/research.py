@@ -1,23 +1,15 @@
-"""网页搜索与研究质量工具。
+"""网页搜索工具。
 
 职责：
-- web_search: 轻量搜索，保持旧接口兼容。
-- research_sources: 多后端搜索、去重、排序并输出引用 ID。
-- research_next_queries: 信息不足时生成下一轮搜索建议。
+- web_search: 多后端并发搜索、去重、排序，返回标题/URL/摘要列表。
 
-工具链建议（信息获取的标准流程）：
-  1. research_sources(question)      → 为研究问题寻找多来源候选并分配 [S#] 引用 ID
-  2. web_fetch(url)                  → HTTP 抓取具体 URL 的页面文本
-  3. discover_web_resources(url)     → HTTP 被拦截或页面复杂时，优先寻找 RSS/API/JSON 等公开资源
-  4. browser_navigate(url)           → 公共资源不足且需要渲染时，用浏览器访问公开页面
-  5. browser_extract_content()       → 提取当前浏览器页面正文/metadata/links
-  6. research_next_queries(...)      → 证据不足时生成下一轮搜索语句
+研究质量规范（多来源验证、读正文、带来源）见系统提示词 base.md，不在本工具内强制——
+本工具是原子搜索，只负责"找到候选来源"，关键结论需用 web_fetch / browser 读取正文确认。
 """
 
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 import logging
 import re
@@ -451,7 +443,7 @@ def _format_basic_search_results(query: str, ranked: list[RankedSource], run: Se
         lines.append("")
     if run.backend_errors:
         lines.append("部分搜索后端失败：" + "; ".join(f"{k}: {v}" for k, v in run.backend_errors.items()))
-    lines.append("如需深度研究和引用编号，请优先调用 research_sources(question)；如需读取上述页面的完整内容，请调用 web_fetch(url)，HTTP 失败时可 browser_navigate(url) 后调用 browser_extract_content()。")
+    lines.append("如需读取上述页面的完整内容，请调用 web_fetch(url)，HTTP 失败时可 browser_navigate(url) 后调用 browser_extract_content()。")
     return "\n".join(lines)
 
 
@@ -459,9 +451,14 @@ async def web_search(
     ctx: RunContext[AgentDeps],
     query: str,
     max_results: int = 5,
-    source_type: Literal["general", "tech", "news"] = "general",
+    source_type: SearchSourceType = "general",
 ) -> str:
-    """搜索网页标题、链接和摘要；适合轻量查找，不替代全文验证。"""
+    """多后端网页搜索：并发查询多个搜索后端，去重、排序后返回标题/URL/摘要列表。
+
+    原子搜索工具——只负责"找到候选来源"。搜索摘要不是全文证据：关键结论需继续用
+    web_fetch 或 browser_navigate + browser_extract_content 读取正文确认（研究质量
+    规范见系统提示词，不在本工具内强制）。HTTP 失败时换 browser_navigate。
+    """
     config = _get_research_config(ctx)
     actual_query = _normalize_search_query(query, source_type)
     max_results = max(1, min(max_results, 10))
@@ -469,148 +466,3 @@ async def web_search(
     run = await _search_all_backends(actual_query, max_results, source_type, config)
     ranked = _rank_sources(actual_query, run.results, source_type, config)[:max_results]
     return _format_basic_search_results(query, ranked, run)
-
-
-async def research_sources(
-    ctx: RunContext[AgentDeps],
-    question: str,
-    max_results: int = 8,
-    source_type: SearchSourceType = "general",
-    require_independent_sources: int | None = None,
-) -> str:
-    """为研究问题寻找、去重并排序来源，输出可用于后续引用的 [S#] source id。
-
-    本工具只证明“找到了候选来源”，不代表已阅读全文。关键事实仍应继续调用 web_fetch
-    或在公开页面上使用 browser_navigate + browser_extract_content 读取正文。
-    """
-    config = _get_research_config(ctx)
-    required_sources = require_independent_sources or config.min_independent_sources
-    max_results = max(1, min(max_results, config.max_backend_results))
-    actual_query = _normalize_search_query(question, source_type)
-    run = await _search_all_backends(actual_query, max_results, source_type, config)
-    ranked = _rank_sources(actual_query, run.results, source_type, config)[:max_results]
-
-    lines = [
-        f"Research question: {question}",
-        f"Search query: {actual_query}",
-        f"Backends attempted: {', '.join(run.attempted_backends) or 'none'}",
-        UNTRUSTED_SEARCH_NOTICE,
-    ]
-    if run.backend_errors:
-        lines.append("Backends failed:")
-        for backend, error in run.backend_errors.items():
-            lines.append(f"- {backend}: {error}")
-    lines.append("")
-
-    if not ranked:
-        lines.extend([
-            "未找到可排序来源。不要基于空搜索结果总结。",
-            "建议：换关键词、缩小问题范围，或提供已知 URL 后使用 web_fetch / browser_navigate。",
-        ])
-        return "\n".join(lines)
-
-    lines.append("Ranked sources:")
-    for source in ranked:
-        lines.append(f"- [{source.citation_id}] **{source.title}**")
-        lines.append(f"  URL: {source.url}")
-        lines.append(f"  Score: {source.score}")
-        lines.append(f"  Backends: {', '.join(source.backends)}")
-        lines.append(f"  Why: {'; '.join(source.reasons)}")
-        lines.append(f"  Snippet: {source.snippet}")
-
-    independent_hosts = {urlsplit(source.url).netloc.lower() for source in ranked if source.url}
-    lines.extend([
-        "",
-        "Recommended next fetches:",
-    ])
-    for source in ranked[: min(5, len(ranked))]:
-        lines.append(f"- [{source.citation_id}] web_fetch({source.url})")
-
-    if len(independent_hosts) < required_sources:
-        lines.extend([
-            "",
-            f"[信息不足] 当前只有 {len(independent_hosts)} 个独立域名候选来源，低于要求的 {required_sources} 个。",
-            "请调用 research_next_queries 生成下一轮搜索，不要直接给出确定性深度结论。",
-        ])
-    else:
-        lines.extend([
-            "",
-            f"[待验证] 已找到 {len(independent_hosts)} 个独立域名候选来源，但这些仍只是搜索候选，不是已抓取正文证据。",
-            "请继续用 web_fetch 或 browser_extract_content 验证关键来源正文；若抓取失败，应继续搜索或说明信息不足。",
-        ])
-
-    lines.extend([
-        "",
-        "Citation requirement:",
-        "- 后续回答中的外部事实、数据、时间敏感结论必须引用上面的 [S#]。",
-        "- 搜索摘要不是全文证据；关键结论应先用 web_fetch 或 browser_extract_content 读取正文确认。",
-        "- 若来源被 403/429/验证页阻挡，请换公开来源或明确说明信息不足，不要绕过 CAPTCHA/登录墙/付费墙。",
-    ])
-    return "\n".join(lines)
-
-
-def _looks_chinese(text: str) -> bool:
-    return bool(re.search(r"[一-鿿]", text))
-
-
-def _current_year(ctx: RunContext[AgentDeps]) -> int:
-    current_time = getattr(getattr(ctx, "deps", None), "current_time", None)
-    if isinstance(current_time, datetime.datetime):
-        return current_time.year
-    return datetime.datetime.now().year
-
-
-async def research_next_queries(
-    ctx: RunContext[AgentDeps],
-    question: str,
-    known_findings: str = "",
-    cited_sources: str = "",
-    max_queries: int = 5,
-) -> str:
-    """当已有证据不足时，生成下一轮搜索查询建议。"""
-    config = _get_research_config(ctx)
-    year = _current_year(ctx)
-    is_chinese = _looks_chinese(question)
-    max_queries = max(1, min(max_queries, 10))
-    lowered = f"{question} {known_findings}".lower()
-    queries: list[tuple[str, str]] = []
-
-    def add(query: str, reason: str) -> None:
-        if len(queries) >= max_queries:
-            return
-        normalized = query.strip()
-        if normalized and normalized not in [item[0] for item in queries]:
-            queries.append((normalized, reason))
-
-    if is_chinese:
-        add(f"{question} 官方 原始来源", "优先寻找中文官方/原始来源")
-        add(f"{question} 最新 {year}", "获取当前年份或近期中文信息")
-        add(f"{question} 数据 统计 基准", "补充中文数据、统计或基准证据")
-        add(f"{question} 批评 限制 风险", "补充中文反方、限制和风险视角")
-    else:
-        add(f"{question} official", "优先寻找官方/原始来源")
-        add(f"{question} latest {year}", "获取当前年份或近期信息")
-        add(f"{question} data statistics benchmark", "补充数据、统计或基准证据")
-        add(f"{question} criticism limitations risks", "补充反方、限制和风险视角")
-    if any(token in lowered for token in ("api", "github", "python", "javascript", "版本", "代码", "开源", "库", "框架")):
-        add(f"{question} (site:github.com OR site:docs.github.com OR changelog OR release notes)", "技术主题补充 GitHub、文档、变更记录")
-    if any(token in lowered for token in ("新闻", "news", "发布", "公告", "政策", "价格")):
-        add(f"{question} press release OR announcement when:month", "新闻/公告主题补充近期原始发布")
-
-    source_ids = set(re.findall(r"\[?S\d+\]?", cited_sources))
-    lines = [f"Question: {question}", "Research gaps / next searches:"]
-    if len(source_ids) < config.min_independent_sources:
-        lines.append(f"- 当前引用来源约 {len(source_ids)} 个，低于建议的 {config.min_independent_sources} 个独立来源。")
-    if not known_findings.strip():
-        lines.append("- 尚未提供已验证发现；下一轮应优先获取官方来源和至少两个独立第三方来源。")
-    else:
-        lines.append("- 请围绕已知发现中的未证实断言继续寻找原始来源、数据来源和反方来源。")
-
-    lines.append("")
-    lines.append("Suggested queries:")
-    for index, (query, reason) in enumerate(queries, start=1):
-        lines.append(f"{index}. {query}")
-        lines.append(f"   Why: {reason}")
-    lines.append("")
-    lines.append("使用建议：对上述查询调用 research_sources；找到高分来源后用 web_fetch 读取正文，失败时再考虑 discover_web_resources 或 browser_navigate + browser_extract_content。")
-    return "\n".join(lines)

@@ -310,16 +310,20 @@ def preflight_compress_history(ctx: AgentRunContext) -> None:
         if not compressor.should_compress_preflight(ctx.history):
             return
         before = len(ctx.history)
-        compressed = compressor.compress(ctx.history, allow_llm_summary=False)
-        if len(compressed) < before:
-            ctx.history[:] = compressed
-            logger.info(
-                "context pre-flight compressed role=%s session_id=%s %d->%d",
-                ctx.role,
-                ctx.session_id,
-                before,
-                len(compressed),
-            )
+        result = compressor.compress(ctx.history, allow_llm_summary=False)
+        if result.dropped:
+            # preflight 只在内存里就地写回组装好的运行时视图,不落库、不记元数据 ——
+            # 轮后主压缩(turn.py)才负责落 appendix append-only + record_compression。
+            view = result.runtime_view  # type: ignore[attr-defined]
+            if len(view) < before:
+                ctx.history[:] = view
+                logger.info(
+                    "context pre-flight compressed role=%s session_id=%s %d->%d",
+                    ctx.role,
+                    ctx.session_id,
+                    before,
+                    len(view),
+                )
     except Exception:
         logger.warning(
             "pre-flight compress failed role=%s session_id=%s",

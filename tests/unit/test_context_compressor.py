@@ -116,7 +116,9 @@ def test_compress_protects_head_and_tail():
     )
     msgs = _make_tool_turns(15)
     before = len(msgs)
-    compressed = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
+    result = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
+    assert result.dropped
+    compressed = result.runtime_view
     assert len(compressed) < before
     # 头部首条(用户 start)应保留
     assert any(isinstance(p, UserPromptPart) and "start" in str(p.content) for p in getattr(compressed[0], "parts", []))
@@ -199,8 +201,9 @@ def test_anti_thrash_self_heals_when_real_usage_breaches_ceiling():
 def test_fallback_summary_used_when_no_summarizer():
     comp = ContextCompressor(context_length=8000, threshold_percent=0.75, protect_first_n=2, protect_last_n=3, tail_token_budget=500)
     msgs = _make_tool_turns(10)
-    compressed = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
+    result = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
     assert comp._last_summary_fallback_used is True  # noqa: SLF001
+    compressed = result.runtime_view
     # 摘要应出现在某条 user 消息中
     all_text = "\n".join(str(p.content) for m in compressed for p in getattr(m, "parts", []) if hasattr(p, "content"))
     assert "历史任务快照" in all_text
@@ -220,9 +223,10 @@ def test_abort_on_summary_failure_returns_unchanged():
         summarizer=failing_summarizer,
     )
     msgs = _make_tool_turns(10)
-    compressed = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
+    result = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
     assert comp._last_compress_aborted is True  # noqa: SLF001
-    assert compressed is msgs  # 中止时返回原列表
+    assert result.dropped is False  # 中止时返回不压缩结果
+    assert result.head is msgs  # head 指向原始列表
 
 
 # ── 迭代摘要 / LLM 摘要器 ─────────────────────────────────────────────────
@@ -289,9 +293,11 @@ def test_summarizer_failure_falls_back_and_cools_down():
         summarizer=summarizer,
     )
     msgs = _make_tool_turns(10)
-    compressed = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
+    result = comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs))
     assert comp._last_summary_fallback_used is True  # noqa: SLF001
     assert comp._last_summary_error is not None  # noqa: SLF001
+    assert result.dropped
+    compressed = result.runtime_view
     assert len(compressed) < len(msgs)  # 仍用兜底完成压缩
 
 

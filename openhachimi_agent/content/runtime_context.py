@@ -20,7 +20,7 @@
 公开 API
 ========
 - :func:`build_system_dynamic_block(deps)` —— 给所有 agent(planner/executor)用,
-  返回 ``[时间] + [TaskFrame 摘要] + [记忆召回] + [信息检索原则?]``。
+  返回 ``[时间] + [TaskFrame 摘要] + [记忆召回]``。
 - :func:`build_executor_extra_dynamic_block(deps)` —— 仅 executor 用,
   返回 ``[执行接力规则?] + [直接执行模式提示?] + [技能索引]``。
 - :func:`build_volatile_prefix(deps)` —— 兼容旧测试的 thin wrapper。
@@ -46,16 +46,6 @@ from openhachimi_agent.memory.recall import build_memory_context_text
 logger = logging.getLogger(__name__)
 
 _WEEKDAY_ZH = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
-
-# "信息检索原则"块只在本轮 TaskFrame.task_kind 命中"研究类"任务时注入。
-# 注意 TaskKind 字面量目前只有 "research";这里多列 "investigation" 是给 router 输出
-# 超出约定时的兼容兜底。
-#
-# 旧实现还会扫工作区里 SKILL.md 的 name/description/when_to_use,只要装了任意
-# "网搜/研究类" skill 就强制注入这条提示——结果"你好"这类闲聊也会被污染
-# (deep-research / find-skills 等装了就触发)。现在改回"只看本轮意图":普通
-# 网搜 skill 自己的 SKILL.md 里若需要约束年份等,应在自身的提示词里承载。
-_WEB_SEARCH_TASK_KINDS = {"research", "investigation"}
 
 # 技能索引里 SKILL.md 未声明 category 时的默认分组名。
 _DEFAULT_SKILL_CATEGORY = "general"
@@ -86,34 +76,6 @@ def _memory_block(deps: AgentDeps) -> str:
     try:
         return build_memory_context_text(config, memory_context)
     except Exception:  # noqa: BLE001
-        return ""
-
-
-def _web_search_rules_block(deps: AgentDeps) -> str:
-    """"信息检索原则"按需注入块——只看本轮 TaskFrame.task_kind。
-
-    旧实现会扫工作区里所有 SKILL.md 的 name/description/when_to_use,只要装了
-    任意"网搜/研究类" skill 就注入这条提示。结果是问"你好"这类闲聊也会被污染:
-    只要本机装了 deep-research / netease-music(描述里有"搜索")/ find-skills
-    (描述里有 search)等任意一条,system prompt 就会多出这段年份约束。
-
-    渐进披露之后,网搜类 skill 的提示词应在自身 SKILL.md 内承载这种约束(模型
-    按需 ``get_skill_instructions`` 拉全文时会看到)。运行时这里只负责本轮意图
-    确实是"研究类"任务时的兜底提示。
-    """
-    session_state = getattr(deps, "session_state", None)
-    if not isinstance(session_state, dict):
-        return ""
-    task_frame_dict = session_state.get("task_frame")
-    if not isinstance(task_frame_dict, dict):
-        return ""
-    task_kind = task_frame_dict.get("task_kind")
-    if task_kind not in _WEB_SEARCH_TASK_KINDS:
-        return ""
-    try:
-        return render_system_prompt("runtime/web_search_rules")
-    except Exception:  # noqa: BLE001
-        logger.debug("web_search_rules render failed", exc_info=True)
         return ""
 
 
@@ -351,13 +313,9 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
 def build_system_dynamic_block(deps: AgentDeps | None) -> str:
     """构造**每轮**应该追加到 system prompt 末尾的通用动态段(所有 agent 通用)。
 
-    输出顺序:``[时间] [TaskFrame 摘要] [记忆召回] [信息检索原则?]``。任一块为空
-    或异常则跳过;整体以空行分隔。当 deps 为 None / 异常时返回空字符串,保证 agent
-    构建期间(deps 还没准备好)的安全。
-
-    "信息检索原则"块按需注入(仅当本轮 task_kind 是研究类时才出现),避免闲聊
-    等非检索场景被注入无关提示词。网搜类 skill 自身的提示词应在 SKILL.md 内
-    承载相应约束。
+    输出顺序:``[时间] [TaskFrame 摘要] [记忆召回]``。任一块为空或异常则跳过;
+    整体以空行分隔。当 deps 为 None / 异常时返回空字符串,保证 agent 构建期间
+    (deps 还没准备好)的安全。
     """
     if deps is None:
         # 即便没有 deps 也应该至少提供当前时间，便于模型在"会话开始第一轮模板渲染"
@@ -373,9 +331,6 @@ def build_system_dynamic_block(deps: AgentDeps | None) -> str:
     memory_block = _memory_block(deps)
     if memory_block:
         blocks.append(memory_block)
-    web_search_block = _web_search_rules_block(deps)
-    if web_search_block:
-        blocks.append(web_search_block)
     return "\n\n".join(blocks)
 
 

@@ -132,15 +132,32 @@ def test_save_load_preserves_v3_metadata(store: SessionStore):
     }
 
 
-def test_save_overwrites_full_history(store: SessionStore):
-    """save 5 条 → save 3 条:load 必须返回 3 条(不是 8)。"""
+def test_save_appends_not_overwrites(store: SessionStore):
+    """append-only:save 5 条 → save 3 条 → load 8 条(不覆盖)。
+
+    原始消息一旦写入永不删 —— 压缩只记元数据,不破坏历史。
+    """
     sid = _new_sid()
     long = [
         ModelRequest(parts=[UserPromptPart(content=f"u{i}")]) for i in range(5)
     ]
+    start0 = store.save_messages("default", sid, long)
+    assert start0 == 0  # 首次写入从 turn_index 0 起
+    short = [ModelRequest(parts=[UserPromptPart(content="only-u0")])] * 3
+    start1 = store.save_messages("default", sid, short)
+    assert start1 == 5  # 追加:从已有 MAX+1 = 5 起
+    _, loaded = store.load_messages("default", sid)
+    assert len(loaded) == 8  # 5 + 3,不覆盖
+
+
+def test_save_append_false_overwrites(store: SessionStore):
+    """append=False 兼容旧覆盖语义:清空后从 0 重编。"""
+    sid = _new_sid()
+    long = [ModelRequest(parts=[UserPromptPart(content=f"u{i}")]) for i in range(5)]
     store.save_messages("default", sid, long)
     short = [ModelRequest(parts=[UserPromptPart(content="only-u0")])] * 3
-    store.save_messages("default", sid, short)
+    start = store.save_messages("default", sid, short, append=False)
+    assert start == 0
     _, loaded = store.load_messages("default", sid)
     assert len(loaded) == 3
 
@@ -543,3 +560,128 @@ def test_message_json_round_trip_via_typeadapter(store: SessionStore):
     # 不抛即通过
     parsed = list(ModelMessagesTypeAdapter.validate_json(arr_json))
     assert len(parsed) == 2
+
+
+# ── 压缩元数据:append-only + session_compressions + load_context ──────────
+
+
+def _build_history(n: int) -> list:
+    """造 n 条 user/response 交替的原始历史。"""
+    msgs = []
+    for i in range(n):
+        msgs.append(ModelRequest(parts=[UserPromptPart(content=f"u{i}")]))
+        msgs.append(ModelResponse(parts=[TextPart(content=f"r{i}")]))
+    return msgs
+
+
+def test_record_compression_and_load_context(store: SessionStore):
+    """记录压缩元数据后,load_context 返回 head+summary+tail 视图,原始消息仍全在。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(10))  # 20 条
+    assert store.current_turn_count("default", sid) == 20
+
+    # 模拟压缩:head=前 4 条(turn 0..3),tail=后 8 条(turn 12..19),中间 turn 4..11 折叠
+    comp_id = store.record_compression(
+        "default", sid,
+        head_end_turn=3, tail_start_turn=12,
+        summary="历史压缩摘要:用户讨论了 abc",
+        total_len=20,
+    )
+    assert comp_id == 1
+
+    # 原始 20 条仍在(append-only,没被删)
+    _, all_msgs = store.load_messages("default", sid)
+    assert len(all_msgs) == 20
+
+    # 视图 = head 4 + tail 8 = 12 条(中间 8 条折叠;summary 合并进 tail 首条 user,
+    # 不独立成条 —— assemble_runtime_context 的「避免连续 user 消息」设计)
+    _, view = store.load_context("default", sid)
+    assert len(view) == 12
+    # head 首条仍是首条 user
+    assert "u0" in str(view[0].parts[0].content)
+    # summary 注入:tail 首条(u6)前缀合并了摘要文本
+    view_text = "\n".join(str(getattr(p, "content", "")) for m in view for p in getattr(m, "parts", ()))
+    assert "历史压缩摘要" in view_text
+    # tail 段 u6..u9 都在视图里
+    assert "u6" in view_text and "u9" in view_text
+    # 被折叠的中间段 u2..u5 不在视图里(head 只到 u1/tail 从 u6 起)
+    assert "u2" not in view_text and "u5" not in view_text
+
+
+def test_load_context_no_compression_equals_load_messages(store: SessionStore):
+    """无压缩元数据时,load_context 等价于 load_messages。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(3))  # 6 条
+    _, raw = store.load_messages("default", sid)
+    _, view = store.load_context("default", sid)
+    assert len(view) == len(raw) == 6
+
+
+def test_load_context_latest_generation_wins(store: SessionStore):
+    """多代压缩:load_context 只取最新一代(compression_id 最大)的边界。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(10))  # 20 条
+    # 第一代:折叠 turn 4..11
+    store.record_compression("default", sid, 3, 12, "摘要v1", total_len=20)
+    # 第二代:在已有 tail 上再压缩 —— 折叠 turn 4..17(把第一代的 tail 的一部分也折进去)
+    store.record_compression("default", sid, 3, 18, "摘要v2", total_len=20)
+    _, view = store.load_context("default", sid)
+    view_text = "\n".join(str(getattr(p, "content", "")) for m in view for p in getattr(m, "parts", ()))
+    # 最新一代的摘要胜出
+    assert "摘要v2" in view_text
+    assert "摘要v1" not in view_text
+
+
+def test_record_compression_rejects_bad_bounds(store: SessionStore):
+    """非法边界(head_end >= tail_start,或越过 total_len)应抛 ValueError。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(2))  # 4 条
+    with pytest.raises(ValueError):
+        store.record_compression("default", sid, 2, 2, "x", total_len=4)  # head_end == tail_start
+    with pytest.raises(ValueError):
+        store.record_compression("default", sid, 2, 5, "x", total_len=4)  # tail_start > total_len
+    with pytest.raises(ValueError):
+        store.record_compression("default", sid, 2, 3, "", total_len=4)  # 空 summary
+
+
+def test_get_folded_messages_returns_middle_window(store: SessionStore):
+    """取折叠区原始消息:返回 head_end+1 .. tail_start-1 区间。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(10))  # turn 0..19
+    store.record_compression("default", sid, 3, 12, "sum", total_len=20)
+    folded = store.get_folded_messages("default", sid, 1)
+    assert len(folded) == 8  # turn 4..11
+    folded_text = "\n".join(str(getattr(p, "content", "")) for m in folded for p in getattr(m, "parts", ()))
+    # 中间段 u2..u5 对应的回复/请求都在
+    assert "u2" in folded_text and "u5" in folded_text
+    # head/tail 段不在折叠区
+    assert "u0" not in folded_text
+    assert "u6" not in folded_text
+
+
+def test_get_folded_messages_unknown_compression(store: SessionStore):
+    """不存在的 compression_id 返回空列表。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(2))
+    assert store.get_folded_messages("default", sid, 999) == []
+
+
+def test_list_compressions_ordered(store: SessionStore):
+    """list_compressions 按 compression_id 升序返回。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(10))
+    store.record_compression("default", sid, 3, 12, "v1", total_len=20)
+    store.record_compression("default", sid, 3, 18, "v2", total_len=20)
+    comps = store.list_compressions("default", sid)
+    assert [c["compression_id"] for c in comps] == [1, 2]
+    assert comps[1]["summary_text"] == "v2"
+
+
+def test_current_turn_count_after_appends(store: SessionStore):
+    """current_turn_count 反映 append-only 累计条数,而非单次 save。"""
+    sid = _new_sid()
+    store.save_messages("default", sid, _build_history(2))  # 4 条
+    assert store.current_turn_count("default", sid) == 4
+    store.save_messages("default", sid, _build_history(1))  # 追加 2 条
+    assert store.current_turn_count("default", sid) == 6
+

@@ -8,15 +8,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-TaskKind = Literal[
-    "qa",
-    "code_change",
-    "file_ops",
-    "shell",
-    "browser",
-    "research",
-    "unknown",
-]
 Complexity = Literal["simple", "complex"]
 RiskLevel = Literal["low", "medium", "high"]
 AllowedAutonomy = Literal["narrow", "bounded", "broad"]
@@ -73,7 +64,6 @@ class IntentDecision(BaseModel):
     # 老会话持久化的 task_frame_json 可能仍含 relevant_skills 等已删字段，忽略以兼容。
     model_config = ConfigDict(extra="ignore")
 
-    task_kind: TaskKind = "unknown"
     complexity: Complexity = "simple"
     risk: RiskLevel = "low"
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -114,7 +104,6 @@ class TaskFrame(BaseModel):
 
     user_request: str = ""
     goal: str = ""
-    task_kind: TaskKind = "unknown"
     complexity: Complexity = "simple"
     risk: RiskLevel = "low"
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -212,7 +201,6 @@ def build_task_frame(message: str, decision: IntentDecision | None = None) -> Ta
     return TaskFrame(
         user_request=message,
         goal=message.strip(),
-        task_kind=decision.task_kind,
         complexity=decision.complexity,
         risk=decision.risk,
         confidence=decision.confidence,
@@ -240,7 +228,6 @@ def classify_intent_heuristic(message: str) -> IntentDecision:
     target_urls = extract_urls(message)
     if not text:
         return IntentDecision(
-            task_kind="unknown",
             complexity="simple",
             risk="low",
             confidence=0.0,
@@ -253,7 +240,6 @@ def classify_intent_heuristic(message: str) -> IntentDecision:
     risk: RiskLevel = "high" if any(term in text for term in _HIGH_RISK_TERMS) else "low"
 
     return IntentDecision(
-        task_kind="unknown",
         complexity="simple",
         risk=risk,
         confidence=0.5,

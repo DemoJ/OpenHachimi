@@ -444,7 +444,10 @@ async def run_turn(
             channel_context_data.update(delivery_target)
     channel_name = str(channel_context_data.get("type") or channel_context_data.get("platform") or "local")
 
-    actual_session_id, history = service.session_store.load_messages(role, session_id, latest_scope)
+    # 入口取运行时上下文视图(head+summary+tail),而非完整原始序列 —— append-only 后
+    # 原始消息永不删,压缩只产元数据(session_compressions),load_context 据此组装视图喂模型。
+    # 喂模型用视图,落库用差量(new_history[len(history):]),压缩时再重读完整原始序列。
+    actual_session_id, history = service.session_store.load_context(role, session_id, latest_scope)
     lock = service._get_session_lock(actual_session_id)
 
     async with lock:
@@ -486,6 +489,23 @@ async def run_turn(
             channel_context=channel_context_data,
             scheduler_context=dict(scheduler_context or {}),
         )
+        # 注入子 agent 委派所需挂载点(对齐 hermes delegate_task 哲学):
+        # - subagent_agent:复用的子 agent 实例(走 service._get_agent 的 mtime 热重载缓存),
+        #   运行时由 delegate_task 经 resolve_child_toolsets 裁剪工具集后注入 child.run。
+        # - subagent_registry:SubagentRegistry,记录运行中子 agent task 供中断传播
+        #   (父被 cancel 时 run_delegation 的 finally 调 cancel_all,无需此处接入 /stop)。
+        # 失败时降级为 None(delegate_task 工具会返回不可用提示,不阻断主流程)。
+        # scheduled_executor 不注入(无人值守不委派);其余 run_mode 都注入。
+        if run_mode != "scheduled":
+            try:
+                from openhachimi_agent.agent.subagents import SubagentRegistry
+
+                deps.subagent_agent = service._get_agent(role, "subagent")
+                deps.subagent_registry = SubagentRegistry()
+            except Exception:
+                logger.debug("failed to inject subagent for role=%s", role, exc_info=True)
+                deps.subagent_agent = None
+                deps.subagent_registry = None
         stream_queue: asyncio.Queue[StreamEventItem | object] = asyncio.Queue()
         stream_stats = StreamStats()
         result_holder: dict[str, object] = {}
@@ -780,7 +800,10 @@ async def run_turn(
                 except Exception:
                     logger.debug("failed to register static context to pool", exc_info=True)
             _stamp_turn_metadata(new_history, len(history), message, _dynamic_text, _static_hash)
-            # 上下文压缩:用本轮真实用量判定,触发则压缩(含 LLM 摘要,经 to_thread 避免阻塞事件循环)
+            # 上下文压缩:用本轮真实用量判定。append-only 语义下落库与压缩解耦——
+            # 先把本轮新增差量追加落库(视图 head/tail/summary 不重复存),再单独判定是否压缩;
+            # 触发时重读完整原始序列(load_messages)做 compress,边界即 session_messages.turn_index,
+            # record_compression 只记元数据,绝不删原始消息。
             compressor = ctx.context_compressor
             if compressor is not None:
                 try:
@@ -790,39 +813,57 @@ async def run_turn(
                     compressor.update_from_response(result.usage)  # type: ignore[attr-defined]
                 except Exception:
                     logger.debug("context usage update failed", exc_info=True)
-                if compressor.should_compress():
-                    try:
-                        new_history = await asyncio.to_thread(
-                            compressor.compress,
-                            new_history,
-                            current_tokens=compressor.last_prompt_tokens,
-                        )
-                        logger.info(
-                            "context compressed post-turn role=%s session_id=%s messages=%d compression_count=%d",
-                            role,
-                            actual_session_id,
-                            len(new_history),
-                            compressor.compression_count,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "context compression failed role=%s session_id=%s",
-                            role,
-                            actual_session_id,
-                            exc_info=True,
-                        )
-            # SessionStore.save_messages 接 list[ModelMessage],store 内部按条入 SQLite。
-            # 这里不再手动 dump_json —— v3 文件方案的"每轮全量字节落盘"已经退役。
-            # scope_key 与旧 save_message_history 一致沿用 latest_scope 值。
+            # 差量追加:只存本轮新增(new_history[len(history):])。视图已折叠的中间段不重存。
+            # _stamp_turn_metadata 已用 len(history) 定位本轮新增起点,这里与之对齐。
+            new_slice = new_history[len(history):]
             await asyncio.to_thread(
                 service.session_store.save_messages,
                 role,
                 actual_session_id,
-                new_history,
+                new_slice,
                 scope=latest_scope,
                 channel=resolved_channel_code,
                 scope_key=latest_scope,
+                append=True,
             )
+            # 压缩判定与落库:重读完整原始序列,compress 作用于 turn_index 升序的全量,
+            # 边界内存下标 == turn_index,映射零误差。
+            if compressor is not None and compressor.should_compress():
+                try:
+                    _, full_raw = await asyncio.to_thread(
+                        service.session_store.load_messages, role, actual_session_id, latest_scope,
+                    )
+                    comp_result = await asyncio.to_thread(
+                        compressor.compress,
+                        full_raw,
+                        current_tokens=compressor.last_prompt_tokens,
+                    )
+                    if comp_result.dropped:
+                        await asyncio.to_thread(
+                            service.session_store.record_compression,
+                            role,
+                            actual_session_id,
+                            comp_result.head_end_idx,
+                            comp_result.tail_start_idx,
+                            comp_result.summary,
+                            total_len=len(full_raw),
+                        )
+                        logger.info(
+                            "context compressed post-turn role=%s session_id=%s head_end=%d tail_start=%d compression_count=%d",
+                            role, actual_session_id,
+                            comp_result.head_end_idx, comp_result.tail_start_idx,
+                            compressor.compression_count,
+                        )
+                    else:
+                        logger.info(
+                            "context compression skipped(no dropped) role=%s session_id=%s",
+                            role, actual_session_id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "context compression failed role=%s session_id=%s",
+                        role, actual_session_id, exc_info=True,
+                    )
             capture_args = (
                 service.config,
                 memory_scope,

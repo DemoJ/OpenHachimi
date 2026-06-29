@@ -253,6 +253,10 @@ class MessageItem(BaseModel):
     # 仅 assistant：本轮请求的 token 用量。pydantic_ai 的 ModelResponse.usage 提供，
     # 旧会话或缺失 usage 时为 None。键固定为 ``input`` / ``output`` / ``total``。
     tokens: dict[str, int] | None = None
+    # 折叠占位条：非 None 时本条是「折叠条」而非真实消息(role 仍为 user 占位)。
+    # 前端据此渲染一张折叠卡片，点击展开时调 GET /sessions/{id}/messages/folded/{compression_id}
+    # 取回被折叠的原始消息。content 在折叠条上为空串。
+    fold: dict | None = None
 
 
 class SessionMessagesResponse(BaseModel):

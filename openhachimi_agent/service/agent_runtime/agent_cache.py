@@ -16,6 +16,7 @@ from openhachimi_agent.agent.factory import (
     build_planner_agent,
     build_router_agent,
     build_scheduled_executor_agent,
+    build_subagent_agent,
 )
 from openhachimi_agent.core.config import ROLES_CONFIG_FILE_NAME, AppConfig
 
@@ -77,6 +78,8 @@ def build_agent_by_type(
         return build_continuation_agent(config)
     if agent_type == "planner":
         return build_planner_agent(config, role_name, mcp_toolsets=mcp_toolsets)
+    if agent_type == "subagent":
+        return build_subagent_agent(config, role_name, mcp_toolsets=mcp_toolsets)
     if agent_type == "scheduled_executor":
         return build_scheduled_executor_agent(config, role_name, mcp_toolsets=mcp_toolsets)
     return build_executor_agent(config, role_name, mcp_toolsets=mcp_toolsets)

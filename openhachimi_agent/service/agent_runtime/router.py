@@ -134,8 +134,7 @@ async def resolve_task_frame(ctx: AgentRunContext, get_agent: Callable[[str, str
         logger.warning("Router failed: %s. Falling back to conservative planning.", router_e)
 
     logger.info(
-        "Task frame kind=%s complexity=%s risk=%s confidence=%.2f requires_plan=%s autonomy=%s targets=%s rationale=%s",
-        task_frame.task_kind,
+        "Task frame complexity=%s risk=%s confidence=%.2f requires_plan=%s autonomy=%s targets=%s rationale=%s",
         task_frame.complexity,
         task_frame.risk,
         task_frame.confidence,

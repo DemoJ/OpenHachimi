@@ -47,6 +47,16 @@ from openhachimi_agent.transport.api_models import (
 logger = logging.getLogger(__name__)
 
 
+def _summary_excerpt(summary: str, limit: int = 160) -> str:
+    """从摘要全文取首段做预览,供折叠占位条展示。按空行取首段 + 截断。"""
+    if not summary:
+        return ""
+    first_para = summary.split("\n\n", 1)[0].strip()
+    if len(first_para) <= limit:
+        return first_para
+    return first_para[:limit].rstrip() + "…"
+
+
 class AgentService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -545,16 +555,76 @@ class AgentService:
         if not resolved_session_id:
             raise ValueError("session_id 不能为空")
 
-        _, msgs = self.session_store.load_messages(role, resolved_session_id)
-        parts = self._extract_text_parts(msgs, role=role)
+        # 展示用「完整原始消息序列 + 折叠占位条」:append-only 后原始消息永不删,
+        # session_compressions 记录每次压缩的折叠区间。遍历 turn_index,落入折叠区间
+        # [head_end_turn+1, tail_start_turn-1] 的消息跳过,在区间起始位置插一个 fold 占位条;
+        # summary 不进消息流(用户点展开时另调 get_folded_messages 取回原始消息)。
+        compressions = self.session_store.list_compressions(role, resolved_session_id)
+        # 区间按起始 turn_index 排,便于遍历时一次性建立「当前是否在折叠区间」状态
+        fold_ranges = [
+            {
+                "compression_id": c["compression_id"],
+                "lo": c["head_end_turn"] + 1,
+                "hi": c["tail_start_turn"] - 1,
+                "count": c["tail_start_turn"] - c["head_end_turn"] - 1,
+                "summary_excerpt": _summary_excerpt(c["summary_text"]),
+                "head_end_turn": c["head_end_turn"],
+                "tail_start_turn": c["tail_start_turn"],
+            }
+            for c in compressions
+            if c["tail_start_turn"] - c["head_end_turn"] - 1 > 0
+        ]
+        fold_starts = {f["lo"] for f in fold_ranges}
+        fold_set = set()
+        for f in fold_ranges:
+            fold_set.update(range(f["lo"], f["hi"] + 1))
 
         from openhachimi_agent.transport.api_models import MessageItem
+
+        # 直接按 turn_index 读原始行 + 折叠判定,不走 _extract_text_parts 的视图路径
+        # —— 视图会跳过折叠区间,但展示恰恰要把折叠条插入到该位置。
+        safe_role = role
+        rows = self.session_store._load_message_rows(safe_role, resolved_session_id)
+        messages: list[MessageItem] = []
+        folded_seen: set[int] = set()
+        for turn_idx, msg in rows:
+            if turn_idx in fold_set:
+                # 落在折叠区间:跳过原始消息,在区间起始处插一个占位条
+                if turn_idx in fold_starts and turn_idx not in folded_seen:
+                    fold_info = next(f for f in fold_ranges if f["lo"] == turn_idx)
+                    messages.append(MessageItem(
+                        role="user", content="", fold={
+                            "compression_id": fold_info["compression_id"],
+                            "dropped_count": fold_info["count"],
+                            "summary_excerpt": fold_info["summary_excerpt"],
+                            "head_end_turn": fold_info["head_end_turn"],
+                            "tail_start_turn": fold_info["tail_start_turn"],
+                        },
+                    ))
+                    folded_seen.add(turn_idx)
+                continue
+            parts = self._extract_text_parts([msg], role=role)
+            for p in parts:
+                messages.append(MessageItem(**p))
 
         return {
             "role": role,
             "session_id": resolved_session_id,
-            "messages": [MessageItem(**p) for p in parts],
+            "messages": messages,
         }
+
+    def get_folded_messages(
+        self, role_name: str | None, session_id: str, compression_id: int
+    ) -> list[dict]:
+        """返回某次压缩被折叠的原始消息(展开用),已抽成 MessageItem 文本结构。"""
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        resolved_session_id = self._normalize_session_id(session_id)
+        msgs = self.session_store.get_folded_messages(role, resolved_session_id, compression_id)
+        out: list[dict] = []
+        for msg in msgs:
+            out.extend(self._extract_text_parts([msg], role=role))
+        return out
 
     # ------------------------------------------------------------------ 中断与停止
 
@@ -706,6 +776,7 @@ class AgentService:
     ) -> ChatResponse:
         """手动压缩指定会话的上下文历史(可带焦点主题)。
 
+        append-only 语义下压缩只记元数据(``session_compressions``),绝不删原始消息。
         与 turn.py 的 ``run_turn`` 一样套住 per-session asyncio.Lock —— 旧实现
         没套,理论上一次手动 /compress 可能在 turn 写入 session 的瞬间插队读旧
         history 然后用陈旧值覆盖回去。SQLite 端虽有 ``BEGIN IMMEDIATE`` 兜底,
@@ -729,36 +800,39 @@ class AgentService:
             return ChatResponse(output="当前对话历史较短,暂无需压缩。", role=role, session_id=actual_session_id)
         focus = focus_topic.strip() or None
         before = len(history)
-        try:
-            compressed = await asyncio.to_thread(
-                compressor.compress,
-                history,
-                focus_topic=focus,
-                force=True,
-            )
-        except Exception as exc:
-            logger.warning("manual compress failed role=%s session_id=%s: %s", role, actual_session_id, exc)
-            return ChatResponse(output=f"压缩失败:{exc.__class__.__name__}", role=role, session_id=actual_session_id)
-        if len(compressed) >= before:
-            return ChatResponse(
-                output=f"未产生压缩(可能已无可压缩的中间窗口)。历史共 {before} 条消息。",
-                role=role,
-                session_id=actual_session_id,
-            )
-        # 写回阶段:套 session lock,与 turn.py 的写入路径互斥。
         lock = self._get_session_lock(actual_session_id)
         async with lock:
-            await asyncio.to_thread(
-                self.session_store.save_messages,
+            try:
+                # 压缩作用于完整原始序列(turn_index 升序),边界内存下标 == turn_index,映射零误差。
+                result = await asyncio.to_thread(
+                    compressor.compress,
+                    history,
+                    focus_topic=focus,
+                    force=True,
+                )
+            except Exception as exc:
+                logger.warning("manual compress failed role=%s session_id=%s: %s", role, actual_session_id, exc)
+                return ChatResponse(output=f"压缩失败:{exc.__class__.__name__}", role=role, session_id=actual_session_id)
+            if not result.dropped:
+                return ChatResponse(
+                    output=f"未产生压缩(可能已无可压缩的中间窗口)。历史共 {before} 条消息。",
+                    role=role,
+                    session_id=actual_session_id,
+                )
+            comp_id = await asyncio.to_thread(
+                self.session_store.record_compression,
                 role,
                 actual_session_id,
-                compressed,
-                scope=latest_scope,
+                result.head_end_idx,
+                result.tail_start_idx,
+                result.summary,
+                total_len=len(history),
             )
         savings = compressor._last_compression_savings_pct  # noqa: SLF001
         focus_hint = f"(焦点:{focus})" if focus else ""
+        dropped = result.tail_start_idx - result.head_end_idx - 1
         return ChatResponse(
-            output=f"已压缩上下文{focus_hint}:{before}→{len(compressed)} 条消息(第 {compressor.compression_count} 次压缩,约省 {savings:.0f}%)。",
+            output=f"已压缩上下文{focus_hint}:折叠 {dropped} 条中间消息(第 {compressor.compression_count} 次压缩 / compression_id={comp_id},约省 {savings:.0f}%)。原始消息仍可在历史中展开查看。",
             role=role,
             session_id=actual_session_id,
         )

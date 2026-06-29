@@ -160,8 +160,7 @@ async def web_fetch(ctx: RunContext[AgentDeps], url: str) -> str:
     如果返回 'Fetch failed' + 'Hint'，说明该页面可能有反爬保护，请改用 browser_navigate 后再调用 browser_extract_content。
 
     【工具选择建议】：
-    - 先用 research_sources 获取带引用编号的高质量来源，再用本工具读取页面内容
-    - 轻量查找可先用 web_search 获取相关链接，再用本工具读取页面内容
+    - 先用 web_search 搜索相关来源，再用本工具读取页面内容
     - 若本工具失败（403 / 429 等），升级到 browser_navigate(url) + browser_extract_content()
     """
     del ctx

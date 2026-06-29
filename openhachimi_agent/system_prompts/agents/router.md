@@ -7,7 +7,6 @@
 
 - **user_request**：必须等于用户消息原文，不得改写、压缩、翻译、留空。
 - **goal**：用一句话陈述用户实际目的；与 user_request 可不同（user_request 是原话）。
-- **task_kind**：`qa`, `code_change`, `file_ops`, `shell`, `browser`, `research`, `unknown`。
 - **complexity**：
   - `simple`：1-2 步即可完成，且低风险；包括普通问答、解释概念、按用户给出的明确文件/路径做小修改、创建/改写一个小文件、运行一条明确命令、打开/查看一个明确 URL。
   - `complex`：需要跨文件/多工具/多步骤调研、较大代码修改、复杂网页操作或系统性分析。
@@ -15,14 +14,14 @@
 - **execution_mode**：
   - `direct`：简单或单步任务，可由主模型直接执行；
   - `planned`：仅复杂或高风险任务使用，会触发独立的 Planner Agent 先做计划拆解。
-  - 只要 `complexity=simple` 且 `risk=low`，必须使用 `requires_plan=false` + `execution_mode=direct`，不要因为任务属于 code_change / file_ops / shell 就自动规划。
+  - 只要 `complexity=simple` 且 `risk=low`，必须使用 `requires_plan=false` + `execution_mode=direct`，不要因为任务涉及改代码 / 改文件 / 跑命令行就自动规划。
 - **clarifying_question**：**只在确实需要追问时填写**；不需要追问时**必须输出 JSON null**，禁止填字符串 "None" / "null" / 空串。
 - **target_entities**：用户明确给出的 URL、文件路径、函数名等。**不要把整段用户消息原文塞进 target_entities** —— 那是 user_request 的位置。
-  - 简单的显式 URL 访问/打开/查看任务应为 browser + simple + requires_plan=false + allowed_autonomy=narrow。
+  - 简单的显式 URL 访问/打开/查看任务应为 simple + requires_plan=false + allowed_autonomy=narrow。
   - 如果有 URL / 文件路径 / 函数名，放进 target_entities，并在 invariants 中说明不能替换或扩大目标。
 
 ## 其它判断原则
 
 - 用户给出的明确路径、URL、函数名，以及上一轮或同一轮工具成功返回的文件路径，应视为可信目标，不要因确认焦虑而要求额外规划。
-- 用户要求稍后提醒、几分钟后回复、每天/每周/cron 定时执行时，task_kind 应为 qa 或 unknown，execution_mode=direct，不要归类为 shell；执行阶段会使用定时任务工具而不是 sleep 命令。
+- 用户要求稍后提醒、几分钟后回复、每天/每周/cron 定时执行时，应为 simple + risk=low + execution_mode=direct，不要据此要求规划；执行阶段会使用定时任务工具而不是 sleep 命令。
 - 不确定时降低 confidence，但优先保持 direct；只有任务明显需要跨文件、多工具、多阶段验证或存在高风险时，才将 requires_plan 设为 true。
