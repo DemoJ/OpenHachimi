@@ -257,18 +257,35 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                 parts.append("未完成的 TODO：\n" + "\n".join(unfinished_lines))
             if latest_failure_lines:
                 parts.append("最近一次工具调用没有成功：\n" + "\n".join(latest_failure_lines))
-            parts.append(
-                "请按以下顺序操作，**不要给用户回复任何文字**：\n"
-                "1. 调用 `get_todos` 查看完整列表；\n"
-                "2. 挑出第一个 status=pending 且依赖已 done 的任务，"
-                "用 `update_todo(id, \"in-progress\")` 标记；\n"
-                "3. 调用相应执行工具（write_file/run_command/web_fetch/research_sources 等）真正完成它；\n"
-                "4. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
-                "5. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），"
-                "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
-                "然后在最终回复里清楚告知用户：已完成什么 / 卡在哪 / 需要什么——"
-                "不要装作完成。"
-            )
+
+            # 检查本轮是否已经查看过计划。如果已经查看过，validator 不再强制要求
+            # get_todos（避免冗余循环），直接给出增量执行指令。
+            plan_already_viewed = bool(ctx.deps.session_state.get("_plan_viewed_this_turn", False))
+            if plan_already_viewed:
+                parts.append(
+                    "请按以下顺序操作，**不要给用户回复任何文字**：\n"
+                    "1. 挑出第一个 status=pending 且依赖已 done 的任务，"
+                    "用 `update_todo(id, \"in-progress\")` 标记（如果已有 in-progress 任务则跳过此步）；\n"
+                    "2. 调用相应执行工具（write_file/run_command/web_fetch/research_sources 等）真正完成它；\n"
+                    "3. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
+                    "4. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），"
+                    "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
+                    "然后在最终回复里清楚告知用户：已完成什么 / 卡在哪 / 需要什么——"
+                    "不要装作完成。"
+                )
+            else:
+                parts.append(
+                    "请按以下顺序操作，**不要给用户回复任何文字**：\n"
+                    "1. 调用 `get_todos` 查看完整列表；\n"
+                    "2. 挑出第一个 status=pending 且依赖已 done 的任务，"
+                    "用 `update_todo(id, \"in-progress\")` 标记；\n"
+                    "3. 调用相应执行工具（write_file/run_command/web_fetch/research_sources 等）真正完成它；\n"
+                    "4. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
+                    "5. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），\n"
+                    "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
+                    "然后在最终回复里清楚告知用户：已完成什么 / 卡在哪 / 需要什么——"
+                    "不要装作完成。"
+                )
             parts.append(
                 "禁止在文字里模仿工具返回格式（如 \"✅ 任务 X → done\"）；"
                 "系统能区分真假，假陈述会再次被打回。"

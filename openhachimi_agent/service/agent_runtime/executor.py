@@ -461,6 +461,8 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     ctx.session_state.pop("_final_validator_retries", None)
     ctx.session_state.pop("_final_validator_yielded", None)
     ctx.session_state.pop("_final_validator_last_signal", None)
+    # 清零"本轮已查看计划"标志，使 validator 能正确判断是否需要强制 get_todos
+    ctx.session_state.pop("_plan_viewed_this_turn", None)
     text_buffer: list[str] = []
     preflight_compress_history(ctx)
 
@@ -510,6 +512,8 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
             ctx.session_state.pop("_final_validator_retries", None)
             ctx.session_state.pop("_final_validator_yielded", None)
             ctx.session_state.pop("_final_validator_last_signal", None)
+            # replan 后重新执行，清零本轮"已查看计划"标志
+            ctx.session_state.pop("_plan_viewed_this_turn", None)
             await _replan_after_execution_signal(ctx, signal, get_agent)
             preflight_compress_history(ctx)
             retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result)
@@ -647,6 +651,7 @@ async def execute_task_resume(
     ctx.session_state.pop("_final_validator_retries", None)
     ctx.session_state.pop("_final_validator_yielded", None)
     ctx.session_state.pop("_final_validator_last_signal", None)
+    ctx.session_state.pop("_plan_viewed_this_turn", None)
 
     results = DeferredToolResults(calls={tool_call_id: ctx.message})
     executor_agent = _build_executor_agent(
@@ -655,6 +660,26 @@ async def execute_task_resume(
     ctx.operation_state.start("model", "executor_resume")
     preflight_compress_history(ctx)
     text_buffer: list[str] = []
+
+    # 注入 TODO 恢复执行提醒：模型从 clarify_user 恢复后，history 顶部的上下文
+    # 可能让模型沉浸在"正在研究"的状态中，忽略 TODO 接力规则。
+    # 在历史末尾追加一条系统提示，强制模型先查看 TODO、更新已完成任务、再继续。
+    try:
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+        if has_active_todos(ctx.session_state):
+            todo_reminder = (
+                "[System 恢复执行提醒] 你当前有一个活动计划，用户刚刚回复了你的追问。\n"
+                "请严格按以下顺序操作：\n"
+                "1. **立即查看 TODO 列表**（确认当前进度）；\n"
+                "2. 如果之前因等待用户输入而暂停的任务现在有了答案，"
+                "先 `update_todo(任务id, \"done\")` 标记完成；\n"
+                "3. 然后挑出第一个 status=pending 且依赖已 done 的任务继续执行；\n"
+                "4. 不要在不查看 TODO 的情况下直接调用执行工具。"
+            )
+            ctx.history.append(ModelRequest(parts=[SystemPromptPart(content=todo_reminder)]))
+    except Exception:
+        logger.debug("failed to inject todo resume reminder", exc_info=True)
 
     run_kwargs: dict[str, Any] = {
         "message_history": ctx.history,

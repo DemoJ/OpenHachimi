@@ -367,7 +367,10 @@ def create_todos(
         len(tasks),
         ctx.deps.session_id,
     )
-    return get_todos(ctx)
+    # 不再返回 get_todos 的完整列表（避免 history 中提前塞入 TODO 全文，
+    # 导致 executor 首步 get_todos 冗余展示同一份信息）。
+    goal_str = f"。目标：{state.goal}" if state.goal else ""
+    return f"已创建 {len(state.tasks)} 个 TODO 任务{goal_str}。\n使用 `get_todos` 可查看完整列表和状态。"
 
 
 def update_todo(
@@ -472,7 +475,20 @@ def update_todo(
     _save_state(ctx, state)
     logger.info("Updated TODO %d to %s for session %s", task_id, status, ctx.deps.session_id)
 
-    return get_todos(ctx)
+    # 标记本轮已查看过计划：让 output_validator 知道模型已经有了 TODO 上下文，
+    # 不再强制 get_todos。注意直接用 get_todos 的完整输出会占用大量 tokens
+    # 并且重置模型对"当前进行到哪里"的感知，改为简洁确认。
+    session_state = ctx.deps.session_state
+    if isinstance(session_state, dict):
+        session_state["_plan_viewed_this_turn"] = True
+
+    remaining = [t for t in state.tasks.values() if t.status not in {"done", "blocked"}]
+    summary = f"已更新任务 {task_id} → {status}。"
+    if remaining:
+        summary += f" 剩余 {len(remaining)} 项待办。使用 `get_todos` 可查看完整列表。"
+    else:
+        summary += " 所有 TODO 已完成！"
+    return summary
 
 
 def get_todos(ctx: RunContext[AgentDeps]) -> str:
@@ -480,6 +496,11 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
     state = _get_state(ctx)
     if not state.tasks:
         return "当前没有活动的 TODO 任务。"
+
+    # 标记本轮已查看过计划，供 output_validator 判断是否需要强制 get_todos。
+    session_state = ctx.deps.session_state
+    if isinstance(session_state, dict):
+        session_state["_plan_viewed_this_turn"] = True
         
     lines = ["## 当前 TODO 列表："]
     if state.goal:
