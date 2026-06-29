@@ -29,6 +29,8 @@ from openhachimi_agent.scheduler.models import ScheduledRun, ScheduledTask
 from openhachimi_agent.service.agent_runtime.command_registry import CommandOutcome
 from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.service.agent_service import AgentService
+from openhachimi_agent.memory.recall import get_memory_store
+from openhachimi_agent.memory.scheduler import MemoryScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +422,18 @@ async def run_embedded_cli() -> None:
     await service.start()
     backend = EmbeddedBackend(service)
     scheduler = None
+    # 长期记忆后台调度器:消费 memory_jobs 队列。不启动则 embed/extract/consolidate
+    # 任务永远 pending(embeddings_pending 虚高、L1 抽取不跑)。与 http.py lifespan 对齐。
+    memory_scheduler: MemoryScheduler | None = None
+    if config.memory.enabled and config.memory.scheduler.enabled:
+        memory_scheduler = MemoryScheduler(
+            get_memory_store(config),
+            config=config,
+            poll_interval_seconds=config.memory.scheduler.poll_interval_seconds,
+            batch_size=config.memory.scheduler.batch_size,
+        )
+        await memory_scheduler.start()
+        logger.info("memory scheduler started")
 
     delivery_registry = DeliverySenderRegistry()
     delivery_registry.register(InboxDeliverySender())
@@ -456,6 +470,11 @@ async def run_embedded_cli() -> None:
     finally:
         if scheduler is not None:
             await scheduler.stop()
+        if memory_scheduler is not None:
+            try:
+                await memory_scheduler.stop()
+            except Exception as exc:
+                logger.debug("memory scheduler stop failed: %s", exc)
         try:
             await service.browser_manager.close()
         except Exception as exc:

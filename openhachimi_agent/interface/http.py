@@ -51,8 +51,15 @@ from openhachimi_agent.transport.api_models import (
     ChatRequest,
     CommandDispatchRequest,
     CommandDispatchResponse,
+    CommandResponse,
     ConfigUpdateRequest,
     DeliveryPreviewResponse,
+    MemoryDeleteRequest,
+    MemoryDeleteResult,
+    MemoryItem,
+    MemoryListResponse,
+    MemoryUpdateRequest,
+    MemoryUpdateResult,
     MessageItem,
     MCPServerItem,
     McpServersResponse,
@@ -83,6 +90,10 @@ from openhachimi_agent.transport.api_models import (
     StopRequest,
 )
 from openhachimi_agent.tools.utils import resolve_workspace_path
+from openhachimi_agent.memory.models import MemoryScope
+from openhachimi_agent.memory.privacy import PrivacyGuard
+from openhachimi_agent.memory.recall import get_memory_store
+from openhachimi_agent.memory.scheduler import MemoryScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +200,7 @@ async def lifespan(app: FastAPI):
     app.state.config = config
     app.state.schedule_store = None
     app.state.scheduler = None
+    app.state.memory_scheduler = None
     app.state.delivery_registry = DeliverySenderRegistry()
     app.state.delivery_registry.register(InboxDeliverySender())
     scheduler = None
@@ -224,6 +236,19 @@ async def lifespan(app: FastAPI):
                 )
                 app.state.scheduler = scheduler
                 await scheduler.start()
+                # 长期记忆后台调度器:消费 memory_jobs 队列(embed/extract/consolidate/maintenance)。
+                # 不启动则队列无人消费,记忆永远停在 pending(embeddings_pending 虚高、L1 抽取不跑)。
+                memory_scheduler: MemoryScheduler | None = None
+                if config.memory.enabled and config.memory.scheduler.enabled:
+                    memory_scheduler = MemoryScheduler(
+                        get_memory_store(config),
+                        config=config,
+                        poll_interval_seconds=config.memory.scheduler.poll_interval_seconds,
+                        batch_size=config.memory.scheduler.batch_size,
+                    )
+                    app.state.memory_scheduler = memory_scheduler
+                    await memory_scheduler.start()
+                    logger.info("memory scheduler started")
                 logger.info("server module initialized")
                 logger.info("all channels started")
                 yield
@@ -231,6 +256,11 @@ async def lifespan(app: FastAPI):
     finally:
         if scheduler is not None:
             await scheduler.stop()
+        try:
+            if app.state.memory_scheduler is not None:
+                await app.state.memory_scheduler.stop()
+        except Exception as exc:
+            logger.debug("memory scheduler stop failed: %s", exc)
         try:
             await app.state.service.browser_manager.close()
         except Exception as exc:
@@ -676,6 +706,16 @@ def get_session_messages(session_id: str, role: str | None = None, service: Agen
         raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
 
 
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str, role: str | None = None, service: AgentService = Depends(get_service)) -> CommandResponse:
+    """删除指定会话:消息历史、TODO、最新指针一并清除,不可撤销。"""
+    logger.info("http delete session request session_id=%s role=%s", session_id, role)
+    try:
+        return service.delete_session(role, session_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+
+
 @app.post("/role")
 def switch_role(request: RoleSwitchRequest, service: AgentService = Depends(get_service)):
     logger.info("http switch role request role=%s", request.role.strip())
@@ -1111,6 +1151,204 @@ def update_roles_config(request: RolesConfigUpdateRequest, config=Depends(get_co
 async def stop_session(request: StopRequest, service: AgentService = Depends(get_service)):
     logger.info("http stop session request session_id=%s", request.session_id)
     return await service.stop_session(request.session_id)
+
+
+# ------------------------------------------------------------------ WebUI 记忆管理(设置页)
+# GET /memory 列出/搜索长期记忆(L1/L2/L3);PATCH /memory/{id} 编辑(仅 L1);
+# DELETE /memory 软删除(任意层级)。复用 MemoryStore 原语,HTTP 层独立于 agent 工具。
+# 编辑仅限 L1(L2/L3 无 update_*_content 方法);删除为软删除(status=deleted),
+# 既不进列表也不进召回。secret 记忆由 list_memories 的 SQL 自动排除(L1)。
+
+_MEMORY_ALL = "__all__"
+_HEX_ID_LEN = 32
+
+
+def _memory_item_from_result(result) -> MemoryItem:
+    return MemoryItem(
+        id=result.id,
+        level=result.level,
+        content=result.content,
+        memory_type=result.memory_type,
+        confidence=float(result.confidence),
+        updated_at=result.updated_at,
+        score=float(result.score),
+        editable=result.level == "L1",
+        metadata=result.metadata or {},
+    )
+
+
+def _memory_scope_for_role(role: str | None, config) -> MemoryScope:
+    """构造单角色记忆查询 scope。role_name 取传入角色或默认角色。"""
+    return MemoryScope(
+        tenant_id="local",
+        user_id="local",
+        role_name=role or config.default_role_name,
+        session_id="",
+        channel="local",
+    )
+
+
+@app.get("/memory")
+def list_memory(
+    role: str | None = None,
+    q: str | None = None,
+    memory_type: str | None = None,
+    level: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    include_archived: bool = False,
+    config=Depends(get_config),
+) -> MemoryListResponse:
+    """列出 / 搜索长期记忆。
+
+    role 为空或 ``__all__`` 时跨全部角色合并(遍历磁盘角色清单各查一次后去重);
+    否则仅查指定角色(含共享记忆 role_name='')。q 非空走 BM25 搜索,空走 list_memories。
+    level / memory_type 在 HTTP 层对结果后置过滤(search 不接受这俩参数)。
+    """
+    role_names = list_role_names(config.roles_dir)
+    stats = {}
+    if not config.memory.enabled:
+        # 未启用:返回空列表 + enabled=False,PATCH/DELETE 端点会回 503。
+        return MemoryListResponse(
+            items=[],
+            total=0,
+            role=role or _MEMORY_ALL,
+            roles=role_names,
+            default_role=config.default_role_name,
+            enabled=False,
+            stats={},
+        )
+
+    store = get_memory_store(config)
+    try:
+        stats = store.stats()
+    except Exception:  # noqa: BLE001  统计失败不应阻断列表展示
+        logger.debug("memory stats failed", exc_info=True)
+        stats = {}
+
+    # 跨角色:遍历每个角色的 scope 各查一次后去重;单角色:查一次。
+    scopes = (
+        [_memory_scope_for_role(r, config) for r in role_names]
+        if not role or role == _MEMORY_ALL
+        else [_memory_scope_for_role(role, config)]
+    )
+    # 跨角色 + 空角色记忆兜底:共享记忆 role_name='' 可能不属于任何磁盘角色文件,
+    # 但单角色查询的 SQL 已含 ``role_name = ? OR role_name = ''`` 能带到。跨角色场景
+    # 任一磁盘角色查询都会带回这些共享记忆,故无需额外查空角色 scope。
+
+    raw = []
+    seen_ids: set[str] = set()
+    per_role_limit = min(limit, 100)  # list_memories 内部 clamp 到 100
+    for scope in scopes:
+        try:
+            if q and q.strip():
+                # search 跨 L1/L2/L3 走 BM25(无效查询词时返回空列表,不抛异常)。
+                results = store.search(scope, q.strip(), limit=per_role_limit, include_archived=include_archived, touch_results=False)
+            else:
+                results = store.list_memories(scope, memory_type=memory_type, limit=per_role_limit, include_archived=include_archived, touch=False)
+        except Exception:  # noqa: BLE001  单角色查询失败不影响其他角色
+            logger.debug("memory list/search failed role=%s", scope.role_name, exc_info=True)
+            continue
+        for item in results:
+            if item.id in seen_ids:
+                continue
+            seen_ids.add(item.id)
+            raw.append(item)
+
+    # 后置过滤:level / memory_type(search 路径下 list_memories 的 type 过滤未生效)。
+    filtered = raw
+    if level:
+        filtered = [item for item in filtered if item.level == level]
+    if memory_type:
+        filtered = [item for item in filtered if item.memory_type == memory_type]
+
+    # 按 updated_at DESC 排序后截断到 limit(跨角色合并后需统一排序)。
+    filtered.sort(key=lambda item: item.updated_at, reverse=True)
+    filtered = filtered[:limit]
+
+    items = [_memory_item_from_result(item) for item in filtered]
+    return MemoryListResponse(
+        items=items,
+        total=len(items),
+        role=role or _MEMORY_ALL,
+        roles=role_names,
+        default_role=config.default_role_name,
+        enabled=True,
+        stats=stats,
+    )
+
+
+@app.patch("/memory/{memory_id}")
+def update_memory(memory_id: str, request: MemoryUpdateRequest, config=Depends(get_config)) -> MemoryUpdateResult:
+    """编辑长期记忆(仅 L1 原子)。L2/L3 为只读,会返回 400。"""
+    if not config.memory.enabled:
+        raise HTTPException(status_code=503, detail="记忆系统未启用")
+    store = get_memory_store(config)
+    # 用 get_atom_content 探测层级:仅 L1 原子表有此 id 才可编辑。
+    if store.get_atom_content(memory_id) is None:
+        raise HTTPException(status_code=400, detail="仅 L1 原子记忆可编辑,L2/L3 为只读")
+    # 隐私处理:保留 secret 拒绝(防误存明文密钥),关闭 PII 脱敏
+    # (管理页是用户主动编辑已存在记忆,自动改手机号会困惑)。
+    guard = PrivacyGuard(
+        allow_secret_memory=config.memory.privacy.allow_secret_memory,
+        pii_redaction=False,
+    )
+    decision = guard.should_store(request.content)
+    if decision.action == "reject":
+        raise HTTPException(status_code=400, detail="内容含机密信息,已拒绝")
+    embedding_status = "pending" if config.memory.embedding.enabled else "disabled"
+    try:
+        updated = store.update_atom_content(memory_id, decision.text, embedding_status=embedding_status)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+    if updated and config.memory.embedding.enabled:
+        # 与 tools/memory.py:update_memory 一致:排队让现有 worker 重算向量。
+        store.enqueue_unique_job(
+            "embed_memory_item",
+            {
+                "item_id": memory_id,
+                "level": "L1",
+                "text": decision.text,
+                "model": config.memory.embedding.model,
+            },
+            dedupe_key=f"embed:L1:{memory_id}",
+        )
+    logger.info("http memory update id=%s updated=%s", memory_id, updated)
+    return MemoryUpdateResult(updated=updated, id=memory_id, embedding_status="queued" if updated and config.memory.embedding.enabled else embedding_status)
+
+
+@app.delete("/memory")
+def delete_memory(request: MemoryDeleteRequest, config=Depends(get_config)) -> MemoryDeleteResult:
+    """软删除长期记忆(任意层级)。ids 为 32 位 hex 记忆 ID 列表。
+
+    forget 在 ID 路径下 SQL 是 ``UPDATE ... WHERE id=?``,不按 scope 过滤,故 scope
+    仅供日志可读。软删后 status=deleted,既不进列表也不进召回,FTS 行一并删除。
+    """
+    if not config.memory.enabled:
+        raise HTTPException(status_code=503, detail="记忆系统未启用")
+    # 安全校验:仅接受 32 位 hex ID,拒绝通配符 / 全量删除语义
+    # (复刻 tools/memory.py:forget_memory 的约束,防误删)。
+    cleaned_ids: list[str] = []
+    for raw_id in request.ids:
+        sid = raw_id.strip()
+        if not sid:
+            continue
+        if sid in {"*", "%", "all", "ALL"} or set(sid) <= {"*", "%"}:
+            raise HTTPException(status_code=400, detail="拒绝通配符删除,请传入明确的记忆 ID")
+        if len(sid) != _HEX_ID_LEN or any(c not in "0123456789abcdefABCDEF" for c in sid):
+            raise HTTPException(status_code=400, detail=f"无效的记忆 ID: {sid}")
+        cleaned_ids.append(sid)
+    if not cleaned_ids:
+        raise HTTPException(status_code=400, detail="未提供有效的记忆 ID")
+
+    store = get_memory_store(config)
+    # scope 仅供 forget 签名一致与日志可读;ID 路径不按 scope 过滤。
+    scope = _memory_scope_for_role(None, config)
+    try:
+        deleted = store.forget(scope, ",".join(cleaned_ids), hard_delete=False)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+    logger.info("http memory delete ids=%s deleted=%d", cleaned_ids, deleted)
+    return MemoryDeleteResult(deleted=deleted, ids=cleaned_ids)
 
 
 @app.post("/commands")

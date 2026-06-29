@@ -381,3 +381,55 @@ class RolesConfigUpdateRequest(BaseModel):
     - 不再出现的既有角色(且非 default_role):删 .md + 删 roles-config 记录。
     """
     roles: list[RoleBindingItem] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------------ WebUI 记忆管理(设置页)
+# 数据形态:长期记忆库(SQLite)里 L1 原子/L2 区块/L3 画像的列表与增删改。
+# 复用 MemoryStore 原语(list_memories/search/update_atom_content/forget/stats),
+# HTTP 层独立于 agent 工具(不依赖 RunContext)。同 /prompts / /mcp / /roles-config
+# 属"特殊设置分组",不走 yaml 字段表。编辑仅限 L1;删除为软删除(status=deleted)。
+
+
+class MemoryItem(BaseModel):
+    """单条记忆。L1=原子事实(可编辑),L2=合并区块,L3=用户画像(均只读)。"""
+    id: str
+    level: Literal["L1", "L2", "L3"]
+    content: str                       # L1=原始内容;L2/L3="title：summary"(store 已拼好)
+    memory_type: str
+    confidence: float = 0.0
+    updated_at: str                    # ISO-8601
+    score: float = 0.0
+    editable: bool = False             # L1→True,L2/L3→False(HTTP 层按 level 派生)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryListResponse(BaseModel):
+    """GET /memory 返回:记忆列表 + 角色筛选清单 + 库统计,前端一次拿全。"""
+    items: list[MemoryItem] = Field(default_factory=list)
+    total: int = 0                     # 本页条数(list_memories 无 offset,非全量总数)
+    role: str = ""                     # 回显本次查询的 role("__all__" 或具体角色名)
+    roles: list[str] = Field(default_factory=list)   # 可选角色清单,前端筛选下拉用
+    default_role: str = "default"
+    enabled: bool = True               # config.memory.enabled
+    stats: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryUpdateRequest(BaseModel):
+    """PATCH /memory/{id} 写回请求。仅 L1 原子记忆可编辑。"""
+    content: str = Field(min_length=1)
+
+
+class MemoryUpdateResult(BaseModel):
+    updated: bool
+    id: str
+    embedding_status: str              # pending(已排队重算)/disabled(未启用 embedding)
+
+
+class MemoryDeleteRequest(BaseModel):
+    """DELETE /memory 软删除请求。ids 为 32 位 hex 记忆 ID 列表。"""
+    ids: list[str] = Field(min_length=1)
+
+
+class MemoryDeleteResult(BaseModel):
+    deleted: int
+    ids: list[str] = Field(default_factory=list)

@@ -516,6 +516,28 @@ class AgentService:
             session_id=resolved_session_id,
         )
 
+    def delete_session(self, role_name: str | None = None, session_id: str | None = None) -> CommandResponse:
+        """删除指定会话 —— 消息历史、TODO、最新指针一并清除。
+
+        与 ``load_session`` 走相同的 role/session_id 校验;不存在时透传
+        ``FileNotFoundError`` 给 HTTP 层返回 400。返回的 ``session_id`` 仍是被删的
+        id,前端据此比对本地 ``currentSessionId`` 决定是否清空到空白页。
+        """
+        role = self._normalize_role(role_name)
+        self._validate_role_exists(role)
+        resolved_session_id = self._normalize_session_id(session_id)
+        if not resolved_session_id:
+            raise ValueError("session_id 不能为空，请指定要删除的会话")
+        if not self.session_store.session_exists(role, resolved_session_id):
+            raise FileNotFoundError(f"会话不存在: {resolved_session_id}")
+        self.session_store.delete_session(role, resolved_session_id)
+        logger.info("deleted session role=%s session_id=%s", role, resolved_session_id)
+        return CommandResponse(
+            message="会话已删除。",
+            role=role,
+            session_id=resolved_session_id,
+        )
+
     def get_session_messages(self, role_name: str | None = None, session_id: str | None = None) -> dict:
         role = self._normalize_role(role_name)
         self._validate_role_exists(role)

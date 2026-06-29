@@ -528,6 +528,31 @@ class SessionStore:
             })
         return result
 
+    def delete_session(self, role: str, session_id: str) -> None:
+        """删除会话及其全部关联数据 + 清理悬空的 latest 指针。
+
+        - ``session_messages`` 靠 FK ``ON DELETE CASCADE`` 随 ``sessions`` 行自动清除
+          (``_connect`` 已开 ``PRAGMA foreign_keys=ON``)。
+        - ``session_todos`` 主键只含 ``session_id``,无 FK,需显式删。
+        - ``session_pointers`` 若仍指向该 sid 会变成悬空指针 —— 下次不带 ``session_id``
+          发消息会"恢复"到已删除的会话,故一并清掉该 role 下所有指向它的指针。
+        """
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM session_todos WHERE session_id = ?", (safe_sid,)
+            )
+            conn.execute(
+                "DELETE FROM session_pointers WHERE role = ? AND session_id = ?",
+                (safe_role, safe_sid),
+            )
+            conn.execute(
+                "DELETE FROM sessions WHERE role = ? AND session_id = ?",
+                (safe_role, safe_sid),
+            )  # CASCADE 自动删 session_messages
+
     # ── TODO state(原 .memory/todos/{sid}.json) ─────────────────────────
 
     def load_todo_state(self, session_id: str) -> "TodoState":

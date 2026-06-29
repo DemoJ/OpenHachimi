@@ -251,6 +251,7 @@ def _load_memory_config(base_dir: Path, raw_config: dict[str, Any], llm_config: 
             poll_interval_seconds=_config_int(scheduler_config, "poll_interval_seconds", 2),
             batch_size=_config_int(scheduler_config, "batch_size", 10),
             lock_seconds=_config_int(scheduler_config, "lock_seconds", 300),
+            maintenance_interval_seconds=_config_int(scheduler_config, "maintenance_interval_seconds", 21600),
         ),
         consolidation=MemoryConsolidationConfig(
             enabled=_config_bool(consolidation_config, "enabled", True),

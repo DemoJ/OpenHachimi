@@ -164,6 +164,17 @@ export function switchRole(role: string) {
   return post<CommandResponse>('/role', { role })
 }
 
+export function deleteSession(session_id: string, role?: string) {
+  const q = role ? `?role=${encodeURIComponent(role)}` : ''
+  return request<CommandResponse>(`/sessions/${encodeURIComponent(session_id)}${q}`, {
+    method: 'DELETE',
+  })
+}
+
+export function stop(session_id: string) {
+  return post<CommandResponse>('/stop', { session_id })
+}
+
 // ---------------------------------------------------------------- 配置(设置页)
 // 字段定义与后端 config.py 的 SETTINGS_FIELD_GROUPS 对齐。
 export type ConfigFieldKind = 'secret' | 'string' | 'select' | 'bool' | 'int' | 'float' | 'multi'
@@ -339,4 +350,72 @@ export function getRolesConfig() {
 
 export function putRolesConfig(roles: RoleBindingItem[]) {
   return put<RolesConfigResponse>('/roles-config', { roles })
+}
+
+// ---------------------------------------------------------------- 记忆管理(设置页)
+// 数据形态:长期记忆库(SQLite)L1/L2/L3 的列表与增删改。后端 GET /memory 一次返回
+// 列表 + 角色清单 + 库统计;编辑仅 L1;删除为软删除。属"特殊设置分组",不走 yaml 字段表。
+export interface MemoryItem {
+  id: string
+  level: 'L1' | 'L2' | 'L3'
+  content: string
+  memory_type: string
+  confidence: number
+  updated_at: string
+  score: number
+  editable: boolean           // L1→true,L2/L3→false(后端按 level 派生)
+  metadata: Record<string, unknown>
+}
+
+export interface MemoryListResponse {
+  items: MemoryItem[]
+  total: number               // 本页条数(后端无 offset 分页,非全量总数)
+  role: string                // 回显查询 role("__all__" 或具体角色名)
+  roles: string[]             // 可选角色清单,筛选下拉用
+  default_role: string
+  enabled: boolean            // config.memory.enabled
+  stats: Record<string, number>
+}
+
+export interface MemoryUpdateResult {
+  updated: boolean
+  id: string
+  embedding_status: string
+}
+
+export interface MemoryDeleteResult {
+  deleted: number
+  ids: string[]
+}
+
+export function getMemories(opts?: {
+  role?: string
+  q?: string
+  memory_type?: string
+  level?: string
+  limit?: number
+  include_archived?: boolean
+}) {
+  const params: string[] = []
+  if (opts?.role) params.push(`role=${encodeURIComponent(opts.role)}`)
+  if (opts?.q) params.push(`q=${encodeURIComponent(opts.q)}`)
+  if (opts?.memory_type) params.push(`memory_type=${encodeURIComponent(opts.memory_type)}`)
+  if (opts?.level) params.push(`level=${encodeURIComponent(opts.level)}`)
+  if (opts?.limit !== undefined) params.push(`limit=${opts.limit}`)
+  if (opts?.include_archived) params.push(`include_archived=true`)
+  const q = params.length ? `?${params.join('&')}` : ''
+  return get<MemoryListResponse>(`/memory${q}`)
+}
+
+export function updateMemory(id: string, content: string) {
+  return patch<MemoryUpdateResult>(`/memory/${encodeURIComponent(id)}`, { content })
+}
+
+export function deleteMemories(ids: string[]) {
+  // DELETE 带 body:与 deleteSkill 同款写法(request + 手动 JSON.stringify)。
+  return request<MemoryDeleteResult>('/memory', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  })
 }

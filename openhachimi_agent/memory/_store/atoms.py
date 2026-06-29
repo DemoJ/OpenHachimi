@@ -272,14 +272,6 @@ class AtomStoreMixin:
                 (old_id, conflict_group_id, now, new_id),
             )
 
-    def update_atom_status(self, atom_id: str, status: MemoryStatus | str) -> None:
-        status_value = str(status)
-        now = utc_now_iso()
-        with self.connect() as conn:
-            conn.execute("UPDATE memory_atoms SET status = ?, updated_at = ? WHERE id = ?", (status_value, now, atom_id))
-            if status_value != MemoryStatus.ACTIVE.value:
-                conn.execute("DELETE FROM memory_atoms_fts WHERE id = ?", (atom_id,))
-
     def record_conflict(self, scope: MemoryScope, conflict_key: str, winner_id: str, loser_id: str, reason: str) -> str:
         conflict_id = uuid4().hex
         now = utc_now_iso()

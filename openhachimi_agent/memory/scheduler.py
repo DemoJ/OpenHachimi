@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from openhachimi_agent.core.config import AppConfig
@@ -35,6 +36,8 @@ class MemoryScheduler:
         self.batch_size = batch_size
         self.running = False
         self._task: asyncio.Task[None] | None = None
+        # 上次执行 maintenance 的 wall-clock 时间戳;初始化为 0 确保首次 run_once 尽快执行。
+        self._last_maintenance_ts: float = 0.0
 
     async def start(self) -> None:
         if self.running:
@@ -76,6 +79,19 @@ class MemoryScheduler:
                 self.store.fail_job(job.id, str(exc))
                 stats["failed"] += 1
                 logger.exception("memory job failed job_id=%s type=%s", job.id, job.job_type)
+        # 独立 maintenance 定时:不依赖新对话产生的 consolidate job,确保
+        # expire_due_atoms / archive_decayed_atoms 定期执行。若 config 未配置
+        # 或配置为 0 则不下发(仅通过 maintenance job 手动触发)。
+        interval = (self.config.memory.scheduler.maintenance_interval_seconds
+                    if self.config else 21600)
+        if interval > 0 and time.monotonic() - self._last_maintenance_ts >= interval:
+            try:
+                self.store.expire_due_atoms()
+                self.store.archive_decayed_atoms()
+                self._last_maintenance_ts = time.monotonic()
+                stats["maintenance"] += 1
+            except Exception as exc:
+                logger.exception("memory scheduler inline maintenance failed: %s", exc)
         return stats
 
     async def handle_job(self, job: MemoryJob) -> dict[str, int]:

@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import type { SessionSummary, MessageItem, StateResponse } from './api'
-import { fetchRoles, listSessions, fetchState, fetchChannels, getSessionMessages } from './api'
+import { fetchRoles, listSessions, fetchState, fetchChannels, getSessionMessages, deleteSession } from './api'
 import { getToken, clearToken } from './api'
 
 interface ChatStoreState {
@@ -129,6 +129,21 @@ export const useChatStore = defineStore('chat', {
       } finally {
         this.sessionsLoading = false
       }
+    },
+    async deleteSession(session_id: string) {
+      // 删除指定会话。调用方(Sidebar)负责:删除当前会话且 isGenerating 时先 /stop,
+      // 以及 confirm 二次确认。这里只管落库 + 本地态同步。
+      await deleteSession(session_id, this.currentRole)
+      // 本地先剔除该条,避免等接口刷新的视觉闪烁。
+      this.sessions = this.sessions.filter((s) => s.session_id !== session_id)
+      this.sessionsTotal = Math.max(0, this.sessionsTotal - 1)
+      // 删除的是当前会话 → 进入空白页(不预创建,发消息时自动 /new)。
+      if (session_id === this.currentSessionId) {
+        this.currentSessionId = null
+        this.messages = []
+      }
+      // 重拉第一页,补齐因分页漂移缺失的后续条目。
+      await this.refreshSessions()
     },
     setCurrentSession(id: string | null) {
       this.currentSessionId = id

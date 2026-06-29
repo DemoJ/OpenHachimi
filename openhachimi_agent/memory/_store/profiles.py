@@ -55,24 +55,6 @@ class ProfileStoreMixin:
                 )
         return profile.id
 
-    def list_blocks_for_profile_consolidation(self, scope: MemoryScope | None = None, *, limit: int = 50) -> list[sqlite3.Row]:
-        scope_sql = ""
-        params: list[Any] = [MemoryStatus.ACTIVE.value]
-        if scope:
-            scope_sql = "AND tenant_id = ? AND user_id = ? AND (role_name = ? OR role_name = '')"
-            params.extend([scope.tenant_id, scope.user_id, scope.role_name])
-        params.append(limit)
-        with self.connect() as conn:
-            return conn.execute(
-                f"""
-                SELECT * FROM memory_blocks
-                WHERE status = ? {scope_sql}
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                tuple(params),
-            ).fetchall()
-
     def get_active_profile(self, tenant_id: str, user_id: str, role_name: str | None, profile_type: str) -> MemoryProfile | None:
         with self.connect() as conn:
             row = conn.execute(

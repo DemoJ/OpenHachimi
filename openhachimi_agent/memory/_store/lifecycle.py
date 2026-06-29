@@ -87,9 +87,12 @@ class LifecycleStoreMixin:
                 "atoms": conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE status = ?", (MemoryStatus.ACTIVE.value,)).fetchone()[0],
                 "blocks": conn.execute("SELECT COUNT(*) FROM memory_blocks WHERE status = ?", (MemoryStatus.ACTIVE.value,)).fetchone()[0],
                 "profiles": conn.execute("SELECT COUNT(*) FROM memory_profiles WHERE status = ?", (MemoryStatus.ACTIVE.value,)).fetchone()[0],
-                "embeddings_pending": conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE embedding_status = 'pending'").fetchone()[0],
-                "embeddings_ready": conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE embedding_status = 'ready'").fetchone()[0],
-                "embeddings_failed": conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE embedding_status = 'failed'").fetchone()[0],
+                # 仅统计 active 记忆:被取代(superseded)/软删除(deleted)/过期(expired)的 atom
+                # 仅改 status、不碰 embedding_status,若不过滤会把这些死记忆的 pending/failed 一并计入,
+                # 让"待向量化"虚高且永不清零。与下面 stats.atoms 的 active 过滤口径保持一致。
+                "embeddings_pending": conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE embedding_status = 'pending' AND status = ?", (MemoryStatus.ACTIVE.value,)).fetchone()[0],
+                "embeddings_ready": conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE embedding_status = 'ready' AND status = ?", (MemoryStatus.ACTIVE.value,)).fetchone()[0],
+                "embeddings_failed": conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE embedding_status = 'failed' AND status = ?", (MemoryStatus.ACTIVE.value,)).fetchone()[0],
                 "vectors": conn.execute("SELECT COUNT(*) FROM memory_vectors").fetchone()[0],
                 "vector_shards": conn.execute("SELECT COUNT(*) FROM memory_vector_shards").fetchone()[0],
                 "jobs_pending": conn.execute(

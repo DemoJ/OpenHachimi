@@ -101,6 +101,16 @@
         </div>
 
         <div v-else-if="fields.length" class="settings-content">
+          <!-- 记忆管理入口:仅 memory 分组显示。点击打开单一管理弹窗,弹窗内完成
+               全部查看/编辑/删除(弹窗自管加载与保存,不接入本页 dirty/保存条)。 -->
+          <section v-if="currentGroup === 'memory'" class="settings-card memory-manage-entry">
+            <div class="card-head">
+              <h3 class="card-title">记忆管理</h3>
+              <p class="card-desc">查看、修改或删除 Agent 已记住的内容(长期记忆 L1/L2/L3)。编辑仅限 L1 原子记忆,删除为软删除。</p>
+            </div>
+            <button type="button" class="btn btn-primary memory-manage-btn" @click="showMemoryDialog = true">管理记忆</button>
+          </section>
+
           <!-- 按 currentGroup 渲染对应卡片组;卡片元数据见 GROUP_CARDS。 -->
           <section
             v-for="card in activeCards"
@@ -163,6 +173,9 @@
         </div>
       </div>
     </div>
+
+    <!-- 记忆管理弹窗:由「记忆系统」配置页的入口卡片触发。 -->
+    <MemoryManageDialog v-if="showMemoryDialog" @close="showMemoryDialog = false" />
   </div>
 </template>
 
@@ -174,6 +187,7 @@ import PromptsCard from '../components/PromptsCard.vue'
 import RolesCard from '../components/RolesCard.vue'
 import SkillsCard from '../components/SkillsCard.vue'
 import McpServersCard from '../components/McpServersCard.vue'
+import MemoryManageDialog from '../components/MemoryManageDialog.vue'
 import { getConfigGroup, updateConfigGroup } from '../api'
 import type { ConfigField as ConfigFieldType } from '../api'
 
@@ -250,6 +264,10 @@ const activeMeta = computed(() => groups.find((g) => g.id === currentGroup.value
 const activeCards = computed(() => GROUP_CARDS[currentGroup.value] || [])
 
 const currentGroup = ref<string>((route.params.group as string) || 'ai-models')
+
+// 记忆管理弹窗:在「记忆系统」配置页顶部放入口卡片,点击打开单一弹窗完成全部
+// 查看/编辑/删除操作(弹窗自管一切,不触碰本页 dirty/保存条逻辑)。
+const showMemoryDialog = ref(false)
 
 const loading = ref(false)
 const loadError = ref('')
@@ -740,4 +758,15 @@ loadConfig()
 }
 .dirty-hint.saved { color: var(--accent-soft); }
 .action-buttons { display: flex; gap: var(--sp-sm); }
+
+/* 记忆管理入口卡片:寄生在 memory 配置分组顶部,按钮置于卡片内。 */
+.memory-manage-entry {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-md);
+}
+.memory-manage-btn {
+  align-self: flex-start;
+  padding: var(--sp-xs) var(--sp-lg);
+}
 </style>

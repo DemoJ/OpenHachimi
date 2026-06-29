@@ -35,11 +35,6 @@ class VectorStoreMixin:
             elif level == "L2":
                 conn.execute("UPDATE memory_blocks SET embedding_status = ?, updated_at = ? WHERE id = ?", ("ready", now, item_id))
 
-    def get_atom_content(self, atom_id: str) -> str | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT content FROM memory_atoms WHERE id = ?", (atom_id,)).fetchone()
-            return str(row["content"]) if row else None
-
     def vector_search(
         self,
         scope: MemoryScope,

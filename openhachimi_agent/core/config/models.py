@@ -57,6 +57,10 @@ class MemorySchedulerConfig:
     poll_interval_seconds: int = 2
     batch_size: int = 10
     lock_seconds: int = 300
+    # 不依赖新对话的独立定时清理周期(expire_due_atoms/archive_decayed_atoms)。
+    # maintenance job handler 也可被外部手动入队,但核心定时逻辑在 MemoryScheduler
+    # _run_loop 内内联(不走 job queue,避免队列竞争)。默认 6 小时。
+    maintenance_interval_seconds: int = 21600
 
 
 @dataclass(frozen=True)

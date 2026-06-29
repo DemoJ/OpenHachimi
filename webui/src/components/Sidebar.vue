@@ -30,7 +30,11 @@
       >
         <div class="preview-row">
           <span class="preview">{{ s.preview || '(空会话)' }}</span>
-          <span class="channel-tag" v-if="s.channel">{{ channelLabel(s.channel) }}</span>
+          <button
+            class="session-delete"
+            title="删除会话"
+            @click.stop="onDeleteSession(s.session_id)"
+          >×</button>
         </div>
         <div class="time">{{ formatTime(s.mtime) }}</div>
       </div>
@@ -59,6 +63,19 @@
     <div class="sidebar-footer">
       <button class="btn-settings" @click="onSettings">设置</button>
     </div>
+
+    <!-- 删除会话弹窗:用自定义 ConfirmDialog 替代浏览器原生 confirm/alert,
+         与页面整体风格一致。pendingDelete 为 null 时不渲染。
+         失败时复用同一弹窗展示错误(deleteError 非空),确认按钮变"知道了"。 -->
+    <ConfirmDialog
+      v-if="pendingDelete"
+      :title="deleteError ? '删除失败' : '删除会话'"
+      :message="deleteError || '确定删除该会话？消息历史将被清除，此操作不可撤销。'"
+      :confirm-text="deleteError ? '知道了' : '删除'"
+      :loading="deleting"
+      @confirm="deleteError ? closeDialog() : confirmDelete()"
+      @cancel="closeDialog()"
+    />
   </aside>
 </template>
 
@@ -66,7 +83,8 @@
 import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useChatStore } from '../store'
-import { newSession, switchRole, loadSession, getSessionMessages } from '../api'
+import { newSession, switchRole, loadSession, getSessionMessages, stop } from '../api'
+import ConfirmDialog from './ConfirmDialog.vue'
 
 const store = useChatStore()
 const router = useRouter()
@@ -123,17 +141,6 @@ onBeforeUnmount(() => {
   detachObserver()
 })
 
-const CHANNEL_LABELS: Record<string, string> = {
-  webui: 'WebUI',
-  cli: 'CLI',
-  telegram: 'TG',
-  weixin: '微信',
-}
-
-function channelLabel(code: string): string {
-  return CHANNEL_LABELS[code] ?? code
-}
-
 function formatTime(mtime: number): string {
   const d = new Date(mtime * 1000)
   const now = new Date()
@@ -181,6 +188,54 @@ async function onLoadSession(session_id: string) {
     console.error(e)
   }
 }
+
+// 删除会话:点 × 只打开确认弹窗(记下待删 session_id),真正删除在 confirmDelete。
+// pendingDelete 非 null 即弹窗打开;deleting 期间禁用弹窗按钮,防止删一半被中断。
+// deleteError 非空时弹窗切到"错误提示"态(标题/文案/按钮文案都变,确认即关闭)。
+const pendingDelete = ref<string | null>(null)
+const deleting = ref(false)
+const deleteError = ref('')
+
+function onDeleteSession(session_id: string) {
+  pendingDelete.value = session_id
+  deleteError.value = ''
+}
+
+function closeDialog() {
+  if (deleting.value) return
+  pendingDelete.value = null
+  deleteError.value = ''
+}
+
+async function confirmDelete() {
+  const session_id = pendingDelete.value
+  if (!session_id || deleting.value) return
+  deleting.value = true
+  deleteError.value = ''
+  // 删除当前会话且正在流式生成时,先中断后台任务,避免向已删除会话写回消息
+  // (消息表 ON DELETE CASCADE 已清空,后台 run_turn 写回会重建空行造成脏数据)。
+  if (session_id === store.currentSessionId && store.isGenerating) {
+    try {
+      await stop(session_id)
+      store.setGenerating(false)
+    } catch (e) {
+      console.error(e)
+    }
+  }
+  try {
+    await store.deleteSession(session_id)
+    // 删除的是当前会话 → store 已把它置空、清消息;通知父组件进入空白态。
+    if (session_id === store.currentSessionId) {
+      emit('session-loaded')
+    }
+    pendingDelete.value = null
+  } catch (e) {
+    console.error(e)
+    deleteError.value = (e as Error)?.message || '删除会话失败，请重试。'
+  } finally {
+    deleting.value = false
+  }
+}
 </script>
 
 <style scoped>
@@ -197,14 +252,30 @@ async function onLoadSession(session_id: string) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.channel-tag {
+/* 删除按钮:平时透明但占位(避免 hover 显形时 preview 文字宽度跳动),
+   仅在 hover 会话项时浮现;按钮自身 hover 转红。点击靠 @click.stop 不冒泡到 onLoadSession。 */
+.session-delete {
   flex: 0 0 auto;
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: rgba(120, 120, 160, 0.18);
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
   color: var(--body-mid, #888);
-  letter-spacing: 0.04em;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 20px;
+  text-align: center;
+  border-radius: var(--radius-sm, 4px);
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+}
+.session-item:hover .session-delete {
+  opacity: 1;
+}
+.session-delete:hover {
+  color: #d33;
+  background: rgba(220, 50, 50, 0.12);
 }
 .session-item.load-more {
   cursor: default;

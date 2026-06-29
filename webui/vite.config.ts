@@ -20,8 +20,10 @@ const apiPaths = [
   '/commands',
   '/session',
   '/sessions',
+  '/channels',
   '/artifacts',
   '/schedules',
+  '/memory',
 ]
 
 export default defineConfig({

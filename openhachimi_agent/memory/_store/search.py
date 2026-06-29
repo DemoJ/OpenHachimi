@@ -35,7 +35,7 @@ class SearchStoreMixin:
             self.touch([item.id for item in final])
         return final
 
-    def list_memories(self, scope: MemoryScope, memory_type: str | None = None, limit: int = 20, include_archived: bool = False) -> list[MemorySearchResult]:
+    def list_memories(self, scope: MemoryScope, memory_type: str | None = None, limit: int = 20, include_archived: bool = False, touch: bool = True) -> list[MemorySearchResult]:
         limit = max(1, min(limit, 100))
         statuses = [MemoryStatus.ACTIVE.value]
         if include_archived:
@@ -126,7 +126,10 @@ class SearchStoreMixin:
         )
         results.sort(key=lambda item: item.updated_at, reverse=True)
         final = results[:limit]
-        self.touch([item.id for item in final])
+        # touch=False 时仅查阅不更新访问态——HTTP 管理页列出记忆不应污染
+        # access_count/last_accessed_at(那会干扰衰减打分逻辑)。agent 工具默认 True。
+        if touch:
+            self.touch([item.id for item in final])
         return final
 
     def _search_atoms(self, conn: sqlite3.Connection, scope: MemoryScope, query: str, statuses: list[str], limit: int) -> list[MemorySearchResult]:
