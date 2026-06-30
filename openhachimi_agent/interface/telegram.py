@@ -16,9 +16,10 @@ import contextlib
 import shutil
 from collections.abc import AsyncIterator, Callable, Awaitable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from telegram import Update, constants
-from telegram.error import TelegramError
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -57,6 +58,59 @@ def _exception_text(exc: BaseException) -> str:
 
 def _is_message_not_modified(exc: BaseException) -> bool:
     return "message is not modified" in str(exc).lower()
+
+
+# 网络瞬时错误重试配置：代理或链路偶尔抖动时，让 Telegram 出站请求能自愈，
+# 避免一次抖动就让流式编辑断裂成新消息、或让 typing 任务崩溃刷 ERROR 日志。
+_NET_RETRY_BASE_DELAY = 0.8
+_NET_RETRY_JITTER = 0.3
+# 确定性错误：重试无意义，立即抛出交给上层处理。
+# BadRequest 继承自 NetworkError 但属确定性错误（请求本身有问题），故在重试分支里
+# 用 except 精确排除。Forbidden/InvalidToken/Conflict 等不继承 NetworkError，
+# 本就不会落到重试分支，无需在此列举。
+
+
+async def _retry_network_call(
+    coro_factory: Callable[[], Awaitable[Any]],
+    *,
+    max_retries: int = 3,
+) -> Any:
+    """对 Telegram 出站请求做有限次重试，仅针对瞬时网络错误。
+
+    - 重试 ``NetworkError`` 及其子类 ``TimedOut``（代理抖动 / 超时）。
+    - ``BadRequest`` 虽继承 ``NetworkError`` 但属确定性错误，立即抛出不重试。
+    - ``Forbidden`` / ``InvalidToken`` / ``Conflict`` 等不继承 ``NetworkError``，
+      本就不会进入重试分支。
+    - ``RetryAfter``（限流）按服务端给定的 ``retry_after`` 秒 sleep 后再重试一次。
+    - ``message is not modified`` 由调用方在进入本函数前自行 short-circuit，不在此处理。
+    - 重试耗尽后抛出最后一次的原异常，由上层决定 fallback（发新消息 / 记 warning）。
+
+    ``coro_factory`` 是无参返回协程的可调用对象，便于每次重试重建协程。
+    """
+    attempt = 0
+    while True:
+        try:
+            return await coro_factory()
+        except RetryAfter as exc:
+            # 限流：按服务端要求等待后重试，不受 max_retries 计数约束。
+            retry_after = exc.retry_after
+            wait = float(retry_after) if isinstance(retry_after, (int, float)) else 1.0
+            logger.debug("telegram retry-after %.1fs", wait)
+            await asyncio.sleep(wait)
+            continue
+        except BadRequest:
+            # 确定性错误：立即抛出，交给上层 fallback。
+            raise
+        except (NetworkError, TimedOut) as exc:
+            attempt += 1
+            if attempt >= max_retries:
+                raise
+            delay = _NET_RETRY_BASE_DELAY * (2 ** (attempt - 1)) + _NET_RETRY_JITTER
+            logger.debug(
+                "telegram network error, retry %d/%d in %.1fs: %s",
+                attempt, max_retries, delay, _exception_text(exc),
+            )
+            await asyncio.sleep(delay)
 
 
 def _split_long_text(text: str) -> list[str]:
@@ -146,7 +200,12 @@ async def _keep_typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if chat is None:
         return
     while True:
-        await ctx.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.TYPING)
+        # typing 是装饰性请求，瞬时网络抖动时静默跳过即可——不能让它崩溃刷 ERROR 日志，
+        # 也不能误吞 asyncio.CancelledError（外层 finally 靠它收尾）。
+        try:
+            await ctx.bot.send_chat_action(chat_id=chat.id, action=constants.ChatAction.TYPING)
+        except (NetworkError, TimedOut) as exc:
+            logger.debug("telegram send_chat_action failed, skipping: %s", _exception_text(exc))
         await asyncio.sleep(_TYPING_INTERVAL)
 
 
@@ -442,7 +501,9 @@ class TelegramBot:
             async def edit_or_send(messages: list, index: int, text: str, parse_mode=None):
                 if index < len(messages):
                     try:
-                        await messages[index].edit_text(text, parse_mode=parse_mode)
+                        await _retry_network_call(
+                            lambda: messages[index].edit_text(text, parse_mode=parse_mode)
+                        )
                         return messages[index]
                     except TelegramError as exc:
                         if _is_message_not_modified(exc):
@@ -454,7 +515,9 @@ class TelegramBot:
                             _exception_text(exc),
                             exc_info=True,
                         )
-                return await update.message.reply_text(text, parse_mode=parse_mode)
+                return await _retry_network_call(
+                    lambda: update.message.reply_text(text, parse_mode=parse_mode)
+                )
 
             async def ensure_tool_messages() -> None:
                 nonlocal unused_placeholder, tool_messages
@@ -627,8 +690,10 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
     proxy_url = config.telegram_proxy_url
     if proxy_url:
         logger.info("telegram bot using proxy: %s", proxy_url)
-        request = HTTPXRequest(proxy=proxy_url)
-        get_updates_request = HTTPXRequest(proxy=proxy_url, read_timeout=30.0)
+        # 代理分支显式设置 connect_timeout：代理不通时尽快暴露给重试层，
+        # 而不是挂到 httpx 默认超时才让用户看到「卡住」。
+        request = HTTPXRequest(proxy=proxy_url, connect_timeout=10.0)
+        get_updates_request = HTTPXRequest(proxy=proxy_url, read_timeout=30.0, connect_timeout=10.0)
         app = (
             Application.builder()
             .token(token)
