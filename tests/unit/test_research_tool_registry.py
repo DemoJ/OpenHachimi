@@ -1,4 +1,4 @@
-from openhachimi_agent.tools.registry import EXECUTOR_TOOLSET, PLANNER_TOOLSET, SCHEDULED_EXECUTOR_TOOLSET
+from openhachimi_agent.tools.registry import MAIN_TOOLSET
 
 
 def _tool_names(toolset):
@@ -8,8 +8,8 @@ def _tool_names(toolset):
     return {getattr(tool, "__name__", "") or getattr(tool, "name", "") for tool in tools}
 
 
-def test_executor_toolset_contains_web_search():
-    names = _tool_names(EXECUTOR_TOOLSET)
+def test_main_toolset_contains_web_search():
+    names = _tool_names(MAIN_TOOLSET)
 
     assert "web_search" in names
     assert "browser_extract_content" in names
@@ -18,20 +18,15 @@ def test_executor_toolset_contains_web_search():
     assert "research_next_queries" not in names
 
 
-def test_planner_toolset_does_not_contain_network_research_tools():
-    names = _tool_names(PLANNER_TOOLSET)
-
-    assert "web_search" not in names
-    assert "web_fetch" not in names
-    assert "browser_navigate" not in names
-    assert "browser_extract_content" not in names
+def test_main_toolset_contains_install_skill():
+    names = _tool_names(MAIN_TOOLSET)
+    assert "install_skill" in names
 
 
-def test_executor_toolset_contains_install_skill_but_planner_does_not():
-    executor_names = _tool_names(EXECUTOR_TOOLSET)
-    scheduled_names = _tool_names(SCHEDULED_EXECUTOR_TOOLSET)
-    planner_names = _tool_names(PLANNER_TOOLSET)
-
-    assert "install_skill" in executor_names
-    assert "install_skill" in scheduled_names
-    assert "install_skill" not in planner_names
+def test_main_toolset_contains_create_todos_as_normal_tool():
+    """Hermes 式重构后 create_todos 是普通工具(不再是 planner output tool),
+    与 get_todos / update_todo 一起在 MAIN_TOOLSET。"""
+    names = _tool_names(MAIN_TOOLSET)
+    assert "create_todos" in names
+    assert "get_todos" in names
+    assert "update_todo" in names

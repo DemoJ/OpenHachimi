@@ -8,7 +8,7 @@ def test_load_system_prompt_supports_root_prompt():
 
 
 def test_load_system_prompt_supports_nested_prompt():
-    assert "Planner Agent" in load_system_prompt("agents/planner")
+    assert "主 Agent" in load_system_prompt("agents/main_agent")
 
 
 def test_render_system_prompt_replaces_variables():

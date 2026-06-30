@@ -18,7 +18,6 @@ from openhachimi_agent.core.redaction import redact_exception
 from openhachimi_agent.service.agent_runtime.commands import SIGNAL_LABELS
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
-    fail_current_plan,
     has_active_todos,
     suspend_current_plan,
 )
@@ -49,9 +48,10 @@ def _stall_event(
     session_state: dict[str, object],
     deps: AgentDeps,
 ) -> object | None:
-    """处理 OperationStalledError:挂起/失败 plan,返回要 yield 的系统提示(或 None)。
+    """处理 OperationStalledError:有活动 todos 则挂起计划,返回要 yield 的系统提示。
 
-    有 active todos 时挂起计划并提示"已暂停";否则失败计划并提示"已失败"。
+    Hermes 式重构后不再 fail plan(plan 状态机已简化):无活动 todos 时直接给
+    "任务未完成"提示,下一轮主 agent 重新理解用户请求。
     """
     stalled_detail = {"operation": exc.operation, "stalled_for": exc.stalled_for, "timeout": exc.timeout}
     if has_active_todos(session_state):
@@ -61,8 +61,7 @@ def _stall_event(
             f"{exc} 旧计划已挂起,不会影响下一轮对话;"
             "如需恢复,请明确说明\"继续刚才的任务\"。"
         )
-    fail_current_plan(session_state, reason="operation_stalled", detail=stalled_detail)
-    return system_stream_event(f"\n\n[System] 当前任务已失败:{exc} 未生成可恢复计划,下一轮将重新理解用户请求。")
+    return system_stream_event(f"\n\n[System] 当前任务未完成:{exc} 未生成可恢复计划,下一轮将重新理解用户请求。")
 
 
 async def _iter_post_completion(

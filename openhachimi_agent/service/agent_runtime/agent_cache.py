@@ -11,11 +11,7 @@ import time
 from typing import Any
 
 from openhachimi_agent.agent.factory import (
-    build_continuation_agent,
-    build_executor_agent,
-    build_planner_agent,
-    build_router_agent,
-    build_scheduled_executor_agent,
+    build_main_agent,
     build_subagent_agent,
 )
 from openhachimi_agent.core.config import ROLES_CONFIG_FILE_NAME, AppConfig
@@ -70,19 +66,16 @@ def build_agent_by_type(
     role_name: str,
     agent_type: str,
     mcp_toolsets: list,
+    run_mode: str = "interactive",
 ):
-    """根据 agent_type 分发到对应工厂函数。"""
-    if agent_type == "router":
-        return build_router_agent(config)
-    if agent_type == "continuation":
-        return build_continuation_agent(config)
-    if agent_type == "planner":
-        return build_planner_agent(config, role_name, mcp_toolsets=mcp_toolsets)
+    """根据 agent_type 分发到对应工厂函数。
+
+    Hermes 式重构后只剩两类:subagent(委派子 agent,零记忆 str 输出)和
+    main(单一主 agent,scheduled 模式复用 main + 注入 scheduled prompt)。
+    """
     if agent_type == "subagent":
         return build_subagent_agent(config, role_name, mcp_toolsets=mcp_toolsets)
-    if agent_type == "scheduled_executor":
-        return build_scheduled_executor_agent(config, role_name, mcp_toolsets=mcp_toolsets)
-    return build_executor_agent(config, role_name, mcp_toolsets=mcp_toolsets)
+    return build_main_agent(config, role_name, mcp_toolsets=mcp_toolsets, run_mode=run_mode)
 
 
 def get_or_build_agent(
@@ -92,9 +85,14 @@ def get_or_build_agent(
     agent_type: str,
     mcp_toolsets: list,
     current_mtime: float,
+    run_mode: str = "interactive",
 ):
-    """读写 `agents` 缓存,过期则重建。返回 Agent 实例。"""
-    cache_key = f"{role_name}:{agent_type}"
+    """读写 `agents` 缓存,过期则重建。返回 Agent 实例。
+
+    缓存键含 run_mode,使 interactive / scheduled 的 main agent 各占一条缓存
+    (scheduled 多注入了 scheduled_executor prompt,不能复用 interactive 实例)。
+    """
+    cache_key = f"{role_name}:{agent_type}:{run_mode}"
     cached = agents.get(cache_key)
     if cached is None or cached[1] < current_mtime:
         if cached is not None:
@@ -103,6 +101,6 @@ def get_or_build_agent(
                 agent_type,
                 role_name,
             )
-        agent = build_agent_by_type(config, role_name, agent_type, mcp_toolsets)
+        agent = build_agent_by_type(config, role_name, agent_type, mcp_toolsets, run_mode=run_mode)
         agents[cache_key] = (agent, current_mtime)
     return agents[cache_key][0]

@@ -1,22 +1,34 @@
-"""Executor orchestration with replan and final verification repair."""
+"""主 agent 单次 run 编排(Hermes 式单循环)。
+
+替代旧 ``executor.py`` 的 ``execute_task`` / ``execute_task_resume``。区别:
+
+- **不再有 router/planner 前置分流** —— 主 agent 自主决定要不要建 todo。
+- **不再有单 turn 内 replan/repair 串行** —— 失败由主 agent 自己 cancel+修订 todo;
+  停止时的完整性校验由 ``factory._validate_execution_result`` 的 output_validator
+  闸门(verification_stop + final_verification_signal)一次完成,不再二次拉起 planner。
+- **保留** clarify_user 的 deferred 跨轮链路、视觉预处理、preflight 压缩、
+  output_validator 闸门。
+
+视觉/消息构造相关函数(``message_with_attachments`` 等)从 ``executor.py`` 原样迁入,
+供 ``turn_setup.py`` / ``turn.py`` 继续使用。
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import UserContent
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
 from pydantic_ai.usage import UsageLimits
 
-from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length, get_replan_signal
-from openhachimi_agent.agent.factory import build_scheduled_executor_agent
+from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length
+from openhachimi_agent.agent.verification_stop import reset_turn_verification
 from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -26,7 +38,6 @@ from openhachimi_agent.service.agent_runtime.context import (
     has_restorable_suspended_plan,
     restore_suspended_plan,
 )
-from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.transport.api_models import AttachmentRef
 from openhachimi_agent.vision.capabilities import mark_model_vision_support
 from openhachimi_agent.vision.preprocess import VisionPreprocessResult, image_attachments, preprocess_vision_attachments
@@ -34,6 +45,9 @@ from openhachimi_agent.tools.vision_guard import normalize_vision_guard_path
 
 
 logger = logging.getLogger(__name__)
+
+
+# ── 附件 / 视觉(从 executor.py 原样迁入) ────────────────────────────────────
 
 
 def _normalize_attachment_path(config: AppConfig, attachment: AttachmentRef) -> str:
@@ -153,6 +167,7 @@ def format_attachments_for_prompt(attachments: list[AttachmentRef], vision_resul
 
 
 def message_with_attachments(message: str, attachments: list[AttachmentRef], vision_result: VisionPreprocessResult | None = None) -> str:
+    """构造给模型的 user-prompt 文本:用户原话 + 附件元数据块(+ 视觉前缀)。"""
     attachment_block = format_attachments_for_prompt(attachments, vision_result)
     user_message = message.strip() or "用户发送了附件，请根据附件内容协助处理。"
     prefix = vision_result.text_prefix.strip() if vision_result and vision_result.text_prefix.strip() else ""
@@ -180,30 +195,21 @@ def _degrade_direct_vision_result(vision_result: VisionPreprocessResult, error: 
     )
 
 
+# ── 主 agent run ────────────────────────────────────────────────────────────
+
+
 @dataclass
 class ExecutionOutcome:
     result: Any
     final_verification_signal: dict[str, object] | None = None
 
 
-def _build_executor_message(
-    task_frame_payload: dict[str, Any] | None,
+def _build_main_message(
     message: str,
-    attachments: list[AttachmentRef] | None = None,
-    vision_result: VisionPreprocessResult | None = None,
+    attachments: list[AttachmentRef] | None,
+    vision_result: VisionPreprocessResult | None,
 ) -> str | list[UserContent]:
-    """构造发送给 Executor 的 user-prompt。
-
-    v2: 不再把 TaskFrame、时间块、记忆召回、SKILL 全文塞进 user-prompt。
-    这些系统级运行时上下文统一由 ``factory._dynamic_system_prompt`` 通过
-    ``@agent.system_prompt`` 钩子注入到 system prompt 末尾。user-prompt 只承载
-    用户原话和附件元数据；对 Executor 单独再渲染 executor_task 模板，只是为了
-    保留一个轻量"任务起点"提示。
-
-    保留 ``task_frame_payload`` 入参是为了向后兼容（已有调用方仍会传），但内部
-    不再嵌入 JSON。
-    """
-    del task_frame_payload  # noqa: F841 — kept for backward compatibility
+    """主 agent 的 user-prompt:executor_task 模板包裹用户原话 + 附件。"""
     user_message = message_with_attachments(message, attachments or [], vision_result)
     text = render_system_prompt(
         "runtime/executor_task",
@@ -212,69 +218,20 @@ def _build_executor_message(
     return _with_direct_vision_parts(text, vision_result)
 
 
-def _build_repair_message(
-    task_frame_payload: dict[str, Any] | None,
-    message: str,
-    verification_signal: dict[str, object],
-    attachments: list[AttachmentRef] | None = None,
-    vision_result: VisionPreprocessResult | None = None,
-) -> str | list[UserContent]:
-    del task_frame_payload  # noqa: F841 — kept for backward compatibility
-    text = render_system_prompt(
-        "runtime/executor_repair",
-        {
-            "verification_signal": json.dumps(verification_signal, ensure_ascii=False),
-            "user_message": message_with_attachments(message, attachments or [], vision_result),
-        },
-    )
-    return _with_direct_vision_parts(text, vision_result)
+def _build_main_agent(role: str, run_mode: str, get_agent: Callable[..., Any]) -> Any:
+    """选主 agent 实例(经 service._get_agent 统一缓存)。
 
-
-def _build_retry_message(
-    task_frame_payload: dict[str, Any] | None,
-    message: str,
-    attachments: list[AttachmentRef] | None = None,
-    vision_result: VisionPreprocessResult | None = None,
-) -> str | list[UserContent]:
-    del task_frame_payload  # noqa: F841 — TaskFrame 已在 system prompt 中注入
-    text = render_system_prompt(
-        "runtime/executor_retry",
-        {
-            "user_message": message_with_attachments(message, attachments or [], vision_result),
-        },
-    )
-    return _with_direct_vision_parts(text, vision_result)
-
-
-def _get_task_frame_payload(session_state: dict[str, Any]) -> dict[str, Any] | None:
-    task_frame_payload = session_state.get("task_frame")
-    if not isinstance(task_frame_payload, dict):
-        return None
-    payload = dict(task_frame_payload)
-    known_paths = session_state.get("known_paths")
-    if isinstance(known_paths, dict) and known_paths:
-        payload["known_paths"] = known_paths
-    return payload
-
-
-def _build_executor_agent(config: AppConfig, role: str, task_frame_payload: dict[str, Any] | None, get_agent: Callable[[str, str], Any], run_mode: str = "interactive"):
-    """选 executor agent 实例。
-
-    渐进披露改造后,我们不再根据 ``task_frame.relevant_skills[*].allowed_tools``
-    在轮内动态重建受限 executor —— skill 召回已经下放给主模型自己,通过
-    ``get_skill_instructions`` 按需读全文,SKILL.md 里的 ``allowed-tools`` 字段
-    不再作为 router 派生的硬性工具沙箱。``task_frame_payload`` 参数保留以兼容
-    调用方签名,但不再被消费。
+    单一主 agent 持全套工具(含 create_todos / clarify_user / delegate_task);scheduled
+    模式由 ``_build_base_agent`` 内部注入 scheduled_executor prompt 实现(build_main_agent
+    透传 run_mode),scheduler 写工具的拦截由 scheduler 工具自身的
+    ``ensure_scheduler_mutation_allowed`` 在 run_mode=scheduled 时负责,无需此处裁剪。
     """
-    del task_frame_payload  # 渐进披露后不再用 relevant_skills 派生工具沙箱
-    if run_mode == "scheduled":
-        return build_scheduled_executor_agent(config, role)
-    return get_agent(role, "executor")
+    return get_agent(role, "main", run_mode=run_mode)
 
 
-async def run_executor_once(
+async def run_main_agent_once(
     *,
-    executor_agent: Any,
+    main_agent: Any,
     run_message: str | list[UserContent],
     history: list[Any],
     deps: AgentDeps,
@@ -282,17 +239,17 @@ async def run_executor_once(
     stream: bool,
     handle_stream_events: Callable[[object, object], Any] | None,
 ) -> object:
-    run_kwargs = {
+    run_kwargs: dict[str, Any] = {
         "message_history": history,
         "deps": deps,
         "usage_limits": UsageLimits(request_limit=60),
     }
     if stream and handle_stream_events is not None:
         run_kwargs["event_stream_handler"] = handle_stream_events
-        return await executor_agent.run(run_message, **run_kwargs)
+        return await main_agent.run(run_message, **run_kwargs)
 
     return await asyncio.wait_for(
-        executor_agent.run(run_message, **run_kwargs),
+        main_agent.run(run_message, **run_kwargs),
         timeout=config.agent_timeout_seconds,
     )
 
@@ -300,8 +257,8 @@ async def run_executor_once(
 def preflight_compress_history(ctx: AgentRunContext) -> None:
     """轮内预检:history 粗略估计达硬上限时,做廉价压缩(无 LLM)防止 API 超限。
 
-    针对单轮内 replan/repair/critique 多次 extend history 导致的膨胀。
-    使用 allow_llm_summary=False 走确定性兜底,避免中途中断去调 LLM。
+    针对单 turn 内主 agent 多步 ReAct 多次 extend history 导致的膨胀。使用
+    ``allow_llm_summary=False`` 走确定性兜底,避免中途中断去调 LLM。
     """
     compressor = ctx.context_compressor
     if compressor is None:
@@ -312,8 +269,6 @@ def preflight_compress_history(ctx: AgentRunContext) -> None:
         before = len(ctx.history)
         result = compressor.compress(ctx.history, allow_llm_summary=False)
         if result.dropped:
-            # preflight 只在内存里就地写回组装好的运行时视图,不落库、不记元数据 ——
-            # 轮后主压缩(turn.py)才负责落 appendix append-only + record_compression。
             view = result.runtime_view  # type: ignore[attr-defined]
             if len(view) < before:
                 ctx.history[:] = view
@@ -333,37 +288,21 @@ def preflight_compress_history(ctx: AgentRunContext) -> None:
         )
 
 
-def _executor_stream_handler(ctx: AgentRunContext, text_buffer: list[str]) -> Callable[[object, object], Any] | None:
-    # 正文实时流式：直接复用 turn.py 里构建的无缓冲 handler（ctx.stream_event_handler），
-    # 不再传 text_buffer。原来传 text_buffer 会把所有正文 chunk 缓冲到 list 里，
-    # 直到下游裁判跑完才在 _flush_buffered_text 一次性 flush，导致 WebUI
-    # 看不到逐字打字机效果、整段回复在最后才一口气出现。
-    #
-    # 取消缓冲的代价：final_verification 要求重写时，首版正文已经
-    # 流式显示给用户了，repair 的输出会作为续写追加在同一条 assistant 消息后，
-    # 中间有 [System] 提示分隔。这与 ChatGPT/Claude 等主流产品的行为一致，
-    # 优于"长时间静默后一次性吐出"。
-    #
-    # text_buffer 参数仅为兼容调用处保留，不再使用（_flush_buffered_text 退化为 no-op）。
+def _main_stream_handler(ctx: AgentRunContext) -> Callable[[object, object], Any] | None:
+    """正文实时流式:复用 ctx.stream_event_handler(无缓冲)。
+
+    取消缓冲的代价:verification 闸门要求重写时,首版正文已经流式显示给用户,
+    repair 输出会作为续写追加。这与 ChatGPT/Claude 等主流产品的行为一致,
+    优于"长时间静默后一次性吐出"。
+    """
     if not ctx.stream or ctx.stream_queue is None:
         return ctx.stream_event_handler
     return ctx.stream_event_handler
 
 
-async def _flush_buffered_text(ctx: AgentRunContext, text_buffer: list[str]) -> None:
-    # 正文已改为实时流式（见 _executor_stream_handler），此处保留为 no-op 兜底，
-    # 不破坏 execute_task 既有的 repair/critique 分支结构。
-    if not text_buffer or not ctx.stream or ctx.stream_queue is None:
-        return
-    for chunk in text_buffer:
-        await ctx.stream_queue.put(StreamEventItem(type="text", text=chunk))
-    text_buffer.clear()
-
-
-async def _run_executor_with_vision_fallback(
+async def _run_main_with_vision_fallback(
     *,
-    executor_agent: Any,
-    task_frame_payload: dict[str, Any] | None,
+    main_agent: Any,
     message: str,
     attachments: list[AttachmentRef],
     vision_result: VisionPreprocessResult,
@@ -372,11 +311,11 @@ async def _run_executor_with_vision_fallback(
     config: AppConfig,
     stream: bool,
     handle_stream_events: Callable[[object, object], Any] | None,
-) -> tuple[object, VisionPreprocessResult]:
-    run_message = _build_executor_message(task_frame_payload, message, attachments, vision_result)
+) -> object:
+    run_message = _build_main_message(message, attachments, vision_result)
     try:
-        result = await run_executor_once(
-            executor_agent=executor_agent,
+        result = await run_main_agent_once(
+            main_agent=main_agent,
             run_message=run_message,
             history=history,
             deps=deps,
@@ -384,7 +323,7 @@ async def _run_executor_with_vision_fallback(
             stream=stream,
             handle_stream_events=handle_stream_events,
         )
-        return result, vision_result
+        return result
     except ModelHTTPError as exc:
         if not vision_result.direct_parts:
             raise
@@ -396,9 +335,9 @@ async def _run_executor_with_vision_fallback(
         )
         mark_model_vision_support(config, False)
         degraded_vision_result = _degrade_direct_vision_result(vision_result, exc)
-        degraded_message = _build_executor_message(task_frame_payload, message, attachments, degraded_vision_result)
-        result = await run_executor_once(
-            executor_agent=executor_agent,
+        degraded_message = _build_main_message(message, attachments, degraded_vision_result)
+        result = await run_main_agent_once(
+            main_agent=main_agent,
             run_message=degraded_message,
             history=history,
             deps=deps,
@@ -406,37 +345,15 @@ async def _run_executor_with_vision_fallback(
             stream=stream,
             handle_stream_events=handle_stream_events,
         )
-        return result, degraded_vision_result
+        return result
 
 
-async def _replan_after_execution_signal(
-    ctx: AgentRunContext,
-    signal: dict[str, object],
-    get_agent: Callable[[str, str], Any],
-) -> None:
-    planner_agent = get_agent(ctx.role, "planner")
-    if ctx.stream and ctx.stream_queue is not None:
-        await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 执行遇到偏差，正在根据执行记录修订计划...\n", counted_as_output=False))
-    planner_result = await planner_agent.run(
-        render_system_prompt(
-            "runtime/executor_replan",
-            {
-                "execution_ledger_signal": json.dumps(signal, ensure_ascii=False),
-                "user_message": ctx.message,
-            },
-        ),
-        message_history=ctx.history,
-        deps=ctx.deps,
-        event_stream_handler=ctx.stream_event_handler if ctx.stream else None,
-    )
-    ctx.history.extend(planner_result.all_messages())
+async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) -> ExecutionOutcome:
+    """主 agent 单次 run:视觉预处理 → 单次 agent.run → deferred 短路 → verification signal 上抛。
 
-
-async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any]) -> ExecutionOutcome:
-    task_frame_payload = _get_task_frame_payload(ctx.session_state)
-    # 易变上下文（时间/记忆/技能/TaskFrame）已通过 factory._dynamic_system_prompt
-    # 注入到 system prompt 末尾，不再拼到 user-prompt 前缀。user-prompt 只承载
-    # 用户原话和附件元数据，让 capture_turn_memories 拿到的就是干净的输入。
+    不再有 replan/repair 内部循环。失败由主 agent 自己 cancel+修订 todo;
+    停止时完整性校验由 ``factory._validate_execution_result`` 闸门一次完成。
+    """
     if image_attachments(ctx.attachments):
         ctx.operation_state.start("vision", "preprocess")
         _mark_vision_processing(ctx.session_state, ctx.config, ctx.attachments)
@@ -453,94 +370,37 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
     elif failed or vision_result.errors:
         await _emit_system_event(ctx, "\n\n[System] 图片视觉识别未能取得可用结果，将按附件处理状态继续执行。\n")
 
-    ctx.operation_state.start("model", "executor")
-    executor_agent = _build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode)
+    ctx.operation_state.start("model", "main")
+    main_agent = _build_main_agent(ctx.role, ctx.deps.run_mode, get_agent)
     ledger_start_seq = get_ledger_length(ctx.session_state)
     ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
-    # 清零本轮 final-answer validator 的连续打回计数与"yielded"旗标。
-    # 这两个字段由 factory.py 的 _validate_execution_result 维护:counter 用于
-    # VALIDATOR_HARD_LIMIT 硬熔断,yielded 旗标用于本函数末尾决定是否给用户加
-    # "[System] 任务实际未完成"提示。跨轮必须清零,否则上一轮的死循环遗产会
-    # 立刻让新一轮放行。
+    # 清零本轮 verification / final-answer validator 的计数与旗标。跨轮必须清零,
+    # 否则上一轮的死循环遗产会立刻让新一轮放行。
     ctx.session_state.pop("_final_validator_retries", None)
     ctx.session_state.pop("_final_validator_yielded", None)
     ctx.session_state.pop("_final_validator_last_signal", None)
-    # 清零"本轮已查看计划"标志，使 validator 能正确判断是否需要强制 get_todos
     ctx.session_state.pop("_plan_viewed_this_turn", None)
-    text_buffer: list[str] = []
+    reset_turn_verification(ctx.session_state)
     preflight_compress_history(ctx)
 
-    try:
-        result, vision_result = await _run_executor_with_vision_fallback(
-            executor_agent=executor_agent,
-            task_frame_payload=task_frame_payload,
-            message=ctx.message,
-            attachments=ctx.attachments,
-            vision_result=vision_result,
-            history=ctx.history,
-            deps=ctx.deps,
-            config=ctx.config,
-            stream=ctx.stream,
-            handle_stream_events=_executor_stream_handler(ctx, text_buffer),
-        )
-    except Exception as exc:
-        signal = get_replan_signal(ctx.session_state, ledger_start_seq)
-        # validator 反复打回最终会撞 UnexpectedModelBehavior(retries 耗尽)。
-        # 这种情况下 ledger 里要么已经被 _validate_execution_result 写入了
-        # <final_answer_validator> blocked 事件(满足 get_replan_signal 的"连续
-        # >=2 次 blocked"条件),要么只发生过 1 次还不到阈值——此时仍然要救:
-        # 用一个合成的 signal 强行触发 replan,让 planner 看到"答案被反复拦截"
-        # 并据此修订计划(通常是补一步获取缺失信息、或把 blocked 任务拆细)。
-        if (
-            not signal
-            and isinstance(exc, UnexpectedModelBehavior)
-            and int(ctx.session_state.get("_final_validator_retries", 0) or 0) > 0
-        ):
-            signal = {
-                "reason": "final answer validator retry exhausted",
-                "consecutive_failures": int(ctx.session_state.get("_final_validator_retries", 0) or 0),
-                "latest_status": "blocked",
-                "events": [
-                    {
-                        "tool_name": "<final_answer_validator>",
-                        "status": "blocked",
-                        "detail": str(exc)[:500],
-                    }
-                ],
-            }
-        if signal and ctx.turn_state.replan_attempts < 1:
-            ctx.turn_state.replan_attempts += 1
-            text_buffer.clear()
-            # 进入 replan 之前清掉 validator 旗标:replan 会重新跑一次 executor,
-            # 那次的 validator 应该重新计数,而不是带着上次的"yielded"状态。
-            ctx.session_state.pop("_final_validator_retries", None)
-            ctx.session_state.pop("_final_validator_yielded", None)
-            ctx.session_state.pop("_final_validator_last_signal", None)
-            # replan 后重新执行，清零本轮"已查看计划"标志
-            ctx.session_state.pop("_plan_viewed_this_turn", None)
-            await _replan_after_execution_signal(ctx, signal, get_agent)
-            preflight_compress_history(ctx)
-            retry_message = _build_retry_message(task_frame_payload, ctx.message, ctx.attachments, vision_result)
-            result = await run_executor_once(
-                executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
-                run_message=retry_message,
-                history=ctx.history,
-                deps=ctx.deps,
-                config=ctx.config,
-                stream=ctx.stream,
-                handle_stream_events=_executor_stream_handler(ctx, text_buffer),
-            )
-        else:
-            raise
+    result = await _run_main_with_vision_fallback(
+        main_agent=main_agent,
+        message=ctx.message,
+        attachments=ctx.attachments,
+        vision_result=vision_result,
+        history=ctx.history,
+        deps=ctx.deps,
+        config=ctx.config,
+        stream=ctx.stream,
+        handle_stream_events=_main_stream_handler(ctx),
+    )
 
     # clarify_user 抛了 CallDeferred:run 已被 pydantic-ai 在 graph 层合法终止,
-    # output 是 DeferredToolRequests 而非 final answer。下游 final_verification /
-    # validator 等裁判全部跳过——任务在"等用户输入"这个合法暂停态,任何"补齐缺口"
-    # 的尝试都会误伤(详见 tools/clarification.py 与 turn.py 的 deferred 分支处理)。
+    # output 是 DeferredToolRequests 而非 final answer。下游 verification 闸门
+    # 全部跳过——任务在"等用户输入"这个合法暂停态。
     if isinstance(getattr(result, "output", None), DeferredToolRequests):
-        await _flush_buffered_text(ctx, text_buffer)
         logger.info(
-            "execute_task: deferred tool request (clarify_user) — short-circuit "
+            "run_main_agent: deferred tool request (clarify_user) — short-circuit "
             "role=%s session_id=%s",
             ctx.role,
             ctx.session_id,
@@ -548,49 +408,12 @@ async def execute_task(ctx: AgentRunContext, get_agent: Callable[[str, str], Any
         return ExecutionOutcome(result=result)
 
     verification_signal = get_final_verification_signal(ctx.session_state)
-    validator_yielded = bool(ctx.session_state.get("_final_validator_yielded", False))
-    # validator 已经被硬熔断放行,说明模型已被反复证明"突破不了任务未完成的阻塞"
-    # (常见原因:工具/权限缺失、用户输入不完整、模型坚持已完成)。再发起 repair
-    # 轮次毫无意义——下一次 validator 看到 counter 仍在上限,会立刻再次 yield,
-    # 浪费 LLM 调用并把模型反复拉进同一死局。直接把 signal 上抛给 turn.py,
-    # 由后者走 suspend_current_plan + 给用户加 [System] 提示。
-    if verification_signal and validator_yielded:
-        await _flush_buffered_text(ctx, text_buffer)
-        logger.info(
-            "skipping final_verification_repair because validator was yielded "
-            "(task is genuinely stuck, not a recoverable transient) role=%s session_id=%s",
-            ctx.role,
-            ctx.session_id,
-        )
-        return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
-    if verification_signal and ctx.turn_state.final_verification_repair_attempts < 1:
-        ctx.turn_state.final_verification_repair_attempts += 1
-        text_buffer.clear()
-        if ctx.stream and ctx.stream_queue is not None:
-            await ctx.stream_queue.put(StreamEventItem(type="system", text="\n\n[System] 最终验证发现任务尚未满足，正在补齐缺口...\n", counted_as_output=False))
-        repair_message = _build_repair_message(task_frame_payload, ctx.message, verification_signal, ctx.attachments, vision_result)
-        preflight_compress_history(ctx)
-        result = await run_executor_once(
-            executor_agent=_build_executor_agent(ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode),
-            run_message=repair_message,
-            history=ctx.history,
-            deps=ctx.deps,
-            config=ctx.config,
-            stream=ctx.stream,
-            handle_stream_events=_executor_stream_handler(ctx, text_buffer),
-        )
-        # repair 后模型可能又调 clarify_user 触发 deferred,这种情况也走短路。
-        if isinstance(getattr(result, "output", None), DeferredToolRequests):
-            await _flush_buffered_text(ctx, text_buffer)
-            return ExecutionOutcome(result=result)
-        verification_signal = get_final_verification_signal(ctx.session_state)
-
     if verification_signal:
-        await _flush_buffered_text(ctx, text_buffer)
         return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
-
-    await _flush_buffered_text(ctx, text_buffer)
     return ExecutionOutcome(result=result)
+
+
+# ── clarify_user deferred resume(从 executor.py 原样迁入,精简 plan 状态机依赖) ──
 
 
 def _find_pending_clarify_tool_call(history: list[Any]) -> str | None:
@@ -615,26 +438,25 @@ def _find_pending_clarify_tool_call(history: list[Any]) -> str | None:
                     and part.tool_call_id not in consumed
                 ):
                     return part.tool_call_id
-            # 最近的 ModelResponse 没有 pending clarify → 不是一次 clarify resume
             break
     return None
 
 
-async def execute_task_resume(
+async def resume_main_agent(
     ctx: AgentRunContext,
-    get_agent: Callable[[str, str], Any],
+    get_agent: Callable[..., Any],
 ) -> ExecutionOutcome | None:
     """处理 clarify_user 触发的下一轮:把用户回复以 deferred tool result 形式
-    无感知地灌回模型。
+    无感知地灌回主 agent。
 
     返回 None 表示无法 resume(状态损坏或 history 中找不到 pending tool call),
-    上层应清理 ``_user_clarification`` 并退回正常 execute_task 路径。
+    上层应清理 ``_user_clarification`` 并退回正常 run_main_agent 路径。
     """
     info = ctx.session_state.get("_user_clarification", {}) or {}
     tool_call_id = info.get("tool_call_id") or _find_pending_clarify_tool_call(ctx.history)
     if not tool_call_id:
         logger.warning(
-            "execute_task_resume: pending _user_clarification has no tool_call_id and "
+            "resume_main_agent: pending _user_clarification has no tool_call_id and "
             "history lacks an unconsumed clarify_user call; fall back to normal flow. "
             "role=%s session_id=%s",
             ctx.role,
@@ -645,29 +467,25 @@ async def execute_task_resume(
 
     # 恢复挂起的活动计划(若有):上一次 clarify_user 触发的 suspend_current_plan 把
     # todo_state.is_active 翻成了 False。回灌结果前先把它翻回去,模型回到工具循环
-    # 之后才能正常 with_execution_guard。
+    # 之后才能正常推进。
     if has_restorable_suspended_plan(ctx.session_state):
         restore_suspended_plan(ctx.session_state, deps=ctx.deps)
 
-    task_frame_payload = _get_task_frame_payload(ctx.session_state)
     ledger_start_seq = get_ledger_length(ctx.session_state)
     ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
     ctx.session_state.pop("_final_validator_retries", None)
     ctx.session_state.pop("_final_validator_yielded", None)
     ctx.session_state.pop("_final_validator_last_signal", None)
     ctx.session_state.pop("_plan_viewed_this_turn", None)
+    reset_turn_verification(ctx.session_state)
 
     results = DeferredToolResults(calls={tool_call_id: ctx.message})
-    executor_agent = _build_executor_agent(
-        ctx.config, ctx.role, task_frame_payload, get_agent, run_mode=ctx.deps.run_mode,
-    )
-    ctx.operation_state.start("model", "executor_resume")
+    main_agent = _build_main_agent(ctx.role, ctx.deps.run_mode, get_agent)
+    ctx.operation_state.start("model", "main_resume")
     preflight_compress_history(ctx)
-    text_buffer: list[str] = []
 
-    # 注入 TODO 恢复执行提醒：模型从 clarify_user 恢复后，history 顶部的上下文
-    # 可能让模型沉浸在"正在研究"的状态中，忽略 TODO 接力规则。
-    # 在历史末尾追加一条系统提示，强制模型先查看 TODO、更新已完成任务、再继续。
+    # 注入 TODO 恢复执行提醒:模型从 clarify_user 恢复后,history 顶部的上下文
+    # 可能让模型沉浸在"正在研究"的状态中,忽略 TODO 接力规则。
     try:
         from pydantic_ai.messages import ModelRequest, SystemPromptPart
 
@@ -695,7 +513,7 @@ async def execute_task_resume(
         run_kwargs["event_stream_handler"] = ctx.stream_event_handler
 
     logger.info(
-        "execute_task_resume: feeding user reply as deferred tool result "
+        "resume_main_agent: feeding user reply as deferred tool result "
         "session_id=%s tool_call_id=%s reply_chars=%d",
         ctx.session_id,
         tool_call_id,
@@ -705,19 +523,17 @@ async def execute_task_resume(
     # 注意:run 的第一个位置参数(user_prompt)传 None —— 用户当前消息已经作为
     # tool return 注入,不再独立作 user-prompt;否则 graph 会拼一个空 ModelRequest
     # 让模型困惑。
-    result = await executor_agent.run(None, **run_kwargs)
+    result = await main_agent.run(None, **run_kwargs)
 
     # 消费成功 → 清掉 _user_clarification 标志(无论本轮是否又触发了新的 deferred)。
     ctx.session_state.pop("_user_clarification", None)
 
     # 模型在 resume 之后又调用了一次 clarify_user → 输出仍是 DeferredToolRequests,
-    # 走和正常 execute_task 一致的短路语义。
+    # 走和正常 run_main_agent 一致的短路语义。
     if isinstance(getattr(result, "output", None), DeferredToolRequests):
-        await _flush_buffered_text(ctx, text_buffer)
         return ExecutionOutcome(result=result)
 
     verification_signal = get_final_verification_signal(ctx.session_state)
     if verification_signal:
         return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
     return ExecutionOutcome(result=result)
-

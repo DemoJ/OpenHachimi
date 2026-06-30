@@ -10,7 +10,7 @@ from openhachimi_agent.agent.execution import (
     get_replan_signal,
     with_execution_ledger,
 )
-from openhachimi_agent.tools.planning import create_todos, update_todo, with_execution_guard
+from openhachimi_agent.tools.planning import create_todos, update_todo
 
 
 @dataclass
@@ -34,20 +34,24 @@ def test_execution_ledger_records_success(mock_agent_deps):
     assert get_ledger_length(mock_agent_deps.session_state) == 2
 
 
-def test_execution_ledger_records_execution_guard_block(mock_agent_deps):
+def test_execution_ledger_records_tool_failure(mock_agent_deps):
+    """工具抛异常时,ledger 记一条 started + 一条 failed。
+
+    (旧版测的是 execution_guard 被 ledger 记成 blocked;guard 已随 Hermes 式
+    重构拆除,改为测普通工具失败路径,确认 ledger 仍在记录失败。)
+    """
     def write_file(ctx):
-        return {"ok": True}
+        raise RuntimeError("disk full")
 
     ctx = MockRunContext(deps=mock_agent_deps)
-    guarded = with_execution_ledger(with_execution_guard(write_file))
-    create_todos(ctx, ["Task 1"])
+    guarded = with_execution_ledger(write_file)
 
-    with pytest.raises(ModelRetry):
+    with pytest.raises(RuntimeError):
         guarded(ctx)
 
     ledger = get_execution_ledger(ctx)
-    assert [event["status"] for event in ledger] == ["started", "blocked"]
-    assert "计划执行守卫" in ledger[-1]["violation"]
+    assert [event["status"] for event in ledger] == ["started", "failed"]
+    assert ledger[-1]["tool_name"] == "write_file"
 
 
 

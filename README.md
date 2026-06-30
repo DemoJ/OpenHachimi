@@ -4,9 +4,9 @@
 
 ---
 
-> 📖 **普通用户请看 [用户指南 (USER_GUIDE.md)](USER_GUIDE.md)**：详细的安装、配置和功能说明，适合非技术人员阅读。
+> 📖 **普通用户请看 [用户指南 (USER_GUIDE.md)](docs/USER_GUIDE.md)**：详细的安装、配置和功能说明，适合非技术人员阅读。
 > 
-> 技术细节和架构设计请继续阅读本文档和 [ARCHITECTURE.md](ARCHITECTURE.md)。
+> 技术细节和架构设计请继续阅读本文档和 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ---
 

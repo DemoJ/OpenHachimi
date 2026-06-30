@@ -21,7 +21,7 @@ from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.memory.recall import recall_memories
 from openhachimi_agent.service.agent_runtime.commands import channel_code_from_context
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
-from openhachimi_agent.service.agent_runtime.executor import message_with_attachments
+from openhachimi_agent.service.agent_runtime.main_agent import message_with_attachments
 from openhachimi_agent.service.agent_runtime.streaming import (
     StreamEventItem,
     StreamStats,

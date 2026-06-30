@@ -324,7 +324,7 @@ class AgentService:
         self._agent_dependency_mtime_cache = new_cache
         return mtime
 
-    def _get_agent(self, role_name: str, agent_type: str = "executor"):
+    def _get_agent(self, role_name: str, agent_type: str = "main", run_mode: str = "interactive"):
         current_mtime = self._get_agent_dependency_mtime(role_name)
         return get_or_build_agent(
             self._agents,
@@ -333,6 +333,7 @@ class AgentService:
             agent_type,
             self._mcp_toolsets,
             current_mtime,
+            run_mode=run_mode,
         )
 
     def register_artifacts(self, artifacts: list[ArtifactRef]) -> None:

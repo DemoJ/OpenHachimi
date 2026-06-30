@@ -1,8 +1,12 @@
-"""单轮对话编排:router → planner → executor 编排与持久化。
+"""单轮对话编排:主 agent 单次 run + verification 闸门 + 持久化。
 
-从 `AgentService._run_with_session` 整体搬出。状态字典仍挂在 `AgentService`
-实例上(`_session_states` / `_running_tasks` / `_session_locks` 等),
-本模块通过传入的 service 引用读写,以保持与既有测试的兼容。
+Hermes 式重构后:不再有 router → planner → executor 多阶段串行。单条用户消息
+直接喂给主 agent 的 ReAct 循环,失败由主 agent 自己 cancel/修订 todo,停止时
+完整性校验由 factory 的 output_validator 闸门(verification_stop + final_verification
+signal)一次完成。
+
+状态字典仍挂在 ``AgentService`` 实例上(``_session_states`` / ``_running_tasks`` /
+``_session_locks`` 等),本模块通过传入的 service 引用读写,以保持与既有测试兼容。
 
 上下文快照构建见 ``context_snapshot``;流式末尾补发与 signal 渲染见
 ``turn_render``;后台 task 取消由本模块 ``_cancel_and_drain_task`` 提供。
@@ -21,20 +25,17 @@ from typing import TYPE_CHECKING
 
 
 from openhachimi_agent.core.deps import AgentDeps
-from openhachimi_agent.core.redaction import redact_exception, redact_text
+from openhachimi_agent.core.redaction import redact_text
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
-    complete_current_plan,
-    fail_current_plan,
-    has_active_todos,
     mark_turn_finished,
     mark_turn_started,
-    suspend_current_plan,
 )
-from openhachimi_agent.service.agent_runtime.executor import execute_task
-from openhachimi_agent.service.agent_runtime.planner import needs_planning, run_planner
-from openhachimi_agent.service.agent_runtime.router import resolve_task_frame, should_route_message
+from openhachimi_agent.service.agent_runtime.main_agent import (
+    resume_main_agent,
+    run_main_agent,
+)
 from openhachimi_agent.service.agent_runtime.streaming import STREAM_DONE, StreamStats
 from openhachimi_agent.service.agent_runtime.turn_postprocess import (
     _capture_turn_memory,
@@ -88,50 +89,24 @@ def _finalize_outcome(
     deps: AgentDeps,
     result_holder: dict[str, object],
 ) -> None:
-    """处理 DeferredToolRequests / final_verification_signal / 正常 complete 三分支。
+    """处理 DeferredToolRequests / final_verification_signal / 正常完成 三分支。
 
-    写 result_holder + 挂起/失败/完成 plan。deferred 路径只补 plan_status 兜底,
-    不调 complete_current_plan(任务确实没完成)。
+    写 result_holder。deferred 路径(clarify_user)只把 question 交给用户;
+    final_verification_signal 路径把 signal 上抛给 turn_stream 渲染;正常路径直接
+    把 result 落 result_holder。不再调 plan 状态机(plan_status 已废,主 agent 自主)。
     """
     from pydantic_ai.tools import DeferredToolRequests
 
     result_holder["result"] = outcome.result
-    # 优先处理 deferred 输出:本轮模型在调 clarify_user 等延迟工具时
-    # pydantic-ai 把 DeferredToolRequests 作为 run output 返回。要把
-    # 待澄清问题(_user_clarification.question)交给用户;计划已在
-    # clarify_user 工具内挂起,这里只补一个 plan_status 兜底,不再调
-    # complete_current_plan(任务确实没完成)。
+    # deferred:本轮模型在调 clarify_user 时 pydantic-ai 把 DeferredToolRequests 作为
+    # run output 返回。把待澄清问题交给用户;clarify_user 工具内部已按需挂起 plan。
     if isinstance(getattr(outcome.result, "output", None), DeferredToolRequests):
         pending = session_state.get("_user_clarification") or {}
         question_text = pending.get("question") or "需要你提供更多信息以继续。"
         result_holder["clarification_question"] = question_text
-        if not session_state.get("suspended_plan") and has_active_todos(session_state):
-            # clarify_user 内部 has_active_todos 判定有可能因 todo_state
-            # 已不再 is_active 而漏挂(例如未启计划的 direct 任务):此处
-            # 补一次 plan 状态,WebUI 能正确展示"等待用户输入"。
-            suspend_current_plan(
-                session_state,
-                reason="awaiting_user_clarification",
-                detail={"question": question_text},
-                deps=deps,
-            )
     elif outcome.final_verification_signal:
         result_holder["final_verification_signal"] = outcome.final_verification_signal
-        if has_active_todos(session_state):
-            suspend_current_plan(
-                session_state,
-                reason="final_verification_failed",
-                detail=outcome.final_verification_signal,
-                deps=deps,
-            )
-        else:
-            fail_current_plan(
-                session_state,
-                reason="final_verification_failed",
-                detail=outcome.final_verification_signal,
-            )
-    else:
-        complete_current_plan(session_state)
+    # 正常完成:无额外动作
 
 
 def _handle_run_agent_exception(
@@ -145,15 +120,13 @@ def _handle_run_agent_exception(
     role: str,
     actual_session_id: str,
 ) -> None:
-    """TimeoutError / 其它 Exception 两分类,统一挂起/失败 plan + 写 result_holder + 日志。
+    """TimeoutError / 其它 Exception 分类,写 result_holder + 日志。
 
-    CancelledError 由 ``run_agent`` 自行处理(透传 raise),不进此函数。
+    CancelledError 由 ``run_agent_task`` 自行处理(透传 raise),不进此函数。
+    plan 状态机已废,异常不再挂起/失败计划,只记日志 + 写 error。
     """
+    del session_state, deps  # noqa: F841 — 保留入参以维持签名稳定,后续可复用
     if isinstance(exc, asyncio.TimeoutError):
-        if has_active_todos(session_state):
-            suspend_current_plan(session_state, reason="operation_timeout", detail=str(exc), deps=deps)
-        else:
-            fail_current_plan(session_state, reason="operation_timeout", detail=str(exc))
         if stream:
             result_holder["error"] = TimeoutError(
                 "Agent 执行超时:"
@@ -172,10 +145,6 @@ def _handle_run_agent_exception(
             logger.exception("chat timed out role=%s session_id=%s stream=false", role, actual_session_id)
         return
     # 兜底:其它异常
-    if has_active_todos(session_state):
-        suspend_current_plan(session_state, reason="error", detail=redact_exception(exc), deps=deps)
-    else:
-        fail_current_plan(session_state, reason="error", detail=redact_exception(exc))
     result_holder["error"] = exc
     logger.exception(
         "chat failed role=%s session_id=%s stream=%s",
@@ -188,35 +157,23 @@ async def _resolve_turn_outcome(
     ctx: AgentRunContext,
     deps: AgentDeps,
     refreshed: list[bool],
-    should_route: bool,
     result_holder: dict[str, object],
 ) -> None:
-    """deferred resume 或 router → planner → executor,再 finalize outcome 写入 result_holder。
+    """deferred resume 或主 agent 单次 run,再 finalize outcome 写入 result_holder。
 
     clarify_user 上一轮若留下 ``_user_clarification`` 标志,本轮直接 deferred resume
-    把用户回复灌回 graph;否则走 route → (planner) → executor。planner 无 clarify_user
-    工具,deferred 只可能来自 executor 路径(由 execute_task 内部短路返回)。
+    把用户回复灌回 graph;否则走主 agent 单次 run。无 router/planner 前置分流。
     """
-    from openhachimi_agent.service.agent_runtime.executor import execute_task_resume
-
     session_state = ctx.session_state
     outcome = None
     if session_state.get("_user_clarification"):
         await _refresh_mcp_once(service, ctx, deps, refreshed)
-        outcome = await execute_task_resume(ctx, service._get_agent)
+        outcome = await resume_main_agent(ctx, service._get_agent)
         # 状态损坏导致无法 resume → outcome=None,fall through 到正常流程。
 
     if outcome is None:
-        if should_route:
-            await _refresh_mcp_once(service, ctx, deps, refreshed)
-            task_frame = await resolve_task_frame(ctx, service._get_agent)
-            session_state["task_frame"] = task_frame.model_dump(mode="json")
-            if needs_planning(task_frame):
-                await _refresh_mcp_once(service, ctx, deps, refreshed)
-                await run_planner(ctx, task_frame, service._get_agent)
-
         await _refresh_mcp_once(service, ctx, deps, refreshed)
-        outcome = await execute_task(ctx, service._get_agent)
+        outcome = await run_main_agent(ctx, service._get_agent)
     _finalize_outcome(outcome, session_state, deps, result_holder)
 
 
@@ -225,7 +182,6 @@ async def _run_agent_task(
     ctx: AgentRunContext,
     deps: AgentDeps,
     refreshed: list[bool],
-    should_route: bool,
     result_holder: dict[str, object],
     *,
     stream: bool,
@@ -236,19 +192,12 @@ async def _run_agent_task(
     ``_handle_run_agent_exception`` 写入 result_holder。finally 保证 mark_turn_finished
     与(流式时)STREAM_DONE 入队。
     """
-    session_state = ctx.session_state
     role = ctx.role
     actual_session_id = ctx.session_id
-    mark_turn_started(session_state)
+    mark_turn_started(ctx.session_state)
     try:
-        await _resolve_turn_outcome(service, ctx, deps, refreshed, should_route, result_holder)
+        await _resolve_turn_outcome(service, ctx, deps, refreshed, result_holder)
     except asyncio.CancelledError:
-        # CancelledError 透传给上层(run_turn 的 try/finally 负责清理 task),
-        # 但仍要先挂起/失败 plan + 记日志,与原行为一致。
-        if has_active_todos(session_state):
-            suspend_current_plan(session_state, reason="cancelled", detail="agent task cancelled", deps=deps)
-        else:
-            fail_current_plan(session_state, reason="cancelled", detail="agent task cancelled")
         logger.info(
             "chat stream cancelled role=%s session_id=%s" if stream else "chat cancelled role=%s session_id=%s stream=false",
             role, actual_session_id,
@@ -256,11 +205,11 @@ async def _run_agent_task(
         raise
     except Exception as exc:
         _handle_run_agent_exception(
-            exc, session_state, deps, result_holder,
+            exc, ctx.session_state, deps, result_holder,
             stream=stream, service=service, role=role, actual_session_id=actual_session_id,
         )
     finally:
-        mark_turn_finished(session_state)
+        mark_turn_finished(ctx.session_state)
         if stream:
             with contextlib.suppress(asyncio.CancelledError):
                 await ctx.stream_queue.put(STREAM_DONE)  # type: ignore[arg-type]
@@ -359,9 +308,8 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
     ctx = state.ctx
     actual_session_id = state.actual_session_id
     stream = state.stream
-    should_route = await should_route_message(ctx, service._get_agent)
     task = asyncio.create_task(
-        _run_agent_task(service, ctx, state.deps, [False], should_route, state.result_holder, stream=stream)
+        _run_agent_task(service, ctx, state.deps, [False], state.result_holder, stream=stream)
     )
     service._running_tasks[actual_session_id] = task
 

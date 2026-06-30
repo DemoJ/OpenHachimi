@@ -32,7 +32,7 @@ from openhachimi_agent.tools.scheduler import (
     update_scheduled_task,
     update_scheduled_task_delivery,
 )
-from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder, with_execution_guard
+from openhachimi_agent.tools.planning import create_todos, update_todo, get_todos, with_todo_reminder
 from openhachimi_agent.tools.clarification import clarify_user
 from openhachimi_agent.tools.memory import forget_memory, list_memory, memory_stats, remember, search_memory
 from openhachimi_agent.tools.middleware import apply_middlewares, with_prompt_injection
@@ -148,7 +148,7 @@ for _orig_tools, _middlewares in [
     _wrapped_tools = apply_middlewares(_orig_tools, _middlewares) if _middlewares else _orig_tools
     for _orig, _wrapped in zip(_orig_tools, _wrapped_tools):
         if _orig in _MUTATION_FUNCS:
-            _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_wrapped))))
+            _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(_wrapped)))
         else:
             _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_wrapped))
 
@@ -156,13 +156,13 @@ for _tool in _MEMORY_READ_TOOLS:
     _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_tool))
 
 for _tool in _MEMORY_MUTATION_TOOLS:
-    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_tool))))
+    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(_tool)))
 
 for _tool in _SCHEDULER_READ_TOOLS:
     _READ_ONLY_FINAL_TOOLS.append(with_execution_ledger(_tool))
 
 for _tool in _SCHEDULER_MUTATION_TOOLS:
-    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(with_execution_guard(_tool))))
+    _EXECUTION_FINAL_TOOLS.append(with_execution_ledger(with_todo_reminder(_tool)))
 
 _SCHEDULED_MUTATION_NAMES = {tool.__name__ for tool in _SCHEDULER_MUTATION_TOOLS}
 _SCHEDULED_EXECUTION_FINAL_TOOLS = [
@@ -170,67 +170,17 @@ _SCHEDULED_EXECUTION_FINAL_TOOLS = [
     if getattr(tool, "__name__", "") not in _SCHEDULED_MUTATION_NAMES and getattr(tool, "name", "") not in _SCHEDULED_MUTATION_NAMES
 ]
 
-# ── Planner 专用工具集 ──
-# Planner 是纯规划者：只需要本地只读工具来理解项目上下文，然后基于对
-# Executor 工具能力的了解来制定计划。不应该有任何网络执行类工具（web_search、
-# web_fetch、browser_* 等），否则 Planner 会"提前调研"导致目标漂移。
-_PLANNER_CONTEXT_FUNCS = {
-    list_files, find_files, search_text, read_file,   # 本地文件只读
-    git_status, git_diff,                              # Git 只读
-    list_skills, get_skill_instructions,               # 技能查询
-    search_memory, list_memory, memory_stats,           # 长期记忆查询
-}
-_planner_allowed_names = {f.__name__ for f in _PLANNER_CONTEXT_FUNCS}
-_PLANNER_CONTEXT_TOOLS = [
-    tool for tool in _READ_ONLY_FINAL_TOOLS
-    if getattr(tool, "__name__", "") in _planner_allowed_names
-]
-
-# Planner 故意不注册 clarify_user:
-# - planner 没有执行类工具(无 run_command / 无 browser_* / 无 MCP),无法做出
-#   "我已经试过工具自查、确认信息只能由用户提供"这种合法触发条件;
-# - planner 的"只读自查"证据强度不足(只能看本地静态文件),据此提前 clarify 会
-#   退化为"懒规划"——把不确定打包成用户必答题;
-# - 语义层的歧义由 router 阶段的 ``TaskFrame.clarifying_question`` 通道承担,
-#   不需要 planner 在执行计划阶段重复一次;
-# - 真正缺资源时,正确做法是把"探测/确认 X"列成 TODO,让 executor 在真实证据上
-#   决定要不要 clarify_user(executor 工具集仍注册)。
-#
-# 同样地,``create_todos`` 也不再放进 PLANNER_TOOLSET —— 它已经通过
-# ``factory.py`` 的 ``ToolOutput(create_todos)`` 作为 *output tool* 挂到 planner
-# agent 上,模型一调它就视为 final answer,graph 立即终止 run。这样彻底取消了
-# "planner 调完 create_todos 后再 emit 一段重复文本"那个第 2 步 LLM 调用。
-# ``get_todos`` 仍然保留作为调研类只读工具(planner 可以在新 plan 之前查看
-# 既有计划状态)。
-PLANNER_TOOLSET = FunctionToolset(
-    tools=_PLANNER_CONTEXT_TOOLS
-    + [with_execution_ledger(get_todos)],
-    max_retries=3,
-)
-
-# ── Executor 专用工具集 ──
-# Executor 拥有所有执行权限、只读权限和更新 TODO 能力
-EXECUTOR_TOOLSET = FunctionToolset(
+# ── 主 agent 工具集 ──────────────────────────────────────────────────────
+# Hermes 式重构后只有单一主 agent,持全套工具:create_todos 作为普通工具(不再
+# 是 planner 的 output tool),clarify_user/delegate_task 仍注册。create_todos
+# 包 with_execution_ledger 以统一 ledger 记录 + 触发 verification evidence 状态更新。
+MAIN_TOOLSET = FunctionToolset(
     tools=_READ_ONLY_FINAL_TOOLS
     + _EXECUTION_FINAL_TOOLS
+    + [with_execution_ledger(create_todos)]
     + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL]
     + [with_execution_ledger(get_todos)]
     + [with_execution_ledger(clarify_user)]
     + [DELEGATE_TASK_TOOL],  # 已在 delegation.py 包过 with_execution_ledger
-    max_retries=3,
-)
-
-# ── Scheduled Executor 专用工具集 ──
-# 定时任务无人值守执行期间允许普通执行能力和调度只读能力，但不暴露调度写入/触发工具。
-# 注意:scheduled executor 默认无人值守,不应注册 clarify_user(没人回答),由模型在
-# 卡死时改走 update_todo blocked + notes 的路径。
-SCHEDULED_EXECUTOR_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _SCHEDULED_EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _UPDATE_TODO_TOOL] + [with_execution_ledger(get_todos)],
-    max_retries=3,
-)
-
-# 保持后向兼容（部分遗留代码可能仍引用这个）
-WORKSPACE_TOOLSET = FunctionToolset(
-    tools=_READ_ONLY_FINAL_TOOLS + _EXECUTION_FINAL_TOOLS + [with_execution_ledger(tool) for tool in _PLANNING_TOOLS + _UPDATE_TODO_TOOL],
     max_retries=3,
 )

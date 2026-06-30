@@ -66,7 +66,7 @@ def _stamp_turn_context(
     _dynamic_text = ""
     _static_hash = ""
     try:
-        _executor_for_intro = service._get_agent(role, "executor")
+        _executor_for_intro = service._get_agent(role, "main")
     except Exception:
         _executor_for_intro = None
     try:

@@ -103,33 +103,33 @@ def test_build_system_dynamic_block_handles_none_deps():
 # ── executor 专用按需块 ───────────────────────────────────────────────────────
 
 
-def test_executor_md_core_no_longer_contains_handoff_section():
-    """executor.md 主体不应再含'执行接力规则' / '直接执行模式'相关大段——已迁出按需。"""
-    text = load_system_prompt("agents/executor")
+def test_main_agent_md_core_no_longer_contains_handoff_section():
+    """main_agent.md 主体不应再含'执行接力规则' / '直接执行模式'相关大段——已迁出按需。"""
+    text = load_system_prompt("agents/main_agent")
     assert _TODO_HANDOFF_HEADING not in text
     assert _DIRECT_MODE_HEADING not in text
 
 
-def test_executor_md_core_keeps_tool_specific_rules():
+def test_main_agent_md_core_keeps_tool_specific_rules():
     """工具特异性提示词(install_skill / create_delayed_task 等)仍应保留在主体里。"""
-    text = load_system_prompt("agents/executor")
+    text = load_system_prompt("agents/main_agent")
     assert "install_skill" in text
     assert "create_delayed_task" in text
     assert "publish_artifact" in text
     assert "delegate_task" in text
-    # research_sources 已合并删除,executor.md 不再提它
+    # research_sources 已合并删除,main_agent.md 不再提它
     assert "research_sources" not in text
 
 
-def test_executor_md_does_not_duplicate_skills_index_guidance():
-    """executor.md 主体不应再讲'如何使用 skill'——这部分指引由 skills_index.md
+def test_main_agent_md_does_not_duplicate_skills_index_guidance():
+    """main_agent.md 主体不应再讲'如何使用 skill'这一节——这部分指引由 skills_index.md
     在按需注入索引时一起承载,避免重复。
 
     工作区无 skill 时,索引段不出现,这套指引也跟着消失,语义自洽。
+    (工具清单里列出 get_skill_instructions 工具名是允许的,这里只拦截整段使用指引。)
     """
-    text = load_system_prompt("agents/executor")
-    assert "get_skill_instructions" not in text
-    # "技能（skill）使用方式" 这一节也应不存在
+    text = load_system_prompt("agents/main_agent")
+    # "技能（skill）使用方式" 这一节不应存在
     assert "技能（skill）使用方式" not in text
 
 
@@ -142,19 +142,22 @@ def test_skills_index_template_contains_progressive_disclosure_guidance():
 
 
 def test_executor_extra_block_empty_for_idle_chat_no_skills(mock_config):
-    """无 TODO + 无 task_frame + 无 skill:executor 额外块仅含产物落点引导。
+    """无 TODO + 无 skill:executor 额外块含 direct mode 提示 + 产物落点引导。
 
+    Hermes 式重构后 direct_mode 触发条件改为"无活动 TODO 即注入"(不再依赖
+    router 产出的 execution_mode 字段)。所以 idle chat 也会注入 direct mode
+    提示,告诉主 agent 不要给简单任务堆 TODO。
     mock_config.skills_dirs 默认指向 ``tmp_path / .claude / skills``(conftest 设置),
     那个目录不存在,所以 find_skills 返回空,索引块不注入。
     产物落点引导(workspace_hint)是常驻块,只要 deps.session_id 非空就出现。
     """
     deps = _make_executor_deps(mock_config, task_frame=None)
     block = build_executor_extra_dynamic_block(deps)
-    # TODO 接力块、direct mode 块、skills index 块都不应出现
+    # 无 TODO → direct mode 块注入;TODO 接力块、skills index 块不出现
     assert "执行接力规则" not in block
-    assert "直接执行模式" not in block
+    assert "直接执行模式" in block
     assert "技能索引" not in block
-    # 仅产物落点引导常驻
+    # 产物落点引导常驻
     assert "中间产物落点" in block
     assert ".workspace/" in block
 
@@ -244,7 +247,12 @@ def test_executor_extra_block_inactive_todo_state_not_handoff(mock_config):
 
 
 def test_executor_extra_block_planned_without_active_todos_empty(mock_config):
-    """execution_mode=planned 但 TODO 还没创建:direct 块不该注入(模式不匹配)。"""
+    """无活动 TODO 时,direct 块注入(不再看 task_frame.execution_mode)。
+
+    Hermes 式重构后 direct_mode 触发条件改为"无活动 TODO 即注入",router 已废,
+    execution_mode 字段不再决定 prompt 分支。所以即便残留 task_frame 标记为
+    planned,只要没有活动 TODO,direct 提示仍注入(让主 agent 自主决定建不建 todo)。
+    """
     deps = _make_executor_deps(
         mock_config,
         task_frame={
@@ -255,9 +263,9 @@ def test_executor_extra_block_planned_without_active_todos_empty(mock_config):
         },
     )
     block = build_executor_extra_dynamic_block(deps)
-    # planned 模式不触发 direct 块;工作区也没 skill;只保留产物落点常驻引导。
+    # 无 TODO → direct 块注入;TODO 接力块、skills index 块不出现
     assert "执行接力规则" not in block
-    assert "直接执行模式" not in block
+    assert "直接执行模式" in block
     assert "技能索引" not in block
     assert "中间产物落点" in block
 

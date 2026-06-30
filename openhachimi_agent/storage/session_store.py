@@ -852,7 +852,6 @@ class SessionStore:
             invariants=[str(item) for item in data.get("invariants", []) if item],
             tool_calls_since_update=int(data.get("tool_calls_since_update", 0) or 0),
             is_active=bool(data.get("is_active", False)),
-            created_turn_seq=int(data.get("created_turn_seq", 0) or 0),
         )
 
         raw_tasks = data.get("tasks", {})

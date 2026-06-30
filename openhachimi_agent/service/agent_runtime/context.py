@@ -130,31 +130,6 @@ def restore_suspended_plan(session_state: dict[str, Any], deps: AgentDeps | None
     session_state.pop("suspended_plan", None)
 
 
-def complete_current_plan(session_state: dict[str, Any]) -> None:
-    todo_state = _current_todo_state(session_state)
-    if todo_state is not None and getattr(todo_state, "is_active", False):
-        if not has_active_todos(session_state):
-            todo_state.is_active = False
-    session_state["plan_status"] = "completed"
-    session_state["active_plan_lease"] = {"status": "completed"}
-    session_state.pop("suspended_plan", None)
-
-
-def fail_current_plan(session_state: dict[str, Any], reason: str, detail: object | None = None) -> None:
-    session_state["plan_status"] = "failed"
-    session_state["last_plan_error"] = {
-        "reason": reason,
-        "detail": detail,
-        "task_frame": session_state.get("task_frame"),
-    }
-    session_state["active_plan_lease"] = {
-        "status": "failed",
-        "reason": reason,
-        "detail": detail,
-    }
-    session_state.pop("suspended_plan", None)
-
-
 def should_route_new_turn(session_state: dict[str, Any]) -> bool:
     return bool(session_state.get("last_turn_complete", True))
 

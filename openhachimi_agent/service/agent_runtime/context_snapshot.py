@@ -111,9 +111,9 @@ def _build_executor_static_context(
     executor_agent: object,
     service: "AgentService | None" = None,
 ) -> str:
-    """直接构建 executor 的静态 system prompt 段(不含每轮动态注入的部分)。
+    """直接构建主 agent 的静态 system prompt 段(不含每轮动态注入的部分)。
 
-    包括:base.md + agents/executor.md + role instructions + runtime/config.md
+    包括:base.md + agents/main_agent.md + role instructions + runtime/config.md
     + 可用工具摘要清单。每段独立 try/except,单段加载失败不影响其余。
     """
     from openhachimi_agent.content.prompts import load_system_prompt, render_system_prompt
@@ -130,7 +130,7 @@ def _build_executor_static_context(
             logger.debug(msg, *args, exc_info=True)
 
     append(lambda: load_system_prompt("base"), "failed to load base.md")
-    append(lambda: load_system_prompt("agents/executor"), "failed to load executor.md")
+    append(lambda: load_system_prompt("agents/main_agent"), "failed to load main_agent.md")
     append(lambda: load_role_content(config.roles_dir, role), "failed to load role content role=%s", role)
     append(
         lambda: render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")}),

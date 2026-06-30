@@ -13,8 +13,7 @@ from openhachimi_agent.content.roles import load_role_content
 from openhachimi_agent.content.skills import find_skills
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
-from openhachimi_agent.tools import PLANNER_TOOLSET, EXECUTOR_TOOLSET, SCHEDULED_EXECUTOR_TOOLSET
-from openhachimi_agent.agent.intent import PlanContinuationDecision, TaskFrame
+from openhachimi_agent.tools import MAIN_TOOLSET
 
 
 logger = logging.getLogger(__name__)
@@ -55,7 +54,7 @@ def should_pass_through_validation(signal: dict | None, session_state: dict) -> 
     return None
 
 
-def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None) -> Agent:
+def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None, run_mode: str = "interactive") -> Agent:
     if not config.openai_api_key:
         raise ValueError("未配置 llm.api_key，请先在 user/config.yaml 中填写 API Key。")
 
@@ -97,59 +96,48 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     filtered_mcp = filter_mcp_toolsets_for_role(role_filters, mcp_toolsets)
     mcp_instances = [ts for _name, ts in filtered_mcp]
 
-    # output_type 按 agent 类型分:
-    # - executor:注册了 clarify_user(可能抛 CallDeferred),所以输出域是
-    #   ``[str, DeferredToolRequests]``。
-    # - planner:把 ``create_todos`` 标成 output tool —— 模型调它即视为本次 run 的
-    #   final answer,graph 在工具执行后立刻终止,**不会再发起第 2 步 LLM 调用
-    #   让模型 emit 一段重复的"执行步骤概览"自然语言**。read_file / list_files
-    #   等只读调研工具仍可被普通调用,不影响 planner 先调研后规划的工作流。
-    #   (改造前用 ``output_type=str``,模型必须额外 emit 一段 final text 才能
-    #    结束 run,与刚刚调过的 create_todos 工具卡片内容完全重复。)
-    # - scheduled_executor:无人值守路径,直接 ``str`` fail-fast。
-    if agent_type == "executor":
+    # ── 主 agent / subagent 两分支 ──────────────────────────────────────
+    # Hermes 式重构后只有两类 agent:
+    # - main:单一主 agent,持全套工具(含 create_todos/clarify_user/delegate_task),
+    #   output_type=[str, DeferredToolRequests](兼容 clarify_user 的 CallDeferred)。
+    #   todo 是普通工具,主 agent 自主决定要不要建计划;停止时由 output_validator
+    #   闸门(verification_stop + final_verification_signal)校验完整性。
+    # - subagent:delegate_task 委派的子 agent,全新会话零记忆,str 输出,
+    #   主工具集运行时由 resolve_child_toolsets 裁剪注入,构建时只挂骨架。
+    #
+    # scheduled 模式不再单独建 agent 实例:走 main agent,注入 scheduled_executor
+    # prompt(见下方 main 分支);scheduler 写工具由 scheduler 工具自身的
+    # ``ensure_scheduler_mutation_allowed`` 在 run_mode=scheduled 时拦截。
+    if agent_type == "main":
         output_type: object = [str, DeferredToolRequests]
-    elif agent_type == "planner":
-        from pydantic_ai.output import ToolOutput
-        from openhachimi_agent.tools.planning import create_todos
-
-        # name="create_todos" 让该 output tool 复用现成函数签名 / docstring。
-        # max_retries 默认沿用 agent.retries,无需再单独指定。
-        output_type = ToolOutput(create_todos, name="create_todos")
-    else:
-        # subagent / scheduled_executor:直接 str 输出。
-        # subagent 是"黑盒调用→返回文本",用 str 最简;其内部消息不回灌 history。
-        # 主工具集不在此固定——运行时由 delegate_task 经 resolve_child_toolsets
-        # 裁剪后通过 child.run(..., toolsets=[...]) 注入(见 agent/subagents.py)。
+    else:  # subagent
         output_type = str
 
-    if agent_type == "planner":
-        toolsets = [PLANNER_TOOLSET, dynamic_toolset] + mcp_instances
-        extra_prompt = load_system_prompt("agents/planner")
-    elif agent_type == "subagent":
+    if agent_type == "subagent":
         # 通用子 agent(对齐 hermes delegate_task 委派的 child)。
         # 构建时只挂骨架工具集(dynamic_toolset 角色技能 + mcp),主工具集(read/file/web/
         # browser/terminal 等)不在此固定——运行时由 delegate_task 经 resolve_child_toolsets
         # 按 toolsets 参数裁剪后,通过 child.run(..., toolsets=[resolved]) 注入。
         # 隔离哲学:子 agent 全新会话、零记忆、独立预算(见 agent/subagents.py)。
-        # 不注册 output_validator(subagent 走 str fail-fast,不像 executor 那样校验 TODO)。
+        # 不注册 output_validator(subagent 走 str fail-fast,不像主 agent 那样校验 TODO)。
         toolsets = [dynamic_toolset] + mcp_instances
         extra_prompt = load_system_prompt("agents/subagent")
-    else:
-        base_executor_toolset = SCHEDULED_EXECUTOR_TOOLSET if agent_type == "scheduled_executor" else EXECUTOR_TOOLSET
-        filtered_executor_toolset = base_executor_toolset
+    else:  # main
+        base_main_toolset = MAIN_TOOLSET
         if allowed_tools is not None:
             filtered_tools = [
-                t for t in base_executor_toolset.tools
+                t for t in base_main_toolset.tools
                 if getattr(t, "__name__", "") in allowed_tools or getattr(t, "name", "") in allowed_tools
             ]
-            filtered_executor_toolset = FunctionToolset(tools=filtered_tools)
+            base_main_toolset = FunctionToolset(tools=filtered_tools)
 
-        toolsets = [filtered_executor_toolset, dynamic_toolset] + mcp_instances
-        if agent_type == "scheduled_executor":
-            extra_prompt = load_system_prompt("agents/scheduled_executor")
+        toolsets = [base_main_toolset, dynamic_toolset] + mcp_instances
+        if run_mode == "scheduled":
+            # 定时任务无人值守:复用主 agent + 主 prompt,额外注入 scheduled_executor
+            # 提示词(明确不暴露调度写入、不主动 clarify_user)。
+            extra_prompt = load_system_prompt("agents/main_agent") + "\n\n" + load_system_prompt("agents/scheduled_executor")
         else:
-            extra_prompt = load_system_prompt("agents/executor")
+            extra_prompt = load_system_prompt("agents/main_agent")
 
     agent = Agent(
         OpenAIChatModel(config.model_name, provider=provider),
@@ -167,9 +155,9 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         retries=5,
     )
 
-    if agent_type in {"executor", "scheduled_executor"}:
-        # 同一轮内 validator 连续打回的次数,用于硬熔断。在 execute_task 入口处
-        # 会清零(见 service.agent_runtime.executor.execute_task)。
+    if agent_type == "main":
+        # 同一轮内 validator 连续打回的次数,用于硬熔断。在 run_main_agent 入口处
+        # 会清零(见 service.agent_runtime.main_agent.run_main_agent)。
         VALIDATOR_RETRY_KEY = "_final_validator_retries"
         VALIDATOR_HARD_LIMIT = 2  # 第 0、1 次打回,第 2 次强制放行避免 UnexpectedModelBehavior
 
@@ -179,14 +167,34 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                 _append_ledger_event,
                 get_final_verification_signal,
             )
+            from openhachimi_agent.agent.verification_stop import build_verify_on_stop_nudge
             import json
             from pydantic_ai.exceptions import ModelRetry
 
-            signal = get_final_verification_signal(ctx.deps.session_state)
+            session_state = ctx.deps.session_state
+
+            # ── 闸门 1:验证缺口(workspace_edited 后无 fresh evidence) ──
+            # 照搬 Hermes verification_stop:模型编辑了代码却想直接结束,先 nudge 它验证。
+            # nudge 内部自带 max_attempts 上限,超限即返回 None 放行,不会死循环。
+            verify_nudge = build_verify_on_stop_nudge(session_state)
+            if verify_nudge:
+                try:
+                    _append_ledger_event(
+                        session_state,
+                        tool_name="<verification_stop>",
+                        status="blocked",
+                        args={"reason": "edited_without_fresh_evidence"},
+                        result=verify_nudge,
+                        violation=verify_nudge[:500],
+                    )
+                except Exception:
+                    logger.debug("failed to append verification_stop event to ledger", exc_info=True)
+                raise ModelRetry(verify_nudge)
+
+            # ── 闸门 2:final verification signal(未完成 TODO + 最近工具失败) ──
+            signal = get_final_verification_signal(session_state)
             if not signal:
                 return result
-
-            session_state = ctx.deps.session_state
 
             # 短路放行:见 should_pass_through_validation 文档(在 ledger 写入之前判断,
             # 避免污染连续 blocked 检测)。
@@ -332,12 +340,12 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             logger.exception("runtime dynamic block failed")
             return ""
 
-    # executor agent 额外的按需块(TODO 接力 / direct-mode / 技能索引):
+    # 主 agent 额外的按需块(TODO 接力 / direct-mode / 技能索引):
     # 把过去恒定写在 executor.md 里的几大段策略按 session 状态按需注入,并永远
     # 附上一份"技能索引"(name + 一句话用途,按 category 分组),让主模型自主
-    # 决定要不要调 get_skill_instructions 拉某个 skill 的全文。planner /
-    # scheduled_executor 各自的角色文档已经明确职责,这套块不在它们身上注册。
-    if agent_type == "executor":
+    # 决定要不要调 get_skill_instructions 拉某个 skill 的全文。subagent 各自的
+    # 角色文档已经明确职责,这套块不在它身上注册。
+    if agent_type == "main":
         @agent.system_prompt
         def _executor_extra_block(ctx: RunContext[AgentDeps]) -> str:
             try:
@@ -351,61 +359,21 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     return agent
 
 
-def build_planner_agent(config: AppConfig, role_name: str, mcp_toolsets: list | None = None) -> Agent:
-    """创建专职规划的 Agent。"""
-    return _build_base_agent(config, role_name, "planner", mcp_toolsets=mcp_toolsets)
+def build_main_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None, run_mode: str = "interactive") -> Agent:
+    """创建单一主 Agent(Hermes 式:持全套工具 + todo 普通工具 + verification 闸门)。
 
-
-def build_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None) -> Agent:
-    """创建专职执行的 Agent（拥有所有权限）。"""
-    return _build_base_agent(config, role_name, "executor", allowed_tools=allowed_tools, mcp_toolsets=mcp_toolsets)
-
-
-def build_scheduled_executor_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None) -> Agent:
-    """创建定时任务执行 Agent（不暴露调度写入工具）。"""
-    return _build_base_agent(config, role_name, "scheduled_executor", allowed_tools=allowed_tools, mcp_toolsets=mcp_toolsets)
+    ``run_mode="scheduled"`` 时复用主 agent,但额外注入 scheduled_executor 提示词,
+    scheduler 写工具由 scheduler 工具自身的 ``ensure_scheduler_mutation_allowed`` 拦截。
+    """
+    return _build_base_agent(config, role_name, "main", allowed_tools=allowed_tools, mcp_toolsets=mcp_toolsets, run_mode=run_mode)
 
 
 def build_subagent_agent(config: AppConfig, role_name: str, mcp_toolsets: list | None = None) -> Agent:
     """创建通用子 Agent(对齐 hermes delegate_task 委派的 child)。
 
-    供 Executor 通过 ``delegate_task`` 工具委派(pydantic-ai 多 agent 模式① +
+    供主 agent 通过 ``delegate_task`` 工具委派(pydantic-ai 多 agent 模式 +
     hermes 隔离哲学)。子 agent 全新会话、零长期记忆、独立预算;主工具集运行时
     由 :func:`openhachimi_agent.agent.subagents.resolve_child_toolsets` 裁剪注入,
     构建时不固定(只挂 dynamic_toolset + mcp 骨架)。
     """
     return _build_base_agent(config, role_name, "subagent", mcp_toolsets=mcp_toolsets)
-
-
-def _build_router_model(config: AppConfig) -> OpenAIChatModel:
-    provider = OpenAIProvider(
-        base_url=config.openai_base_url or None,
-        api_key=config.openai_api_key,
-    )
-    return OpenAIChatModel(config.model_name, provider=provider)
-
-
-def build_router_agent(config: AppConfig) -> Agent:
-    """创建用于路由决策的轻量级 Agent。
-
-    渐进披露改造后 router 不再做 skill 召回 —— skill 选择已下放给主模型在 executor
-    阶段通过 ``get_skill_instructions`` 自助决定。router 只负责产出 complexity /
-    risk / requires_plan / execution_mode 等 TaskFrame 元字段。
-    """
-    model = _build_router_model(config)
-    system_prompt = load_system_prompt("agents/router")
-    return Agent(
-        model,
-        system_prompt=system_prompt,
-        output_type=TaskFrame,
-    )
-
-
-def build_continuation_agent(config: AppConfig) -> Agent:
-    """创建用于判断用户是否要继续旧计划的轻量级 Agent。"""
-    system_prompt = load_system_prompt("agents/continuation")
-    return Agent(
-        _build_router_model(config),
-        system_prompt=system_prompt,
-        output_type=PlanContinuationDecision,
-    )

@@ -3,7 +3,6 @@
 import json
 import logging
 from dataclasses import dataclass, field
-from collections.abc import Iterable
 from typing import Literal
 from typing_extensions import TypedDict
 from functools import wraps
@@ -15,14 +14,6 @@ from pydantic_ai.exceptions import ModelRetry
 from openhachimi_agent.core.deps import AgentDeps
 
 logger = logging.getLogger(__name__)
-
-_GUARD_TASK_SUMMARY_LIMIT = 8
-
-
-class ExecutionGuardViolation(ModelRetry):
-    """Raised when a mutating tool violates the active TODO execution contract."""
-
-    ledger_status = "blocked"
 
 
 class TodoTaskInput(TypedDict, total=False):
@@ -54,10 +45,6 @@ class TodoState:
     tasks: dict[int, TodoTask] = field(default_factory=dict)
     tool_calls_since_update: int = 0
     is_active: bool = False
-    # 记录 ``create_todos`` 被调时所在的 turn 序号(取自
-    # ``session_state["current_turn_ledger_start_seq"]``)。下次 ``create_todos`` 调用
-    # 判定"同轮 refine vs 跨轮覆盖"用这个字段比较,跨轮覆盖默认拒绝并要求模型显式 merge。
-    created_turn_seq: int = 0
 
 def _load_state(ctx: RunContext[AgentDeps]) -> TodoState:
     """从 SessionStore 加载本会话 TODO 状态。
@@ -177,55 +164,6 @@ def _refresh_active_flag(state: TodoState) -> None:
         state.is_active = False
 
 
-def _coerce_tool_names(tool_name: str | Iterable[str]) -> tuple[str, ...]:
-    if isinstance(tool_name, str):
-        raw_names = [tool_name]
-    else:
-        raw_names = [str(name) for name in tool_name]
-
-    names = [name.strip() for name in raw_names if name and name.strip()]
-    return tuple(dict.fromkeys(names or ["unknown_tool"]))
-
-
-def _tool_name_candidates(func) -> tuple[str, ...]:
-    names: list[str] = []
-    for attr in ("__name__", "name"):
-        value = getattr(func, attr, None)
-        if isinstance(value, str) and value.strip():
-            names.append(value.strip())
-    return tuple(dict.fromkeys(names or ["unknown_tool"]))
-
-
-def _format_guard_task(task: TodoTask) -> str:
-    parts = [f"{task.id}:{task.status}", task.description]
-    if task.depends_on:
-        parts.append(f"依赖={task.depends_on}")
-    return " ".join(parts)
-
-
-def _format_guard_snapshot(state: TodoState) -> str:
-    tasks = sorted(state.tasks.values(), key=lambda task: task.id)
-    rendered = [_format_guard_task(task) for task in tasks[:_GUARD_TASK_SUMMARY_LIMIT]]
-    if len(tasks) > _GUARD_TASK_SUMMARY_LIMIT:
-        rendered.append(f"... 另有 {len(tasks) - _GUARD_TASK_SUMMARY_LIMIT} 项")
-    return "；".join(rendered) if rendered else "空计划"
-
-
-def _raise_guard_violation(
-    *,
-    state: TodoState,
-    tool_name: str,
-    reason: str,
-    next_step: str,
-) -> None:
-    logger.warning("Execution guard blocked %s: %s", tool_name, reason)
-    raise ExecutionGuardViolation(
-        f"[计划执行守卫] 已阻止变更工具 `{tool_name}`：{reason}\n"
-        f"当前计划状态：{_format_guard_snapshot(state)}\n"
-        f"下一步：{next_step}"
-    )
-
-
 def _normalize_invariants(invariants: list[str] | str | None) -> list[str]:
     if invariants is None:
         return []
@@ -264,9 +202,9 @@ def create_todos(
       没有约束时省略或传 []。
     - tasks: 任务列表。可以是简单字符串列表（每个元素代表 description），也可以是字典列表。
       字典可选字段：id, description, parent_id, depends_on, success_criteria, verification, risk_level。
-    - merge: 默认 False，即"全量替换"语义；当**跨轮**已经存在一个活动计划时，仅在传 merge=True
-      时按 id 合并新旧任务（保留旧任务的 status/evidence/notes，新增 id 追加，未列出的旧 id 保留）。
-      同一轮内重复调用 create_todos 始终视作 planner 的 refine，按全量替换处理，无需手动传 merge。
+    - merge: 默认 False，即"全量替换"语义。当已存在一个活动计划时，仅传 merge=True
+      才按 id 合并新旧任务（保留旧任务的 status/evidence/notes，新增 id 追加，未列出的旧 id 保留）；
+      不传 merge=True 的 create_todos 会拒绝覆盖既有活动计划，避免静默丢失进度。
 
     调用后，请逐一执行工具完成任务，并使用 update_todo 及时更新状态。
     """
@@ -337,31 +275,19 @@ def create_todos(
 
     state = _get_state(ctx)
 
-    # 同一轮内重复调用 create_todos 视为 planner 自然 refine,允许全量替换不拦截;
     # 跨轮再次 create_todos 且未传 merge=True 时拒绝,避免静默覆盖既有活动计划。
-    current_turn_seq = int(
-        ctx.deps.session_state.get("current_turn_ledger_start_seq", 0) or 0
-    )
-    if state.is_active and state.tasks:
-        same_turn = state.created_turn_seq == current_turn_seq
-        if not same_turn and not merge:
-            raise ModelRetry(
-                f"已存在跨轮活动计划（{len(state.tasks)} 个任务，"
-                f"goal={state.goal!r}）。三选一：\n"
-                f"(a) 同一目标的细化：用 update_todo 修改具体任务，不要重新 create_todos；\n"
-                f"(b) 跨轮 refine：调 create_todos(merge=True, tasks=[...])，"
-                f"按 id 合并而非覆盖（保留旧任务的 status/evidence/notes）；\n"
-                f"(c) 全新无关任务：先把旧计划所有 pending/in-progress 任务 "
-                f"update_todo(..., status=\"blocked\")，再 create_todos(merge=False, ...) 覆盖。"
-            )
-        if same_turn and not merge:
-            logger.info(
-                "create_todos same-turn replace, prior plan with %d tasks discarded "
-                "for session %s",
-                len(state.tasks),
-                ctx.deps.session_id,
-            )
-
+    # 同轮内(主 agent ReAct 循环里模型主动重写计划)不拦截,允许全量替换 —— 主 agent
+    # 拿到新工具证据后调整计划是正常行为,守卫只会把它逼进死循环。
+    if state.is_active and state.tasks and not merge:
+        raise ModelRetry(
+            f"已存在活动计划（{len(state.tasks)} 个任务，"
+            f"goal={state.goal!r}）。三选一：\n"
+            f"(a) 同一目标的细化：用 update_todo 修改具体任务，不要重新 create_todos；\n"
+            f"(b) 修订计划：调 create_todos(merge=True, tasks=[...])，"
+            f"按 id 合并而非覆盖（保留旧任务的 status/evidence/notes）；\n"
+            f"(c) 全新无关任务：先把旧计划所有 pending/in-progress 任务 "
+            f"update_todo(..., status=\"blocked\")，再 create_todos(merge=False, ...) 覆盖。"
+        )
     if merge and state.tasks:
         # merge 语义参考 Hermes tools/todo_tool.py:
         # - 已有 id:用新值更新 description/parent_id/depends_on/success_criteria/
@@ -396,7 +322,6 @@ def create_todos(
     state.tasks = new_tasks
     state.tool_calls_since_update = 0
     state.is_active = True
-    state.created_turn_seq = current_turn_seq
     _save_state(ctx, state)
     logger.info(
         "%s %d TODO tasks for session %s.",
@@ -579,71 +504,8 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
     for task in state.tasks.values():
         if task.parent_id is None or task.parent_id not in valid_ids:
             render_task(task, 0)
-        
+
     return "\n".join(lines)
-
-
-def get_current_task_for_tool(ctx: RunContext[AgentDeps], tool_name: str | Iterable[str]) -> TodoTask | None:
-    """Return the authorized in-progress task for a mutating tool.
-
-    No active plan means direct execution is allowed. Once a plan is active,
-    mutating tools fail closed unless exactly one current task authorizes the
-    action and all of that task's dependencies are complete.
-    """
-
-    tool_names = _coerce_tool_names(tool_name)
-    display_name = tool_names[0]
-    state = _get_state(ctx)
-    if not state.is_active or not state.tasks:
-        return None
-
-    pending = [task for task in state.tasks.values() if task.status != "done"]
-    if not pending:
-        state.is_active = False
-        _save_state(ctx, state)
-        return None
-
-    in_progress = [task for task in state.tasks.values() if task.status == "in-progress"]
-    if len(in_progress) != 1:
-        if not in_progress:
-            next_step = "先调用 `update_todo` 将当前要执行的任务标记为 `in-progress`，然后再调用变更工具。"
-        else:
-            next_step = "先调用 `update_todo`，只保留一个任务为 `in-progress`，其余任务标记为 `pending`、`done` 或 `blocked`。"
-        _raise_guard_violation(
-            state=state,
-            tool_name=display_name,
-            reason=f"活跃计划中必须恰好有一个 in-progress 任务，当前有 {len(in_progress)} 个。",
-            next_step=next_step,
-        )
-
-    task = in_progress[0]
-    if not _all_dependencies_done(state, task):
-        missing = [dep_id for dep_id in task.depends_on if state.tasks[dep_id].status != "done"]
-        _raise_guard_violation(
-            state=state,
-            tool_name=display_name,
-            reason=f"当前任务 {task.id} 的依赖尚未完成：{missing}。",
-            next_step="先完成依赖任务并用 `update_todo(..., 'done')` 记录证据，再继续当前变更操作。",
-        )
-    return task
-
-
-def with_execution_guard(func):
-    """Block mutating tools when an active plan has no valid in-progress task."""
-
-    tool_names = _tool_name_candidates(func)
-    if inspect.iscoroutinefunction(func):
-        @wraps(func)
-        async def async_wrapper(ctx, *args, **kwargs):
-            get_current_task_for_tool(ctx, tool_names)
-            return await func(ctx, *args, **kwargs)
-        return async_wrapper
-
-    @wraps(func)
-    def sync_wrapper(ctx, *args, **kwargs):
-        get_current_task_for_tool(ctx, tool_names)
-        return func(ctx, *args, **kwargs)
-    return sync_wrapper
 
 
 def with_todo_reminder(func):

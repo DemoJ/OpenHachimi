@@ -420,7 +420,6 @@ def test_todo_state_roundtrip(store: SessionStore):
         invariants=["tests must pass", "lint clean"],
         tool_calls_since_update=5,
         is_active=True,
-        created_turn_seq=7,
         tasks={
             1: TodoTask(id=1, description="design", status="done"),
             2: TodoTask(
@@ -439,7 +438,6 @@ def test_todo_state_roundtrip(store: SessionStore):
     assert loaded.invariants == ["tests must pass", "lint clean"]
     assert loaded.tool_calls_since_update == 5
     assert loaded.is_active is True
-    assert loaded.created_turn_seq == 7
     assert set(loaded.tasks.keys()) == {1, 2}
     assert loaded.tasks[2].depends_on == [1]
     assert loaded.tasks[2].risk_level == "medium"

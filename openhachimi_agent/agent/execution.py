@@ -235,7 +235,13 @@ def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, ob
 
 
 def with_execution_ledger(func: Callable) -> Callable:
-    """Record tool execution and block actions that contradict the active TaskFrame."""
+    """Record tool execution in the in-memory ledger + feed verification state.
+
+    ledger 记每个工具的 started/succeeded/failed(供 ``get_replan_signal``/
+    ``get_final_verification_signal`` 消费);succeeded 后再调
+    ``verification_stop.mark_tool_succeeded`` 按工具语义更新验证状态(编辑类
+    置 stale、验证类清 stale),供停止闸门 ``build_verify_on_stop_nudge`` 判定。
+    """
 
     tool_name = getattr(func, "__name__", "unknown_tool")
 
@@ -259,6 +265,7 @@ def with_execution_ledger(func: Callable) -> Callable:
                 )
                 raise
             _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
+            _mark_verify_state(session_state, tool_name)
             return result
         return async_wrapper
 
@@ -281,5 +288,20 @@ def with_execution_ledger(func: Callable) -> Callable:
             )
             raise
         _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
+        _mark_verify_state(session_state, tool_name)
         return result
     return sync_wrapper
+
+
+def _mark_verify_state(session_state: dict[str, Any], tool_name: str) -> None:
+    """工具成功后按语义更新验证状态(编辑置 stale / 验证清 stale)。
+
+    延迟 import 防止 ``agent.execution`` ↔ ``agent.verification_stop`` 循环;
+    验证模块失败不应阻断工具返回(ledger 已记完,闸门判定可缺位)。
+    """
+    try:
+        from openhachimi_agent.agent.verification_stop import mark_tool_succeeded
+
+        mark_tool_succeeded(session_state, tool_name)
+    except Exception:
+        pass

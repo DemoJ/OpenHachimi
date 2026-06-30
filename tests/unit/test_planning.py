@@ -10,7 +10,6 @@ from openhachimi_agent.tools.planning import (
     update_todo,
     _get_state,
     TodoState,
-    with_execution_guard,
 )
 
 @dataclass
@@ -121,55 +120,18 @@ def test_all_done_deactivates_plan(mock_ctx):
     assert _get_state(mock_ctx).is_active is False
 
 
-def test_execution_guard_allows_without_active_plan(mock_ctx):
+def test_execution_guard_removed_allows_mutating_without_in_progress(mock_ctx):
+    """execution_guard 已随 Hermes 式重构拆除:变动工具不再被"必须有恰好一个
+    in-progress 任务"硬拦截。主 agent 靠 prompt 软引导 + verification 停止闸门
+    兜底。这里只断言旧 guard 语义已不复存在——没有计划时直接调用不抛。"""
     def mutating_tool(ctx):
         return {"ok": True}
 
-    guarded = with_execution_guard(mutating_tool)
-
-    assert guarded(mock_ctx) == {"ok": True}
-
-
-def test_execution_guard_blocks_without_in_progress_task(mock_ctx):
-    called = False
-
-    def mutating_tool(ctx):
-        nonlocal called
-        called = True
-        return {"ok": True}
-
-    guarded = with_execution_guard(mutating_tool)
+    # 不再包 guard;直接调用应放行
+    assert mutating_tool(mock_ctx) == {"ok": True}
     create_todos(mock_ctx, ["Task 1"])
-
-    with pytest.raises(ModelRetry, match="必须恰好有一个 in-progress"):
-        guarded(mock_ctx)
-
-    assert called is False
-
-    update_todo(mock_ctx, 1, "in-progress")
-    assert guarded(mock_ctx) == {"ok": True}
-
-
-def test_execution_guard_blocks_unfinished_dependencies(mock_ctx):
-    called = False
-
-    def mutating_tool(ctx):
-        nonlocal called
-        called = True
-        return {"ok": True}
-
-    guarded = with_execution_guard(mutating_tool)
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "Prepare"},
-        {"id": 2, "description": "Change", "depends_on": [1]},
-    ])
-    state = _get_state(mock_ctx)
-    state.tasks[2].status = "in-progress"
-
-    with pytest.raises(ModelRetry, match="依赖尚未完成"):
-        guarded(mock_ctx)
-
-    assert called is False
+    # 有计划但无 in-progress,旧 guard 会拦;现在也不拦
+    assert mutating_tool(mock_ctx) == {"ok": True}
 
 
 def test_update_todo_rejects_second_in_progress_task(mock_ctx):
@@ -182,44 +144,12 @@ def test_update_todo_rejects_second_in_progress_task(mock_ctx):
     assert _get_state(mock_ctx).tasks[2].status == "pending"
 
 
-def test_execution_guard_blocks_multiple_in_progress_tasks(mock_ctx):
-    def mutating_tool(ctx):
-        return {"ok": True}
-
-    guarded = with_execution_guard(mutating_tool)
-    create_todos(mock_ctx, ["Task 1", "Task 2"])
-    state = _get_state(mock_ctx)
-    state.tasks[1].status = "in-progress"
-    state.tasks[2].status = "in-progress"
-
-    with pytest.raises(ModelRetry, match="当前有 2 个"):
-        guarded(mock_ctx)
-
-
-@pytest.mark.asyncio
-async def test_execution_guard_supports_async_tools(mock_ctx):
-    async def run_command(ctx):
-        return {"ok": True}
-
-    guarded = with_execution_guard(run_command)
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "Task 1"},
-    ])
-    update_todo(mock_ctx, 1, "in-progress")
-
-    assert await guarded(mock_ctx) == {"ok": True}
-
-
 def test_create_todos_cross_turn_blocks_without_merge(mock_ctx):
-    """跨轮再次 create_todos 时,若未传 merge=True,应拒绝覆盖既有活动计划。"""
-    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 1
+    """已有活动计划时,再次 create_todos 若未传 merge=True,应拒绝覆盖。"""
     create_todos(mock_ctx, ["Task A"])
     update_todo(mock_ctx, 1, "in-progress")
 
-    # 模拟跨轮:新一轮 ledger seq 推进
-    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 10
-
-    with pytest.raises(ModelRetry, match="跨轮活动计划"):
+    with pytest.raises(ModelRetry, match="活动计划"):
         create_todos(mock_ctx, ["Brand new task"])
 
     state = _get_state(mock_ctx)
@@ -228,16 +158,14 @@ def test_create_todos_cross_turn_blocks_without_merge(mock_ctx):
 
 
 def test_create_todos_cross_turn_merge_keeps_status(mock_ctx):
-    """跨轮 merge=True 时应按 id 合并:更新 description 等可变字段,
+    """merge=True 时应按 id 合并:更新 description 等可变字段,
     保留旧任务的 status/evidence/notes。"""
-    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 1
     create_todos(mock_ctx, [
         {"id": 1, "description": "Original"},
         {"id": 2, "description": "Will stay"},
     ])
     update_todo(mock_ctx, 1, "in-progress", notes="halfway", evidence="ev")
 
-    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 10
     res = create_todos(
         mock_ctx,
         [
@@ -260,15 +188,15 @@ def test_create_todos_cross_turn_merge_keeps_status(mock_ctx):
     assert "Refined" in res
 
 
-def test_create_todos_same_turn_replace_allowed(mock_ctx):
-    """同一轮内重复 create_todos 视作 planner refine,允许全量替换。"""
-    mock_ctx.deps.session_state["current_turn_ledger_start_seq"] = 5
+def test_create_todos_same_turn_still_requires_merge(mock_ctx):
+    """拆除 planner 后不再有"同轮 refine"豁免:一旦存在活动计划,同轮内再次
+    create_todos(无 merge)同样被拒——主 agent 要修订计划就走 merge=True。
+    这避免了"中途 create_todos 全量替换"造成的突兀抖动。"""
     create_todos(mock_ctx, ["Old A", "Old B"])
-    # 同一轮再调一次,无 merge 也应允许覆盖
-    res = create_todos(mock_ctx, ["Fresh"])
+    with pytest.raises(ModelRetry, match="活动计划"):
+        create_todos(mock_ctx, ["Fresh"])
 
     state = _get_state(mock_ctx)
-    assert len(state.tasks) == 1
-    assert state.tasks[1].description == "Fresh"
-    assert "Fresh" in res
+    assert len(state.tasks) == 2
+    assert state.tasks[1].description == "Old A"
 

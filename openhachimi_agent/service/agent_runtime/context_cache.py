@@ -58,7 +58,7 @@ def resolve_static_context(service, role: str | None, hash_key: str) -> str:
     # 池中不存在:尝试重建当前版本的静态段,若哈希相同则写入池
     if role:
         try:
-            executor_agent = service._get_agent(role, "executor")
+            executor_agent = service._get_agent(role, "main")
         except Exception:
             return ""
         try:
