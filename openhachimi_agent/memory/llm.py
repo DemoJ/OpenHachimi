@@ -70,13 +70,18 @@ def run_memory_extraction(
 ) -> MemoryExtractionOutput | None:
     """Run structured long-term memory extraction through pydantic_ai.
 
-    本函数是**同步**接口,由 ``turn.py`` 经 ``asyncio.to_thread`` 放到工作线程
-    里调用。用 ``asyncio.run`` 而非 ``agent.run_sync``:后者内部用
+    本函数是**同步**接口,调用方必须把它放到**没有运行中事件循环**的工作
+    线程里执行(经 ``asyncio.to_thread``)——``MemoryScheduler.handle_job`` 即
+    如此调用。切勿在主事件循环里直接同步调用,否则下面的 ``asyncio.run`` 会抛
+    ``RuntimeError: asyncio.run() cannot be called from a running event loop``,
+    而 ``agent.run(...)`` 此时已被求值为协程对象、尚未被 await,协程随之泄漏,
+    触发 ``coroutine 'AbstractAgent.run' was never awaited`` 警告。
+
+    用 ``asyncio.run`` 而非 ``agent.run_sync``:后者内部用
     ``get_event_loop().run_until_complete(...)``,在工作线程里会创建并 ``set``
     一个**不关闭**的事件循环,跨 ``to_thread`` 调用残留,导致退出时
-    Windows Proactor pipe transport 未清理(``OverlappedFuture 句柄无效``)
-    及 ``coroutine 'AbstractAgent.run' was never awaited``。``asyncio.run``
-    每次创建并**关闭**临时循环,彻底清理 transport,杜绝泄漏。
+    Windows Proactor pipe transport 未清理(``OverlappedFuture 句柄无效``)。
+    ``asyncio.run`` 每次创建并**关闭**临时循环,彻底清理 transport,杜绝泄漏。
     """
     if not _memory_llm_available(config):
         return None

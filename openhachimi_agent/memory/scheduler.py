@@ -86,8 +86,7 @@ class MemoryScheduler:
                     if self.config else 21600)
         if interval > 0 and time.monotonic() - self._last_maintenance_ts >= interval:
             try:
-                self.store.expire_due_atoms()
-                self.store.archive_decayed_atoms()
+                await asyncio.to_thread(self._run_maintenance)
                 self._last_maintenance_ts = time.monotonic()
                 stats["maintenance"] += 1
             except Exception as exc:
@@ -96,15 +95,16 @@ class MemoryScheduler:
 
     async def handle_job(self, job: MemoryJob) -> dict[str, int]:
         if job.job_type == "extract_atoms_from_turn":
-            return self._handle_extract_atoms(job.payload)
+            return await asyncio.to_thread(self._handle_extract_atoms, job.payload)
         if job.job_type == "embed_memory_item":
-            return self._handle_embed_memory_item(job.payload)
+            return await asyncio.to_thread(self._handle_embed_memory_item, job.payload)
         if job.job_type == "consolidate_scope":
             if self.config and not self.config.memory.consolidation.enabled:
                 return {"consolidations": 0}
             scope = _scope_from_payload(job.payload.get("scope", {}))
             consolidation = self.config.memory.consolidation if self.config else None
-            consolidate_due_memories(
+            await asyncio.to_thread(
+                consolidate_due_memories,
                 self.store,
                 scope=scope,
                 atom_limit=consolidation.atom_limit if consolidation else 200,
@@ -115,10 +115,13 @@ class MemoryScheduler:
             )
             return {"consolidations": 1}
         if job.job_type == "maintenance":
-            self.store.expire_due_atoms()
-            self.store.archive_decayed_atoms()
+            await asyncio.to_thread(self._run_maintenance)
             return {"maintenance": 1}
         return {}
+
+    def _run_maintenance(self) -> None:
+        self.store.expire_due_atoms()
+        self.store.archive_decayed_atoms()
 
     def _handle_extract_atoms(self, payload: dict[str, Any]) -> dict[str, int]:
         scope = _scope_from_payload(payload.get("scope", {}))
