@@ -21,8 +21,8 @@
 ========
 - :func:`build_system_dynamic_block(deps)` —— 给所有 agent(planner/executor)用,
   返回 ``[时间] + [TaskFrame 摘要] + [记忆召回]``。
-- :func:`build_executor_extra_dynamic_block(deps)` —— 仅 executor 用,
-  返回 ``[执行接力规则?] + [直接执行模式提示?] + [技能索引]``。
+- :func:`build_executor_extra_dynamic_block(deps)` —— 仅 main agent 用,
+  返回 ``[执行接力规则?] + [产物落点引导] + [技能索引]``。
 - :func:`build_volatile_prefix(deps)` —— 兼容旧测试的 thin wrapper。
 
 key 设计原则:user-prompt 只承载用户原始消息 + 附件;其它一切系统级运行时
@@ -165,14 +165,12 @@ def _skills_index_block(deps: AgentDeps) -> str:
         return ""
 
 
-# ── executor 专用动态段(只在 executor agent 上注册;planner/scheduled_executor
-# 不挂这套) ──
+# ── executor 专用动态段(只在 main agent 上注册) ──
 #
-# 触发矩阵:
+# 触发:
 #   - executor_todo_handoff.md  ← has_active_todos(session_state)
-#   - executor_direct_mode.md   ← execution_mode == "direct"
-#                                  且 has_active_todos == False
 #   - skills_index.md           ← 始终注入(若工作区有可见 skill)
+#   - workspace_hint.md         ← 始终注入(若 session_id 不空)
 #
 # "通用底线"(严禁假完成/伪造工具结果)随 TODO 接力一起出现 —— 这条只在有 TODO
 # 时才有真正意义,简单单步任务里它本身就是噪声。
@@ -212,25 +210,6 @@ def _todo_handoff_block(deps: AgentDeps) -> str:
         return ""
 
 
-def _direct_mode_block(deps: AgentDeps) -> str:
-    """无活动 TODO 时,注入"不要给低风险任务造 TODO"提示。
-
-    有活动 TODO 时这条会和 _todo_handoff_block 的"严格按 TODO 执行"冲突,因此
-    显式互斥:有 TODO → 走接力规则,无 TODO → 走 direct 提示。
-
-    Hermes 式重构后不再依赖 router 产出的 execution_mode 字段(router 已废):
-    无活动 TODO 即视为 direct 模式,注入提示让主 agent 不要给简单任务堆 TODO。
-    """
-    session_state = getattr(deps, "session_state", None)
-    if not isinstance(session_state, dict):
-        return ""
-    if _has_active_todos_in_state(session_state):
-        return ""
-    try:
-        return render_system_prompt("runtime/executor_direct_mode")
-    except Exception:  # noqa: BLE001
-        logger.debug("executor_direct_mode render failed", exc_info=True)
-        return ""
 
 
 def _workspace_hint_block(deps: AgentDeps) -> str:
@@ -255,8 +234,8 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
     污染 —— 它们各自的角色提示词已经明确了职责。把 executor 专用块单独出口,
     在 ``factory.py`` 中只对 executor agent 注册。
 
-    输出顺序:``[执行接力规则? + 通用底线] [直接执行模式提示?] [产物落点引导]
-    [技能索引]``。前两块按需,后两块常驻。
+    输出顺序:``[执行接力规则? + 通用底线] [产物落点引导]
+    [技能索引]``。前一块按需,后两块常驻。
     """
     if deps is None:
         return ""
@@ -264,9 +243,6 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
     handoff = _todo_handoff_block(deps)
     if handoff:
         blocks.append(handoff)
-    direct = _direct_mode_block(deps)
-    if direct:
-        blocks.append(direct)
     workspace_hint = _workspace_hint_block(deps)
     if workspace_hint:
         blocks.append(workspace_hint)

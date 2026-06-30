@@ -2,7 +2,7 @@
 的按需注入回归测试。
 
 重点覆盖:
-- executor 专用动态段:TODO 接力 / direct-mode / 技能索引按本轮 session 状态触发。
+- executor 专用动态段:TODO 接力 / 技能索引按本轮 session 状态触发。
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from openhachimi_agent.tools.planning import TodoState, TodoTask
 
 
 _TODO_HANDOFF_HEADING = "执行接力规则"
-_DIRECT_MODE_HEADING = "直接执行模式"
 _SKILLS_INDEX_HEADING = "Skills（可用技能索引）"
 
 
@@ -104,10 +103,9 @@ def test_build_system_dynamic_block_handles_none_deps():
 
 
 def test_main_agent_md_core_no_longer_contains_handoff_section():
-    """main_agent.md 主体不应再含'执行接力规则' / '直接执行模式'相关大段——已迁出按需。"""
+    """main_agent.md 主体不应再含'执行接力规则'相关大段——已迁出按需。"""
     text = load_system_prompt("agents/main_agent")
     assert _TODO_HANDOFF_HEADING not in text
-    assert _DIRECT_MODE_HEADING not in text
 
 
 def test_main_agent_md_core_keeps_tool_specific_rules():
@@ -142,46 +140,32 @@ def test_skills_index_template_contains_progressive_disclosure_guidance():
 
 
 def test_executor_extra_block_empty_for_idle_chat_no_skills(mock_config):
-    """无 TODO + 无 skill:executor 额外块含 direct mode 提示 + 产物落点引导。
+    """无 TODO + 无 skill:仅产物落点引导常驻,TODO 接力与技能索引不出现。
 
-    Hermes 式重构后 direct_mode 触发条件改为"无活动 TODO 即注入"(不再依赖
-    router 产出的 execution_mode 字段)。所以 idle chat 也会注入 direct mode
-    提示,告诉主 agent 不要给简单任务堆 TODO。
-    mock_config.skills_dirs 默认指向 ``tmp_path / .claude / skills``(conftest 设置),
-    那个目录不存在,所以 find_skills 返回空,索引块不注入。
-    产物落点引导(workspace_hint)是常驻块,只要 deps.session_id 非空就出现。
+    重构后 direct_mode 提示已删除(已被 main_agent.md 主体覆盖),idle chat
+    只看到产物落点引导和可能的技能索引。
     """
     deps = _make_executor_deps(mock_config, task_frame=None)
     block = build_executor_extra_dynamic_block(deps)
-    # 无 TODO → direct mode 块注入;TODO 接力块、skills index 块不出现
+    # 无 TODO → TODO 接力块不出现;skills index 不出现
     assert "执行接力规则" not in block
-    assert "直接执行模式" in block
+    assert "直接执行模式" not in block
     assert "技能索引" not in block
     # 产物落点引导常驻
     assert "中间产物落点" in block
     assert ".workspace/" in block
 
 
-def test_executor_extra_block_direct_mode_only(mock_config):
-    """direct 模式(简单任务)且无 TODO + 无 skill:仅注入'直接执行模式'。"""
-    deps = _make_executor_deps(
-        mock_config,
-        task_frame={
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
-    )
+def test_executor_extra_block_no_todos_and_no_skills_emits_workspace_hint(mock_config):
+    """无 TODO + 无 skill:仅产物落点引导,TODO 接力不出现。"""
+    deps = _make_executor_deps(mock_config, task_frame=None)
     block = build_executor_extra_dynamic_block(deps)
-    assert _DIRECT_MODE_HEADING in block
     assert _TODO_HANDOFF_HEADING not in block
-    # 工作区无 skill → 不应出现技能索引
-    assert _SKILLS_INDEX_HEADING not in block
+    assert "中间产物落点" in block
 
 
 def test_executor_extra_block_active_todos_only_handoff(mock_config):
-    """有活动 TODO:只注入接力规则,direct 块互斥让位。"""
+    """有活动 TODO:只注入接力规则。"""
     todo_state = TodoState(
         goal="test goal",
         is_active=True,
@@ -189,17 +173,11 @@ def test_executor_extra_block_active_todos_only_handoff(mock_config):
     )
     deps = _make_executor_deps(
         mock_config,
-        task_frame={
-            "complexity": "complex",
-            "risk": "low",
-            "requires_plan": True,
-            "execution_mode": "planned",
-        },
+        task_frame=None,
         todo_state=todo_state,
     )
     block = build_executor_extra_dynamic_block(deps)
     assert _TODO_HANDOFF_HEADING in block
-    assert _DIRECT_MODE_HEADING not in block
 
 
 def test_executor_extra_block_all_todos_done_treated_as_inactive(mock_config):
@@ -211,17 +189,11 @@ def test_executor_extra_block_all_todos_done_treated_as_inactive(mock_config):
     )
     deps = _make_executor_deps(
         mock_config,
-        task_frame={
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
+        task_frame=None,
         todo_state=todo_state,
     )
     block = build_executor_extra_dynamic_block(deps)
     assert _TODO_HANDOFF_HEADING not in block
-    assert _DIRECT_MODE_HEADING in block
 
 
 def test_executor_extra_block_inactive_todo_state_not_handoff(mock_config):
@@ -233,25 +205,17 @@ def test_executor_extra_block_inactive_todo_state_not_handoff(mock_config):
     )
     deps = _make_executor_deps(
         mock_config,
-        task_frame={
-            "complexity": "simple",
-            "risk": "low",
-            "requires_plan": False,
-            "execution_mode": "direct",
-        },
+        task_frame=None,
         todo_state=todo_state,
     )
     block = build_executor_extra_dynamic_block(deps)
     assert _TODO_HANDOFF_HEADING not in block
-    assert _DIRECT_MODE_HEADING in block
 
 
 def test_executor_extra_block_planned_without_active_todos_empty(mock_config):
-    """无活动 TODO 时,direct 块注入(不再看 task_frame.execution_mode)。
+    """无活动 TODO 时,仅产物落点引导,TODO 接力不出现。
 
-    Hermes 式重构后 direct_mode 触发条件改为"无活动 TODO 即注入",router 已废,
-    execution_mode 字段不再决定 prompt 分支。所以即便残留 task_frame 标记为
-    planned,只要没有活动 TODO,direct 提示仍注入(让主 agent 自主决定建不建 todo)。
+    execution_mode 字段不再决定 prompt 分支。
     """
     deps = _make_executor_deps(
         mock_config,
@@ -263,9 +227,7 @@ def test_executor_extra_block_planned_without_active_todos_empty(mock_config):
         },
     )
     block = build_executor_extra_dynamic_block(deps)
-    # 无 TODO → direct 块注入;TODO 接力块、skills index 块不出现
     assert "执行接力规则" not in block
-    assert "直接执行模式" in block
     assert "技能索引" not in block
     assert "中间产物落点" in block
 
