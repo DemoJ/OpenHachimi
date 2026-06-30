@@ -1,6 +1,6 @@
 # pyrefly: ignore [missing-import]
+from openhachimi_agent.core.redaction import REDACTED
 from openhachimi_agent.service.agent_runtime.streaming import (
-    REDACTED,
     format_tool_call,
     redact_tool_args,
     summarize_tool_args,
