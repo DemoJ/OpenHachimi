@@ -4,8 +4,8 @@ import pytest
 import asyncio
 from unittest.mock import MagicMock, patch
 
-from openhachimi_agent.service import agent_service as agent_service_module
 from openhachimi_agent.service.agent_service import AgentService
+from openhachimi_agent.service.agent_runtime.agent_cache import AGENT_DEPENDENCY_MTIME_TTL_SECONDS
 from openhachimi_agent.agent.intent import extract_urls
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.tools import mcp as mcp_module
@@ -193,7 +193,7 @@ def test_agent_dependency_mtime_uses_short_ttl_cache(agent_service, mock_config)
 
     checked_at, cached_mtime = agent_service._agent_dependency_mtime_cache
     agent_service._agent_dependency_mtime_cache = (
-        checked_at - agent_service_module.AGENT_DEPENDENCY_MTIME_TTL_SECONDS - 1,
+        checked_at - AGENT_DEPENDENCY_MTIME_TTL_SECONDS - 1,
         cached_mtime,
     )
 

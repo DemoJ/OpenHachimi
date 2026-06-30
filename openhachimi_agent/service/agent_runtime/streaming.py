@@ -20,7 +20,7 @@ from pydantic_ai.messages import (
 )
 
 from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.core.redaction import REDACTED, redact_tool_args, summarize_redacted
+from openhachimi_agent.core.redaction import redact_tool_args, summarize_redacted
 from openhachimi_agent.service.agent_runtime.context import OperationState
 from openhachimi_agent.transport.api_models import ArtifactRef
 

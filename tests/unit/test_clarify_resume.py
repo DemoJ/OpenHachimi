@@ -300,7 +300,7 @@ def test_emit_output_tool_card_compensates_for_missing_event():
 def test_terminal_stream_text_yields_clarification_when_chunks_streamed():
     """模型在 clarify_user 之前流式过 26 字符过渡文字(chunk_count=8)。
     deferred 路径必须仍然把 question 文本补发,且前面加 \\n\\n 与过渡文字隔开。"""
-    from openhachimi_agent.service.agent_runtime.turn import _resolve_terminal_stream_text
+    from openhachimi_agent.service.agent_runtime.turn_render import _resolve_terminal_stream_text
 
     question = "请提供 SMTP 服务器、端口、发件人邮箱、授权码"
     result_holder = {"clarification_question": question}
@@ -311,7 +311,7 @@ def test_terminal_stream_text_yields_clarification_when_chunks_streamed():
 def test_terminal_stream_text_yields_clarification_when_no_chunks_streamed():
     """deferred 路径但前面一个 chunk 都没有(模型直接调 clarify_user 不带任何前置
     解释):仍要补发,但不需要前置 \\n\\n。"""
-    from openhachimi_agent.service.agent_runtime.turn import _resolve_terminal_stream_text
+    from openhachimi_agent.service.agent_runtime.turn_render import _resolve_terminal_stream_text
 
     question = "需要凭据"
     out = _resolve_terminal_stream_text(
@@ -323,7 +323,7 @@ def test_terminal_stream_text_yields_clarification_when_no_chunks_streamed():
 def test_terminal_stream_text_yields_final_output_when_no_chunks_streamed():
     """非 deferred 但 chunk_count == 0:模型靠 result.output 字段返回最终答案
     (结构化输出 / 极短回复)。仍需补一次 text 事件,否则用户拿不到任何输出。"""
-    from openhachimi_agent.service.agent_runtime.turn import _resolve_terminal_stream_text
+    from openhachimi_agent.service.agent_runtime.turn_render import _resolve_terminal_stream_text
 
     out = _resolve_terminal_stream_text("最终答案", {}, chunk_count=0)
     assert out == "最终答案"
@@ -332,7 +332,7 @@ def test_terminal_stream_text_yields_final_output_when_no_chunks_streamed():
 def test_terminal_stream_text_silent_when_chunks_streamed_and_not_deferred():
     """正常路径(非 deferred 且 chunk_count > 0):final answer 已经流过,不要重复
     yield,否则会双倍出现在 UI 上。"""
-    from openhachimi_agent.service.agent_runtime.turn import _resolve_terminal_stream_text
+    from openhachimi_agent.service.agent_runtime.turn_render import _resolve_terminal_stream_text
 
     out = _resolve_terminal_stream_text("最终答案", {}, chunk_count=5)
     assert out == ""
@@ -340,7 +340,7 @@ def test_terminal_stream_text_silent_when_chunks_streamed_and_not_deferred():
 
 def test_terminal_stream_text_silent_when_output_empty():
     """final_output_text 为空(模型彻底没产生任何输出):不要 yield 空 text 事件。"""
-    from openhachimi_agent.service.agent_runtime.turn import _resolve_terminal_stream_text
+    from openhachimi_agent.service.agent_runtime.turn_render import _resolve_terminal_stream_text
 
     assert _resolve_terminal_stream_text("", {"clarification_question": ""}, chunk_count=0) == ""
     assert _resolve_terminal_stream_text("", {}, chunk_count=0) == ""
