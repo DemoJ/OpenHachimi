@@ -113,8 +113,11 @@ def _build_executor_static_context(
 ) -> str:
     """直接构建主 agent 的静态 system prompt 段(不含每轮动态注入的部分)。
 
-    包括:base.md + agents/main_agent.md + role instructions + runtime/config.md
+    包括:base.md + role instructions + agents/main_agent.md + runtime/config.md
     + 可用工具摘要清单。每段独立 try/except,单段加载失败不影响其余。
+
+    段内顺序与 ``factory._build_base_agent`` 拼入 ``system_prompt`` 字符串的顺序
+    保持一致(base → role → main_agent),保证 WebUI 展示与模型实际所见相符。
     """
     from openhachimi_agent.content.prompts import load_system_prompt, render_system_prompt
     from openhachimi_agent.content.roles import load_role_content
@@ -130,8 +133,8 @@ def _build_executor_static_context(
             logger.debug(msg, *args, exc_info=True)
 
     append(lambda: load_system_prompt("base"), "failed to load base.md")
-    append(lambda: load_system_prompt("agents/main_agent"), "failed to load main_agent.md")
     append(lambda: load_role_content(config.roles_dir, role), "failed to load role content role=%s", role)
+    append(lambda: load_system_prompt("agents/main_agent"), "failed to load main_agent.md")
     append(
         lambda: render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")}),
         "failed to render config.md",

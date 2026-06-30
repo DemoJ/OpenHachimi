@@ -139,10 +139,14 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         else:
             extra_prompt = load_system_prompt("agents/main_agent")
 
+    # 最终 system prompt 顺序（从上到下）:
+    #   1. base.md              — 系统人格、核心原则、安全边界
+    #   2. role_content         — 角色设定（用户级 user/roles/<name>.md）
+    #   3. extra_prompt         — main_agent.md / subagent.md 操作规范
+    #   4. @agent.system_prompt — 运行时动态块（config/time/memory/技能索引）
     agent = Agent(
         OpenAIChatModel(config.model_name, provider=provider),
-        system_prompt=system_prompt + "\n\n" + extra_prompt,
-        instructions=role_content,
+        system_prompt=system_prompt + "\n\n" + role_content + "\n\n" + extra_prompt,
         deps_type=AgentDeps,
         toolsets=toolsets,
         output_type=output_type,

@@ -11,9 +11,9 @@ class TurnStoreMixin:
                 INSERT OR REPLACE INTO memory_turns(
                     id, turn_id, tenant_id, user_id, role_name, session_id, channel,
                     user_message, assistant_output, tool_calls_summary_json, task_frame_json,
-                    memory_context_ids_json, status, error_summary, started_at, finished_at,
+                    memory_context_ids_json, status, source, error_summary, started_at, finished_at,
                     duration_ms, raw_messages_json_ref, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     turn.id,
@@ -29,6 +29,7 @@ class TurnStoreMixin:
                     turn.task_frame_json,
                     turn.memory_context_ids_json,
                     turn.status,
+                    turn.source,
                     turn.error_summary,
                     turn.started_at,
                     turn.finished_at,

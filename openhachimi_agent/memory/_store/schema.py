@@ -5,6 +5,18 @@ from openhachimi_agent.memory.models import utc_now_iso
 SCHEMA_VERSION = 2
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    """探测 SQLite 表是否已有指定列(ADD COLUMN 不支持 IF NOT EXISTS)。"""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row[1] == column for row in rows)
+
+
+def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
+    """列缺失时幂等补列。``ddl`` 为 ADD COLUMN 的列定义,如 ``"TEXT NOT NULL DEFAULT 'user'"``。"""
+    if not _column_exists(conn, table, column):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 class SchemaStoreMixin:
     def initialize(self) -> None:
         with self.connect() as conn:
@@ -30,6 +42,7 @@ class SchemaStoreMixin:
                     task_frame_json TEXT NOT NULL,
                     memory_context_ids_json TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'user',
                     error_summary TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     finished_at TEXT NOT NULL,
@@ -222,6 +235,9 @@ class SchemaStoreMixin:
                 CREATE INDEX IF NOT EXISTS idx_memory_conflicts_scope ON memory_conflicts(tenant_id, user_id, role_name, conflict_key);
                 """
             )
+            # 旧库幂等补列:memory_turns.source 在 schema v2 建表语句里新增,
+            # 已存在的旧库需 ALTER 补上,默认 'user' 与模型字段一致。
+            _ensure_column(conn, "memory_turns", "source", "TEXT NOT NULL DEFAULT 'user'")
             conn.execute(
                 "INSERT OR IGNORE INTO memory_schema_migrations(version, applied_at) VALUES(?, ?)",
                 (SCHEMA_VERSION, utc_now_iso()),

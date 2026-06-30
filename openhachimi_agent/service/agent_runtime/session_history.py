@@ -55,7 +55,7 @@ def extract_text_parts(
     user 消息额外返回 ``prefix`` 字段（运行时注入的可折叠上下文）。读取优先级：
       1. v3:同时读 ``openhachimi_ctx_dynamic`` + ``openhachimi_ctx_static_hash``,
          由 ``service._resolve_static_context(role, hash)`` 查池/重建静态段;
-         prefix = dynamic + "\\n\\n" + static。
+         prefix = static + "\\n\\n" + dynamic(与实际发给模型的顺序一致)。
       2. v2 兜底:``openhachimi_system_context`` 整段(老会话历史)。
       3. v1 兜底:从 UserPromptPart 全文中拆出 ``openhachimi_user_message`` 之前的前缀。
       4. 兜底:prefix = ""。
@@ -96,13 +96,16 @@ def extract_text_parts(
                     item_ts = part_ts.isoformat() if part_ts is not None else ts_iso
 
                     # ---- v3 路径：分段 metadata + 静态池回填 ----
+                    # 展示顺序与实际发给模型的 system prompt 顺序保持一致:
+                    # 静态段(base/role/main_agent/config/工具清单)在前,
+                    # 动态段(时间/记忆/中间产物/Skills)在后。
                     prefix_v3 = ""
-                    if isinstance(dynamic_meta, str) and dynamic_meta.strip():
-                        prefix_v3 = dynamic_meta.strip()
                     if isinstance(static_hash_meta, str) and static_hash_meta:
                         static_text = service._resolve_static_context(role, static_hash_meta)
                         if static_text:
-                            prefix_v3 = f"{prefix_v3}\n\n{static_text}" if prefix_v3 else static_text
+                            prefix_v3 = static_text
+                    if isinstance(dynamic_meta, str) and dynamic_meta.strip():
+                        prefix_v3 = f"{prefix_v3}\n\n{dynamic_meta.strip()}" if prefix_v3 else dynamic_meta.strip()
                     if prefix_v3:
                         if isinstance(user_message_meta, str) and user_message_meta:
                             content = user_message_meta
