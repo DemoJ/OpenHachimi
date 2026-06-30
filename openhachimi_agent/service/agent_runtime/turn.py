@@ -41,6 +41,7 @@ from openhachimi_agent.service.agent_runtime.turn_postprocess import (
     _capture_turn_memory,
     _collect_turn_artifacts,
     _maybe_compress_post_turn,
+    _persist_failed_turn_user_message,
     _persist_turn,
     _resolve_final_output_text,
 )
@@ -388,5 +389,20 @@ async def run_turn(
             session_state=session_state, deps=deps, memory_scope=memory_scope, memory_context=memory_context,
             ctx=ctx, stream_queue=stream_queue, stream_stats=stream_stats, result_holder=result_holder,
         )
-        async for event in _run_turn_locked(state):
-            yield event
+        try:
+            async for event in _run_turn_locked(state):
+                yield event
+        except Exception:
+            # agent 调用失败(CDP 超时 / 模型错误等):正常路径的 _persist_turn 被跳过,
+            # 本轮用户输入从未进入历史 → 下一轮 load_context 读不到,agent 表现为
+            # "忘了刚才聊什么"。这里在 per-session lock 内(与压缩互斥)兜底落库一条
+            # 用户消息,使下一轮能看到上下文;落库失败只 warn,绝不掩盖原始异常。
+            # CancelledError / GeneratorExit 不在此捕获:用户主动中断或消费方关闭
+            # generator 时,本轮视为放弃,不落库。
+            await _persist_failed_turn_user_message(
+                service, ctx,
+                role=inputs.role, actual_session_id=actual_session_id,
+                latest_scope=inputs.latest_scope, resolved_channel_code=inputs.resolved_channel_code,
+                user_message=message,
+            )
+            raise

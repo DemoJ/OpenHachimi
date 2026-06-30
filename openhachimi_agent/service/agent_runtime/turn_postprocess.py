@@ -12,11 +12,14 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.memory.capture import capture_turn_memories
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
 from openhachimi_agent.service.agent_runtime.context_snapshot import (
+    _USER_MESSAGE_METADATA_KEY,
     _snapshot_executor_context,
     _stamp_turn_metadata,
 )
@@ -148,6 +151,65 @@ async def _persist_turn(
         resolved_channel_code=resolved_channel_code, history=history,
     )
     return new_history
+
+
+async def _persist_failed_turn_user_message(
+    service: "AgentService",
+    ctx: AgentRunContext,
+    *,
+    role: str,
+    actual_session_id: str,
+    latest_scope: str | None,
+    resolved_channel_code: str | None,
+    user_message: str,
+) -> None:
+    """agent 调用失败兜底:把本轮用户输入落库,避免下一轮丢失上下文。
+
+    正常路径下用户消息由 pydantic-ai 追加进 ``result.all_messages()``,再经
+    ``_persist_turn`` 差量落库。但 agent 抛异常时 ``result`` 不可用,该 user 消息
+    从未进入历史,下一轮 ``load_context`` 读不到它 → agent 表现为"忘了刚才聊什么"。
+    本函数在失败时用一条 ``ModelRequest(UserPromptPart)`` 兜底落库,使下一轮能看到。
+
+    幂等:append-only + ``INSERT OR IGNORE`` + ``MAX(turn_index)+1`` 续编;下一轮
+    成功时 ``_persist_turn`` 的 ``new_history[len(history):]`` 会自然跳过已落库部分,
+    不会重复。落库失败只 warn,绝不掩盖原始 agent 错误。
+    """
+    # clarify_user deferred 路径:用户回复以 deferred tool result 灌回模型,不应再
+    # 作为独立 user 消息落库(否则下一轮会出现"用户消息 + 未消费 tool return"双入口)。
+    if ctx.session_state.get("_user_clarification"):
+        return
+    if not (user_message or "").strip():
+        return
+
+    user_request = ModelRequest(
+        parts=[UserPromptPart(content=user_message)],
+        metadata={_USER_MESSAGE_METADATA_KEY: user_message},
+    )
+    # save_messages 是 append-only 追加语义:只传本轮新增的 user 消息,不能带 history
+    # (否则会把已落库的历史再存一遍)。turn_index 由 MAX(turn_index)+1 续编。
+    new_slice = [user_request]
+    try:
+        await asyncio.to_thread(
+            service.session_store.save_messages,
+            role,
+            actual_session_id,
+            new_slice,
+            scope=latest_scope,
+            channel=resolved_channel_code,
+            scope_key=latest_scope,
+            append=True,
+        )
+    except Exception:
+        logger.warning(
+            "failed-turn user message fallback persist failed role=%s session_id=%s",
+            role, actual_session_id, exc_info=True,
+        )
+        return
+
+    logger.info(
+        "failed-turn user message persisted role=%s session_id=%s",
+        role, actual_session_id,
+    )
 
 
 async def _maybe_compress_post_turn(
