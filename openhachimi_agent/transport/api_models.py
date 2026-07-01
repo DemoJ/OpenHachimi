@@ -263,6 +263,9 @@ class SessionMessagesResponse(BaseModel):
     role: str
     session_id: str
     messages: list[MessageItem] = Field(default_factory=list)
+    total: int = 0
+    has_more: bool = False
+    next_before_turn: int | None = None
 
 
 # ------------------------------------------------------------------ WebUI Skills 配置(设置页)

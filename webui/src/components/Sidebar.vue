@@ -181,8 +181,7 @@ async function onLoadSession(session_id: string) {
   try {
     await loadSession(store.currentRole, session_id)
     store.setCurrentSession(session_id)
-    const msgs = await getSessionMessages(session_id, store.currentRole)
-    store.setMessages(msgs.messages)
+    await store.loadMessages(session_id, store.currentRole)
     emit('session-loaded')
   } catch (e) {
     console.error(e)

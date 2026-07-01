@@ -126,6 +126,9 @@ export interface SessionMessagesResponse {
   role: string
   session_id: string
   messages: MessageItem[]
+  total?: number
+  has_more?: boolean
+  next_before_turn?: number | null
 }
 
 // ---------------------------------------------------------------- 会话
@@ -159,8 +162,12 @@ export function loadSession(role: string | null, session_id: string) {
   return post<CommandResponse>('/sessions/load', { role, session_id })
 }
 
-export function getSessionMessages(session_id: string, role?: string) {
-  const q = role ? `?role=${encodeURIComponent(role)}` : ''
+export function getSessionMessages(session_id: string, role?: string, opts?: { limit?: number; before_turn?: number }) {
+  const params: string[] = []
+  if (role) params.push(`role=${encodeURIComponent(role)}`)
+  if (opts?.limit !== undefined) params.push(`limit=${opts.limit}`)
+  if (opts?.before_turn !== undefined) params.push(`before_turn=${opts.before_turn}`)
+  const q = params.length ? `?${params.join('&')}` : ''
   return get<SessionMessagesResponse>(`/sessions/${encodeURIComponent(session_id)}/messages${q}`)
 }
 

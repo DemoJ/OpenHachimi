@@ -1,6 +1,11 @@
 <template>
   <div class="messages-container" ref="containerRef">
     <div class="messages-list">
+      <!-- 无限滚动触发哨兵 -->
+      <div v-if="store.messagesHasMore" ref="loadMoreSentinel" class="load-more-sentinel" style="text-align: center; padding: 12px; color: var(--body-mid);">
+        <span v-if="store.messagesLoading">加载中...</span>
+        <span v-else>滚动加载更多</span>
+      </div>
       <template v-for="(m, idx) in messages" :key="idx">
         <!-- 折叠占位条：压缩过的中间段不直接渲染原始消息，而是显示一张可展开卡片。
              点击展开调 fetchFoldedMessages 取回被折叠的原始消息内联渲染。 -->
@@ -45,7 +50,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, computed } from 'vue'
+import { ref, watch, nextTick, computed, onMounted, onBeforeUnmount } from 'vue'
 import MessageBubble from './MessageBubble.vue'
 import FoldCard from './FoldCard.vue'
 import type { MessageItem } from '../api'
@@ -87,12 +92,88 @@ const scrollTrigger = computed(
     (activity.value || ''),
 )
 
+const loadMoreSentinel = ref<HTMLElement | null>(null)
+let observer: IntersectionObserver | null = null
+let isPrepending = false
+
+function attachObserver() {
+  if (observer || !loadMoreSentinel.value) return
+  observer = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((e) => e.isIntersecting)) {
+        loadOlderMessages()
+      }
+    },
+    {
+      root: containerRef.value ?? null,
+      rootMargin: '100px',
+      threshold: 0,
+    },
+  )
+  observer.observe(loadMoreSentinel.value)
+}
+
+function detachObserver() {
+  observer?.disconnect()
+  observer = null
+}
+
+watch(loadMoreSentinel, (el) => {
+  detachObserver()
+  if (el) attachObserver()
+})
+
+onMounted(() => {
+  attachObserver()
+})
+
+onBeforeUnmount(() => {
+  detachObserver()
+})
+
+async function loadOlderMessages() {
+  if (store.messagesLoading || !store.messagesHasMore) return
+  
+  if (!containerRef.value) return
+  const el = containerRef.value
+  const oldScrollHeight = el.scrollHeight
+  const oldScrollTop = el.scrollTop
+  
+  isPrepending = true
+  
+  await store.loadOlderMessages()
+  
+  await nextTick()
+  const newScrollHeight = el.scrollHeight
+  el.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight)
+  
+  // 等待一下避免 watch 里的滚动逻辑干扰
+  setTimeout(() => {
+    isPrepending = false
+  }, 100)
+}
+
+let wasAtBottom = false
+watch(
+  scrollTrigger,
+  () => {
+    if (!containerRef.value) return
+    const el = containerRef.value
+    // 距离底部 100px 以内认为是在底部附近
+    wasAtBottom = Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 100
+  },
+  { flush: 'pre' }
+)
+
 watch(
   scrollTrigger,
   async () => {
+    if (isPrepending) return
     await nextTick()
     if (containerRef.value) {
-      containerRef.value.scrollTop = containerRef.value.scrollHeight
+      if (generating.value || wasAtBottom) {
+        containerRef.value.scrollTop = containerRef.value.scrollHeight
+      }
     }
   },
   { flush: 'post' },

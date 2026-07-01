@@ -207,8 +207,8 @@ class AgentService:
         """删除指定会话。详见 ``session_history.delete_session``。"""
         return session_history.delete_session(self, role_name, session_id)
 
-    def get_session_messages(self, role_name: str | None = None, session_id: str | None = None) -> dict:
-        return session_history.get_session_messages(self, role_name, session_id)
+    def get_session_messages(self, role_name: str | None = None, session_id: str | None = None, limit: int | None = None, before_turn: int | None = None) -> dict:
+        return session_history.get_session_messages(self, role_name, session_id, limit=limit, before_turn=before_turn)
 
     def get_folded_messages(
         self, role_name: str | None, session_id: str, compression_id: int

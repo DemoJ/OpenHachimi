@@ -64,16 +64,17 @@ async function syncMessagesFromServer() {
     const res = await getSessionMessages(sid, store.currentRole)
     // 按顺序对齐本地与远端消息（按 role 匹配），只回填 metadata 字段，
     // 不替换 content —— 避免覆盖 SSE 期间流式追加的 assistant 文本，也避免触发
-    // MessageList 的滚动闪烁。
+    // MessageList 的滚动闪烁。因为远端分页只返回最新一页，所以从后往前遍历对齐。
     const local = store.messages
     const remote = res.messages
-    let li = 0
+    let li = local.length - 1
     let filledPrefix = 0
     let filledTime = 0
     let filledTokens = 0
-    for (const rm of remote) {
-      while (li < local.length && local[li].role !== rm.role) li += 1
-      if (li >= local.length) break
+    for (let ri = remote.length - 1; ri >= 0; ri--) {
+      const rm = remote[ri]
+      while (li >= 0 && local[li].role !== rm.role) li -= 1
+      if (li < 0) break
       const lm = local[li]
       if (lm.role === 'user' && rm.role === 'user' && rm.prefix && !lm.prefix) {
         lm.prefix = rm.prefix
@@ -89,7 +90,7 @@ async function syncMessagesFromServer() {
         lm.tokens = rm.tokens
         filledTokens += 1
       }
-      li += 1
+      li -= 1
     }
     console.info('[Chat] message meta sync done', {
       sid,

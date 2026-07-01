@@ -698,10 +698,10 @@ def load_session(request: SessionLoadRequest, service: AgentService = Depends(ge
 
 
 @app.get("/sessions/{session_id}/messages")
-def get_session_messages(session_id: str, role: str | None = None, service: AgentService = Depends(get_service)) -> SessionMessagesResponse:
-    logger.info("http get session messages request session_id=%s role=%s", session_id, role)
+def get_session_messages(session_id: str, role: str | None = None, limit: int | None = None, before_turn: int | None = None, service: AgentService = Depends(get_service)) -> SessionMessagesResponse:
+    logger.info("http get session messages request session_id=%s role=%s limit=%s before_turn=%s", session_id, role, limit, before_turn)
     try:
-        return SessionMessagesResponse(**service.get_session_messages(role, session_id))
+        return SessionMessagesResponse(**service.get_session_messages(role, session_id, limit=limit, before_turn=before_turn))
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
 

@@ -308,7 +308,7 @@ def delete_session(service, role_name: str | None = None, session_id: str | None
     )
 
 
-def get_session_messages(service, role_name: str | None = None, session_id: str | None = None) -> dict:
+def get_session_messages(service, role_name: str | None = None, session_id: str | None = None, limit: int | None = None, before_turn: int | None = None) -> dict:
     role = service._normalize_role(role_name)
     service._validate_role_exists(role)
     resolved_session_id = service._normalize_session_id(session_id)
@@ -344,9 +344,12 @@ def get_session_messages(service, role_name: str | None = None, session_id: str 
     # 直接按 turn_index 读原始行 + 折叠判定,不走 extract_text_parts 的视图路径
     # —— 视图会跳过折叠区间,但展示恰恰要把折叠条插入到该位置。
     safe_role = role
-    rows = service.session_store._load_message_rows(safe_role, resolved_session_id)
+    rows, has_more = service.session_store._load_message_rows(safe_role, resolved_session_id, limit=limit, before_turn=before_turn)
+    total = service.session_store.count_messages(safe_role, resolved_session_id)
     messages: list[MessageItem] = []
     folded_seen: set[int] = set()
+    next_before_turn = rows[0][0] if rows and has_more else None
+
     for turn_idx, msg in rows:
         if turn_idx in fold_set:
             # 落在折叠区间:跳过原始消息,在区间起始处插一个占位条

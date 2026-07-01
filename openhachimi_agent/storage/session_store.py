@@ -370,9 +370,9 @@ class SessionStore:
         return resolved_sid, messages
 
     def _load_message_rows(
-        self, role: str, session_id: str
-    ) -> list[tuple[int, ModelMessage]]:
-        """按 turn_index 升序返回 ``[(turn_index, ModelMessage), ...]``。
+        self, role: str, session_id: str, limit: int | None = None, before_turn: int | None = None,
+    ) -> tuple[list[tuple[int, ModelMessage]], bool]:
+        """按 turn_index 升序返回 ``([(turn_index, ModelMessage), ...], has_more)``。
 
         供展示层折叠渲染用 —— 需要逐条的 turn_index 来判定是否落入某次压缩的折叠区间,
         ``load_messages`` 丢弃了 turn_index,故单列此方法。每条独立 validate(展示路径,
@@ -380,12 +380,32 @@ class SessionStore:
         """
         safe_role = validate_role_name(role)
         safe_sid = validate_session_id(session_id, allow_legacy=False)
+        query = (
+            "SELECT turn_index, message_json FROM session_messages "
+            "WHERE role=? AND session_id=?"
+        )
+        params: list[Any] = [safe_role, safe_sid]
+        
+        if before_turn is not None:
+            query += " AND turn_index < ?"
+            params.append(before_turn)
+            
+        query += " ORDER BY turn_index DESC"
+        
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit + 1)
+            
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT turn_index, message_json FROM session_messages "
-                "WHERE role=? AND session_id=? ORDER BY turn_index",
-                (safe_role, safe_sid),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
+            
+        has_more = False
+        if limit is not None and len(rows) > limit:
+            has_more = True
+            rows = rows[:limit]
+            
+        rows.reverse()
+        
         result: list[tuple[int, ModelMessage]] = []
         for r in rows:
             msg = ModelMessagesTypeAdapter.validate_json(
@@ -393,7 +413,18 @@ class SessionStore:
             )
             if msg:
                 result.append((int(r["turn_index"]), msg[0]))
-        return result
+        return result, has_more
+
+    def count_messages(self, role: str, session_id: str) -> int:
+        """返回某会话的消息总数。"""
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM session_messages WHERE role=? AND session_id=?",
+                (safe_role, safe_sid),
+            ).fetchone()
+        return int(row[0] or 0)
 
 
     def save_messages(

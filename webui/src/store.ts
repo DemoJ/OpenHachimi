@@ -25,6 +25,11 @@ interface ChatStoreState {
   // Agent 当前正在执行的动作文案（来自 SSE 的 temporary 工具调用事件）。
   // 首 chunk 到达前用它驱动"思考中"指示器；流式中调工具时作为底部状态条。
   activity: string | null
+  // 消息分页
+  messagesTotal: number
+  messagesHasMore: boolean
+  messagesNextBeforeTurn: number | null
+  messagesLoading: boolean
 }
 
 const SESSIONS_PAGE_SIZE = 50
@@ -45,6 +50,10 @@ export const useChatStore = defineStore('chat', {
     messages: [],
     isGenerating: false,
     activity: null,
+    messagesTotal: 0,
+    messagesHasMore: false,
+    messagesNextBeforeTurn: null,
+    messagesLoading: false,
   }),
   getters: {
     authenticated: (state) => !!state.token,
@@ -76,6 +85,10 @@ export const useChatStore = defineStore('chat', {
       this.messages = []
       this.isGenerating = false
       this.activity = null
+      this.messagesTotal = 0
+      this.messagesHasMore = false
+      this.messagesNextBeforeTurn = null
+      this.messagesLoading = false
       clearToken()
     },
     async loadInit(role?: string) {
@@ -151,6 +164,38 @@ export const useChatStore = defineStore('chat', {
     setMessages(msgs: MessageItem[]) {
       this.messages = msgs
     },
+    async loadMessages(session_id: string, role?: string) {
+      this.messagesLoading = true
+      try {
+        const msgs = await getSessionMessages(session_id, role || this.currentRole)
+        this.messages = msgs.messages
+        this.messagesTotal = msgs.total ?? 0
+        this.messagesHasMore = msgs.has_more ?? false
+        this.messagesNextBeforeTurn = msgs.next_before_turn ?? null
+      } catch (err) {
+        console.warn('[store] failed to load messages', err)
+        this.messages = []
+      } finally {
+        this.messagesLoading = false
+      }
+    },
+    async loadOlderMessages(onBeforePrepend?: () => void, onAfterPrepend?: () => void) {
+      if (this.messagesLoading || !this.messagesHasMore || !this.currentSessionId) return
+      this.messagesLoading = true
+      try {
+        const msgs = await getSessionMessages(this.currentSessionId, this.currentRole, { before_turn: this.messagesNextBeforeTurn ?? undefined })
+        if (onBeforePrepend) onBeforePrepend()
+        this.messages.unshift(...msgs.messages)
+        if (onAfterPrepend) onAfterPrepend()
+        this.messagesTotal = msgs.total ?? this.messagesTotal
+        this.messagesHasMore = msgs.has_more ?? false
+        this.messagesNextBeforeTurn = msgs.next_before_turn ?? null
+      } catch (err) {
+        console.warn('[store] failed to load older messages', err)
+      } finally {
+        this.messagesLoading = false
+      }
+    },
     async setCurrentChannel(channel: string) {
       // 切换渠道:重新拉 sidebar 第一页,自动选中 mtime 最新一条并加载消息;
       // 列表为空时把 currentSessionId 置 null,空白页直发会自动新建一条绑该渠道。
@@ -163,8 +208,7 @@ export const useChatStore = defineStore('chat', {
           const top = res.sessions[0]
           this.currentSessionId = top.session_id
           try {
-            const msgs = await getSessionMessages(top.session_id, this.currentRole)
-            this.messages = msgs.messages
+            await this.loadMessages(top.session_id, this.currentRole)
           } catch (err) {
             console.warn('[store] failed to load messages after channel switch', err)
             this.messages = []
