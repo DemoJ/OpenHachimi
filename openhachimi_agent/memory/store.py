@@ -67,6 +67,12 @@ class MemoryStore(
             conn.close()
             self._local.conn = None
 
+    def __enter__(self) -> "MemoryStore":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
     def __del__(self) -> None:
         try:
             self.close()

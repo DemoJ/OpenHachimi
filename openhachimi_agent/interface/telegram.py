@@ -16,6 +16,7 @@ import contextlib
 import shutil
 from collections.abc import AsyncIterator, Callable, Awaitable
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Any
 
 from telegram import Update, constants
@@ -93,8 +94,16 @@ async def _retry_network_call(
             return await coro_factory()
         except RetryAfter as exc:
             # 限流：按服务端要求等待后重试，不受 max_retries 计数约束。
+            # PTB v22.2+ 预告 ``retry_after`` 未来将返回 ``timedelta``（可通过
+            # ``PTB_TIMEDELTA=1`` 提前切换），这里同时兼容 int/float/timedelta，
+            # 避免切到新语义后落到回退分支丢失服务端等待秒数。
             retry_after = exc.retry_after
-            wait = float(retry_after) if isinstance(retry_after, (int, float)) else 1.0
+            if isinstance(retry_after, timedelta):
+                wait = retry_after.total_seconds()
+            elif isinstance(retry_after, (int, float)):
+                wait = float(retry_after)
+            else:
+                wait = 1.0
             logger.debug("telegram retry-after %.1fs", wait)
             await asyncio.sleep(wait)
             continue

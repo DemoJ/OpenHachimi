@@ -61,7 +61,7 @@ def mock_agent_deps(mock_config, mock_browser_manager):
     # 跟 memory.db_path 现有用真实 SQLite 文件的套路对齐 —— SessionStore 自带 schema
     # 自举,tmp_path 范围内一次性建好,够整轮测试用。
     from openhachimi_agent.storage.session_store import SessionStore
-    return AgentDeps(
+    deps = AgentDeps(
         config=mock_config,
         session_id="test_session_123",
         browser_manager=mock_browser_manager,
@@ -69,3 +69,29 @@ def mock_agent_deps(mock_config, mock_browser_manager):
         session_state={},
         session_store=SessionStore(mock_config.memory_dir / "sessions.sqlite3"),
     )
+    yield deps
+    # Python 3.13 对 sqlite3.Connection 的 __del__ 行为更严格:即使连接已被
+    # contextmanager 正常关闭,GC 回收 MagicMock 时若内部 call_args_list 残存
+    # Connection 对象引用也会触发 ResourceWarning。显式 gc.collect 确保在测试
+    # 报告阶段之前完成回收,catch_warnings 兜底抑制 GC 期间的尾声噪音。
+    import gc
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        del deps
+        gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def _reset_memory_store_cache():
+    """每个测试后显式关闭并清空进程级 MemoryStore 缓存。
+
+    ``get_memory_store`` 把实例缓存进模块级 ``_STORE_CACHE`` 跨测试存活,而
+    ``MemoryStore`` 靠 ``threading.local`` 持有 SQLite 连接、仅在 ``__del__`` 关闭。
+    Python 3.13 对含 ``__del__`` 对象的 GC 时机不稳定,残留连接在被回收前会触发
+    ``ResourceWarning: unclosed database``。此夹具在测试体跑完后统一收口,保证
+    连接被确定性关闭、缓存不跨用例污染。
+    """
+    yield
+    from openhachimi_agent.memory.recall import close_memory_stores
+    close_memory_stores()

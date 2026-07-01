@@ -35,10 +35,10 @@ def test_execution_ledger_records_success(mock_agent_deps):
 
 
 def test_execution_ledger_records_tool_failure(mock_agent_deps):
-    """工具抛异常时,ledger 记一条 started + 一条 failed。
+    """可恢复的工具异常被吞成错误字符串回灌给 LLM,ledger 仍记 started + failed。
 
-    (旧版测的是 execution_guard 被 ledger 记成 blocked;guard 已随 Hermes 式
-    重构拆除,改为测普通工具失败路径,确认 ledger 仍在记录失败。)
+    (旧版断言 ``RuntimeError`` 直接冒泡;改为"错误回灌"后,普通运行时错误不再
+    中断整轮,而是返回带 ``[工具执行出错]`` 前缀的脱敏字符串,ledger 照常记失败。)
     """
     def write_file(ctx):
         raise RuntimeError("disk full")
@@ -46,12 +46,74 @@ def test_execution_ledger_records_tool_failure(mock_agent_deps):
     ctx = MockRunContext(deps=mock_agent_deps)
     guarded = with_execution_ledger(write_file)
 
-    with pytest.raises(RuntimeError):
-        guarded(ctx)
+    result = guarded(ctx)
 
+    assert "[工具执行出错]" in result
+    assert "RuntimeError" in result
+    assert "disk full" in result
     ledger = get_execution_ledger(ctx)
     assert [event["status"] for event in ledger] == ["started", "failed"]
     assert ledger[-1]["tool_name"] == "write_file"
+
+
+def test_tool_failure_redacts_sensitive_detail(mock_agent_deps):
+    """回灌给 LLM 的错误字符串必须抹掉 api_key/token 等敏感信息。"""
+    def web_fetch(ctx):
+        raise RuntimeError("请求失败 api_key=sk-secret1234567890 token=abc")
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    guarded = with_execution_ledger(web_fetch)
+
+    result = guarded(ctx)
+
+    assert "[工具执行出错]" in result
+    assert "[REDACTED]" in result
+    assert "sk-secret1234567890" not in result
+
+
+def test_model_retry_still_propagates(mock_agent_deps):
+    """``ModelRetry`` 是工具主动要求 LLM 重试的信号,必须原样向上抛,不能被吞。"""
+    def read_file(ctx):
+        raise ModelRetry("文件不存在,请检查路径后重试")
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    guarded = with_execution_ledger(read_file)
+
+    with pytest.raises(ModelRetry):
+        guarded(ctx)
+
+
+def test_call_deferred_still_propagates(mock_agent_deps):
+    """``CallDeferred`` 是 pydantic-ai deferred 控制流(clarify_user 依赖),必须透传。"""
+    from pydantic_ai.exceptions import CallDeferred
+
+    def clarify_user(ctx):
+        raise CallDeferred(metadata={"kind": "clarify_user"})
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    guarded = with_execution_ledger(clarify_user)
+
+    with pytest.raises(CallDeferred):
+        guarded(ctx)
+
+
+def test_async_tool_failure_returned_as_string(mock_agent_deps):
+    """异步工具的可恢复异常同样被吞成错误字符串(覆盖 async_wrapper 分支)。"""
+    async def browser_navigate(ctx):
+        raise RuntimeError("等待浏览器 CDP 端口 53797 就绪超时(已等待 45s)。")
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    guarded = with_execution_ledger(browser_navigate)
+
+    import asyncio
+
+    result = asyncio.run(guarded(ctx))
+
+    assert "[工具执行出错]" in result
+    assert "CDP" in result
+    ledger = get_execution_ledger(ctx)
+    assert [event["status"] for event in ledger] == ["started", "failed"]
+
 
 
 

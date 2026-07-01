@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,24 @@ def get_memory_store(config: AppConfig) -> MemoryStore:
         store = MemoryStore(db_path)
         _STORE_CACHE[db_path] = store
     return store
+
+
+def close_memory_stores() -> None:
+    """关闭并清空进程级 store 缓存。
+
+    幂等：供 ``atexit`` 钩子与测试夹具共用。生产侧 ``http`` / ``cli`` 长期持有
+    store 实例，本函数确保进程退出时显式释放 SQLite 连接，避免依赖 ``__del__``
+    的不确定回收时机触发 ``ResourceWarning``。
+    """
+    for store in _STORE_CACHE.values():
+        try:
+            store.close()
+        except Exception:
+            logger.debug("memory store close failed during cleanup", exc_info=True)
+    _STORE_CACHE.clear()
+
+
+atexit.register(close_memory_stores)
 
 
 def fuse_results(groups: list[list[MemorySearchResult]], *, rrf_k: int = 60, level_weights: dict[str, float] | None = None) -> list[MemorySearchResult]:

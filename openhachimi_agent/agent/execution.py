@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import time
@@ -98,6 +99,42 @@ def _exception_ledger_status(exc: Exception) -> str:
 
 def _exception_violation(exc: Exception, status: str) -> str:
     return str(exc) if status == "blocked" else ""
+
+
+def _should_reraise_tool_exception(exc: BaseException) -> bool:
+    """判断工具异常是否必须原样向上抛,不能被吞成返回值。
+
+    - ``CallDeferred`` / ``ApprovalRequired``:pydantic-ai deferred 控制流
+      (``clarify_user`` 依赖它阻断本轮 run)。
+    - ``ModelRetry``:工具主动要求 LLM 重试(路径越界、危险命令、文件不存在等),
+      交给 pydantic-ai 的 retry 预算机制,不要在这里吞掉。
+    - ``asyncio.CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit``:
+      不可恢复中断,必须透传。
+    其余 ``Exception`` 视为可恢复的运行时错误,回灌给 LLM 由其自行决策。
+    """
+    from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry
+
+    if isinstance(exc, (CallDeferred, ApprovalRequired, ModelRetry)):
+        return True
+    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+        return True
+    return False
+
+
+def _format_tool_error(exc: Exception) -> str:
+    """把可恢复的工具异常格式化为回灌给 LLM 的错误字符串。
+
+    复用 ``safe_error_detail`` 抹掉 api_key/token/cookie 等敏感信息,避免把
+    凭据泄露进对话历史。LLM 拿到这段字符串后可自行判断重试/换方案/告知用户。
+    """
+    from openhachimi_agent.core.redaction import safe_error_detail
+
+    return (
+        f"[工具执行出错] {safe_error_detail(exc)}\n\n"
+        "该工具调用未能完成。请根据上述错误信息判断下一步:可修正参数后重试、"
+        "换用其它工具,或若无法自行恢复则如实告知用户原因。"
+        "不要重复以完全相同的方式重试。"
+    )
 
 
 def get_execution_ledger(ctx: object) -> list[dict[str, Any]]:
@@ -263,7 +300,12 @@ def with_execution_ledger(func: Callable) -> Callable:
                     result=exc,
                     violation=_exception_violation(exc, status),
                 )
-                raise
+                # 控制流 / 重试信号(CallDeferred/ApprovalRequired/ModelRetry)原样向上抛,
+                # 交给 pydantic-ai 的 deferred / retry 预算机制;其余可恢复运行时错误
+                # 吞成错误字符串回灌给 LLM,不中断整轮。
+                if _should_reraise_tool_exception(exc):
+                    raise
+                return _format_tool_error(exc)
             _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
             _mark_verify_state(session_state, tool_name)
             return result
@@ -286,7 +328,9 @@ def with_execution_ledger(func: Callable) -> Callable:
                 result=exc,
                 violation=_exception_violation(exc, status),
             )
-            raise
+            if _should_reraise_tool_exception(exc):
+                raise
+            return _format_tool_error(exc)
         _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
         _mark_verify_state(session_state, tool_name)
         return result
