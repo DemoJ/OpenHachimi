@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal
 
 from openhachimi_agent.core.identifiers import validate_latest_scope
+from openhachimi_agent.storage.session_store import CHANNEL_CODES
 
 
 if TYPE_CHECKING:
@@ -322,6 +323,130 @@ async def _handle_start(
     )
 
 
+def _channel_code_from_context(channel_context: dict[str, object] | None) -> str | None:
+    """从 channel_context 提取当前渠道码,未注册的值返回 None。
+
+    与 ``commands.channel_code_from_context`` 同逻辑,这里就地实现以避免
+    ``command_registry`` ↔ ``commands`` 的循环 import。handler 用它判渠道
+    (而非 ``channel`` 形参 —— 后者在 HTTP /commands 入口传 "http",不可靠)。
+    """
+    if not channel_context:
+        return None
+    code = channel_context.get("channel_code")
+    if not isinstance(code, str):
+        return None
+    return code if code in CHANNEL_CODES else None
+
+
+async def _handle_back(
+    service: "AgentService",
+    args: str,
+    role: str | None,
+    session_id: str | None,
+    channel_context: dict[str, object] | None,
+    channel: str,
+) -> CommandOutcome:
+    """跳回指定会话继续对话 —— 与 /new 对称,/new 写新会话指针,/back 写回旧会话指针。
+
+    渠道隔离:目标会话的渠道必须等于当前渠道,否则拒绝(避免跨渠道串号)。
+    """
+    target = args.strip()
+    if not target:
+        return CommandOutcome(
+            message="请在命令后跟上会话 id,例如:/back 20250701-103045-a1b2c3d4",
+            kind="info",
+        )
+    channel_code = _channel_code_from_context(channel_context)
+    if channel_code is None:
+        return CommandOutcome(
+            message="当前渠道无法识别,无法跳转。",
+            kind="info",
+        )
+    try:
+        resolved_role = service._normalize_role(role)  # noqa: SLF001
+        service._validate_role_exists(resolved_role)  # noqa: SLF001
+        target_sid = service._normalize_session_id(target)  # noqa: SLF001
+    except (ValueError, FileNotFoundError) as exc:
+        return CommandOutcome(message=f"跳转失败:{exc}", kind="info")
+
+    store = service.session_store
+    # 必须先校验存在性再比对渠道:get_channel 对不存在的会话会兜底返回
+    # DEFAULT_CHANNEL("webui"),先比渠道会把"不存在"误判成"webui 渠道不匹配"。
+    if not store.session_exists(resolved_role, target_sid):
+        return CommandOutcome(
+            message=f"会话不存在:{target_sid}",
+            kind="info",
+        )
+    if store.get_channel(resolved_role, target_sid) != channel_code:
+        return CommandOutcome(
+            message=f"会话 {target_sid} 不属于当前渠道({channel_code}),无法跳转。",
+            kind="info",
+        )
+    # 写回当前 scope 的 latest 指针,与 /new 对称 —— 微信 / WebUI 空白页直发
+    # 下一次消息靠这个指针落回旧会话;CLI / Telegram 虽靠本地记忆,写指针保持
+    # 一致语义、避免渠道间行为分裂。
+    latest_scope = _scope_from_context(channel_context)
+    store.set_latest_session_id(resolved_role, target_sid, latest_scope)
+    return CommandOutcome(
+        message=f"↩️ 已切回会话:{target_sid}\n直接输入内容继续对话。",
+        kind="new_session",
+        role=resolved_role,
+        session_id=target_sid,
+    )
+
+
+async def _handle_sessions(
+    service: "AgentService",
+    args: str,
+    role: str | None,
+    session_id: str | None,
+    channel_context: dict[str, object] | None,
+    channel: str,
+) -> CommandOutcome:
+    """列出当前渠道下的最近会话(渠道隔离),供用户复制 id 再 /back。
+
+    复用 ``service.list_sessions(with_preview=True, channel=...)`` —— 它已按
+    channel 过滤并返回每条会话的 session_id / preview / message_count / mtime。
+    """
+    channel_code = _channel_code_from_context(channel_context)
+    if channel_code is None:
+        return CommandOutcome(
+            message="当前渠道无法识别,无法列出会话。",
+            kind="info",
+        )
+    try:
+        resolved_role = service._normalize_role(role)  # noqa: SLF001
+        service._validate_role_exists(resolved_role)  # noqa: SLF001
+    except (ValueError, FileNotFoundError) as exc:
+        return CommandOutcome(message=f"列会话失败:{exc}", kind="info")
+
+    resp = service.list_sessions(
+        resolved_role, with_preview=True, channel=channel_code, limit=10, offset=0,
+    )
+    sessions = resp["sessions"] if isinstance(resp, dict) else []
+    if not sessions:
+        return CommandOutcome(
+            message=f"当前渠道({channel_code})下暂无历史会话。",
+            kind="info",
+        )
+    # 标记当前 latest 会话,让用户一眼看出"现在在哪个"。
+    latest_scope = _scope_from_context(channel_context)
+    latest_sid = service.session_store.get_latest_session_id(resolved_role, latest_scope)
+
+    lines = [f"最近会话(渠道:{channel_code}):"]
+    for s in sessions:
+        sid = s["session_id"]
+        marker = "⭐ " if sid == latest_sid else "   "
+        preview = (s.get("preview") or "(空)").replace("\n", " ").strip()
+        if not preview:
+            preview = "(空)"
+        count = s.get("message_count", 0)
+        lines.append(f"{marker}{sid}  ({count}条)  {preview}")
+    lines.append("")
+    lines.append("用 /back <会话id> 跳回指定会话。")
+    return CommandOutcome(message="\n".join(lines), kind="info")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # 默认命令清单
 
@@ -385,4 +510,19 @@ register(CommandSpec(
     show_in_help=False,
     show_in_tg_menu=False,  # Telegram 自动为新用户提供 /start
     channels=frozenset({"telegram"}),
+))
+register(CommandSpec(
+    name="back",
+    aliases=("/back", "/回退", "回退"),
+    args_hint="<会话id>",
+    summary="跳回指定会话继续对话(限当前渠道)",
+    handler=_handle_back,
+    tg_menu_label="↩️ 跳回指定会话(如:/back <id>)",
+))
+register(CommandSpec(
+    name="sessions",
+    aliases=("/sessions", "/会话列表", "/历史"),
+    summary="列出当前渠道的最近会话",
+    handler=_handle_sessions,
+    tg_menu_label="📋 列出当前渠道的最近会话",
 ))
