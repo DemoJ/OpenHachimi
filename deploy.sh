@@ -256,14 +256,25 @@ VENV_HACHIMI="$VENV_DIR/bin/hachimi"
 # ── 步骤 4：安装依赖 ─────────────────────────────────────────────────────────
 info "步骤 3/5：安装项目依赖（pip install -e .）..."
 
-if ! "$VENV_PYTHON" -m pip install -U pip --quiet 2>/tmp/_oh_pip_err; then
+# 外网访问不稳定时，pip 直连 pypi.org 易在 SSL 握手阶段失败（SSLEOFError）。
+# 用户已通过 PIP_INDEX_URL/PIP_INDEX 指定镜像源时不覆盖；否则默认走清华 TUNA 镜像。
+# 加大 retries/timeout 容忍抖动；镜像源参数会传递给 PEP 517 build 阶段（setuptools/wheel）。
+if [[ -z "${PIP_INDEX_URL:-}" && -z "${PIP_INDEX:-}" ]]; then
+    PIP_MIRROR_ARGS=(-i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn)
+else
+    PIP_MIRROR_ARGS=()
+fi
+PIP_ROBUST_ARGS=(--retries 5 --timeout 60)
+
+# pip 升级非必需，失败时只告警不中断后续依赖安装。
+if ! "$VENV_PYTHON" -m pip install -U pip "${PIP_ROBUST_ARGS[@]}" "${PIP_MIRROR_ARGS[@]}" --quiet 2>/tmp/_oh_pip_err; then
     cat /tmp/_oh_pip_err >&2
-    error "pip 升级失败，请检查网络连接或代理设置后重试。"
+    warn "pip 升级失败，已跳过（不影响后续依赖安装）。"
 fi
 
-if ! "$VENV_PYTHON" -m pip install -e "$PROJECT_ROOT" --quiet 2>/tmp/_oh_pip_err; then
+if ! "$VENV_PYTHON" -m pip install -e "$PROJECT_ROOT" "${PIP_ROBUST_ARGS[@]}" "${PIP_MIRROR_ARGS[@]}" --quiet 2>/tmp/_oh_pip_err; then
     cat /tmp/_oh_pip_err >&2
-    error "依赖安装失败，请查看上方错误信息。\n常见原因：\n  - 网络不通或需要设置代理\n  - 缺少系统编译依赖（尝试：sudo apt-get install -y build-essential）"
+    error "依赖安装失败，请查看上方错误信息。\n常见原因：\n  - 外网访问不稳定（SSL 握手失败），可设置镜像源：export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple\n  - 需要走代理：export HTTPS_PROXY=http://127.0.0.1:7890\n  - 缺少系统编译依赖（尝试：sudo apt-get install -y build-essential）"
 fi
 
 success "依赖安装完成。"

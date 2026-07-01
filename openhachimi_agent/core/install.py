@@ -112,11 +112,56 @@ def build_webui(project_root: Path) -> None:
     print("[OK] 前端构建完成，产物位于 openhachimi_agent/webui_dist/。")
 
 
+# 外网访问不稳定时，pip 直连 pypi.org 易在 SSL 握手阶段失败（SSLEOFError）。
+# 用国内镜像 + trusted-host 兜底，并加大超时与重试次数容忍抖动。
+_DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+_DEFAULT_PIP_TRUSTED_HOST = "pypi.tuna.tsinghua.edu.cn"
+
+
+def _pip_mirror_args() -> list[str]:
+    """返回镜像源参数；用户已通过 PIP_INDEX_URL/PIP_INDEX 显式指定时不覆盖。"""
+    if os.environ.get("PIP_INDEX_URL") or os.environ.get("PIP_INDEX"):
+        # 用户自行配置了镜像源，交由 pip 处理 trusted-host，这里不干预。
+        return []
+    return ["-i", _DEFAULT_PIP_INDEX_URL, "--trusted-host", _DEFAULT_PIP_TRUSTED_HOST]
+
+
+def _print_pip_failure_hint(returncode: int) -> None:
+    """依赖安装失败时打印可操作的排错建议。"""
+    print(f"[x] 依赖安装失败，pip 退出码：{returncode}")
+    print("  常见原因是外网访问不稳定（SSL 握手失败）。可尝试：")
+    print("    1. 指定镜像源：设置环境变量 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple")
+    print("    2. 走代理：设置环境变量 HTTPS_PROXY=http://127.0.0.1:7890")
+    print("    3. 修复后重装：hachimi update --force")
+
+
 def install_project(project_root: Path, python_executable: str | None = None) -> None:
-    """Install the project in editable mode using the active Python by default."""
+    """Install the project in editable mode using the active Python by default.
+
+    pip 升级非必需，失败时只告警不中断；项目依赖安装失败才中止并给出镜像源/代理建议。
+    镜像源参数会传递给 PEP 517 build isolation 阶段，build 依赖（setuptools/wheel）
+    的拉取同样走镜像，避免 build dependencies 阶段 SSL 失败。
+    """
     python_path = python_executable or sys.executable
+    mirror_args = _pip_mirror_args()
+    robust_args = ["--retries", "5", "--timeout", "60"]
+
+    print("[INFO] 升级 pip ...")
+    pip_upgrade_cmd = [python_path, "-m", "pip", "install", "-U", "pip",
+                       *robust_args, *mirror_args, "--quiet"]
+    try:
+        run(pip_upgrade_cmd, cwd=project_root)
+    except subprocess.CalledProcessError:
+        print("[WARN] pip 升级失败，已跳过（不影响后续依赖安装）。")
+
     print("[INFO] 安装项目依赖（pip install -e .）...")
-    run([python_path, "-m", "pip", "install", "-U", "pip", "--quiet"], cwd=project_root)
-    run([python_path, "-m", "pip", "install", "-e", ".", "--quiet"], cwd=project_root)
+    install_cmd = [python_path, "-m", "pip", "install", "-e", ".",
+                   *robust_args, *mirror_args, "--quiet"]
+    try:
+        run(install_cmd, cwd=project_root)
+    except subprocess.CalledProcessError as exc:
+        _print_pip_failure_hint(exc.returncode)
+        raise
+
     print("[OK] 依赖安装完成。")
     build_webui(project_root)
