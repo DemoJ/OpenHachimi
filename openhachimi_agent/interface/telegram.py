@@ -140,11 +140,14 @@ def _split_long_text(text: str) -> list[str]:
 def _md_to_tg_html(text: str) -> str:
     """将 Markdown 文本转换为 Telegram 支持的 HTML 格式。
 
+    使用基于栈的单遍扫描解析器，保证输出 HTML 标签嵌套正确，不会出现交叉嵌套。
+
     处理顺序：
-    1. 提取代码块和行内代码（保护内容不被其他规则误处理）
-    2. 对普通文本进行 HTML 字符转义（& < > → &amp; &lt; &gt;）
-    3. 应用加粗、斜体、标题、删除线、链接等格式规则
-    4. 还原代码块
+    1. 提取多行代码块和行内代码（保护内容不被其他规则误处理）
+    2. 对剩余普通文本进行 HTML 字符转义
+    3. 逐行处理标题
+    4. 对每行逐字符扫描，基于栈正确生成加粗/斜体/删除线/链接标签
+    5. 还原代码块占位符
     """
     saved: list[str] = []
 
@@ -177,25 +180,160 @@ def _md_to_tg_html(text: str) -> str:
     # ④ 标题（# ## ### → 加粗）
     text = re.sub(r"^#{1,3} (.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
 
-    # ⑤ 加粗（**text** 或 __text__）
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
+    # ⑤ 基于栈的格式标记解析
+    text = _parse_inline_formatting(text)
 
-    # ⑥ 斜体（*text* 或 _text_，避免误匹配 ** 和 __）
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"<i>\1</i>", text)
-
-    # ⑦ 删除线（~~text~~）
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-
-    # ⑧ 链接（[text](url)）
-    text = re.sub(r"\[(.+?)\]\((.+?)\)", r'<a href="\2">\1</a>', text)
-
-    # ⑨ 还原代码块占位符
+    # ⑥ 还原代码块占位符
     for i, fragment in enumerate(saved):
         text = text.replace(f"\x00SAVED{i}\x00", fragment)
 
     return text
+
+
+def _parse_inline_formatting(text: str) -> str:
+    """基于栈的单遍扫描，将 Markdown 行内格式标记转换为正确嵌套的 HTML 标签。
+
+    支持的格式标记：
+    - ``**`` / ``__`` → ``<b>``  加粗
+    - ``*``  / ``_``  → ``<i>``  斜体
+    - ``***``         → ``<b><i>`` 加粗斜体
+    - ``~~``          → ``<s>``  删除线
+    - ``[text](url)`` → ``<a href="url">text</a>`` 链接
+
+    核心保证：关闭标签时严格按栈的后进先出顺序输出，永远不会产生交叉嵌套。
+    """
+    result: list[str] = []
+    # 格式栈：记录当前打开的 HTML 标签名，如 ["b", "i"]
+    tag_stack: list[str] = []
+    pos = 0
+    length = len(text)
+
+    def _is_tag_open(tag: str) -> bool:
+        return tag in tag_stack
+
+    def _open_tag(tag: str) -> None:
+        """打开一个格式标签，压入栈并输出开标签。"""
+        tag_stack.append(tag)
+        result.append(f"<{tag}>")
+
+    def _close_tag(tag: str) -> None:
+        """关闭指定标签，保证嵌套正确。
+
+        如果要关闭的标签不在栈顶，先从栈顶逐一关闭中间的标签，
+        关闭目标标签后，再按原顺序重新打开中间被临时关闭的标签。
+        """
+        if tag not in tag_stack:
+            return
+        # 从栈顶弹出并关闭，直到遇到目标标签
+        reopening: list[str] = []
+        while tag_stack:
+            top = tag_stack.pop()
+            result.append(f"</{top}>")
+            if top == tag:
+                break
+            reopening.append(top)
+        # 重新打开被临时关闭的标签（保持原顺序）
+        for t in reversed(reopening):
+            _open_tag(t)
+
+    def _toggle_tag(tag: str) -> None:
+        """切换标签的打开/关闭状态。"""
+        if _is_tag_open(tag):
+            _close_tag(tag)
+        else:
+            _open_tag(tag)
+
+    while pos < length:
+        ch = text[pos]
+
+        # --- 跳过占位符（代码块/行内代码），原样输出 ---
+        if ch == "\x00":
+            end = text.find("\x00", pos + 1)
+            if end != -1:
+                result.append(text[pos: end + 1])
+                pos = end + 1
+                continue
+
+        # --- *** 三星号：加粗斜体 ---
+        if ch == "*" and pos + 2 < length and text[pos + 1] == "*" and text[pos + 2] == "*":
+            # 如果加粗和斜体都已打开，关闭它们；否则打开它们
+            if _is_tag_open("b") and _is_tag_open("i"):
+                _close_tag("i")
+                _close_tag("b")
+            elif _is_tag_open("b"):
+                # 已有加粗，再开斜体（然后多一个 * 会被下次循环处理——
+                # 但此处 *** 是完整 token，所以同时开/关）
+                _close_tag("b")
+                _toggle_tag("i")
+            elif _is_tag_open("i"):
+                _close_tag("i")
+                _toggle_tag("b")
+            else:
+                _open_tag("b")
+                _open_tag("i")
+            pos += 3
+            continue
+
+        # --- ** 双星号：加粗 ---
+        if ch == "*" and pos + 1 < length and text[pos + 1] == "*":
+            # 确保不是三星号（已在上面处理）
+            if pos + 2 < length and text[pos + 2] == "*":
+                pass  # 让三星号分支处理（但正常不会到这里，因为三星号在前面）
+            else:
+                _toggle_tag("b")
+                pos += 2
+                continue
+
+        # --- * 单星号：斜体 ---
+        if ch == "*":
+            _toggle_tag("i")
+            pos += 1
+            continue
+
+        # --- __ 双下划线：加粗 ---
+        if ch == "_" and pos + 1 < length and text[pos + 1] == "_":
+            _toggle_tag("b")
+            pos += 2
+            continue
+
+        # --- _ 单下划线：斜体 ---
+        # 仅当前后不是字母数字时才视为格式标记，避免 snake_case 被误处理
+        if ch == "_":
+            prev_alnum = pos > 0 and text[pos - 1].isalnum()
+            next_alnum = pos + 1 < length and text[pos + 1].isalnum()
+            if not (prev_alnum and next_alnum):
+                _toggle_tag("i")
+                pos += 1
+                continue
+
+        # --- ~~ 双波浪：删除线 ---
+        if ch == "~" and pos + 1 < length and text[pos + 1] == "~":
+            _toggle_tag("s")
+            pos += 2
+            continue
+
+        # --- [text](url) 链接 ---
+        if ch == "[":
+            # 尝试匹配链接语法
+            bracket_end = text.find("]", pos + 1)
+            if bracket_end != -1 and bracket_end + 1 < length and text[bracket_end + 1] == "(":
+                paren_end = text.find(")", bracket_end + 2)
+                if paren_end != -1:
+                    link_text = text[pos + 1: bracket_end]
+                    link_url = text[bracket_end + 2: paren_end]
+                    result.append(f'<a href="{link_url}">{link_text}</a>')
+                    pos = paren_end + 1
+                    continue
+
+        # --- 普通字符，原样输出 ---
+        result.append(ch)
+        pos += 1
+
+    # 扫描结束后，自动关闭所有未关闭的标签（按栈顺序逆序关闭）
+    while tag_stack:
+        result.append(f"</{tag_stack.pop()}>")
+
+    return "".join(result)
 
 
 def _live_text(text: str) -> str:
