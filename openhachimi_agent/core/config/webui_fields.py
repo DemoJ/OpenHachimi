@@ -239,12 +239,6 @@ RESEARCH_FIELDS: list[dict[str, Any]] = [
      "label": "搜索超时(秒)", "description": "单次搜索请求超时秒数(上限 60)"},
     {"path": "research.max_backend_results", "kind": CONFIG_KIND_INT, "group": "research-main",
      "label": "单后端结果数上限", "description": "每个后端返回的最大结果数(上限 50)"},
-    {"path": "research.min_independent_sources", "kind": CONFIG_KIND_INT, "group": "research-main",
-     "label": "最少独立来源数", "description": "研究报告要求的最少独立来源数(上限 20);提高可增强可信度"},
-    {"path": "research.require_citations", "kind": CONFIG_KIND_BOOL, "group": "research-main",
-     "label": "强制引用", "description": "开启则研究报告必须附来源引用"},
-    {"path": "research.browser_fallback_enabled", "kind": CONFIG_KIND_BOOL, "group": "research-main",
-     "label": "浏览器兜底", "description": "API 后端全部失败时回退到浏览器自动化抓取。依赖浏览器实例可用"},
 ]
 
 # 路径与日志设置页字段定义(基础设施,低频)。

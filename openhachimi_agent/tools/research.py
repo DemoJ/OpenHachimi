@@ -1,10 +1,12 @@
 """网页搜索工具。
 
 职责：
-- web_search: 多后端并发搜索、去重、排序，返回标题/URL/摘要列表。
+- web_search: 多后端并发搜索、去重、按原始排名+多后端共识轻量排序，返回标题/URL/摘要列表。
 
-研究质量规范（多来源验证、读正文、带来源）见系统提示词 base.md，不在本工具内强制——
-本工具是原子搜索，只负责"找到候选来源"，关键结论需用 web_fetch / browser 读取正文确认。
+本工具是原子搜索，只负责"找到候选来源"：怎么搜、搜几条、是否限定来源站点，
+都由调用方（AI）按任务自行决定——可在 query 中直接写 `site:github.com` 等。
+搜索摘要不是全文证据：关键结论需用 web_fetch / browser 读取正文确认。
+研究质量规范（多来源验证、读正文、带来源）见系统提示词 base.md，不在本工具内强制。
 """
 
 from __future__ import annotations
@@ -13,8 +15,7 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request
@@ -27,18 +28,8 @@ from openhachimi_agent.tools.web import _NO_REDIRECT_OPENER, _normalize_public_u
 
 logger = logging.getLogger(__name__)
 
-SearchSourceType = Literal["general", "tech", "news", "academic"]
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid", "igshid", "ref", "spm"}
-LOW_QUALITY_SIGNALS = (
-    "coupon", "promo code", "free download", "crack", "apk", "top 10", "best ",
-    "alternatives", "deal", "discount", "下载站", "优惠码", "破解", "免费下载",
-)
-TECH_DOMAINS = (
-    "github.com", "docs.", "developer.", "stackoverflow.com", "news.ycombinator.com",
-    "readthedocs.io", "pypi.org", "npmjs.com",
-)
-AUTHORITY_SUFFIXES = (".gov", ".edu", ".org")
 MAX_QUERY_CHARS = 500
 MAX_TITLE_CHARS = 200
 MAX_URL_CHARS = 1000
@@ -69,7 +60,6 @@ class SearchResult:
     snippet: str
     backend: str
     rank: int
-    source_type: str = "general"
 
 
 @dataclass(frozen=True)
@@ -79,19 +69,6 @@ class MergedSource:
     snippet: str
     backends: list[str]
     original_ranks: dict[str, int]
-    source_type: str = "general"
-
-
-@dataclass(frozen=True)
-class RankedSource:
-    citation_id: str
-    title: str
-    url: str
-    snippet: str
-    score: float
-    reasons: list[str] = field(default_factory=list)
-    backends: list[str] = field(default_factory=list)
-    original_ranks: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -107,25 +84,9 @@ def _get_research_config(ctx: RunContext[AgentDeps]) -> ResearchConfig:
     return getattr(config, "research", ResearchConfig())
 
 
-def _normalize_search_query(query: str, source_type: SearchSourceType) -> str:
-    actual_query = _clean_query(query)
-    lowered_query = actual_query.lower()
-    if source_type == "tech":
-        if not any(s in lowered_query for s in ("github.com", "stackoverflow.com", "news.ycombinator.com")):
-            actual_query += " (site:github.com OR site:news.ycombinator.com OR site:stackoverflow.com)"
-    elif source_type == "news":
-        if "site:" not in lowered_query:
-            actual_query += " when:month"
-    elif source_type == "academic":
-        if "site:" not in lowered_query:
-            actual_query += " (site:arxiv.org OR site:scholar.google.com OR site:doi.org OR site:.edu)"
-    return actual_query
-
-
 def _search_duckduckgo(
     query: str,
     max_results: int,
-    source_type: str = "general",
     timeout_seconds: int = 15,
 ) -> list[SearchResult]:
     from ddgs import DDGS
@@ -148,7 +109,6 @@ def _search_duckduckgo(
                 snippet=_clean_external_text(item.get("body") or item.get("snippet") or "（无摘要）", MAX_SNIPPET_CHARS),
                 backend="duckduckgo",
                 rank=index,
-                source_type=source_type,
             )
         )
     return results
@@ -184,7 +144,7 @@ def _request_json(
     return json.loads(raw.decode("utf-8", errors="replace"))
 
 
-def _search_brave(query: str, max_results: int, config: ResearchConfig, source_type: str = "general") -> list[SearchResult]:
+def _search_brave(query: str, max_results: int, config: ResearchConfig) -> list[SearchResult]:
     if not config.brave_api_key:
         raise ValueError("brave 后端已启用，但 research.brave_api_key 为空")
     params = urlencode({"q": query, "count": max_results})
@@ -209,13 +169,12 @@ def _search_brave(query: str, max_results: int, config: ResearchConfig, source_t
                 snippet=_clean_external_text(item.get("description") or "（无摘要）", MAX_SNIPPET_CHARS),
                 backend="brave",
                 rank=index,
-                source_type=source_type,
             )
         )
     return results
 
 
-def _search_tavily(query: str, max_results: int, config: ResearchConfig, source_type: str = "general") -> list[SearchResult]:
+def _search_tavily(query: str, max_results: int, config: ResearchConfig) -> list[SearchResult]:
     if not config.tavily_api_key:
         raise ValueError("tavily 后端已启用，但 research.tavily_api_key 为空")
     payload = _request_json(
@@ -241,7 +200,6 @@ def _search_tavily(query: str, max_results: int, config: ResearchConfig, source_
                 snippet=_clean_external_text(item.get("content") or item.get("raw_content") or "（无摘要）", MAX_SNIPPET_CHARS),
                 backend="tavily",
                 rank=index,
-                source_type=source_type,
             )
         )
     return results
@@ -260,16 +218,15 @@ async def _search_backend(
     backend: str,
     query: str,
     max_results: int,
-    source_type: str,
     config: ResearchConfig,
 ) -> tuple[str, list[SearchResult] | None, str | None]:
     def _run() -> list[SearchResult]:
         if backend in {"duckduckgo", "ddg"}:
-            return _search_duckduckgo(query, max_results, source_type, config.search_timeout_seconds)
+            return _search_duckduckgo(query, max_results, config.search_timeout_seconds)
         if backend == "brave":
-            return _search_brave(query, max_results, config, source_type)
+            return _search_brave(query, max_results, config)
         if backend == "tavily":
-            return _search_tavily(query, max_results, config, source_type)
+            return _search_tavily(query, max_results, config)
         raise ValueError(f"未知搜索后端：{backend}")
 
     try:
@@ -282,12 +239,11 @@ async def _search_backend(
 async def _search_all_backends(
     query: str,
     max_results: int,
-    source_type: str,
     config: ResearchConfig,
 ) -> SearchRunResult:
     max_results = max(1, min(max_results, max(1, config.max_backend_results)))
     backends = _enabled_backends(config)
-    tasks = [_search_backend(backend, query, max_results, source_type, config) for backend in backends]
+    tasks = [_search_backend(backend, query, max_results, config) for backend in backends]
     gathered = await asyncio.gather(*tasks)
 
     results: list[SearchResult] = []
@@ -335,7 +291,6 @@ def _merge_duplicate_results(results: list[SearchResult]) -> list[MergedSource]:
                 snippet=result.snippet,
                 backends=[result.backend],
                 original_ranks={result.backend: result.rank},
-                source_type=result.source_type,
             )
             continue
         existing = merged[key]
@@ -352,81 +307,28 @@ def _merge_duplicate_results(results: list[SearchResult]) -> list[MergedSource]:
             snippet=snippet,
             backends=backends,
             original_ranks=ranks,
-            source_type=existing.source_type,
         )
     return list(merged.values())
 
 
-def _query_tokens(query: str) -> list[str]:
-    tokens = re.findall(r"[\w一-鿿]+", query.lower())
-    return [token for token in tokens if len(token) > 1 and token not in {"site", "http", "https", "or", "and"}]
+def _rank_sources(results: list[SearchResult]) -> list[MergedSource]:
+    """轻量排序：仅按"原始排名（越小越靠前）+ 多后端共识（被多个后端发现则升序）"。
 
+    不做关键词命中、权威域名、SEO 降权等启发式判断——来源质量评估交给调用方
+    （AI）按任务自行决定，避免工具替研究流程做固定决策。
+    """
+    sources = _merge_duplicate_results(results)
 
-def _rank_sources(
-    query: str,
-    results: list[SearchResult],
-    source_type: str,
-    config: ResearchConfig | None = None,
-) -> list[RankedSource]:
-    del config
-    tokens = _query_tokens(query)
-    ranked: list[tuple[float, MergedSource, list[str]]] = []
-    for source in _merge_duplicate_results(results):
-        parsed = urlsplit(source.url)
-        host = parsed.netloc.lower()
-        haystack = f"{source.title} {source.snippet} {source.url}".lower()
+    def sort_key(source: MergedSource) -> tuple[int, int]:
         best_rank = min(source.original_ranks.values()) if source.original_ranks else 10
-        score = max(0.5, 8.0 - best_rank)
-        reasons = [f"原始排名最高为 {best_rank}"]
+        # 多后端共识：被越多后端发现，越靠前（backend 数取负后升序）。
+        return (best_rank, -len(source.backends))
 
-        if len(source.backends) > 1:
-            score += 2.0 * (len(source.backends) - 1)
-            reasons.append(f"被 {len(source.backends)} 个搜索后端同时发现")
-
-        token_hits = sum(1 for token in tokens if token in haystack)
-        if token_hits:
-            score += min(3.0, token_hits * 0.4)
-            reasons.append(f"标题/摘要命中 {token_hits} 个查询关键词")
-
-        if any(host.endswith(suffix) for suffix in AUTHORITY_SUFFIXES):
-            score += 1.0
-            reasons.append("权威/机构域名")
-
-        if source_type == "tech" and any(domain in host or domain in source.url.lower() for domain in TECH_DOMAINS):
-            score += 2.0
-            reasons.append("技术源优先：文档/GitHub/开发者社区")
-
-        if source_type == "news" and any(token in haystack for token in ("news", "press", "release", "公告", "新闻", "发布")):
-            score += 1.2
-            reasons.append("新闻/公告相关信号")
-
-        if source_type == "academic" and any(token in host for token in ("arxiv", "doi.org", ".edu", "scholar")):
-            score += 2.0
-            reasons.append("学术来源信号")
-
-        if any(signal in haystack for signal in LOW_QUALITY_SIGNALS):
-            score -= 2.0
-            reasons.append("低质量 SEO/下载/优惠信号降权")
-
-        ranked.append((score, source, reasons))
-
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [
-        RankedSource(
-            citation_id=f"S{index}",
-            title=source.title,
-            url=source.url,
-            snippet=source.snippet,
-            score=round(score, 2),
-            reasons=reasons,
-            backends=source.backends,
-            original_ranks=source.original_ranks,
-        )
-        for index, (score, source, reasons) in enumerate(ranked, start=1)
-    ]
+    sources.sort(key=sort_key)
+    return sources
 
 
-def _format_basic_search_results(query: str, ranked: list[RankedSource], run: SearchRunResult) -> str:
+def _format_basic_search_results(query: str, ranked: list[MergedSource], run: SearchRunResult) -> str:
     if not ranked:
         attempted = ", ".join(run.attempted_backends) or "none"
         if run.backend_errors:
@@ -450,19 +352,20 @@ def _format_basic_search_results(query: str, ranked: list[RankedSource], run: Se
 async def web_search(
     ctx: RunContext[AgentDeps],
     query: str,
-    max_results: int = 5,
-    source_type: SearchSourceType = "general",
+    max_results: int = 10,
 ) -> str:
-    """多后端网页搜索：并发查询多个搜索后端，去重、排序后返回标题/URL/摘要列表。
+    """多后端网页搜索：并发查询多个搜索后端，去重、轻量排序后返回标题/URL/摘要列表。
 
-    原子搜索工具——只负责"找到候选来源"。搜索摘要不是全文证据：关键结论需继续用
-    web_fetch 或 browser_navigate + browser_extract_content 读取正文确认（研究质量
-    规范见系统提示词，不在本工具内强制）。HTTP 失败时换 browser_navigate。
+    原子搜索工具——只负责"找到候选来源"，不替你做研究决策：
+    - 想限定来源站点（如官方文档/GitHub/学术论文），直接在 query 里写 `site:github.com`、`site:arxiv.org` 等；
+    - max_results 可按任务复杂度自行调整（默认 10，上限 50），简单事实查 3~5 条即可，深度调研可调高；
+    - 搜索摘要不是全文证据：关键结论需继续用 web_fetch 或 browser_navigate + browser_extract_content
+      读取正文确认（研究质量规范见系统提示词，不在本工具内强制）。HTTP 失败时换 browser_navigate。
     """
     config = _get_research_config(ctx)
-    actual_query = _normalize_search_query(query, source_type)
-    max_results = max(1, min(max_results, 10))
-    logger.info("web_search query=%r source_type=%s max_results=%d", actual_query, source_type, max_results)
-    run = await _search_all_backends(actual_query, max_results, source_type, config)
-    ranked = _rank_sources(actual_query, run.results, source_type, config)[:max_results]
+    actual_query = _clean_query(query)
+    max_results = max(1, min(max_results, 50))
+    logger.info("web_search query=%r max_results=%d", actual_query, max_results)
+    run = await _search_all_backends(actual_query, max_results, config)
+    ranked = _rank_sources(run.results)[:max_results]
     return _format_basic_search_results(query, ranked, run)

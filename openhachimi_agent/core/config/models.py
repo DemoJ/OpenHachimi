@@ -126,9 +126,6 @@ class ResearchConfig:
     tavily_api_key: str | None = None
     search_timeout_seconds: int = 15
     max_backend_results: int = 10
-    min_independent_sources: int = 3
-    require_citations: bool = True
-    browser_fallback_enabled: bool = True
 
 
 @dataclass(frozen=True)

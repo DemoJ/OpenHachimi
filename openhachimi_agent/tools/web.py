@@ -11,7 +11,6 @@ import asyncio
 import json
 import logging
 import re
-import socket
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit
@@ -19,7 +18,6 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from pydantic_ai import RunContext
 
-from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.tools.url_security import assert_public_hostname, normalize_public_http_url
 from openhachimi_agent.tools.utils import trim_output

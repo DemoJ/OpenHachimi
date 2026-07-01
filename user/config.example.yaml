@@ -79,9 +79,6 @@ research:
   tavily_api_key: ""          # Tavily API Key，留空则不启用
   search_timeout_seconds: 15
   max_backend_results: 10
-  min_independent_sources: 3
-  require_citations: true
-  browser_fallback_enabled: true
 
 scheduler:
   enabled: true

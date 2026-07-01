@@ -1,5 +1,6 @@
 # pyrefly: ignore [missing-import]
 import importlib.util
+import socket
 import sys
 import types
 from pathlib import Path
@@ -19,6 +20,10 @@ _web_spec = importlib.util.spec_from_file_location(
 web_module = importlib.util.module_from_spec(_web_spec)
 assert _web_spec.loader is not None
 _web_spec.loader.exec_module(web_module)
+
+# web._validate_public_host 转调 url_security.assert_public_hostname，
+# DNS 解析（getaddrinfo）实际发生在 url_security 模块内，故 patch 目标是它。
+url_security_module = sys.modules["openhachimi_agent.tools.url_security"]
 
 
 @pytest.mark.parametrize(
@@ -170,11 +175,11 @@ def test_validate_public_host_allows_host_with_any_public_address(monkeypatch):
 
     def fake_getaddrinfo(host, *args, **kwargs):
         return [
-            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("174.37.54.20", 0)),
-            (web_module.socket.AF_INET6, web_module.socket.SOCK_STREAM, 6, "", ("2001::a88f:abba", 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("174.37.54.20", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001::a88f:abba", 0, 0, 0)),
         ]
 
-    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(url_security_module.socket, "getaddrinfo", fake_getaddrinfo)
 
     # 不应抛出异常
     web_module._validate_public_host("www.reuters.com", resolve_dns=True)
@@ -185,11 +190,11 @@ def test_validate_public_host_rejects_host_resolving_only_to_private(monkeypatch
 
     def fake_getaddrinfo(host, *args, **kwargs):
         return [
-            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0)),
-            (web_module.socket.AF_INET6, web_module.socket.SOCK_STREAM, 6, "", ("fd00::1", 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fd00::1", 0, 0, 0)),
         ]
 
-    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(url_security_module.socket, "getaddrinfo", fake_getaddrinfo)
 
     with pytest.raises(ValueError):
         web_module._validate_public_host("intranet.example", resolve_dns=True)
@@ -200,11 +205,11 @@ def test_validate_public_host_rejects_mixed_public_and_private_addresses(monkeyp
 
     def fake_getaddrinfo(host, *args, **kwargs):
         return [
-            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
-            (web_module.socket.AF_INET, web_module.socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0)),
         ]
 
-    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(url_security_module.socket, "getaddrinfo", fake_getaddrinfo)
 
     with pytest.raises(ValueError):
         web_module._validate_public_host("mixed.example", resolve_dns=True)

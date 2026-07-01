@@ -63,9 +63,9 @@ def _ctx(tmp_path, research_config=None):
     return SimpleNamespace(deps=SimpleNamespace(config=config))
 
 
-def test_normalize_search_query_rejects_blank_query():
+def test_clean_query_rejects_blank_query():
     with pytest.raises(ValueError):
-        research_module._normalize_search_query("   ", "general")
+        research_module._clean_query("   ")
 
 
 def test_clean_external_text_truncates_and_strips_control_chars():
@@ -75,15 +75,6 @@ def test_clean_external_text_truncates_and_strips_control_chars():
     assert "\x01" not in text
     assert len(text) <= 23
     assert text.endswith("...")
-
-
-def test_normalize_search_query_keeps_existing_behavior():
-    tech_query = research_module._normalize_search_query("pydantic-ai", "tech")
-    news_query = research_module._normalize_search_query("OpenAI", "news")
-
-    assert "site:github.com" in tech_query
-    assert "site:stackoverflow.com" in tech_query
-    assert "when:month" in news_query
 
 
 def test_canonicalize_result_url_drops_tracking_params():
@@ -105,7 +96,7 @@ def test_rank_sources_skips_malformed_result_urls():
         research_module.SearchResult("Good", "https://example.com/good", "useful", "duckduckgo", 2),
     ]
 
-    ranked = research_module._rank_sources("good", results, "general", ResearchConfig())
+    ranked = research_module._rank_sources(results)
 
     assert len(ranked) == 1
     assert ranked[0].title == "Good"
@@ -117,7 +108,6 @@ def test_enabled_backend_without_api_key_reports_error(tmp_path):
             "brave",
             "topic",
             3,
-            "general",
             ResearchConfig(enabled_backends=["brave"]),
         )
     )
@@ -225,22 +215,20 @@ def test_rank_sources_merges_duplicate_urls():
         research_module.SearchResult("Coupon", "https://coupon.example.com", "free download coupon", "duckduckgo", 1),
     ]
 
-    ranked = research_module._rank_sources("example docs", results, "tech", ResearchConfig())
+    ranked = research_module._rank_sources(results)
 
     # 去重:utm_source 被剥离后两条 docs URL 合并为一条,backends 含两个后端
     assert ranked[0].url.startswith("https://docs.example.com/a")
     assert set(ranked[0].backends) == {"duckduckgo", "brave"}
-    assert any("搜索后端" in reason for reason in ranked[0].reasons)
 
 
 @pytest.mark.asyncio
 async def test_web_search_formats_results_and_clamps_max_results(monkeypatch, tmp_path):
     captured = {}
 
-    async def fake_search_all(query, max_results, source_type, config):
+    async def fake_search_all(query, max_results, config):
         captured["query"] = query
         captured["max_results"] = max_results
-        captured["source_type"] = source_type
         return research_module.SearchRunResult(
             query=query,
             results=[research_module.SearchResult("Title", "https://example.com", "Snippet", "duckduckgo", 1)],
@@ -252,28 +240,9 @@ async def test_web_search_formats_results_and_clamps_max_results(monkeypatch, tm
 
     output = await research_module.web_search(_ctx(tmp_path), "hello", max_results=999)
 
-    assert captured["max_results"] == 10
+    assert captured["max_results"] == 50
     assert "搜索 'hello' 共返回 1 条去重结果" in output
     assert "Title" in output
     # 原子搜索:不再输出引用编号/工作流包装
     assert "[S1]" not in output
     assert "Citation requirement" not in output
-
-
-@pytest.mark.asyncio
-async def test_web_search_supports_academic_source_type(monkeypatch, tmp_path):
-    """合并后 web_search 支持 academic source_type(原 research_sources 的能力)。"""
-    captured = {}
-
-    async def fake_search_all(query, max_results, source_type, config):
-        captured["source_type"] = source_type
-        captured["query"] = query
-        return research_module.SearchRunResult(
-            query=query, results=[], backend_errors={}, attempted_backends=["duckduckgo"],
-        )
-
-    monkeypatch.setattr(research_module, "_search_all_backends", fake_search_all)
-    await research_module.web_search(_ctx(tmp_path), "transformer architecture", source_type="academic")
-
-    assert captured["source_type"] == "academic"
-    assert "arxiv.org" in captured["query"] or "scholar.google.com" in captured["query"]

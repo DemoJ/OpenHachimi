@@ -673,9 +673,6 @@ research:
   tavily_api_key: ""
   search_timeout_seconds: 15
   max_backend_results: 10
-  min_independent_sources: 3
-  require_citations: true
-  browser_fallback_enabled: true
 """
 
 
@@ -688,7 +685,7 @@ def _write_research_config(tmp_path, text=_RESEARCH_SAMPLE_YAML):
 def test_research_group_registered():
     assert "research" in SETTINGS_FIELD_GROUPS
     assert SETTINGS_FIELD_GROUPS["research"] is RESEARCH_FIELDS
-    assert len(RESEARCH_FIELDS) == 8
+    assert len(RESEARCH_FIELDS) == 5
 
 
 def test_research_enabled_backends_is_multi():

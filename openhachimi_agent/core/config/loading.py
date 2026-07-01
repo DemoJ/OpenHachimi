@@ -307,9 +307,6 @@ def _load_research_config(raw_config: dict[str, Any]) -> ResearchConfig:
         tavily_api_key=_config_string(research_config, "tavily_api_key") or None,
         search_timeout_seconds=min(60, _config_int(research_config, "search_timeout_seconds", 15)),
         max_backend_results=min(50, _config_int(research_config, "max_backend_results", 10)),
-        min_independent_sources=min(20, _config_int(research_config, "min_independent_sources", 3)),
-        require_citations=_config_bool(research_config, "require_citations", True),
-        browser_fallback_enabled=_config_bool(research_config, "browser_fallback_enabled", True),
     )
 
 
