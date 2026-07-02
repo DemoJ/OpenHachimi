@@ -22,6 +22,7 @@ llm:
   model: gpt-5.2
   base_url: https://your-openai-compatible-server.example/v1
   supports_vision: auto       # 主模型是否支持图片输入：auto 自动按模型名判断；true 强制直传图片；false 使用 vision 辅助模型
+  reasoning_effort: none      # 思考深度，对齐 OpenAI 官方 reasoning_effort 枚举：none 不思考（默认）；minimal/low/medium/high/xhigh 逐级加深，越高越慢越费 token。需模型支持 reasoning 才生效
 
 vision:
   enabled: true               # 是否处理图片附件
@@ -87,6 +88,13 @@ scheduler:
   max_concurrency: 2
   default_timeout_seconds: 300
   claim_lock_seconds: 600
+  delivery:                   # 任务结果投递方式
+    default_mode: origin      # 新建任务的默认投递模式：origin 回发起会话；inbox 记入收件箱；explicit 按 targets 投递；none 不投递
+    fallback_to_inbox: true   # 投递失败时是否回落记入收件箱
+  security:                   # 定时任务安全策略（无人值守，默认从严）
+    prompt_scan_enabled: true             # 是否校验定时任务 cron 的 prompt 是否符合安全策略
+    allow_scheduler_mutation_in_scheduled_runs: false  # 定时任务执行中是否允许调用调度相关工具改动任务表；关闭更安全
+    allow_interactive_tools_in_scheduled_runs: false   # 定时任务执行中是否允许调用交互类工具；关闭更安全
 
 logging:
   level: INFO

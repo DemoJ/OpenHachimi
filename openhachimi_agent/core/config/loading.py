@@ -463,6 +463,12 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
         default_role_name=_config_string(app_config, "default_role", "default"),
         openai_api_key=_config_string(llm_config, "api_key") or None,
         llm_supports_vision=_config_vision_support(llm_config, "supports_vision", "auto"),
+        llm_reasoning_effort=_config_literal(
+            llm_config,
+            "reasoning_effort",
+            {"none", "minimal", "low", "medium", "high", "xhigh"},
+            "none",
+        ),
         log_dir=_resolve_config_path(
             base_dir,
             _config_string(logging_config, "dir"),

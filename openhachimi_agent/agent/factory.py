@@ -60,6 +60,16 @@ def _build_unfinished_reminder(signal: dict | None) -> str | None:
     )
 
 
+def _build_reasoning_model_settings(config: AppConfig) -> dict:
+    """把 llm_reasoning_effort 配置翻译成 pydantic-ai 的 model_settings。
+
+    值即 openai SDK 官方 reasoning_effort 枚举(none/minimal/low/medium/high/xhigh),
+    原样透传给 OpenAIChatModel。none 也显式发送,行为与官方参数一致;对不支持
+    reasoning 的模型由服务端自行处理。
+    """
+    return {"openai_reasoning_effort": config.llm_reasoning_effort}
+
+
 def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None, run_mode: str = "interactive") -> Agent:
     if not config.openai_api_key:
         raise ValueError("未配置 llm.api_key，请先在 user/config.yaml 中填写 API Key。")
@@ -163,6 +173,7 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         # validator 重试链留出预算,真正的死循环熔断由 validator 内部计数器和
         # executor.py 的 replan 兜底负责,不能只靠抬上限。
         retries=5,
+        model_settings=_build_reasoning_model_settings(config),
     )
 
     if agent_type == "main":

@@ -246,6 +246,9 @@ class AppConfig:
     scheduler: SchedulerConfig
     research: ResearchConfig
     vision: VisionConfig
+    # 思考深度,对齐 openai SDK 官方 ReasoningEffort 枚举(none/minimal/low/medium/high/xhigh)。
+    # none=不思考(默认);其余档位原样透传 reasoning_effort。需模型支持 reasoning 才生效。
+    llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] = "none"
     mcp: MCPConfig = field(default_factory=MCPConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     delegation: DelegationConfig = field(default_factory=DelegationConfig)
