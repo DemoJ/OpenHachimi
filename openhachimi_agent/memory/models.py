@@ -30,7 +30,6 @@ class MemoryStatus(_StringEnum):
     ARCHIVED = "archived"
     DELETED = "deleted"
     EXPIRED = "expired"
-    SUPERSEDED = "superseded"
 
 
 class MemorySensitivity(_StringEnum):
@@ -119,9 +118,6 @@ class MemoryAtom:
     valid_until: str | None = None
     decay_at: str | None = None
     status: MemoryStatus = MemoryStatus.ACTIVE
-    supersedes_id: str | None = None
-    superseded_by_id: str | None = None
-    conflict_group_id: str | None = None
     embedding_status: str = "pending"
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)

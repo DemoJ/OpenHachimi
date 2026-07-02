@@ -44,6 +44,63 @@ def _looks_memorable(user_message: str) -> bool:
     return any(marker in user_message for marker in markers)
 
 
+# LLM 抽取作业入队闸门:正向命中(值得抽)+负向排除(提问/命令噪声)。
+# 是 _looks_memorable 的超集——后者仅驱动同步规则抽取,本函数决定是否
+# 花一次 LLM 调用去抽。普通对话不进 LLM 抽取,从源头止血 L1 泛滥。
+_EXPLICIT_INTENT_MARKERS = (
+    "记住", "以后", "偏好", "习惯", "要求", "纠正", "不要", "禁止",
+    "remember", "prefer", "always", "from now on",
+)
+_EXPLICIT_STATEMENT_MARKERS = (
+    "我喜欢", "我不喜欢", "默认", "一律", "必须", "只能",
+)
+# 项目事实双词(与 extraction.PROJECT_KEYWORD_PAIRS 同思路,各自独立定义,
+# 避免 capture→extraction 的循环依赖)。命中任一组即视为值得抽取。
+_PROJECT_FACT_PAIRS = (
+    ("项目", "使用"),
+    ("项目", "技术栈"),
+    ("仓库", "结构"),
+    ("仓库", "决定"),
+    ("我们", "采用"),
+    ("我们", "决定"),
+)
+# 提问/请求句式:即使含正向词,本质是"问"或"求",不是陈述事实。
+_QUESTION_PREFIXES = ("怎么", "为什么", "如何", "能不能", "能不能够", "帮我", "请问", "可以吗", "是不是", "有没有")
+_COMMAND_NOISE_MARKERS = ("运行", "执行", "跑一下", "跑一下这个", "帮我跑", "帮我运行")
+
+
+def _is_question_like(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(("？", "?")):
+        return True
+    return any(stripped.startswith(prefix) for prefix in _QUESTION_PREFIXES)
+
+
+def _is_command_noise(text: str) -> bool:
+    return any(marker in text for marker in _COMMAND_NOISE_MARKERS)
+
+
+def _is_memorable_turn(user_message: str) -> bool:
+    """判断本轮是否值得进入 LLM 抽取(规则预判闸门)。
+
+    正向命中任一即过闸:显式记忆意图词 / 显式偏好约束陈述 / 项目事实双词。
+    负向排除:提问句式 / 命令噪声——即使混进正向词,本质是请求而非事实。
+    """
+    text = user_message.strip()
+    if not text:
+        return False
+    # 负向排除优先:提问/命令噪声直接拦掉
+    if _is_question_like(text) or _is_command_noise(text):
+        return False
+    if any(marker in text for marker in _EXPLICIT_INTENT_MARKERS):
+        return True
+    if any(marker in text for marker in _EXPLICIT_STATEMENT_MARKERS):
+        return True
+    return any(word_a in text and word_b in text for word_a, word_b in _PROJECT_FACT_PAIRS)
+
+
 def _looks_like_scheduler_payload(text: str) -> bool:
     """判断一段文本是否是定时任务系统下发的执行 payload。
 
@@ -154,6 +211,17 @@ def capture_turn_memories(
     if len(clean_user_message.strip()) < config.memory.capture.min_turn_chars:
         return turn_id
 
+    # 规则预判闸门:不值得记忆的轮次(提问/命令/寒暄)不进 LLM 抽取,从源头止血。
+    # min_turn_chars 只挡长度,本闸门挡"是否值得花一次 LLM 调用去抽"。
+    if not _is_memorable_turn(clean_user_message):
+        logger.info(
+            "memory L1 extraction skipped: not memorable role=%s session_id=%s turn_id=%s",
+            scope.role_name,
+            scope.session_id,
+            turn_id,
+        )
+        return turn_id
+
     payload = {
         "turn_id": turn_id,
         "scope": scope.to_json_dict(),
@@ -201,9 +269,6 @@ def capture_turn_memories(
             atom_id = decision_conflict.winner_id or atom.id
             if decision_conflict.action != "dedupe":
                 atom_id = store.add_atom(atom)
-                if decision_conflict.action == "supersede" and decision_conflict.loser_id:
-                    store.mark_atom_superseded(decision_conflict.loser_id, atom_id, decision_conflict.conflict_group_id)
-                    store.record_conflict(scope, decision_conflict.conflict_key, atom_id, decision_conflict.loser_id, decision_conflict.reason)
             if config.memory.embedding.enabled and decision_conflict.action != "dedupe":
                 if embedding is None:
                     embedding = EmbeddingProvider(config.memory.embedding).embed_sync(atom.content)

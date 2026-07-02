@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from uuid import uuid4
 
 from openhachimi_agent.memory.models import (
     MemoryAtom,
@@ -31,10 +30,9 @@ class AtomStoreMixin:
                     subject, predicate, object, content, normalized_content, search_text,
                     evidence_turn_ids_json, source_quote, entities_json, keywords_json,
                     tags_json, scope_json, confidence, stability, sensitivity, valid_from,
-                    valid_until, decay_at, status, supersedes_id, superseded_by_id,
-                    conflict_group_id, embedding_status, created_at, updated_at,
+                    valid_until, decay_at, status, embedding_status, created_at, updated_at,
                     last_accessed_at, access_count
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
                     user_id = excluded.user_id,
@@ -64,9 +62,6 @@ class AtomStoreMixin:
                     valid_until = excluded.valid_until,
                     decay_at = excluded.decay_at,
                     status = excluded.status,
-                    supersedes_id = COALESCE(excluded.supersedes_id, memory_atoms.supersedes_id),
-                    superseded_by_id = COALESCE(excluded.superseded_by_id, memory_atoms.superseded_by_id),
-                    conflict_group_id = COALESCE(excluded.conflict_group_id, memory_atoms.conflict_group_id),
                     embedding_status = excluded.embedding_status,
                     updated_at = excluded.updated_at
                 """,
@@ -97,9 +92,6 @@ class AtomStoreMixin:
                     atom.valid_until,
                     atom.decay_at,
                     str(atom.status),
-                    atom.supersedes_id,
-                    atom.superseded_by_id,
-                    atom.conflict_group_id,
                     atom.embedding_status,
                     atom.created_at,
                     atom.updated_at,
@@ -258,33 +250,6 @@ class AtomStoreMixin:
         for row in [*exact_rows, *recent_rows]:
             rows_by_id[str(row["id"])] = row
         return list(rows_by_id.values())
-
-    def mark_atom_superseded(self, old_id: str, new_id: str, conflict_group_id: str | None = None) -> None:
-        now = utc_now_iso()
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE memory_atoms SET status = ?, superseded_by_id = ?, conflict_group_id = ?, updated_at = ? WHERE id = ?",
-                (MemoryStatus.SUPERSEDED.value, new_id, conflict_group_id, now, old_id),
-            )
-            conn.execute("DELETE FROM memory_atoms_fts WHERE id = ?", (old_id,))
-            conn.execute(
-                "UPDATE memory_atoms SET supersedes_id = COALESCE(supersedes_id, ?), conflict_group_id = COALESCE(conflict_group_id, ?), updated_at = ? WHERE id = ?",
-                (old_id, conflict_group_id, now, new_id),
-            )
-
-    def record_conflict(self, scope: MemoryScope, conflict_key: str, winner_id: str, loser_id: str, reason: str) -> str:
-        conflict_id = uuid4().hex
-        now = utc_now_iso()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO memory_conflicts(
-                    id, tenant_id, user_id, role_name, conflict_key, winner_id, loser_id, status, reason, created_at, resolved_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (conflict_id, scope.tenant_id, scope.user_id, scope.role_name, conflict_key, winner_id, loser_id, "resolved", reason, now, now),
-            )
-        return conflict_id
 
     def expire_due_atoms(self, *, now: str | None = None, limit: int = 500) -> int:
         current = now or utc_now_iso()

@@ -170,9 +170,6 @@ class MemoryScheduler:
             if decision.action == "dedupe":
                 continue
             atom_id = self.store.add_atom(atom)
-            if decision.action == "supersede" and decision.loser_id:
-                self.store.mark_atom_superseded(decision.loser_id, atom_id, decision.conflict_group_id)
-                self.store.record_conflict(scope, decision.conflict_key, atom_id, decision.loser_id, decision.reason)
             created += 1
             if self.config and self.config.memory.embedding.enabled:
                 if embedding and not embedding.degraded:

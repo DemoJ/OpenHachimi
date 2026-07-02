@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from openhachimi_agent.memory.models import utc_now_iso
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _column_exists(conn, table: str, column: str) -> bool:
@@ -78,9 +78,6 @@ class SchemaStoreMixin:
                     valid_until TEXT,
                     decay_at TEXT,
                     status TEXT NOT NULL,
-                    supersedes_id TEXT,
-                    superseded_by_id TEXT,
-                    conflict_group_id TEXT,
                     embedding_status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -208,20 +205,6 @@ class SchemaStoreMixin:
                     PRIMARY KEY(block_id, atom_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS memory_conflicts (
-                    id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    role_name TEXT NOT NULL,
-                    conflict_key TEXT NOT NULL,
-                    winner_id TEXT,
-                    loser_id TEXT,
-                    status TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    resolved_at TEXT
-                );
-
                 CREATE INDEX IF NOT EXISTS idx_memory_atoms_scope ON memory_atoms(tenant_id, user_id, role_name, status);
                 CREATE INDEX IF NOT EXISTS idx_memory_atoms_due ON memory_atoms(status, valid_until, decay_at);
                 CREATE INDEX IF NOT EXISTS idx_memory_atoms_consolidate ON memory_atoms(tenant_id, user_id, role_name, status, memory_type, updated_at);
@@ -232,13 +215,59 @@ class SchemaStoreMixin:
                 CREATE INDEX IF NOT EXISTS idx_memory_vector_shards_lookup ON memory_vector_shards(level, model, dimensions, shard_key);
                 CREATE INDEX IF NOT EXISTS idx_memory_jobs_status ON memory_jobs(status, run_after);
                 CREATE INDEX IF NOT EXISTS idx_memory_jobs_claim ON memory_jobs(status, run_after, locked_at);
-                CREATE INDEX IF NOT EXISTS idx_memory_conflicts_scope ON memory_conflicts(tenant_id, user_id, role_name, conflict_key);
                 """
             )
             # 旧库幂等补列:memory_turns.source 在 schema v2 建表语句里新增,
             # 已存在的旧库需 ALTER 补上,默认 'user' 与模型字段一致。
             _ensure_column(conn, "memory_turns", "source", "TEXT NOT NULL DEFAULT 'user'")
+            # v3 migration:移除 supersede 机制遗留的列与表,把历史 superseded
+            # atom 降级为 archived。幂等:已应用过 v3 的库不再执行。
+            self._migrate_to_v3(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO memory_schema_migrations(version, applied_at) VALUES(?, ?)",
                 (SCHEMA_VERSION, utc_now_iso()),
             )
+
+    def _migrate_to_v3(self, conn) -> None:
+        """v3:移除 supersede 遗留 (列/表),历史 superseded atom 降级 archived。
+
+        幂等:``memory_schema_migrations`` 已记 version=3 则跳过。对旧 v2 库:
+        - 把 ``status='superseded'`` 的 atom 改成 ``archived``(SUPERSEDED 枚举已删,
+          不迁移会变成无法识别的 status 值,被 recall/store 当作非 active 跳过);
+        - ``ALTER TABLE memory_atoms DROP COLUMN`` 删 supersedes_id / superseded_by_id /
+          conflict_group_id 三列(SQLite 3.35+ 支持 DROP COLUMN);
+        - ``DROP TABLE memory_conflicts`` 及其索引(supersede 删除后该表无写入无读取)。
+        全程在单连接内执行,initialize 的 connect() 上下文会统一提交。
+        """
+        already = conn.execute(
+            "SELECT 1 FROM memory_schema_migrations WHERE version = ?", (3,)
+        ).fetchone()
+        if already:
+            return
+
+        # 建表已用新 schema(无三列/无 conflicts 表),旧库才需要这三列探测。
+        supersede_cols = (
+            "supersedes_id",
+            "superseded_by_id",
+            "conflict_group_id",
+        )
+        existing_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(memory_atoms)").fetchall()
+        }
+        for column in supersede_cols:
+            if column in existing_cols:
+                # 先把残留的 superseded atom 降级为 archived,避免删列后丢失语义
+                if column == "superseded_by_id":
+                    conn.execute(
+                        "UPDATE memory_atoms SET status = 'archived' WHERE status = 'superseded'"
+                    )
+                conn.execute(f"ALTER TABLE memory_atoms DROP COLUMN {column}")
+
+        # memory_conflicts 表仅在旧库存在(新建库不再创建);有则删
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_conflicts'"
+        ).fetchone()
+        if table_exists:
+            conn.execute("DROP INDEX IF EXISTS idx_memory_conflicts_scope")
+            conn.execute("DROP TABLE memory_conflicts")

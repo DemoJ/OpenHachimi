@@ -16,7 +16,7 @@ def test_duplicate_atom_is_deduped(tmp_path):
     assert decision.winner_id == old.id
 
 
-def test_vector_similarity_supersedes_same_slot_different_content(tmp_path):
+def test_vector_similarity_dedupes_same_slot_different_content(tmp_path):
     store = MemoryStore(tmp_path / "memory.sqlite3")
     scope = MemoryScope(role_name="default")
     old = MemoryAtom(memory_type="preference", content="用户喜欢中文回答", scope=scope, subject="user", predicate="likes", object="中文回答")
@@ -26,9 +26,10 @@ def test_vector_similarity_supersedes_same_slot_different_content(tmp_path):
 
     decision = resolve_atom_conflict(store, new, embedding_vector=[0.99, 0.01, 0.0], embedding_model="test")
 
-    assert decision.action == "supersede"
-    assert decision.loser_id == old.id
-    assert decision.reason.startswith("vector_similarity")
+    # 阈值内统一去重(保留旧者,丢弃新者),不再 supersede
+    assert decision.action == "dedupe"
+    assert decision.winner_id == old.id
+    assert decision.reason.startswith("vector_similar")
 
 
 def test_vector_similarity_does_not_supersede_different_slot(tmp_path):

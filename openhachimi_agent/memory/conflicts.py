@@ -4,19 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
-from uuid import uuid4
 
 from openhachimi_agent.memory.models import MemoryAtom
 
 
 @dataclass(frozen=True)
 class ConflictDecision:
-    action: Literal["insert", "dedupe", "supersede", "keep_both"]
+    action: Literal["insert", "dedupe"]
     winner_id: str | None = None
     loser_id: str | None = None
     reason: str = ""
     conflict_key: str = ""
-    conflict_group_id: str | None = None
 
 
 def _normalize_text(text: str) -> str:
@@ -37,7 +35,7 @@ def resolve_atom_conflict(
     *,
     embedding_vector: list[float] | None = None,
     embedding_model: str | None = None,
-    similarity_threshold: float = 0.92,
+    similarity_threshold: float = 0.82,
 ) -> ConflictDecision:
     conflict_key = conflict_key_for_atom(atom)
     normalized_content = _normalize_text(atom.normalized_content or atom.content)
@@ -61,23 +59,13 @@ def resolve_atom_conflict(
         )
         if similar:
             row, similarity = similar
-            if _normalize_text(row["content"]) == normalized_content:
-                return ConflictDecision(
-                    action="dedupe",
-                    winner_id=row["id"],
-                    loser_id=atom.id,
-                    reason=f"vector_duplicate:{similarity:.4f}",
-                    conflict_key=conflict_key,
-                )
-            group_id = atom.conflict_group_id or uuid4().hex
-            atom.supersedes_id = row["id"]
-            atom.conflict_group_id = group_id
+            # 阈值内统一去重(保留旧者,丢弃新者):语义近似更可能是同一事实的
+            # 不同措辞而非偏好演进,保留旧者避免堆积,也避免误覆盖用户后续细化陈述。
             return ConflictDecision(
-                action="supersede",
-                winner_id=atom.id,
-                loser_id=row["id"],
-                reason=f"vector_similarity:{similarity:.4f}",
+                action="dedupe",
+                winner_id=row["id"],
+                loser_id=atom.id,
+                reason=f"vector_similar:{similarity:.4f}",
                 conflict_key=conflict_key,
-                conflict_group_id=group_id,
             )
     return ConflictDecision(action="insert", winner_id=atom.id, reason="no_conflict", conflict_key=conflict_key)

@@ -59,3 +59,46 @@ def test_capture_skips_l1_extraction_for_system_source(mock_config):
     assert _count_extract_jobs(mock_config) == 0
     assert store.stats()["atoms"] == 0
 
+
+def test_capture_skips_llm_extraction_for_plain_chitchat(mock_config):
+    """普通对话(提问/命令/寒暄)不进 LLM 抽取队列,只留 L0。
+
+    验证 _is_memorable_turn 闸门:这些轮次过 min_turn_chars 但不值得记忆。
+    """
+    scope = MemoryScope(role_name="default", session_id="s1")
+
+    for user_msg in (
+        "帮我看看这个报错是什么原因造成的呢",       # 提问("帮我"开头)
+        "今天天气不错我们出去走走散散步吧",          # 寒暄
+        "运行一下这个脚本看看输出的结果如何",        # 命令噪声("运行")
+    ):
+        capture_turn_memories(mock_config, scope, user_msg, "ok")
+
+    store = get_memory_store(mock_config)
+    assert store.stats()["turns"] == 3  # L0 仍写入
+    assert _count_extract_jobs(mock_config) == 0  # 不进 LLM 抽取队列
+    assert store.stats()["atoms"] == 0  # 也不走规则抽取写 atom
+
+
+def test_capture_skips_llm_extraction_for_question_with_intent_word(mock_config):
+    """提问句式即使含正向意图词("以后")也被排除——它是问句不是陈述事实。"""
+    scope = MemoryScope(role_name="default", session_id="s1")
+
+    capture_turn_memories(mock_config, scope, "我以后到底应该怎么配置这个参数比较好？", "ok")
+
+    store = get_memory_store(mock_config)
+    assert store.stats()["turns"] == 1
+    assert _count_extract_jobs(mock_config) == 0
+    assert store.stats()["atoms"] == 0
+
+
+def test_capture_enqueues_llm_extraction_for_explicit_preference(mock_config):
+    """显式偏好陈述过闸,进入 LLM 抽取队列。"""
+    scope = MemoryScope(role_name="default", session_id="s1")
+
+    capture_turn_memories(mock_config, scope, "请你记住,以后所有回答一律使用中文并且保持简洁。", "ok")
+
+    store = get_memory_store(mock_config)
+    assert store.stats()["turns"] == 1
+    assert _count_extract_jobs(mock_config) == 1  # 过闸,入队 LLM 抽取
+
