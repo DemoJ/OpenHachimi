@@ -33,9 +33,6 @@ vision:
   detail: auto                # OpenAI image_url.detail：auto / low / high
   max_images_per_message: 4
   max_image_size_mb: 10
-  # vision.prompt 已废弃：图片识别提示词改由 user/system_prompts/vision/default_user.md
-  # 覆盖（详见 user/system_prompts/README.md）。此 yaml 字段不再读取，
-  # 旧值会在首次启动时自动迁移到上述 .md 并从本文件清除。
 
 paths:
   roles_dir: user/roles
