@@ -19,39 +19,45 @@ from openhachimi_agent.tools import MAIN_TOOLSET
 logger = logging.getLogger(__name__)
 
 
-def should_pass_through_validation(signal: dict | None, session_state: dict) -> str | None:
-    """检测 final-answer validator 是否应短路放行。返回放行原因(用于日志),否则 None。
+def _build_unfinished_reminder(signal: dict | None) -> str | None:
+    """根据 final verification signal 里的 unfinished_todos 生成软提醒文案。
 
-    放行路径:所有未完成任务都显式标 ``blocked``,且最近无工具失败 —— 模型不是
-    乱标 done 而是诚实声明卡点。在 ledger 写入之前判断,避免污染
-    ``_replan_after_execution_signal`` 的连续 blocked 检测。
+    闸门2 对 unfinished_todos 不再打回(对齐 Hermes:停止闸门不卡 TODO 是否全完成),
+    而是在模型最终回复末尾追加这段提醒后放行。返回 None 表示无未完成项,无需追加。
 
-    历史上还有一条"_user_clarification 已写入则放行"的分支。该分支随 clarify_user
-    切到 ``CallDeferred`` 机制后已无意义:抛 CallDeferred 后 run 在 graph 层立刻
-    终止,output 是 ``DeferredToolRequests`` 而非 ``str``,validator 整段都不会
-    被触发。
+    仅统计 pending/in-progress(blocked/done 视为合法终止态,不提醒)。
+    若 signal 同时含 latest_execution_not_successful,返回 None——失败优先走打回
+    路径,软提醒不重复出现。
     """
     if not signal:
         return None
-
     issues = signal.get("issues", []) if isinstance(signal, dict) else []
     has_latest_failure = any(
         isinstance(issue, dict) and issue.get("type") == "latest_execution_not_successful"
         for issue in issues
     )
-    unfinished_issues = [
-        issue for issue in issues
+    if has_latest_failure:
+        return None
+    unfinished_items = [
+        item for issue in issues
         if isinstance(issue, dict) and issue.get("type") == "unfinished_todos"
+        for item in issue.get("items", [])
+        if isinstance(item, dict)
     ]
-    if unfinished_issues and not has_latest_failure:
-        all_items = [
-            item for issue in unfinished_issues
-            for item in issue.get("items", [])
-            if isinstance(item, dict)
-        ]
-        if all_items and all(item.get("status") == "blocked" for item in all_items):
-            return f"all unfinished todos blocked (count={len(all_items)})"
-    return None
+    pending = [it for it in unfinished_items if it.get("status") in {"pending", "in-progress"}]
+    if not pending:
+        return None
+    lines = [
+        f"  - [{it.get('status', '?')}] #{it.get('id', '?')} {it.get('description', '')}"
+        for it in pending[:10]
+    ]
+    return (
+        "\n\n---\n[System 提醒] 当前计划仍有 "
+        f"{len(pending)} 项未完成（pending/in-progress）：\n"
+        + "\n".join(lines)
+        + "\n若这些项确实无法继续，请在回复里如实告知用户：已完成什么、卡在哪、需要什么；"
+          "不要装作全部完成。"
+    )
 
 
 def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None, run_mode: str = "interactive") -> Agent:
@@ -180,7 +186,12 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             # ── 闸门 1:验证缺口(workspace_edited 后无 fresh evidence) ──
             # 照搬 Hermes verification_stop:模型编辑了代码却想直接结束,先 nudge 它验证。
             # nudge 内部自带 max_attempts 上限,超限即返回 None 放行,不会死循环。
-            verify_nudge = build_verify_on_stop_nudge(session_state)
+            # 透传 session_store/session_id 让 nudge 能引用"上次验证"证据(若已持久化)。
+            verify_nudge = build_verify_on_stop_nudge(
+                session_state,
+                session_store=getattr(ctx.deps, "session_store", None),
+                session_id=ctx.deps.session_id,
+            )
             if verify_nudge:
                 try:
                     _append_ledger_event(
@@ -195,29 +206,44 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                     logger.debug("failed to append verification_stop event to ledger", exc_info=True)
                 raise ModelRetry(verify_nudge)
 
-            # ── 闸门 2:final verification signal(未完成 TODO + 最近工具失败) ──
+            # ── 闸门 2:final verification signal ──
+            # signal 含两类 issue:
+            #   - unfinished_todos:计划仍有 pending/in-progress 项。
+            #   - latest_execution_not_successful:本轮最近一次工具调用 failed。
+            #
+            # 语义(对齐 Hermes:停止闸门只校验"别带着失败装完成",不卡 TODO 是否全完成):
+            #   - unfinished_todos → 降级为软提醒:在 result 末尾追加提示后放行,不打回。
+            #     旧实现强制 TODO 全 done/blocked 才能结束,逼模型撒谎标 done 或标 blocked
+            #     逃避交互;现在模型说停就停,用户仍能看到"还有没做完的"提醒。
+            #   - latest_execution_not_successful → 仍打回(别带着失败装完成),带硬熔断。
             signal = get_final_verification_signal(session_state)
             if not signal:
                 return result
 
-            # 短路放行:见 should_pass_through_validation 文档(在 ledger 写入之前判断,
-            # 避免污染连续 blocked 检测)。
-            passthrough_reason = should_pass_through_validation(signal, session_state)
-            if passthrough_reason:
+            issues = signal.get("issues", []) if isinstance(signal, dict) else []
+            latest_failure_issues = [
+                issue for issue in issues
+                if isinstance(issue, dict) and issue.get("type") == "latest_execution_not_successful"
+            ]
+
+            # ── unfinished_todos 软提醒:追加后放行,不打回 ──
+            reminder = _build_unfinished_reminder(signal)
+            if reminder:
+                pending_count = reminder.count("\n  - [")
                 logger.info(
-                    "validator pass-through: %s (session=%s)",
-                    passthrough_reason,
+                    "validator soft-remind unfinished todos (session=%s, pending=%d)",
                     ctx.deps.session_id,
+                    pending_count,
                 )
                 session_state["_final_validator_yielded"] = True
                 session_state["_final_validator_last_signal"] = signal
-                return result
+                return result + reminder
 
+            # ── latest_execution_not_successful 打回(带硬熔断) ──
+            # 到这里要么只有 latest_failure,要么 latest_failure + unfinished 同时存在
+            # (工具刚失败 + 还有未完成项)——失败优先打回,让模型先处理失败。
             counter = int(session_state.get(VALIDATOR_RETRY_KEY, 0) or 0)
 
-            # 同时把"validator 打回"记入 execution_ledger,让上层 executor.py 的
-            # _replan_after_execution_signal 能感知到这条卡死的链条,在合适时机
-            # 触发 replan(get_replan_signal 会看到连续 blocked 事件)。
             try:
                 _append_ledger_event(
                     session_state,
@@ -235,9 +261,6 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
                 logger.debug("failed to append validator event to ledger", exc_info=True)
 
             # 硬熔断:已经被打回 >=VALIDATOR_HARD_LIMIT 次,放行,把模型的话给用户。
-            # 兜底"无解任务"场景(工具/权限缺失、用户输入不完整、模型坚持自己已完成等),
-            # 避免 UnexpectedModelBehavior 把对话整轮报废。模型本来想说的话会和
-            # 系统追加的"[System] 任务未完成"提示一起返回,由 executor.py 决定追加方式。
             if counter >= VALIDATOR_HARD_LIMIT:
                 logger.warning(
                     "final answer validator yielding after %d retries to avoid loop "
@@ -252,64 +275,31 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
 
             session_state[VALIDATOR_RETRY_KEY] = counter + 1
 
-            # 把未完成的 TODO 详情直接列在 ModelRetry 里。原版只说"请调用 update_todo
-            # 将所有完成的任务状态更新为 done"——但任务从未真正完成,模型按指示
-            # 标 done 等同于撒谎;不按又陷入死循环。新版给出具体可操作的下一步,
-            # 让模型从"该不该标 done"转向"先 get_todos 看清状态、再 in-progress、
-            # 再调真实工具",打破认知误区。
-            issues = signal.get("issues", []) if isinstance(signal, dict) else []
-            unfinished_lines: list[str] = []
-            latest_failure_lines: list[str] = []
-            for issue in issues:
-                if not isinstance(issue, dict):
-                    continue
-                if issue.get("type") == "unfinished_todos":
-                    for item in issue.get("items", [])[:10]:
-                        if isinstance(item, dict):
-                            unfinished_lines.append(
-                                f"  - [{item.get('status', '?')}] #{item.get('id', '?')} {item.get('description', '')}"
-                            )
-                elif issue.get("type") == "latest_execution_not_successful":
-                    latest_failure_lines.append(
-                        f"  - 上一次 `{issue.get('tool_name', '?')}` 以 `{issue.get('status', '?')}` 结束："
-                        f"{(issue.get('detail') or '')[:300]}"
-                    )
-
-            parts = [
-                f"[系统拦截] 你不能现在就给用户最终回复——当前轮的任务尚未真正完成（第 {counter + 1} 次拦截）。",
+            latest_failure_lines = [
+                f"  - 上一次 `{issue.get('tool_name', '?')}` 以 `{issue.get('status', '?')}` 结束："
+                f"{(issue.get('detail') or '')[:300]}"
+                for issue in latest_failure_issues
             ]
-            if unfinished_lines:
-                parts.append("未完成的 TODO：\n" + "\n".join(unfinished_lines))
+            parts = [
+                f"[系统拦截] 你不能现在就给用户最终回复——最近一次工具调用没有成功"
+                f"（第 {counter + 1} 次拦截）。",
+            ]
             if latest_failure_lines:
-                parts.append("最近一次工具调用没有成功：\n" + "\n".join(latest_failure_lines))
-
-            # 检查本轮是否已经查看过计划。如果已经查看过，validator 不再强制要求
-            # get_todos（避免冗余循环），直接给出增量执行指令。
-            plan_already_viewed = bool(ctx.deps.session_state.get("_plan_viewed_this_turn", False))
-            if plan_already_viewed:
+                parts.append("失败详情：\n" + "\n".join(latest_failure_lines))
+            parts.append(
+                "请按以下顺序操作，**不要给用户回复任何文字**：\n"
+                "1. 根据上面的失败详情判断根因（参数错？路径不存在？权限？依赖缺失？）；\n"
+                "2. 修正后重试该工具，或换用其它工具/方案；\n"
+                "3. 若确实无法继续（外部条件缺失、需要用户决策），"
+                "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
+                "然后在最终回复里如实告知用户卡在哪、需要什么——不要装作完成。"
+            )
+            # 第 2 次拦截仍未通过 = 同一卡点重试过仍失败,引导模型修订计划而非硬重试。
+            if counter >= 1:
                 parts.append(
-                    "请按以下顺序操作，**不要给用户回复任何文字**：\n"
-                    "1. 挑出第一个 status=pending 且依赖已 done 的任务，"
-                    "用 `update_todo(id, \"in-progress\")` 标记（如果已有 in-progress 任务则跳过此步）；\n"
-                    "2. 调用相应执行工具（write_file/run_command/web_fetch/web_search 等）真正完成它；\n"
-                    "3. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
-                    "4. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），"
-                    "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
-                    "然后在最终回复里清楚告知用户：已完成什么 / 卡在哪 / 需要什么——"
-                    "不要装作完成。"
-                )
-            else:
-                parts.append(
-                    "请按以下顺序操作，**不要给用户回复任何文字**：\n"
-                    "1. 调用 `get_todos` 查看完整列表；\n"
-                    "2. 挑出第一个 status=pending 且依赖已 done 的任务，"
-                    "用 `update_todo(id, \"in-progress\")` 标记；\n"
-                    "3. 调用相应执行工具（write_file/run_command/web_fetch/web_search 等）真正完成它；\n"
-                    "4. 完成后 `update_todo(id, \"done\", notes=...)`，再继续下一项；\n"
-                    "5. 如果某项确实**无法**继续（外部条件缺失、需要用户决策），\n"
-                    "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
-                    "然后在最终回复里清楚告知用户：已完成什么 / 卡在哪 / 需要什么——"
-                    "不要装作完成。"
+                    "你已连续失败多次。如果原计划的这一步确实走不通,考虑用 "
+                    "`create_todos(merge=True, tasks=[...])` 修订计划:把受阻任务标 "
+                    "blocked、追加替代步骤,按新计划继续——不要反复以同样方式重试。"
                 )
             parts.append(
                 "禁止在文字里模仿工具返回格式（如 \"✅ 任务 X → done\"）；"

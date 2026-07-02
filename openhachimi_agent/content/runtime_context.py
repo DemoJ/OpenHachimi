@@ -210,6 +210,27 @@ def _todo_handoff_block(deps: AgentDeps) -> str:
         return ""
 
 
+def _planning_guide_block(deps: AgentDeps) -> str:
+    """无活动 TODO 时注入"规划引导"。
+
+    与 ``_todo_handoff_block`` 互斥:有活动 TODO 说明已进入执行阶段,规划引导让位
+    给接力块;无 TODO 时模型可能正要接手一个复杂任务,此时注入规划粒度标准,引导
+    它"先想清楚再 create_todos",而不是建一堆粗糙的一句话任务就开干。
+
+    简单任务(1-2 步)即使看到这段引导也会自行跳过——引导明确写了"简单任务直接做"。
+    """
+    session_state = getattr(deps, "session_state", None)
+    if not isinstance(session_state, dict):
+        return ""
+    if _has_active_todos_in_state(session_state):
+        return ""
+    try:
+        return render_system_prompt("runtime/planning_guide")
+    except Exception:  # noqa: BLE001
+        logger.debug("planning_guide render failed", exc_info=True)
+        return ""
+
+
 
 
 def _workspace_hint_block(deps: AgentDeps) -> str:
@@ -234,12 +255,16 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
     污染 —— 它们各自的角色提示词已经明确了职责。把 executor 专用块单独出口,
     在 ``factory.py`` 中只对 executor agent 注册。
 
-    输出顺序:``[执行接力规则? + 通用底线] [产物落点引导]
-    [技能索引]``。前一块按需,后两块常驻。
+    输出顺序:``[规划引导? | 执行接力规则? + 通用底线] [产物落点引导]
+    [技能索引]``。前两块按需且互斥(无 TODO 注入规划引导,有 TODO 注入接力块),
+    后两块常驻。
     """
     if deps is None:
         return ""
     blocks: list[str] = []
+    planning_guide = _planning_guide_block(deps)
+    if planning_guide:
+        blocks.append(planning_guide)
     handoff = _todo_handoff_block(deps)
     if handoff:
         blocks.append(handoff)

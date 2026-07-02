@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import CallDeferred
@@ -32,6 +33,70 @@ from pydantic_ai.exceptions import CallDeferred
 from openhachimi_agent.core.deps import AgentDeps
 
 logger = logging.getLogger(__name__)
+
+# 最多 4 个预设选项(对齐 Hermes clarify_tool.MAX_CHOICES)。UI 渲染成可点选行,
+# 第 5 个"其它(自行输入)"由前端自动追加。超过 4 个截断保留前 4 个。
+_MAX_CHOICES = 4
+
+
+def _flatten_choice(c: object) -> str:
+    """把单个 choice 强制归一为用户可见的展示字符串。
+
+    schema 声明 choices 为纯字符串数组,但 LLM 有时输出 dict 形
+    (如 ``[{"description": "..."}]``)。直接 ``str(c)`` 会把整个 dict 变成 Python
+    repr(``{'description': '...'}``)——这会泄露到每个渲染面(CLI/消息渠道/UI)
+    并且原样当作用户的答案回灌。在这里(唯一平台无关入口)统一 unwrap。
+
+    dict 取键顺序:label → description → text → title(对齐 Hermes);name/value
+    故意排除(它们常带枚举值或短标识,不是人读标签)。无任何已知键的 dict 丢弃
+    (返回空——垃圾标签不如没标签)。
+    """
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c.strip()
+    if isinstance(c, dict):
+        for key in ("label", "description", "text", "title"):
+            v = c.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(c, (list, tuple)):
+        return " ".join(_flatten_choice(x) for x in c).strip()
+    return str(c).strip()
+
+
+def _normalize_choices(value: object) -> list[str]:
+    """容错把模型给的 choices 归一为 ``list[str]``(最多 ``_MAX_CHOICES`` 个)。
+
+    - None / [] → [](开放问答,无预设选项)
+    - list → 逐项 _flatten_choice,丢空串,截断到 _MAX_CHOICES
+    - str → 尝试 JSON 解(模型常给字符串化 list);失败则按分隔符切分
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        flat = [s for s in (_flatten_choice(c) for c in value) if s]
+        return flat[:_MAX_CHOICES]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                flat = [s for s in (_flatten_choice(c) for c in parsed) if s]
+                return flat[:_MAX_CHOICES]
+            if isinstance(parsed, str) and parsed.strip():
+                return [parsed.strip()][:_MAX_CHOICES]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        for sep in (",", "，", "、", "\n", ";", "；"):
+            if sep in text:
+                flat = [s.strip() for s in text.split(sep) if s.strip()]
+                return flat[:_MAX_CHOICES]
+        return [text][:_MAX_CHOICES]
+    return []
 
 
 def _normalize_missing_inputs(value: object) -> list[str]:
@@ -78,25 +143,41 @@ def clarify_user(
     ctx: RunContext[AgentDeps],
     question: str,
     missing_inputs: list[str] | str | None = None,
+    choices: list[str] | str | None = None,
 ) -> str:
-    """当你执行中发现必须由用户提供的信息缺失(凭据、账号、目标确认、二选一决策等)
-    且**无法通过工具自行获取**时,调用此工具一次性把所有缺失项问清楚。
+    """当你执行中发现需要用户介入才能继续时,调用此工具一次性问清。支持两种模式:
+
+    1. **多选**:提供最多 4 个 ``choices``,用户选其一(前端会自动加第 5 个"其它
+       (自行输入)")。适合需要用户在多个方案/选项间决策的场景。
+    2. **开放问答**:省略 ``choices``,用户自由文本回复。适合需要用户提供凭据、
+       账号、确认信息等开放输入的场景。
+
+    何时该用(对齐 Hermes clarify 的 4 类场景):
+    - 任务歧义,需要用户选一个方向(用 choices)
+    - 需要凭据/账号/确认等只有用户知道的信息(开放问答)
+    - 某步有多个可行方案、且 trade-off 需要用户权衡(用 choices)
+    - 想在继续前确认一个关键决策(用 choices)
+
+    何时**不要**用:
+    - 能用 read_file / list_files / run_command 自查的信息——先自查。
+    - 低风险决策——自己选一个合理默认值,别为求心安打断用户。
+    - 已经能确定下一步动作时不要调用此工具。
 
     调用后系统会:
     1. 把当前未完成的活动计划挂起(下一轮用户回答后自然 resume);
     2. **立刻终止本轮 agent.run()**,无需再 emit 任何文字、无需再调任何工具;
-    3. ``question`` 参数本身就是要发给用户的追问,系统会自动呈现给用户;
+    3. ``question`` 参数本身就是要发给用户的追问,系统会自动呈现给用户
+       (若提供 ``choices``,前端渲染成可点选项);
     4. 用户下一轮的回复会作为本次工具调用的返回值无感知地灌回,模型继续工作。
-
-    禁止滥用:
-    - 能用 read_file / list_files / run_command 自查的信息**不要**问用户;
-    - **不要**在已经能确定下一步动作时为求心安调用此工具;
-    - 调用之后**不要**再 emit 任何文字——``question`` 本身就是给用户看的。
 
     参数:
     - question: 给用户的自然语言追问,清楚说明你需要什么、为什么需要。
+      **不要**把选项文本写进 question——选项放进 ``choices`` 数组,question 只放
+      问题本身(如"部署到哪个环境?",choices=["staging","prod"])。
     - missing_inputs: 可选,简短罗列每一项缺失输入的名称(如 ["发件人邮箱",
       "SMTP 授权码"]),帮助用户一次性提供齐全。
+    - choices: 可选,最多 4 个预设选项。提供时为多选模式;省略为开放问答模式。
+      每个 choice 是一个字符串(也接受 dict 形如 {"description":"..."} 会自动取值)。
     """
     cleaned_question = (question or "").strip()
     if not cleaned_question:
@@ -109,6 +190,7 @@ def clarify_user(
         )
 
     cleaned_missing = _normalize_missing_inputs(missing_inputs)
+    cleaned_choices = _normalize_choices(choices)
 
     # 延迟 import:tools 包初始化期间 service.agent_runtime.context 还没就绪。
     from openhachimi_agent.service.agent_runtime.context import (
@@ -120,12 +202,17 @@ def clarify_user(
 
     # 写 session_state:
     # - turn.py 在看到 DeferredToolRequests 输出时读 question 当本轮 assistant 回复;
-    # - execute_task_resume 在下一轮读 tool_call_id 构造 DeferredToolResults。
-    session_state["_user_clarification"] = {
+    # - execute_task_resume 在下一轮读 tool_call_id 构造 DeferredToolResults;
+    # - choices 供前端渲染可点选项(created_at 供超时兜底判断)。
+    clarification_entry: dict[str, object] = {
         "question": cleaned_question,
         "missing_inputs": cleaned_missing,
         "tool_call_id": ctx.tool_call_id,
+        "created_at": time.time(),
     }
+    if cleaned_choices:
+        clarification_entry["choices"] = cleaned_choices
+    session_state["_user_clarification"] = clarification_entry
 
     if has_active_todos(session_state):
         suspend_current_plan(
@@ -134,15 +221,17 @@ def clarify_user(
             detail={
                 "question": cleaned_question,
                 "missing_inputs": cleaned_missing,
+                "choices": cleaned_choices,
             },
             deps=ctx.deps,
         )
 
     logger.info(
-        "clarify_user invoked session_id=%s tool_call_id=%s missing=%s question=%r",
+        "clarify_user invoked session_id=%s tool_call_id=%s missing=%s choices=%d question=%r",
         ctx.deps.session_id,
         ctx.tool_call_id,
         cleaned_missing,
+        len(cleaned_choices),
         cleaned_question[:120],
     )
 
@@ -150,10 +239,11 @@ def clarify_user(
     # "external"(等外部回灌结果)、把 DeferredToolRequests 作为 run 的 output 返回,
     # 当前 run 在此刻终止。模型不会被询问要不要 emit 别的文字、不会再调任何工具,
     # final-answer validator / self_critique 等下游裁判全都跑不到。
-    raise CallDeferred(
-        metadata={
-            "kind": "clarify_user",
-            "question": cleaned_question,
-            "missing_inputs": cleaned_missing,
-        }
-    )
+    metadata: dict[str, object] = {
+        "kind": "clarify_user",
+        "question": cleaned_question,
+        "missing_inputs": cleaned_missing,
+    }
+    if cleaned_choices:
+        metadata["choices"] = cleaned_choices
+    raise CallDeferred(metadata=metadata)

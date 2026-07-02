@@ -98,3 +98,157 @@ def test_reset_clears_stale():
     reset_turn_verification(session_state)
     assert _state(session_state)["workspace_edited"] is False
     assert _state(session_state)["nudge_attempts"] == 0
+
+
+# ── 文件类型过滤:纯文本/文档编辑不触发验证 nudge ──
+
+
+def test_non_code_edit_does_not_mark_stale():
+    """write_file 改 .md/.txt 等纯文本 → 不置 stale,闸门放行(照搬 Hermes)。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "docs/README.md"})
+    assert _state(session_state).get("workspace_edited") is not True
+    assert build_verify_on_stop_nudge(session_state) is None
+
+    # .txt / LICENSE 同理
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "NOTES.txt"})
+    assert _state(session_state).get("workspace_edited") is not True
+
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "LICENSE"})
+    assert _state(session_state).get("workspace_edited") is not True
+
+
+def test_code_edit_still_marks_stale():
+    """write_file 改 .py/.ts 等代码 → 仍置 stale,闸门 nudge。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "src/app.py"})
+    assert _state(session_state)["workspace_edited"] is True
+    assert build_verify_on_stop_nudge(session_state) is not None
+
+
+def test_replace_in_file_non_code_does_not_mark_stale():
+    """replace_in_file 改 .md → 不置 stale。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "replace_in_file", {"file_path": "guide.md"})
+    assert _state(session_state).get("workspace_edited") is not True
+
+
+def test_edit_without_path_arg_conservatively_marks_stale():
+    """读不到路径参数时保守置 stale(不误放,宁可多 nudge 一次)。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", None)
+    assert _state(session_state)["workspace_edited"] is True
+
+
+def test_non_file_edit_tool_ignores_path_arg():
+    """run_command 身兼 edit/verify 两职:不论带什么路径参数,net 都自验证不 stale
+    (文件类型过滤只对 write_file/replace_in_file 生效)。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "run_command", {"file_path": "readme.md"})
+    assert build_verify_on_stop_nudge(session_state) is None
+
+
+# ── nudge 引用最近验证证据 ──
+
+
+class _FakeEvidenceStore:
+    """最小 mock:load_recent_verification_evidence 返回预设列表。"""
+
+    def __init__(self, evidence):
+        self._evidence = evidence
+        self.calls = []
+
+    def load_recent_verification_evidence(self, session_id, limit=5):
+        self.calls.append((session_id, limit))
+        return self._evidence
+
+
+def test_nudge_includes_recent_evidence_when_store_provided():
+    """传 session_store + session_id 时,nudge 附上"上次验证"引用。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "src/app.py"})
+    store = _FakeEvidenceStore([{
+        "command": "pytest -x",
+        "cwd": ".",
+        "output_summary": "3 failed, 1 passed",
+        "is_running": False,
+        "created_at": "2026-07-01T00:00:00Z",
+        "seq": 1,
+    }])
+    nudge = build_verify_on_stop_nudge(session_state, session_store=store, session_id="sess-1")
+    assert nudge is not None
+    assert "上次验证参考" in nudge
+    assert "pytest -x" in nudge
+    assert "已结束" in nudge
+    assert "3 failed, 1 passed" in nudge
+    # 调用方传了正确的 session_id
+    assert store.calls[-1][0] == "sess-1"
+
+
+def test_nudge_without_store_degrades_to_original_text():
+    """不传 session_store 时退化为原文案(向后兼容),不含"上次验证"引用。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "src/app.py"})
+    nudge = build_verify_on_stop_nudge(session_state)
+    assert nudge is not None
+    assert "上次验证参考" not in nudge
+    assert "验证缺口" in nudge
+
+
+def test_nudge_without_evidence_omits_reference():
+    """传了 store 但无证据记录时,不附"上次验证"引用(退化为原文案)。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "src/app.py"})
+    store = _FakeEvidenceStore([])
+    nudge = build_verify_on_stop_nudge(session_state, session_store=store, session_id="sess-1")
+    assert nudge is not None
+    assert "上次验证参考" not in nudge
+
+
+def test_nudge_evidence_running_status_label():
+    """证据 is_running=True 时显示"仍在运行中"。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "src/app.py"})
+    store = _FakeEvidenceStore([{
+        "command": "pytest",
+        "cwd": ".",
+        "output_summary": "running...",
+        "is_running": True,
+        "created_at": "2026-07-01T00:00:00Z",
+        "seq": 1,
+    }])
+    nudge = build_verify_on_stop_nudge(session_state, session_store=store, session_id="sess-1")
+    assert nudge is not None
+    assert "仍在运行中" in nudge
+
+
+def test_nudge_evidence_summary_truncated_to_tail():
+    """证据 output_summary 超长时只保留末尾 200 字。"""
+    session_state = {}
+    reset_turn_verification(session_state)
+    mark_tool_succeeded(session_state, "write_file", {"file_path": "src/app.py"})
+    long_summary = "HEAD-" + "y" * 300 + "-TAIL"
+    store = _FakeEvidenceStore([{
+        "command": "pytest",
+        "cwd": ".",
+        "output_summary": long_summary,
+        "is_running": False,
+        "created_at": "2026-07-01T00:00:00Z",
+        "seq": 1,
+    }])
+    nudge = build_verify_on_stop_nudge(session_state, session_store=store, session_id="sess-1")
+    assert nudge is not None
+    # 末尾 TAIL 保留,头部 HEAD 被截断
+    assert "TAIL" in nudge
+    assert "HEAD-" not in nudge

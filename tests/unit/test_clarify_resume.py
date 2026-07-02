@@ -221,3 +221,75 @@ def test_non_clarify_tool_call_still_emits_card():
     assert item is not None
     assert item.type == "tool"
     assert "read_file" in item.tool_name or "读取" in item.text
+
+
+# ── clarify 超时兜底 ──
+
+
+def test_clarification_not_expired_within_timeout():
+    """created_at 在阈值内 → 不算过期,正常 resume。"""
+    import time as _time
+
+    from openhachimi_agent.service.agent_runtime.turn import _clarification_expired
+
+    session_state = {"_user_clarification": {
+        "question": "问", "tool_call_id": "c1", "created_at": _time.time() - 60,
+    }}
+    assert _clarification_expired(session_state) is False
+
+
+def test_clarification_expired_after_timeout():
+    """created_at 超过阈值 → 算过期。"""
+    import time as _time
+
+    from openhachimi_agent.service.agent_runtime import turn as turn_mod
+    from openhachimi_agent.service.agent_runtime.turn import _clarification_expired
+
+    session_state = {"_user_clarification": {
+        "question": "问", "tool_call_id": "c1",
+        "created_at": _time.time() - turn_mod._CLARIFY_TIMEOUT_SECONDS - 1,
+    }}
+    assert _clarification_expired(session_state) is True
+
+
+def test_clarification_without_created_at_not_expired():
+    """旧版本写入的 clarification 无 created_at → 不参与超时判定(向后兼容)。"""
+    from openhachimi_agent.service.agent_runtime.turn import _clarification_expired
+
+    session_state = {"_user_clarification": {
+        "question": "问", "tool_call_id": "c1",
+    }}
+    assert _clarification_expired(session_state) is False
+
+
+def test_clarification_expired_with_no_pending():
+    """无 _user_clarification → 不算过期。"""
+    from openhachimi_agent.service.agent_runtime.turn import _clarification_expired
+
+    assert _clarification_expired({}) is False
+    assert _clarification_expired({"_user_clarification": None}) is False
+
+
+def test_expire_clarification_clears_flag_and_injects_nudge():
+    """_expire_clarification 清掉 _user_clarification 并往 history 注入系统提示。"""
+    from openhachimi_agent.service.agent_runtime.turn import _expire_clarification
+
+    session_state = {"_user_clarification": {
+        "question": "请提供凭据", "tool_call_id": "c1", "created_at": 0,
+    }}
+    ctx = _ctx(session_state=session_state, history=[])
+    assert len(ctx.history) == 0
+
+    _expire_clarification(ctx)
+
+    # 标志已清 → 后续 _resolve_turn_outcome 会 fall through 到正常 run
+    assert "_user_clarification" not in session_state
+    # history 注入了一条 ModelRequest(系统提示)
+    assert len(ctx.history) == 1
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+    parts = ctx.history[0].parts
+    assert any(isinstance(p, SystemPromptPart) for p in parts)
+    nudge_text = next(p.content for p in parts if isinstance(p, SystemPromptPart))
+    assert "长时间未回复" in nudge_text
+    assert "请提供凭据" in nudge_text

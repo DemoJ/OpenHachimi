@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 
 # ── 改动工作区的工具 ──────────────────────────────────────────────────────
@@ -43,6 +44,65 @@ _EDIT_TOOLS: frozenset[str] = frozenset(
         "install_skill",
     }
 )
+
+
+# ── 纯文本/文档后缀:编辑这些不触发验证 nudge ─────────────────────────────
+# 照搬 Hermes verification_stop._NON_CODE_VERIFY_EXTENSIONS:文档/散文/数据标记
+# 没有可验证的运行时行为,改完不需要跑测试/lint。避免"改了个 README 就被 nudge
+# 去跑验证"的误报。
+_NON_CODE_VERIFY_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".mdx",
+        ".rst",
+        ".txt",
+        ".text",
+        ".adoc",
+        ".asciidoc",
+        ".org",
+        ".log",
+        ".csv",
+        ".tsv",
+    }
+)
+
+# 纯文本文件名(无后缀或后缀不在上面集合):LICENSE / CHANGELOG 等。
+_NON_CODE_VERIFY_FILENAMES: frozenset[str] = frozenset(
+    {
+        "license",
+        "licence",
+        "notice",
+        "authors",
+        "contributors",
+        "changelog",
+        "codeowners",
+    }
+)
+
+# 会带文件路径参数的工具——mark_tool_succeeded 据此从 bound_args 里抽路径做后缀判断。
+# 路径参数名因工具而异,这里列已知;未列出的工具读不到路径时保守置 stale(不误放)。
+_PATH_ARG_NAMES: tuple[str, ...] = ("file_path", "path", "target")
+
+
+def is_non_code_path(raw: str | None) -> bool:
+    """该路径是否为文档/散文/数据标记(改了也不需要跑验证)。
+
+    照搬 Hermes:看后缀是否在纯文本集合,或无后缀时看文件名是否为 LICENSE/CHANGELOG 等。
+    解析失败返回 False(保守认为需要验证)。
+    """
+    if not raw:
+        return False
+    try:
+        p = Path(str(raw))
+    except Exception:
+        return False
+    suffix = p.suffix.lower()
+    if suffix in _NON_CODE_VERIFY_EXTENSIONS:
+        return True
+    if not suffix and p.name.lower() in _NON_CODE_VERIFY_FILENAMES:
+        return True
+    return False
 
 
 # ── 产出验证证据的工具 ─────────────────────────────────────────────────────
@@ -95,4 +155,5 @@ __all__ = [
     "verify_tools",
     "is_edit_tool",
     "is_verify_tool",
+    "is_non_code_path",
 ]

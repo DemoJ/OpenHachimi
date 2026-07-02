@@ -65,6 +65,56 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# clarify_user 跨轮 deferred 的超时阈值(秒)。clarify 发出后若用户超过此时长才回
+# 复,视为"过期"——不再把用户的新消息当作那条旧追问的回复灌回(用户可能已经切换
+# 话题),而是清掉 deferred 标志走正常 run,并给模型注入一条提示说明情况。
+# TODO: 后续可提取到 config(如 agent.clarify_timeout_seconds),P1 先用常量。
+_CLARIFY_TIMEOUT_SECONDS = 600  # 10 分钟
+
+
+def _clarification_expired(session_state: dict[str, object]) -> bool:
+    """检查挂起的 ``_user_clarification`` 是否已超时。
+
+    无 ``created_at`` 字段(旧版本写入的)视为不过期,保持向后兼容——只有新写入
+    的 clarification 才带时间戳,参与超时判定。
+    """
+    pending = session_state.get("_user_clarification")
+    if not isinstance(pending, dict):
+        return False
+    created_at = pending.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        return False
+    return (time.time() - float(created_at)) > _CLARIFY_TIMEOUT_SECONDS
+
+
+def _expire_clarification(ctx: AgentRunContext) -> None:
+    """超时兜底:清掉过期的 ``_user_clarification``,注入提示让模型知道情况。
+
+    清标志后 ``_resolve_turn_outcome`` 会 fall through 到正常 ``run_main_agent``,
+    用户这条新消息作为普通 user prompt 进入模型,而非被当作旧追问的回复。
+    """
+    pending = ctx.session_state.pop("_user_clarification", None) or {}
+    question = pending.get("question") or ""
+    question_preview = str(question)[:120]
+    try:
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+        nudge = (
+            "[System 提示] 你之前在执行中调用 clarify_user 向用户追问过"
+            f"(问题: \"{question_preview}\"),但用户长时间未回复。"
+            "现在用户发来了新消息——请判断这条消息是否仍是在回答那个追问:"
+            "如果是,基于该回答继续;如果不是(用户已切换话题),按新消息处理,"
+            "不要强行回到旧追问。若原任务仍需那个信息才能继续,可在合适时机再次追问。"
+        )
+        ctx.history.append(ModelRequest(parts=[SystemPromptPart(content=nudge)]))
+        logger.info(
+            "clarification expired, falling back to normal run session_id=%s question=%r",
+            ctx.session_id,
+            question_preview,
+        )
+    except Exception:
+        logger.debug("failed to inject clarification-expiry nudge", exc_info=True)
+
 
 async def _cancel_and_drain_task(task: asyncio.Task, *, reason: str) -> None:
     """取消后台 agent task 并等待其清理完成。
@@ -105,6 +155,10 @@ def _finalize_outcome(
         pending = session_state.get("_user_clarification") or {}
         question_text = pending.get("question") or "需要你提供更多信息以继续。"
         result_holder["clarification_question"] = question_text
+        # 多选模式:把 choices 透传给前端渲染可点选项(无 choices 时为开放问答)。
+        choices = pending.get("choices")
+        if isinstance(choices, list) and choices:
+            result_holder["clarification_choices"] = list(choices)
     elif outcome.final_verification_signal:
         result_holder["final_verification_signal"] = outcome.final_verification_signal
     # 正常完成:无额外动作
@@ -168,9 +222,13 @@ async def _resolve_turn_outcome(
     session_state = ctx.session_state
     outcome = None
     if session_state.get("_user_clarification"):
-        await _refresh_mcp_once(service, ctx, deps, refreshed)
-        outcome = await resume_main_agent(ctx, service._get_agent)
-        # 状态损坏导致无法 resume → outcome=None,fall through 到正常流程。
+        if _clarification_expired(session_state):
+            # 超时兜底:用户隔太久才回,不再当旧追问的回复灌回,改走正常 run。
+            _expire_clarification(ctx)
+        else:
+            await _refresh_mcp_once(service, ctx, deps, refreshed)
+            outcome = await resume_main_agent(ctx, service._get_agent)
+            # 状态损坏导致无法 resume → outcome=None,fall through 到正常流程。
 
     if outcome is None:
         await _refresh_mcp_once(service, ctx, deps, refreshed)

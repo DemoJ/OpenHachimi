@@ -69,6 +69,10 @@ def is_known_channel(channel: str | None) -> bool:
 
 SQLITE_BUSY_TIMEOUT_SECONDS = 30
 
+# 每会话保留的验证证据条数上限。类比 execution_ledger._LEDGER_LIMIT=200,但这里
+# 是跨轮持久归档(内存 ledger 是本轮即时状态),取更小值避免无限增长。超限删最旧。
+_VERIFY_EVIDENCE_LIMIT = 50
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -172,6 +176,23 @@ class SessionStore:
                     state_json   TEXT NOT NULL,
                     updated_at   TEXT NOT NULL
                 );
+
+                -- 验证证据归档:run_command/command_status 成功时写入,供 verification_stop
+                -- 闸门 nudge 引用"上次验证跑了什么命令、输出啥"。精简持久化:不存 exit_code
+                -- (run_command 不返回),不做 passed/failed 判定,只留命令文本+输出摘要+
+                -- 运行状态+时间戳,跨进程留存。每会话保留最近 N 条(见 _VERIFY_EVIDENCE_LIMIT)。
+                CREATE TABLE IF NOT EXISTS verification_evidence (
+                    session_id     TEXT NOT NULL,
+                    seq            INTEGER NOT NULL,
+                    command        TEXT NOT NULL,
+                    cwd            TEXT NOT NULL,
+                    output_summary TEXT NOT NULL,
+                    is_running     INTEGER NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    PRIMARY KEY (session_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_verify_evidence_session
+                    ON verification_evidence(session_id, seq DESC);
 
                 -- 压缩元数据:原始消息永不删(session_messages append-only),压缩只记边界+摘要,
                 -- AI 运行时上下文(load_context)与前端展示按此表组装/折叠出视图。
@@ -837,6 +858,9 @@ class SessionStore:
                 "DELETE FROM session_todos WHERE session_id = ?", (safe_sid,)
             )
             conn.execute(
+                "DELETE FROM verification_evidence WHERE session_id = ?", (safe_sid,)
+            )
+            conn.execute(
                 "DELETE FROM session_pointers WHERE role = ? AND session_id = ?",
                 (safe_role, safe_sid),
             )
@@ -844,6 +868,95 @@ class SessionStore:
                 "DELETE FROM sessions WHERE role = ? AND session_id = ?",
                 (safe_role, safe_sid),
             )  # CASCADE 自动删 session_messages
+
+    # ── 验证证据归档(run_command/command_status 写入,verification_stop 闸门读) ──
+
+    def record_verification_evidence(
+        self,
+        session_id: str,
+        *,
+        command: str,
+        cwd: str,
+        output_summary: str,
+        is_running: bool,
+    ) -> None:
+        """归档一条验证证据(命令文本 + 输出摘要 + 运行状态)。
+
+        精简持久化:不存 exit_code(run_command 不返回),只留够 verification_stop
+        闸门 nudge 引用的信息。每会话保留最近 ``_VERIFY_EVIDENCE_LIMIT`` 条,超限删最旧。
+        写入失败只 log warning,绝不阻断工具返回(证据归档是旁路,不是主路径)。
+        """
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM verification_evidence WHERE session_id = ?",
+                    (safe_sid,),
+                ).fetchone()
+                next_seq = int(row[0] or 0) + 1
+                conn.execute(
+                    "INSERT INTO verification_evidence"
+                    "(session_id, seq, command, cwd, output_summary, is_running, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        safe_sid,
+                        next_seq,
+                        str(command),
+                        str(cwd),
+                        str(output_summary)[:2000],
+                        1 if is_running else 0,
+                        _now_iso(),
+                    ),
+                )
+                # 超限删最旧(seq 最小)。
+                conn.execute(
+                    "DELETE FROM verification_evidence WHERE session_id = ? AND seq <= ?",
+                    (safe_sid, next_seq - _VERIFY_EVIDENCE_LIMIT),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "failed to record verification evidence session_id=%s: %s",
+                safe_sid,
+                exc,
+            )
+
+    def load_recent_verification_evidence(
+        self,
+        session_id: str,
+        limit: int = 5,
+    ) -> list[dict]:
+        """返回该会话最近 ``limit`` 条验证证据(seq DESC)。无则空列表。
+
+        供 verification_stop 闸门 nudge 引用"上次验证跑了什么"。读失败兜底空列表。
+        """
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT command, cwd, output_summary, is_running, created_at, seq "
+                    "FROM verification_evidence WHERE session_id = ? "
+                    "ORDER BY seq DESC LIMIT ?",
+                    (safe_sid, max(1, int(limit))),
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "failed to load verification evidence session_id=%s: %s",
+                safe_sid,
+                exc,
+            )
+            return []
+        return [
+            {
+                "command": row["command"],
+                "cwd": row["cwd"],
+                "output_summary": row["output_summary"],
+                "is_running": bool(row["is_running"]),
+                "created_at": row["created_at"],
+                "seq": int(row["seq"]),
+            }
+            for row in rows
+        ]
 
     # ── TODO state(原 .memory/todos/{sid}.json) ─────────────────────────
 
@@ -897,29 +1010,20 @@ class SessionStore:
                 status = v.get("status", "pending")
                 if status not in {"pending", "in-progress", "done", "blocked"}:
                     status = "pending"
-                parent_id = v.get("parent_id")
-                if parent_id is not None:
-                    parent_id = int(parent_id)
                 depends_on_raw = v.get("depends_on", [])
                 depends_on = (
                     [int(d) for d in depends_on_raw]
                     if isinstance(depends_on_raw, list) else []
                 )
-                # v.get("allowed_tools", ...) 被有意忽略 ——
-                # 老库可能仍带这个字段,但 TodoTask 已不再有它,丢弃即可保持向后兼容。
-                risk_level = v.get("risk_level", "low")
-                if risk_level not in {"low", "medium", "high"}:
-                    risk_level = "low"
+                # 老库可能仍带 parent_id/success_criteria/verification/risk_level/
+                # allowed_tools 等已删字段,这里一律忽略,只取当前 TodoTask 还保留的
+                # 字段,保持向后兼容(旧会话加载不丢任务)。
                 state.tasks[task_id] = TodoTask(
                     id=task_id,
                     description=str(v.get("description", "Unnamed Task")),
                     status=status,
                     notes=str(v.get("notes", "")),
-                    parent_id=parent_id,
                     depends_on=depends_on,
-                    success_criteria=str(v.get("success_criteria", "")),
-                    verification=str(v.get("verification", "")),
-                    risk_level=risk_level,
                     evidence=str(v.get("evidence", "")),
                 )
             except Exception as exc:  # noqa: BLE001

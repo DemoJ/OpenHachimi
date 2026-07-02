@@ -19,11 +19,7 @@ logger = logging.getLogger(__name__)
 class TodoTaskInput(TypedDict, total=False):
     id: int
     description: str
-    parent_id: int
     depends_on: list[int]
-    success_criteria: str
-    verification: str
-    risk_level: Literal["low", "medium", "high"]
 
 @dataclass
 class TodoTask:
@@ -31,11 +27,7 @@ class TodoTask:
     description: str
     status: Literal["pending", "in-progress", "done", "blocked"] = "pending"
     notes: str = ""
-    parent_id: int | None = None
     depends_on: list[int] = field(default_factory=list)
-    success_criteria: str = ""
-    verification: str = ""
-    risk_level: Literal["low", "medium", "high"] = "low"
     evidence: str = ""
 
 @dataclass
@@ -88,8 +80,6 @@ def _validate_tasks(tasks: dict[int, TodoTask]) -> None:
             raise ModelRetry(f"任务 ID 不一致：key={task_id}, id={task.id}")
         if not task.description.strip():
             raise ModelRetry(f"任务 {task_id} 的 description 不能为空")
-        if task.parent_id == task_id:
-            raise ModelRetry(f"任务 {task_id} 不能把自己设为父任务")
         for dep_id in task.depends_on:
             if dep_id == task_id:
                 raise ModelRetry(f"任务 {task_id} 不能依赖自身")
@@ -132,29 +122,22 @@ def _format_status_box(status: str) -> str:
 
 
 def _render_task_lines(state: TodoState) -> str:
-    """Render all top-level tasks (and their children) into formatted lines.
+    """Render all tasks into formatted lines as a flat priority-ordered list.
 
     Excludes the \"## 当前 TODO 列表：\" header — callers may want
     different prefixes (create summary, update summary, etc.).
+
+    列表顺序即优先级(对齐 Hermes todo schema 语义),不再用 parent_id 嵌套表达
+    层级——嵌套让模型分心构造图结构,扁平顺序更省力也更易读。
     """
     lines: list[str] = []
-    valid_ids = set(state.tasks.keys())
 
-    def render(task: TodoTask, depth: int) -> None:
-        indent = "  " * depth
+    for task in state.tasks.values():
         box = _format_status_box(task.status)
         deps_str = f" [依赖: {', '.join(map(str, task.depends_on))}]" if task.depends_on else ""
         note_str = f" (备注: {task.notes})" if task.notes else ""
-        criteria_str = f" [验收: {task.success_criteria}]" if task.success_criteria else ""
         evidence_str = f" [证据: {task.evidence}]" if task.evidence else ""
-        lines.append(f"{indent}{box} {task.id}. {task.description}{deps_str}{criteria_str}{note_str}{evidence_str}")
-        for child in state.tasks.values():
-            if child.parent_id == task.id:
-                render(child, depth + 1)
-
-    for task in state.tasks.values():
-        if task.parent_id is None or task.parent_id not in valid_ids:
-            render(task, 0)
+        lines.append(f"{box} {task.id}. {task.description}{deps_str}{note_str}{evidence_str}")
 
     return "\n".join(lines)
 
@@ -191,22 +174,24 @@ def create_todos(
     merge: bool = False,
 ) -> str:
     """
-    创建/合并 TODO 任务列表，用于规划复杂的步骤。
+    管理本会话的任务清单,用于把复杂任务拆成可追踪步骤、跟进进度。
 
-    当你需要执行一个包含多个步骤的复杂任务时（如搜集多方面信息、写复杂代码、进行深度研究），
-    请首先调用此工具将模糊意图拆解为具体的 TODO 列表。
+    **何时用**:3 个及以上步骤、或多文件、或多工具串联的复杂任务。1-2 步的简单
+    任务直接做,不要建清单。列表顺序即优先级。**同一时间只让一个任务 in-progress**。
+    某项走不通就 update_todo 标 blocked,并用 merge=True 追加替代步骤——不要硬走
+    原计划,也不要中途无 merge 地全量覆盖丢失进度。
 
-    参数说明：
+    参数说明:
     - goal: 记录本计划要完成的用户目标。
-    - invariants: 计划和执行过程不可违反的约束列表（例如 ["不可修改 API 签名", "必须保持向后兼容"]）。
+    - invariants: 计划和执行过程不可违反的约束列表(例如 ["不可修改 API 签名", "必须保持向后兼容"])。
       没有约束时省略或传 []。
-    - tasks: 任务列表。可以是简单字符串列表（每个元素代表 description），也可以是字典列表。
-      字典可选字段：id, description, parent_id, depends_on, success_criteria, verification, risk_level。
-    - merge: 默认 False，即"全量替换"语义。当已存在一个活动计划时，仅传 merge=True
-      才按 id 合并新旧任务（保留旧任务的 status/evidence/notes，新增 id 追加，未列出的旧 id 保留）；
-      不传 merge=True 的 create_todos 会拒绝覆盖既有活动计划，避免静默丢失进度。
+    - tasks: 任务列表。可以是简单字符串列表(每个元素代表 description),也可以是字典列表。
+      字典可选字段:id, description, depends_on。
+    - merge: 默认 False,即"全量替换"语义。当已存在一个活动计划时,仅传 merge=True
+      才按 id 合并新旧任务(保留旧任务的 status/evidence/notes,新增 id 追加,未列出的旧 id 保留);
+      不传 merge=True 的 create_todos 会拒绝覆盖既有活动计划,避免静默丢失进度。
 
-    调用后，请逐一执行工具完成任务，并使用 update_todo 及时更新状态。
+    调用后,请逐一执行工具完成任务,并使用 update_todo 及时更新状态。
     """
     if not tasks:
         raise ModelRetry("TODO 任务列表不能为空")
@@ -250,8 +235,6 @@ def create_todos(
                 raise ModelRetry(f"重复的任务 ID：{t_id}，请为每个任务指定唯一 ID")
 
             desc = item.get("description", "Unnamed Task")
-            raw_parent = item.get("parent_id")
-            parent_id = _coerce_int(raw_parent, "parent_id")
 
             raw_depends = item.get("depends_on", [])
             if not isinstance(raw_depends, list):
@@ -259,18 +242,10 @@ def create_todos(
             # 同时兼容整数和字符串形式的依赖 ID
             depends_on = [c for dep in raw_depends if (c := _coerce_int(dep, "depends_on")) is not None]
 
-            risk_level = item.get("risk_level", "low")
-            if risk_level not in {"low", "medium", "high"}:
-                risk_level = "low"
-
             new_tasks[t_id] = TodoTask(
                 id=t_id,
                 description=str(desc),
-                parent_id=parent_id,
                 depends_on=depends_on,
-                success_criteria=str(item.get("success_criteria", "")),
-                verification=str(item.get("verification", "")),
-                risk_level=risk_level,
             )
 
     state = _get_state(ctx)
@@ -290,8 +265,8 @@ def create_todos(
         )
     if merge and state.tasks:
         # merge 语义参考 Hermes tools/todo_tool.py:
-        # - 已有 id:用新值更新 description/parent_id/depends_on/success_criteria/
-        #   verification/risk_level,保留 status/evidence/notes/tool_calls_since_update;
+        # - 已有 id:用新值更新 description/depends_on,保留 status/evidence/notes/
+        #   tool_calls_since_update;
         # - 新增 id:追加;
         # - 未在新列表的旧 id:保留。
         merged: dict[int, TodoTask] = dict(state.tasks)
@@ -301,11 +276,7 @@ def create_todos(
                 merged[new_id] = new_task
                 continue
             existing.description = new_task.description
-            existing.parent_id = new_task.parent_id
             existing.depends_on = new_task.depends_on
-            existing.success_criteria = new_task.success_criteria
-            existing.verification = new_task.verification
-            existing.risk_level = new_task.risk_level
         new_tasks = merged
 
     _validate_tasks(new_tasks)
@@ -361,7 +332,7 @@ def update_todo(
       也接受 "in_progress" / "in progress" / "inprogress" 这些常见变体，
       以及 "completed" / "finished" 等同义词，会自动归一化。
     - notes: 简要记录该任务的进展或结论
-    - evidence: 标记 done 时若任务有 success_criteria 必须提供
+    - evidence: 标记 done 时可附上验证证据(如测试命令、产物路径、引用片段),便于回溯
     """
     # task_id 接受字符串形式(GLM/Qwen 等开源模型常生成 "1" 而非 1)。
     # 这里不抛 ValidationError——一旦抛了,pydantic_ai 会把它计入 max_retries,
@@ -431,8 +402,6 @@ def update_todo(
     if status in {"in-progress", "done"} and not _all_dependencies_done(state, task):
         missing = [dep_id for dep_id in task.depends_on if state.tasks[dep_id].status != "done"]
         return f"错误：任务 {task_id} 的依赖尚未完成：{missing}"
-    if status == "done" and task.success_criteria and not (notes or evidence):
-        return f"错误：任务 {task_id} 设置了成功标准，标记 done 时必须提供 notes 或 evidence。"
 
     task.status = status
     if notes:
@@ -481,29 +450,7 @@ def get_todos(ctx: RunContext[AgentDeps]) -> str:
         lines.append("不可变约束：")
         for invariant in state.invariants:
             lines.append(f"- {invariant}")
-    valid_ids = set(state.tasks.keys())
-    
-    def render_task(task: TodoTask, depth: int):
-        indent = "  " * depth
-        box = "[ ]"
-        if task.status == "in-progress":
-            box = "[-]"
-        elif task.status == "done":
-            box = "[x]"
-            
-        deps_str = f" [依赖: {', '.join(map(str, task.depends_on))}]" if task.depends_on else ""
-        note_str = f" (备注: {task.notes})" if task.notes else ""
-        criteria_str = f" [验收: {task.success_criteria}]" if task.success_criteria else ""
-        evidence_str = f" [证据: {task.evidence}]" if task.evidence else ""
-        lines.append(f"{indent}{box} {task.id}. {task.description}{deps_str}{criteria_str}{note_str}{evidence_str}")
-        
-        children = [t for t in state.tasks.values() if t.parent_id == task.id]
-        for child in children:
-            render_task(child, depth + 1)
-
-    for task in state.tasks.values():
-        if task.parent_id is None or task.parent_id not in valid_ids:
-            render_task(task, 0)
+    lines.append(_render_task_lines(state))
 
     return "\n".join(lines)
 

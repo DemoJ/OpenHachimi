@@ -24,6 +24,38 @@ logger = logging.getLogger(__name__)
 MAX_RUN_COMMAND_WAIT_SECONDS = 120
 
 
+def _summarize_output(output: str, max_chars: int = 800) -> str:
+    """把命令输出压缩成证据摘要:空白折叠 + 尾部截断(保留末尾,失败信息通常在末尾)。"""
+    text = " ".join((output or "").split())
+    if len(text) > max_chars:
+        return "..." + text[-(max_chars - 3):]
+    return text
+
+
+def _record_verify_evidence(
+    ctx: RunContext[AgentDeps],
+    *,
+    command: str,
+    cwd: str,
+    output: str,
+    is_running: bool,
+) -> None:
+    """把这次命令执行归档为验证证据(旁路,失败不阻断)。供 verification_stop 闸门引用。"""
+    store = getattr(ctx.deps, "session_store", None)
+    if store is None:
+        return
+    try:
+        store.record_verification_evidence(
+            ctx.deps.session_id,
+            command=command,
+            cwd=cwd,
+            output_summary=_summarize_output(output),
+            is_running=is_running,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("failed to record verification evidence", exc_info=True)
+
+
 async def run_command(
     ctx: RunContext[AgentDeps],
     command: str,
@@ -79,6 +111,14 @@ async def run_command(
         "output_truncated": truncated,
         "message": "命令正在后台运行，可能在等待输入" if is_running else "命令执行完毕",
     }
+    # 归档验证证据(旁路):供 verification_stop 闸门 nudge 引用"上次验证跑了什么"。
+    _record_verify_evidence(
+        ctx,
+        command=command,
+        cwd=result["cwd"],
+        output=output,
+        is_running=is_running,
+    )
     return result
 
 
@@ -98,6 +138,16 @@ def command_status(ctx: RunContext[AgentDeps], command_id: str) -> dict[str, obj
         "output_truncated": truncated,
         "message": "命令仍在运行" if is_running else "命令已结束",
     }
+    # 命令刚结束(从运行中 → 结束)时补写一条完整证据:run_command 当时写的可能是
+    # is_running=True 且 output 不全;这里覆盖为最终状态。proc 存了原始 command/cwd。
+    if not is_running:
+        _record_verify_evidence(
+            ctx,
+            command=getattr(proc, "command", "") or "",
+            cwd=getattr(proc, "cwd", ".") or ".",
+            output=output,
+            is_running=False,
+        )
     return result
 
 

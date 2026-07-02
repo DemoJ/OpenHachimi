@@ -98,3 +98,77 @@ def test_clarify_user_accepts_comma_separated_string(mock_ctx):
         "email",
         "password",
     ]
+
+
+# ── choices 多选模式 ──
+
+
+def test_clarify_user_with_choices(mock_ctx):
+    """提供 choices → 多选模式,写入 _user_clarification 和 CallDeferred metadata。"""
+    with pytest.raises(CallDeferred) as exc_info:
+        clarify_user(
+            mock_ctx,
+            question="部署到哪个环境?",
+            choices=["staging", "prod"],
+        )
+    flag = mock_ctx.deps.session_state["_user_clarification"]
+    assert flag["choices"] == ["staging", "prod"]
+    assert exc_info.value.metadata["choices"] == ["staging", "prod"]
+
+
+def test_clarify_user_without_choices_is_open_ended(mock_ctx):
+    """省略 choices → 开放问答,不写 choices 键。"""
+    with pytest.raises(CallDeferred) as exc_info:
+        clarify_user(mock_ctx, question="请提供 API Key")
+    flag = mock_ctx.deps.session_state["_user_clarification"]
+    assert "choices" not in flag
+    assert "choices" not in exc_info.value.metadata
+
+
+def test_clarify_user_truncates_choices_to_max(mock_ctx):
+    """超过 4 个 choices 截断保留前 4 个(对齐 Hermes MAX_CHOICES=4)。"""
+    with pytest.raises(CallDeferred):
+        clarify_user(
+            mock_ctx,
+            question="选一个",
+            choices=["a", "b", "c", "d", "e", "f"],
+        )
+    assert mock_ctx.deps.session_state["_user_clarification"]["choices"] == ["a", "b", "c", "d"]
+
+
+def test_clarify_user_flattens_dict_choices(mock_ctx):
+    """模型输出 dict 形 choices(如 [{"description":"..."}])→ 自动取展示文本。"""
+    with pytest.raises(CallDeferred):
+        clarify_user(
+            mock_ctx,
+            question="选方案",
+            choices=[
+                {"label": "方案 A", "detail": "..."},
+                {"description": "方案 B"},
+                "方案 C",
+            ],
+        )
+    assert mock_ctx.deps.session_state["_user_clarification"]["choices"] == ["方案 A", "方案 B", "方案 C"]
+
+
+def test_clarify_user_accepts_json_string_choices(mock_ctx):
+    """模型把 choices 输出成 JSON 字符串 ``"[\"a\", \"b\"]"`` → 自动解析。"""
+    with pytest.raises(CallDeferred):
+        clarify_user(mock_ctx, question="选", choices='["x", "y"]')
+    assert mock_ctx.deps.session_state["_user_clarification"]["choices"] == ["x", "y"]
+
+
+def test_clarify_user_records_created_at(mock_ctx):
+    """clarify 写入 created_at 时间戳,供超时兜底判断。"""
+    with pytest.raises(CallDeferred):
+        clarify_user(mock_ctx, question="问")
+    flag = mock_ctx.deps.session_state["_user_clarification"]
+    assert isinstance(flag.get("created_at"), float)
+    assert flag["created_at"] > 0
+
+
+def test_clarify_user_empty_choices_falls_back_to_open_ended(mock_ctx):
+    """空列表/空字符串 choices → 视为开放问答,不写 choices 键。"""
+    with pytest.raises(CallDeferred):
+        clarify_user(mock_ctx, question="问", choices=[])
+    assert "choices" not in mock_ctx.deps.session_state["_user_clarification"]

@@ -427,7 +427,6 @@ def test_todo_state_roundtrip(store: SessionStore):
                 description="impl",
                 status="in-progress",
                 depends_on=[1],
-                risk_level="medium",
                 evidence="WIP",
             ),
         },
@@ -440,14 +439,15 @@ def test_todo_state_roundtrip(store: SessionStore):
     assert loaded.is_active is True
     assert set(loaded.tasks.keys()) == {1, 2}
     assert loaded.tasks[2].depends_on == [1]
-    assert loaded.tasks[2].risk_level == "medium"
+    assert loaded.tasks[2].evidence == "WIP"
 
 
 def test_todo_state_load_ignores_legacy_allowed_tools(store: SessionStore):
-    """旧库可能仍带 ``allowed_tools`` 字段;现在 TodoTask 已经没有这个字段,
-    反序列化时应静默丢弃,不抛 TypeError(保持向后兼容)。"""
+    """旧库可能仍带已删字段(allowed_tools / parent_id / success_criteria /
+    verification / risk_level);现在 TodoTask 已没有这些字段,反序列化时应静默
+    丢弃,不抛 TypeError,任务仍能加载(保持向后兼容)。"""
     sid = _new_sid()
-    # 直接造一条带 legacy 字段的 JSON,模拟 v1 时期遗留状态
+    # 直接造一条带 legacy 字段的 JSON,模拟旧版本遗留状态
     legacy_payload = json.dumps({
         "goal": "legacy goal",
         "invariants": [],
@@ -459,6 +459,9 @@ def test_todo_state_load_ignores_legacy_allowed_tools(store: SessionStore):
                 "description": "legacy task",
                 "status": "pending",
                 "allowed_tools": ["write_file", "*"],
+                "parent_id": None,
+                "success_criteria": "old field",
+                "verification": "old field",
                 "risk_level": "low",
             },
         },
@@ -475,8 +478,9 @@ def test_todo_state_load_ignores_legacy_allowed_tools(store: SessionStore):
     assert loaded.goal == "legacy goal"
     assert set(loaded.tasks.keys()) == {1}
     assert loaded.tasks[1].description == "legacy task"
-    # 关键:没抛 TypeError,且 TodoTask 实例不再带 allowed_tools 属性
-    assert not hasattr(loaded.tasks[1], "allowed_tools")
+    # 关键:没抛 TypeError,且 TodoTask 实例不再带已删字段属性
+    for dropped in ("allowed_tools", "parent_id", "success_criteria", "verification", "risk_level"):
+        assert not hasattr(loaded.tasks[1], dropped)
 
 
 def test_todo_state_missing_returns_empty(store: SessionStore):
@@ -683,3 +687,82 @@ def test_current_turn_count_after_appends(store: SessionStore):
     store.save_messages("default", sid, _build_history(1))  # 追加 2 条
     assert store.current_turn_count("default", sid) == 6
 
+
+
+# ── verification_evidence 持久化 ──
+
+
+def test_verification_evidence_record_and_load(store: SessionStore):
+    """写入后能按 seq DESC 读出最近 N 条。"""
+    sid = _new_sid()
+    store.record_verification_evidence(
+        sid, command="pytest -x", cwd=".", output_summary="3 failed", is_running=False
+    )
+    store.record_verification_evidence(
+        sid, command="ruff check .", cwd=".", output_summary="all good", is_running=False
+    )
+    recent = store.load_recent_verification_evidence(sid, limit=5)
+    assert len(recent) == 2
+    # seq DESC:最新(ruff)在前
+    assert recent[0]["command"] == "ruff check ."
+    assert recent[1]["command"] == "pytest -x"
+    assert recent[0]["seq"] == 2
+    assert recent[1]["seq"] == 1
+    assert recent[0]["is_running"] is False
+
+
+def test_verification_evidence_load_empty(store: SessionStore):
+    """无证据返回空列表。"""
+    assert store.load_recent_verification_evidence(_new_sid()) == []
+
+
+def test_verification_evidence_limit_prunes_oldest(store: SessionStore):
+    """超过 _VERIFY_EVIDENCE_LIMIT 条时最旧被删。"""
+    from openhachimi_agent.storage.session_store import _VERIFY_EVIDENCE_LIMIT
+
+    sid = _new_sid()
+    for i in range(_VERIFY_EVIDENCE_LIMIT + 5):
+        store.record_verification_evidence(
+            sid, command=f"cmd-{i}", cwd=".", output_summary=str(i), is_running=False
+        )
+    recent = store.load_recent_verification_evidence(sid, limit=100)
+    assert len(recent) == _VERIFY_EVIDENCE_LIMIT
+    # 最旧的几条已被删,保留的是最新的 _VERIFY_EVIDENCE_LIMIT 条
+    # seq 从 (_VERIFY_EVIDENCE_LIMIT+6) 到 5(共 _VERIFY_EVIDENCE_LIMIT 条)
+    seqs = [ev["seq"] for ev in recent]
+    assert max(seqs) == _VERIFY_EVIDENCE_LIMIT + 5
+    assert min(seqs) == 6  # seq 1~5 被删
+
+
+def test_verification_evidence_isolated_per_session(store: SessionStore):
+    """证据按 session_id 隔离。"""
+    sid_a = _new_sid()
+    sid_b = _new_sid()
+    store.record_verification_evidence(sid_a, command="a", cwd=".", output_summary="a", is_running=False)
+    store.record_verification_evidence(sid_b, command="b", cwd=".", output_summary="b", is_running=False)
+    assert len(store.load_recent_verification_evidence(sid_a)) == 1
+    assert store.load_recent_verification_evidence(sid_a)[0]["command"] == "a"
+    assert store.load_recent_verification_evidence(sid_b)[0]["command"] == "b"
+
+
+def test_verification_evidence_deleted_with_session(store: SessionStore):
+    """delete_session 后证据随之清除(显式删,无 FK)。"""
+    sid = _new_sid()
+    # 先建 sessions 行(delete_session 依赖它存在)
+    store.save_messages("default", sid, [ModelRequest(parts=[UserPromptPart(content="hi")])])
+    store.record_verification_evidence(sid, command="pytest", cwd=".", output_summary="ok", is_running=False)
+    assert len(store.load_recent_verification_evidence(sid)) == 1
+
+    store.delete_session("default", sid)
+    assert store.load_recent_verification_evidence(sid) == []
+
+
+def test_verification_evidence_output_summary_truncated(store: SessionStore):
+    """超长 output_summary 截断到 2000 字(防止单条膨胀)。"""
+    sid = _new_sid()
+    long_output = "x" * 5000
+    store.record_verification_evidence(
+        sid, command="cat big.log", cwd=".", output_summary=long_output, is_running=False
+    )
+    ev = store.load_recent_verification_evidence(sid)[0]
+    assert len(ev["output_summary"]) <= 2000
