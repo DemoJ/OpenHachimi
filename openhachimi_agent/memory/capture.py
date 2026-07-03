@@ -134,13 +134,34 @@ def _strip_volatile_prefix(text: str) -> str:
     return text
 
 
+# runtime 注入的附件元数据块标志。message_with_attachments 会把"用户原话 +
+# 附件元数据块(+视觉前缀)"用双换行拼接后挂到 state.inputs.effective_message,
+# 此块作为 user_message 进入记忆捕获时会带着"不要"等词错误命中 _is_memorable_turn
+# 的正向闸门,导致图片交互内容被当作长期事实抽取,故在清洗时剥离,只保留用户原话。
+_ATTACHMENT_BLOCK_MARKER = "用户同时发送了以下附件："
+
+
+def _strip_attachment_block(text: str) -> str:
+    """剥离 runtime 注入的附件元数据块,还原用户真正说的那句话。
+
+    附件块用双换行拼在用户原话之后,取其前的内容即可;附件块内部以单换行
+    组织(无双换行),``partition`` 不会误切。不含附件块时原样返回。
+    """
+    if not text or _ATTACHMENT_BLOCK_MARKER not in text:
+        return text
+    head, _, _ = text.partition(_ATTACHMENT_BLOCK_MARKER)
+    return head
+
+
 def _extract_clean_user_message(user_message: str, task_frame: dict[str, object] | None) -> str:
     """优先取 task_frame.user_request 作为真用户输入,缺失时回退到剥离前缀。"""
     if isinstance(task_frame, dict):
         clean = task_frame.get("user_request")
         if isinstance(clean, str) and clean.strip():
             return clean.strip()
-    return _strip_volatile_prefix(user_message).strip()
+    cleaned = _strip_volatile_prefix(user_message)
+    cleaned = _strip_attachment_block(cleaned)
+    return cleaned.strip()
 
 
 def capture_turn_memories(
