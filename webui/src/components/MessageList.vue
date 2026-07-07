@@ -23,6 +23,8 @@
           :timestamp="m.timestamp"
           :tokens="m.tokens"
           :streaming="isStreaming(idx)"
+          :attachments="m.attachments"
+          :artifacts="m.artifacts"
         />
       </template>
       <!-- 空状态:脱离消息流,垂直水平居中于容器中央。

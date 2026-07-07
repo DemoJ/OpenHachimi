@@ -104,6 +104,33 @@ export interface CommandResponse {
   session_id: string
 }
 
+// 附件引用:用户上传的文件经 /attachments/upload 落盘后返回。
+// kind 由 content_type 派生:image/document/audio/video/unknown。
+export interface AttachmentRef {
+  id: string
+  filename: string | null
+  content_type: string | null
+  size_bytes: number | null
+  local_path: string
+  source: 'telegram' | 'weixin' | 'http' | 'local'
+  kind: 'image' | 'document' | 'audio' | 'video' | 'unknown'
+  metadata: Record<string, unknown>
+}
+
+// 产物引用:agent 生成的文件(图片/文档等),通过 SSE artifact 事件下发。
+// download_url 为 /artifacts/{id}/download,前端需拼接 token query 参数。
+export interface ArtifactRef {
+  id: string
+  filename: string
+  content_type: string | null
+  size_bytes: number
+  local_path: string
+  download_url: string | null
+  title: string | null
+  description: string | null
+  metadata: Record<string, unknown>
+}
+
 export interface MessageItem {
   role: 'user' | 'assistant'
   content: string
@@ -120,6 +147,11 @@ export interface MessageItem {
     head_end_turn: number
     tail_start_turn: number
   } | null
+  // 用户消息携带的附件列表。仅 user 消息有值;无附件时为 null。
+  attachments?: AttachmentRef[] | null
+  // assistant 消息携带的产物列表(agent 生成的文件)。流式期间通过 SSE artifact 事件收集;
+  // 历史回放时为 null(产物仅存于内存缓存,不持久化到消息 metadata)。
+  artifacts?: ArtifactRef[] | null
 }
 
 export interface SessionMessagesResponse {
@@ -444,4 +476,54 @@ export function deleteMemories(ids: string[]) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ids }),
   })
+}
+
+// ---------------------------------------------------------------- 附件上传/下载
+// WebUI 文件收发:/attachments/upload 接收 multipart 文件,返回 AttachmentRef;
+// /attachments/download?path=... 按 local_path 下载附件。
+export function uploadAttachment(file: File): Promise<AttachmentRef> {
+  const token = getToken()
+  const form = new FormData()
+  form.append('file', file)
+  // 不能手动设 Content-Type,浏览器会自动设 multipart boundary
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  return fetch('/attachments/upload', {
+    method: 'POST',
+    headers,
+    body: form,
+  }).then(async (res) => {
+    if (res.status === 401) {
+      clearToken()
+      window.location.hash = '#/login'
+      throw new Error('未授权')
+    }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.detail || `上传失败: ${res.status}`)
+    }
+    return res.json() as Promise<AttachmentRef>
+  })
+}
+
+export function attachmentDownloadUrl(localPath: string): string {
+  const token = getToken()
+  const base = `/attachments/download?path=${encodeURIComponent(localPath)}`
+  // <img>/<a> 标签无法设 Authorization header,通过 query 参数传 token。
+  // 后端中间件对 GET 下载端点支持 ?token=... 鉴权。
+  return token ? `${base}&token=${encodeURIComponent(token)}` : base
+}
+
+// 产物下载 URL:artifact.download_url 为 /artifacts/{id}/download,
+// 拼接 token query 参数供 <img>/<a> 标签直接访问。
+export function artifactDownloadUrl(downloadUrl: string): string {
+  const token = getToken()
+  if (!token) return downloadUrl
+  const sep = downloadUrl.includes('?') ? '&' : '?'
+  return `${downloadUrl}${sep}token=${encodeURIComponent(token)}`
+}
+
+// 判断产物是否为图片(用于决定渲染缩略图还是文件链接)。
+export function isArtifactImage(artifact: ArtifactRef): boolean {
+  return (artifact.content_type || '').startsWith('image/')
 }

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 
@@ -31,6 +32,8 @@ USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
 CTX_DYNAMIC_METADATA_KEY = "openhachimi_ctx_dynamic"
 CTX_STATIC_HASH_METADATA_KEY = "openhachimi_ctx_static_hash"
 SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"  # legacy
+ATTACHMENTS_METADATA_KEY = "openhachimi_attachments"
+ARTIFACTS_METADATA_KEY = "openhachimi_artifacts"
 
 
 def summary_excerpt(summary: str, limit: int = 160) -> str:
@@ -79,6 +82,16 @@ def extract_text_parts(
             dynamic_meta = metadata.get(CTX_DYNAMIC_METADATA_KEY)
             static_hash_meta = metadata.get(CTX_STATIC_HASH_METADATA_KEY)
             legacy_system_context_meta = metadata.get(SYSTEM_CONTEXT_METADATA_KEY)
+            # 附件列表:JSON 字符串 -> list[dict]。无附件时为 None。
+            attachments_raw = metadata.get(ATTACHMENTS_METADATA_KEY)
+            attachments_list: list[dict] | None = None
+            if isinstance(attachments_raw, str) and attachments_raw:
+                try:
+                    parsed = json.loads(attachments_raw)
+                    if isinstance(parsed, list) and parsed:
+                        attachments_list = parsed
+                except json.JSONDecodeError:
+                    logger.debug("attachments metadata JSON parse failed")
 
             for part in getattr(msg, "parts", ()):
                 if isinstance(part, UserPromptPart):
@@ -114,6 +127,7 @@ def extract_text_parts(
                         result.append({
                             "role": "user", "content": content, "prefix": prefix_v3,
                             "timestamp": item_ts, "tokens": None,
+                            "attachments": attachments_list,
                         })
                         break
 
@@ -127,6 +141,7 @@ def extract_text_parts(
                         result.append({
                             "role": "user", "content": content, "prefix": prefix,
                             "timestamp": item_ts, "tokens": None,
+                            "attachments": attachments_list,
                         })
                         break
 
@@ -148,6 +163,7 @@ def extract_text_parts(
                         result.append({
                             "role": "user", "content": user_msg, "prefix": prefix,
                             "timestamp": item_ts, "tokens": None,
+                            "attachments": attachments_list,
                         })
                         break
 
@@ -155,9 +171,23 @@ def extract_text_parts(
                     result.append({
                         "role": "user", "content": text.strip(), "prefix": "",
                         "timestamp": item_ts, "tokens": None,
+                        "attachments": attachments_list,
                     })
                     break
         elif isinstance(msg, ModelResponse):
+            # 产物 metadata:与 attachments 类似,从 ModelResponse.metadata 读取 JSON 字符串。
+            resp_metadata = getattr(msg, "metadata", None) or {}
+            if not isinstance(resp_metadata, dict):
+                resp_metadata = {}
+            artifacts_raw = resp_metadata.get(ARTIFACTS_METADATA_KEY)
+            artifacts_list: list[dict] | None = None
+            if isinstance(artifacts_raw, str) and artifacts_raw:
+                try:
+                    parsed = json.loads(artifacts_raw)
+                    if isinstance(parsed, list) and parsed:
+                        artifacts_list = parsed
+                except json.JSONDecodeError:
+                    logger.debug("artifacts metadata JSON parse failed")
             # 把 ModelResponse.usage 抽成 {input, output, total, cache_read}。
             # pydantic_ai 的 RequestUsage 字段为 input_tokens / output_tokens /
             # cache_read_tokens / cache_write_tokens 等。展示层关心:
@@ -188,6 +218,7 @@ def extract_text_parts(
                         result.append({
                             "role": "assistant", "content": text, "prefix": "",
                             "timestamp": ts_iso, "tokens": tokens_dict,
+                            "artifacts": artifacts_list,
                         })
     return result
 

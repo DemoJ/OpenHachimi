@@ -19,8 +19,10 @@ from openhachimi_agent.memory.capture import capture_turn_memories
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
 from openhachimi_agent.service.agent_runtime.context_snapshot import (
+    _ATTACHMENTS_METADATA_KEY,
     _USER_MESSAGE_METADATA_KEY,
     _snapshot_executor_context,
+    _stamp_artifacts_metadata,
     _stamp_turn_metadata,
 )
 from openhachimi_agent.transport.api_models import ArtifactRef
@@ -59,6 +61,8 @@ def _stamp_turn_context(
     role: str,
     message: str,
     history: list,
+    attachments: list | None = None,
+    artifacts: list | None = None,
 ) -> None:
     """构造本轮 executor 系统级上下文快照并打 metadata(分 static_hash/dynamic 两段)。
 
@@ -83,7 +87,8 @@ def _stamp_turn_context(
             service._ensure_context_static(_static_hash, _static_text)
         except Exception:
             logger.debug("failed to register static context to pool", exc_info=True)
-    _stamp_turn_metadata(new_history, len(history), message, _dynamic_text, _static_hash)
+    _stamp_turn_metadata(new_history, len(history), message, _dynamic_text, _static_hash, attachments=attachments)
+    _stamp_artifacts_metadata(new_history, len(history), artifacts)
 
 
 async def _save_turn_messages(
@@ -136,6 +141,8 @@ async def _persist_turn(
     resolved_channel_code: str | None,
     message: str,
     history: list,
+    attachments: list | None = None,
+    artifacts: list | None = None,
 ) -> list:
     """构造本轮系统级上下文快照并打 metadata,再差量追加落库。返回 new_history。
 
@@ -144,7 +151,7 @@ async def _persist_turn(
     的 prev_len 与差量起点的权威来源,须用 load_context 返回的原视图长度。
     """
     new_history = list(result.all_messages())  # type: ignore[attr-defined]
-    _stamp_turn_context(service, new_history, deps, role=role, message=message, history=history)
+    _stamp_turn_context(service, new_history, deps, role=role, message=message, history=history, attachments=attachments, artifacts=artifacts)
     await _save_turn_messages(
         service, ctx, result, new_history,
         role=role, actual_session_id=actual_session_id, latest_scope=latest_scope,
@@ -162,6 +169,7 @@ async def _persist_failed_turn_user_message(
     latest_scope: str | None,
     resolved_channel_code: str | None,
     user_message: str,
+    attachments: list | None = None,
 ) -> None:
     """agent 调用失败兜底:把本轮用户输入落库,避免下一轮丢失上下文。
 
@@ -181,9 +189,16 @@ async def _persist_failed_turn_user_message(
     if not (user_message or "").strip():
         return
 
+    _meta = {_USER_MESSAGE_METADATA_KEY: user_message}
+    if attachments:
+        import json
+        _meta[_ATTACHMENTS_METADATA_KEY] = json.dumps(
+            [a.model_dump(mode="json") if hasattr(a, "model_dump") else a for a in attachments],
+            ensure_ascii=False,
+        )
     user_request = ModelRequest(
         parts=[UserPromptPart(content=user_message)],
-        metadata={_USER_MESSAGE_METADATA_KEY: user_message},
+        metadata=_meta,
     )
     # save_messages 是 append-only 追加语义:只传本轮新增的 user 消息,不能带 history
     # (否则会把已落库的历史再存一遍)。turn_index 由 MAX(turn_index)+1 续编。

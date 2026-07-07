@@ -577,6 +577,86 @@ a:hover { text-decoration: underline; }
   margin: 0 auto;
 }
 
+/* 附件预览条:独立于输入框,在其上方展示为可移除的 chip */
+.att-preview-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-sm);
+  padding: var(--sp-sm);
+  margin-bottom: var(--sp-sm);
+  background: var(--canvas-soft);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+}
+.att-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-xs);
+  padding: var(--sp-xxs) var(--sp-sm);
+  background: var(--canvas);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--body);
+  max-width: 200px;
+}
+.att-chip--error { border-color: rgba(255, 122, 23, 0.45); }
+.att-chip-thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  object-fit: cover;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.att-chip-icon { font-size: 14px; flex-shrink: 0; }
+.att-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.att-chip-status { color: var(--body-mid); flex-shrink: 0; }
+.att-chip-error-text { color: var(--accent); }
+.att-chip-remove {
+  background: none;
+  border: none;
+  color: var(--body-mid);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.att-chip-remove:hover { color: var(--ink); }
+
+/* 附件按钮:与发送按钮并排浮在右下角 */
+.btn-attach {
+  position: absolute;
+  right: 80px;
+  bottom: var(--sp-sm);
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--pill-border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--body);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.btn-attach:hover {
+  border-color: var(--pill-border-hover);
+  color: var(--ink);
+  background: var(--canvas);
+}
+.btn-attach:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* Chat-style 输入外壳：textarea 撑高时发送按钮浮在右下角，整体一体 */
 .chat-input-shell {
   position: relative;
@@ -593,7 +673,7 @@ a:hover { text-decoration: underline; }
 .chat-input-shell textarea {
   flex: 1;
   padding: var(--sp-md) var(--sp-lg);
-  padding-right: 88px;
+  padding-right: 124px;
   background: transparent;
   border: none;
   border-radius: var(--radius-sm);
@@ -603,7 +683,7 @@ a:hover { text-decoration: underline; }
   font-weight: 400;
   resize: none;
   outline: none;
-  min-height: 64px;
+  min-height: 88px;
   max-height: 280px;
   line-height: 24px;
 }
@@ -676,6 +756,47 @@ a:hover { text-decoration: underline; }
 }
 .btn-primary:hover { background: var(--ink-hover); border-color: var(--ink-hover); }
 .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ================================================================ 图片大图预览灯箱(全局) */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.lightbox-img {
+  max-width: 90vw;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  cursor: default;
+}
+.lightbox-close {
+  position: absolute;
+  top: var(--sp-lg);
+  right: var(--sp-lg);
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--pill-border);
+  border-radius: var(--radius-pill);
+  color: var(--ink);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.lightbox-close:hover {
+  border-color: var(--pill-border-hover);
+  background: var(--canvas-soft);
+}
 
 /* ================================================================ hljs 覆盖 */
 .hljs {

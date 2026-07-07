@@ -54,6 +54,8 @@ _USER_MESSAGE_METADATA_KEY = "openhachimi_user_message"
 _SYSTEM_CONTEXT_METADATA_KEY = "openhachimi_system_context"  # legacy, read-only
 _CTX_DYNAMIC_METADATA_KEY = "openhachimi_ctx_dynamic"
 _CTX_STATIC_HASH_METADATA_KEY = "openhachimi_ctx_static_hash"
+_ATTACHMENTS_METADATA_KEY = "openhachimi_attachments"
+_ARTIFACTS_METADATA_KEY = "openhachimi_artifacts"
 
 
 def _stamp_turn_metadata(
@@ -62,6 +64,7 @@ def _stamp_turn_metadata(
     user_message: str,
     dynamic_context: str,
     static_hash: str,
+    attachments: list | None = None,
 ) -> None:
     """给本轮新增的、首个含 ``UserPromptPart`` 的 ``ModelRequest`` 打 metadata：
 
@@ -71,6 +74,8 @@ def _stamp_turn_metadata(
     - ``openhachimi_ctx_static_hash``：本轮 executor 静态 system 段(base/
       executor/role/config/tools)的短哈希。完整文本在 ``AgentService._context_static_pool``
       内查表;读取时按需重建。
+    - ``openhachimi_attachments``：用户随消息发送的附件列表(JSON 字符串),
+      供 WebUI 历史回放时渲染图片/文件下载链接。
 
     Multi-step 单轮中可能多次往 history 追加 ``ModelRequest``（planner、
     executor_repair 等都会 extend），但首个 user 消息就是本轮入口。
@@ -84,6 +89,12 @@ def _stamp_turn_metadata(
         payload[_CTX_DYNAMIC_METADATA_KEY] = dynamic_context
     if static_hash:
         payload[_CTX_STATIC_HASH_METADATA_KEY] = static_hash
+    if attachments:
+        import json
+        payload[_ATTACHMENTS_METADATA_KEY] = json.dumps(
+            [a.model_dump(mode="json") if hasattr(a, "model_dump") else a for a in attachments],
+            ensure_ascii=False,
+        )
 
     for idx in range(prev_len, len(new_history)):
         msg = new_history[idx]
@@ -102,6 +113,46 @@ def _stamp_turn_metadata(
         for k, v in payload.items():
             if k not in meta:
                 meta[k] = v
+        return
+
+
+def _stamp_artifacts_metadata(
+    new_history: list,
+    prev_len: int,
+    artifacts: list | None,
+) -> None:
+    """给本轮新增的最后一个 ``ModelResponse`` 打 artifacts metadata。
+
+    artifacts 为 ``ArtifactRef`` 列表,序列化为 JSON 字符串存入 metadata。
+    读取侧由 ``session_history.extract_text_parts`` 反序列化后注入到 assistant
+    消息的展示结构中,供 WebUI 历史回放时渲染产物图片/文件下载链接。
+
+    选择最后一个 ModelResponse 而非首个:多步 turn 中可能有中间 ModelResponse
+    (planner / executor_repair),最终产物应归属用户看到的最后一条回复。
+    """
+    if not artifacts:
+        return
+    from pydantic_ai.messages import ModelResponse
+
+    payload = None
+    for idx in range(len(new_history) - 1, prev_len - 1, -1):
+        msg = new_history[idx]
+        if not isinstance(msg, ModelResponse):
+            continue
+        if payload is None:
+            import json
+            payload = json.dumps(
+                [a.model_dump(mode="json") if hasattr(a, "model_dump") else a for a in artifacts],
+                ensure_ascii=False,
+            )
+        meta = getattr(msg, "metadata", None)
+        if meta is None:
+            try:
+                msg.metadata = {_ARTIFACTS_METADATA_KEY: payload}
+            except Exception:  # noqa: BLE001
+                logger.debug("failed to stamp artifacts metadata on ModelResponse idx=%d", idx)
+        elif isinstance(meta, dict):
+            meta[_ARTIFACTS_METADATA_KEY] = payload
         return
 
 

@@ -28,7 +28,7 @@ import MessageList from '../components/MessageList.vue'
 import ChatInput from '../components/ChatInput.vue'
 import { useChatStore } from '../store'
 import { chatStream } from '../sse'
-import { post, getToken, getSessionMessages } from '../api'
+import { post, getToken, getSessionMessages, type AttachmentRef } from '../api'
 
 const router = useRouter()
 const store = useChatStore()
@@ -151,7 +151,7 @@ async function onChannelChange(e: Event) {
   await store.setCurrentChannel(channel)
 }
 
-async function onSend(text: string) {
+async function onSend(text: string, attachments: AttachmentRef[]) {
   // 防御：理论上 ChatInput 已经在 generating=true 时禁用了发送，
   // 这里再兜底一次，防止异常路径下产生并发流。
   if (store.isGenerating) {
@@ -167,11 +167,12 @@ async function onSend(text: string) {
     prefix: '',
     timestamp: new Date().toISOString(),
     tokens: null,
+    attachments: attachments.length > 0 ? attachments : null,
   })
   store.setGenerating(true)
   abortCtrl = new AbortController()
   const ctrl = abortCtrl
-  console.info('[Chat] send', { chars: text.length, role: store.currentRole })
+  console.info('[Chat] send', { chars: text.length, role: store.currentRole, attachments: attachments.length })
 
   try {
     await chatStream(text, store.currentRole, {
@@ -195,6 +196,11 @@ async function onSend(text: string) {
           console.info('[Chat] session bound from stream', { sid })
           store.setCurrentSession(sid)
         }
+      },
+      onArtifact(artifact) {
+        // agent 生成的产物文件:附加到当前 assistant 消息上供前端渲染。
+        console.info('[Chat] artifact received', { id: artifact.id, filename: artifact.filename })
+        store.appendArtifact(artifact)
       },
       onDone() {
         console.info('[Chat] stream done')
@@ -221,7 +227,7 @@ async function onSend(text: string) {
         }
         store.setGenerating(false)
       },
-    }, ctrl.signal, { sessionId: store.currentSessionId, channel: store.currentChannel })
+    }, ctrl.signal, { sessionId: store.currentSessionId, channel: store.currentChannel, attachments })
   } catch (err) {
     console.warn('[Chat] chatStream threw', err)
     store.setGenerating(false)

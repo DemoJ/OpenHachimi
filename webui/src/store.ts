@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import type { SessionSummary, MessageItem, StateResponse } from './api'
+import type { SessionSummary, MessageItem, StateResponse, AttachmentRef, ArtifactRef } from './api'
 import { fetchRoles, listSessions, fetchState, fetchChannels, getSessionMessages, deleteSession } from './api'
 import { getToken, clearToken } from './api'
 
@@ -235,6 +235,28 @@ export const useChatStore = defineStore('chat', {
           prefix: '',
           timestamp: new Date().toISOString(),
           tokens: null,
+          artifacts: [],
+        })
+      }
+    },
+    appendArtifact(artifact: ArtifactRef) {
+      // 把 agent 生成的产物附加到最后一条 assistant 消息上。
+      // 若还没有 assistant 消息(理论上不该发生),创建一条空消息。
+      const last = this.messages[this.messages.length - 1]
+      if (last && last.role === 'assistant') {
+        if (!last.artifacts) last.artifacts = []
+        // 去重:同一 id 的 artifact 只保留一次
+        if (!last.artifacts.some(a => a.id === artifact.id)) {
+          last.artifacts.push(artifact)
+        }
+      } else {
+        this.messages.push({
+          role: 'assistant',
+          content: '',
+          prefix: '',
+          timestamp: new Date().toISOString(),
+          tokens: null,
+          artifacts: [artifact],
         })
       }
     },

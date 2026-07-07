@@ -320,6 +320,8 @@ async def _finalize_turn_data(
         service, ctx, result, deps,
         role=role, actual_session_id=actual_session_id, latest_scope=state.inputs.latest_scope,
         resolved_channel_code=state.inputs.resolved_channel_code, message=state.message, history=state.history,
+        attachments=state.inputs.attachment_list,
+        artifacts=turn_artifacts,
     )
     await _maybe_compress_post_turn(
         service, ctx.context_compressor,
@@ -462,5 +464,6 @@ async def run_turn(
                 role=inputs.role, actual_session_id=actual_session_id,
                 latest_scope=inputs.latest_scope, resolved_channel_code=inputs.resolved_channel_code,
                 user_message=message,
+                attachments=inputs.attachment_list,
             )
             raise

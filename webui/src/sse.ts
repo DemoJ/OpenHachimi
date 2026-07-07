@@ -1,5 +1,5 @@
 import { fetchEventSource, EventStreamContentType } from '@microsoft/fetch-event-source'
-import { getToken, clearToken } from './api'
+import { getToken, clearToken, type AttachmentRef, type ArtifactRef } from './api'
 
 export interface SSEPayload {
   text?: string
@@ -14,6 +14,8 @@ export interface SSEPayload {
   session_id?: string
   channel?: string
   auto_created?: boolean
+  // type === "artifact" 时携带:agent 生成的产物文件(AgentRef 的 JSON)。
+  artifact?: ArtifactRef
 }
 
 export interface SSECallbacks {
@@ -21,6 +23,7 @@ export interface SSECallbacks {
   onDone: () => void
   onError: (err: string | Error) => void
   onSession?: (sessionId: string, channel?: string, autoCreated?: boolean) => void
+  onArtifact?: (artifact: ArtifactRef) => void
 }
 
 /**
@@ -41,7 +44,7 @@ export async function chatStream(
   role: string | null,
   callbacks: SSECallbacks,
   signal?: AbortSignal,
-  options?: { sessionId?: string | null; channel?: string },
+  options?: { sessionId?: string | null; channel?: string; attachments?: AttachmentRef[] },
 ): Promise<void> {
   const token = getToken()
   const startedAt = performance.now()
@@ -58,8 +61,9 @@ export async function chatStream(
 
   const sessionId = options?.sessionId ?? null
   const channel = options?.channel ?? 'webui'
+  const attachments = options?.attachments ?? []
 
-  console.info('[SSE] opening stream', { role, channel, sessionId, messageChars: message.length })
+  console.info('[SSE] opening stream', { role, channel, sessionId, messageChars: message.length, attachmentCount: attachments.length })
 
   try {
     await fetchEventSource('/chat/stream', {
@@ -68,7 +72,7 @@ export async function chatStream(
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ message, role, session_id: sessionId, channel }),
+      body: JSON.stringify({ message, role, session_id: sessionId, channel, attachments }),
       signal,
       // 防止 tab 切后台时库自动 close 连接（默认 false）
       openWhenHidden: true,
@@ -119,6 +123,12 @@ export async function chatStream(
             // 后端首事件:把空白页直发自动新建的 session_id 同步给前端 store。
             console.info('[SSE] session bound', { sid: data.session_id, channel: data.channel, autoCreated: data.auto_created })
             callbacks.onSession?.(data.session_id, data.channel, data.auto_created)
+            return
+          }
+          if (data.type === 'artifact' && data.artifact) {
+            // agent 生成的产物文件:图片/文档等,前端需渲染缩略图/下载链接。
+            console.info('[SSE] artifact received', { id: data.artifact.id, filename: data.artifact.filename })
+            callbacks.onArtifact?.(data.artifact)
             return
           }
           if (data.text !== undefined) {

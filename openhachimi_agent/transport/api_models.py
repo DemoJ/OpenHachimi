@@ -257,6 +257,12 @@ class MessageItem(BaseModel):
     # 前端据此渲染一张折叠卡片，点击展开时调 GET /sessions/{id}/messages/folded/{compression_id}
     # 取回被折叠的原始消息。content 在折叠条上为空串。
     fold: dict | None = None
+    # 用户消息携带的附件列表(AttachmentRef 的 dict 形式)。仅 user 消息有值;
+    # 无附件时为 None(与旧客户端兼容)。前端据此渲染图片缩略图/文件下载链接。
+    attachments: list[dict[str, Any]] | None = None
+    # assistant 消息携带的产物列表(ArtifactRef 的 dict 形式)。由 turn_postprocess
+    # 持久化到 ModelResponse.metadata,经 extract_text_parts 反序列化注入。无产物时 None。
+    artifacts: list[dict[str, Any]] | None = None
 
 
 class SessionMessagesResponse(BaseModel):

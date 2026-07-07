@@ -11,7 +11,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request, Depends
+from fastapi import FastAPI, HTTPException, Query, Request, Depends, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from openhachimi_agent.app_logging import configure_logging
@@ -89,6 +89,7 @@ from openhachimi_agent.transport.api_models import (
     SkillToggleResult,
     StopRequest,
 )
+from openhachimi_agent.storage.attachments import AttachmentStorage
 from openhachimi_agent.tools.utils import resolve_workspace_path
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.memory.privacy import PrivacyGuard
@@ -286,9 +287,18 @@ async def require_http_api_token(request: Request, call_next):
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {token}"
-    if not hmac.compare_digest(auth, expected):
-        return JSONResponse(status_code=401, content={"detail": "未授权"})
-    return await call_next(request)
+    if hmac.compare_digest(auth, expected):
+        return await call_next(request)
+
+    # GET 下载端点支持 query 参数传 token(<img>/<a> 标签无法设 Authorization header)
+    if request.method == "GET":
+        path = request.url.path
+        if path.startswith("/attachments/download") or path.startswith("/artifacts/"):
+            query_token = request.query_params.get("token", "")
+            if query_token and hmac.compare_digest(query_token, token):
+                return await call_next(request)
+
+    return JSONResponse(status_code=401, content={"detail": "未授权"})
 
 
 @app.get("/health")
@@ -628,6 +638,70 @@ def chat_stream(
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=safe_error_detail(exc)) from exc
+
+
+@app.post("/attachments/upload")
+async def upload_attachment(
+    file: UploadFile = File(...),
+    service: AgentService = Depends(get_service),
+):
+    """WebUI 文件上传:接收 multipart 文件,落盘到 attachments_dir,返回 AttachmentRef。
+
+    与 Telegram 渠道复用同一套 AttachmentStorage 安全校验(文件名净化、大小限制、
+    路径越界防护)。source 固定为 "http",namespace 用随机 hex 避免冲突。
+    """
+    from uuid import uuid4
+
+    storage = AttachmentStorage(
+        service.config.attachments_dir,
+        service.config.max_attachment_size_bytes,
+        service.config.allowed_attachment_mime_types,
+        workspace_root=service.config.base_dir,
+    )
+    content = await file.read()
+    size_bytes = len(content)
+    filename = file.filename or "attachment"
+    content_type = file.content_type
+    try:
+        storage.validate_metadata(filename=filename, content_type=content_type, size_bytes=size_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
+    namespace = uuid4().hex[:8]
+    target = storage.build_path(source="http", namespace=namespace, filename=filename, content_type=content_type)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    ref = storage.to_ref(
+        path=target, source="http", filename=filename,
+        content_type=content_type, size_bytes=size_bytes,
+    )
+    logger.info("attachment uploaded filename=%s size=%d kind=%s", filename, size_bytes, ref.kind)
+    return ref
+
+
+@app.get("/attachments/download")
+def download_attachment(
+    path: str = Query(..., description="AttachmentRef.local_path"),
+    service: AgentService = Depends(get_service),
+):
+    """按 local_path 下载附件文件。
+
+    路径须落在 attachments_dir 内,防越权读取工作区其他文件。
+    """
+    from pathlib import Path
+
+    raw = Path(path)
+    if raw.is_absolute():
+        target = raw.resolve()
+    else:
+        target = (service.config.base_dir / raw).resolve()
+    attachments_dir = service.config.attachments_dir.resolve()
+    try:
+        target.relative_to(attachments_dir)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="附件路径不在允许目录内")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="附件文件不存在")
+    return FileResponse(target)
 
 
 @app.get("/artifacts/{artifact_id}/download")
