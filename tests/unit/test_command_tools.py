@@ -66,6 +66,7 @@ def make_ctx(process: FakeProcess):
     process_manager = FakeProcessManager(process)
     deps = SimpleNamespace(
         base_dir=Path.cwd(),
+        config=SimpleNamespace(permission=SimpleNamespace(mode="blacklist")),
         process_manager=process_manager,
         session_id="test_session_123",
     )
