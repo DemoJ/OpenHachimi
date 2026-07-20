@@ -245,6 +245,16 @@ class PromptUpdateRequest(BaseModel):
     content: str = ""
 
 
+class PermissionBlacklistResponse(BaseModel):
+    """WebUI 权限设置页黑名单文件内容。"""
+    dangerous_patterns: list[str] = Field(default_factory=list)
+
+
+class PermissionBlacklistUpdateRequest(BaseModel):
+    """WebUI 权限设置页黑名单写回请求。"""
+    dangerous_patterns: list[str] = Field(default_factory=list)
+
+
 class MessageItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str                          # 用户实际输入（user）或 Agent 回复（assistant）

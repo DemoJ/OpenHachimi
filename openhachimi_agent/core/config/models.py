@@ -129,6 +129,21 @@ class ResearchConfig:
 
 
 @dataclass(frozen=True)
+class PermissionConfig:
+    """工具执行权限模式。
+
+    mode:
+      - "blacklist": 黑名单模式(默认)。危险命令匹配内置黑名单时,通过 clarify_user
+        询问用户确认后才执行;非黑名单命令直接放行。
+      - "allow_all": 完全允许模式。所有命令(包括危险命令)直接放行,不询问。
+
+    黑名单文件固定为 user/permission-blacklist.json,与内置黑名单合并生效。
+    """
+
+    mode: Literal["blacklist", "allow_all"] = "blacklist"
+
+
+@dataclass(frozen=True)
 class DelegationConfig:
     """子 agent 委派(delegate_task)的运行时约束。对齐 hermes delegation 配置语义。
 
@@ -246,6 +261,7 @@ class AppConfig:
     scheduler: SchedulerConfig
     research: ResearchConfig
     vision: VisionConfig
+    permission: PermissionConfig = field(default_factory=PermissionConfig)
     # 思考深度,对齐 openai SDK 官方 ReasoningEffort 枚举(none/minimal/low/medium/high/xhigh)。
     # none=不思考(默认);其余档位原样透传 reasoning_effort。需模型支持 reasoning 才生效。
     llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] = "none"

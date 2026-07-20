@@ -38,6 +38,7 @@ from openhachimi_agent.core.config.models import (
     MemoryRecallConfig,
     MemorySchedulerConfig,
     MemoryVectorConfig,
+    PermissionConfig,
     ResearchConfig,
     SchedulerConfig,
     SchedulerDeliveryConfig,
@@ -323,6 +324,14 @@ def _load_delegation_config(raw_config: dict[str, Any]) -> DelegationConfig:
     )
 
 
+def _load_permission_config(raw_config: dict[str, Any]) -> PermissionConfig:
+    """从 ``permission:`` 段读取工具执行权限模式;缺段时默认黑名单模式。"""
+    permission_config = _as_mapping(raw_config.get("permission"), "permission")
+    return PermissionConfig(
+        mode=_config_literal(permission_config, "mode", {"blacklist", "allow_all"}, "blacklist"),  # type: ignore[arg-type]
+    )
+
+
 def _load_vision_config(raw_config: dict[str, Any], llm_config: dict[str, Any]) -> VisionConfig:
     vision_config = _as_mapping(raw_config.get("vision"), "vision")
     # vision.prompt 已废弃;legacy 迁移由 migrate_legacy_vision_prompt 在 load_config 末段处理,
@@ -509,6 +518,7 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
         mcp=_load_mcp_config(user_dir),
         context=_load_context_config(raw_config, llm_config),
         delegation=_load_delegation_config(raw_config),
+        permission=_load_permission_config(raw_config),
     )
 
     # 提示词覆盖机制:启动期注入 user 目录,使 load_system_prompt 优先读 user/system_prompts/。

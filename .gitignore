@@ -1,4 +1,5 @@
 .venv/
+tmp/
 .tmp/
 .tmp-ensurepip/
 tmp_tool_dir/

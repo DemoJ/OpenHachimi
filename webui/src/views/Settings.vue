@@ -155,6 +155,42 @@
             <p v-if="card.restartNote" class="card-restart-note">⚠️ {{ card.restartNote }}</p>
           </section>
 
+          <!-- 权限设置页:黑名单 JSON 编辑器(仅 blacklist 模式显示) -->
+          <section v-if="currentGroup === 'permission' && form['permission.mode'] === 'blacklist'" class="settings-card">
+            <div class="card-head">
+              <h3 class="card-title">危险命令黑名单</h3>
+              <p class="card-desc">
+                自定义危险命令正则表达式列表,与内置黑名单合并生效。文件固定为 user/permission-blacklist.json。
+              </p>
+            </div>
+            <div class="blacklist-editor">
+              <div v-if="blacklistLoading" class="blacklist-loading">
+                <span class="activity-spinner" />
+                <span>加载黑名单中…</span>
+              </div>
+              <div v-else-if="blacklistError" class="blacklist-error">
+                <p>{{ blacklistError }}</p>
+                <button class="btn" @click="loadBlacklist">重试</button>
+              </div>
+              <template v-else>
+                <textarea
+                  v-model="blacklistText"
+                  class="blacklist-textarea"
+                  rows="12"
+                  placeholder='{"dangerous_patterns": ["regex1", "regex2"]}'
+                  spellcheck="false"
+                />
+                <div class="blacklist-actions">
+                  <button class="btn" :disabled="!blacklistDirty || blacklistSaving" @click="onResetBlacklist">放弃修改</button>
+                  <button class="btn btn-primary" :disabled="!blacklistDirty || blacklistSaving" @click="onSaveBlacklist">
+                    {{ blacklistSaving ? '保存中…' : '保存黑名单' }}
+                  </button>
+                </div>
+                <p v-if="blacklistJustSaved" class="blacklist-saved-hint">已保存</p>
+              </template>
+            </div>
+          </section>
+
           <!-- 保存条(所有分组共用) -->
           <div class="settings-actions" :class="{ visible: dirty }">
             <span class="dirty-hint" v-if="dirty">有未保存的修改</span>
@@ -191,6 +227,28 @@ import MemoryManageDialog from '../components/MemoryManageDialog.vue'
 import { getConfigGroup, updateConfigGroup } from '../api'
 import type { ConfigField as ConfigFieldType } from '../api'
 
+// 权限设置页黑名单编辑器的 API(直接读写 user/permission-blacklist.json)。
+async function getPermissionBlacklist(): Promise<{ dangerous_patterns: string[] }> {
+  const res = await fetch('/permission/blacklist', {
+    headers: { Authorization: `Bearer ${localStorage.getItem('openhachimi_token') || ''}` },
+  })
+  if (!res.ok) throw new Error(`加载黑名单失败: ${res.status}`)
+  return res.json()
+}
+
+async function putPermissionBlacklist(patterns: string[]): Promise<{ dangerous_patterns: string[] }> {
+  const res = await fetch('/permission/blacklist', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${localStorage.getItem('openhachimi_token') || ''}`,
+    },
+    body: JSON.stringify({ dangerous_patterns: patterns }),
+  })
+  if (!res.ok) throw new Error(`保存黑名单失败: ${res.status}`)
+  return res.json()
+}
+
 const router = useRouter()
 const route = useRoute()
 
@@ -207,6 +265,7 @@ const groups = [
   { id: 'context', label: '上下文压缩', icon: '✂️' },
   { id: 'scheduler', label: '任务调度', icon: '⏰' },
   { id: 'research', label: '联网研究', icon: '🔎' },
+  { id: 'permission', label: '权限设置', icon: '🔐' },
   { id: 'paths-logging', label: '路径与日志', icon: '📁' },
 ] as const
 
@@ -253,6 +312,9 @@ const GROUP_CARDS: Record<string, {
   ],
   'research': [
     { key: 'research-main', title: '联网研究', desc: '搜索后端、API Key 与结果策略。brave/tavily 需对应 Key,勾选后端时记得填写其 Key。', restartNote: '后端选择与对应 API Key 联动:启用 brave/tavily 前请先填好对应 Key,否则该后端会报错。' },
+  ],
+  'permission': [
+    { key: 'permission-main', title: '工具执行权限', desc: '控制 Agent 执行危险命令时的行为。改后新会话生效。' },
   ],
   'paths-logging': [
     { key: 'paths', title: '路径', desc: '角色/记忆/外部技能/附件目录。改错会导致服务找不到资源,改后需重启进程。', restartNote: '路径改错可能导致服务找不到角色/记忆库/技能/附件,且需重启进程才重新加载;请谨慎修改。' },
@@ -323,6 +385,16 @@ const maskedSecrets = ref<Set<string>>(new Set())
 // 折叠态:collapsedKeys 存放当前处于收起态的卡片 key。
 // 初始按当前分组各卡片 defaultCollapsed 推导;切换分组时在 loadConfig 内重建。
 const collapsedCards = ref<Set<string>>(new Set())
+
+// ── 权限设置页:黑名单编辑器状态 ──
+const blacklistText = ref('')
+const blacklistSnapshot = ref('')
+const blacklistLoading = ref(false)
+const blacklistError = ref('')
+const blacklistSaving = ref(false)
+const blacklistJustSaved = ref(false)
+
+const blacklistDirty = computed(() => blacklistText.value !== blacklistSnapshot.value)
 
 const dirty = computed(() => {
   // 特殊分组分支:用各子组件暴露的 dirty;其余分组:比对 config 字段快照。
@@ -474,6 +546,46 @@ function isMaskLike(s: string): boolean {
   return s.includes('••••')
 }
 
+// ── 权限设置页:黑名单编辑器逻辑 ──
+async function loadBlacklist() {
+  if (currentGroup.value !== 'permission') return
+  blacklistLoading.value = true
+  blacklistError.value = ''
+  try {
+    const data = await getPermissionBlacklist()
+    const text = JSON.stringify(data, null, 2)
+    blacklistText.value = text
+    blacklistSnapshot.value = text
+  } catch (e) {
+    blacklistError.value = (e as Error).message || '加载黑名单失败'
+  } finally {
+    blacklistLoading.value = false
+  }
+}
+
+async function onSaveBlacklist() {
+  if (!blacklistDirty.value || blacklistSaving.value) return
+  blacklistSaving.value = true
+  blacklistError.value = ''
+  try {
+    const parsed = JSON.parse(blacklistText.value)
+    const patterns = Array.isArray(parsed?.dangerous_patterns) ? parsed.dangerous_patterns : []
+    await putPermissionBlacklist(patterns)
+    blacklistSnapshot.value = blacklistText.value
+    blacklistJustSaved.value = true
+    setTimeout(() => { blacklistJustSaved.value = false }, 2500)
+  } catch (e) {
+    blacklistError.value = (e as Error).message || '保存黑名单失败'
+  } finally {
+    blacklistSaving.value = false
+  }
+}
+
+function onResetBlacklist() {
+  blacklistText.value = blacklistSnapshot.value
+  blacklistError.value = ''
+}
+
 // 路由参数变化时切换分组并重新加载。
 watch(
   () => route.params.group,
@@ -482,12 +594,14 @@ watch(
     if (next !== currentGroup.value) {
       currentGroup.value = next
       loadConfig()
+      loadBlacklist()
     }
   },
 )
 
 // 进入页面即加载当前分组。
 loadConfig()
+loadBlacklist()
 </script>
 
 <style scoped>
@@ -725,6 +839,53 @@ loadConfig()
   font-size: 14px;
 }
 .settings-error { flex-direction: column; align-items: flex-start; gap: var(--sp-md); }
+
+/* 权限设置页:黑名单编辑器 */
+.blacklist-editor {
+  padding: 0 var(--sp-lg) var(--sp-lg);
+}
+.blacklist-loading,
+.blacklist-error {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  padding: var(--sp-md);
+  color: var(--body-mid);
+}
+.blacklist-error p {
+  color: var(--error, #c00);
+  margin: 0;
+}
+.blacklist-textarea {
+  width: 100%;
+  min-height: 240px;
+  padding: var(--sp-sm) var(--sp-md);
+  background: var(--canvas-soft);
+  border: 1px solid var(--canvas-mid);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  font-size: 13px;
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+  box-sizing: border-box;
+}
+.blacklist-textarea:focus {
+  border-color: var(--pill-border-hover);
+}
+.blacklist-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-sm);
+  margin-top: var(--sp-sm);
+}
+.blacklist-saved-hint {
+  margin: var(--sp-xs) 0 0;
+  font-size: 12px;
+  color: var(--body-mid);
+  text-align: right;
+}
 
 /* 保存条 */
 .settings-actions {

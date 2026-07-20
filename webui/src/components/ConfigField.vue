@@ -70,7 +70,7 @@
         :value="String(modelValue ?? '')"
         @change="onInput(($event.target as HTMLSelectElement).value)"
       >
-        <option v-for="opt in field.options" :key="opt" :value="opt">{{ opt }}</option>
+        <option v-for="opt in field.options" :key="opt" :value="opt">{{ optionLabel(opt) }}</option>
       </select>
     </div>
 
@@ -155,6 +155,12 @@ const datalistId = computed(() => `cfg-datalist-${props.field.path.replace(/\./g
 
 function onInput(v: string | number | boolean | string[]) {
   emit('update:modelValue', v)
+}
+
+// select 选项标签:优先使用 field.option_labels 映射,否则显示原始值。
+function optionLabel(opt: string): string {
+  const labels = props.field.option_labels as Record<string, string> | undefined
+  return labels?.[opt] ?? opt
 }
 
 // multi:取当前选中的字符串数组(只读安全降级)。

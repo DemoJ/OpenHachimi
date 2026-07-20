@@ -244,6 +244,8 @@ export interface ConfigField {
   label: string
   description: string
   options?: string[]
+  // select 选项的显示标签映射(如 {blacklist: "黑名单模式"}),无映射时显示原始值。
+  option_labels?: Record<string, string>
   // editable=true 的 select 渲染为可选预设、可填任意值的输入(如浏览器通道允许填绝对路径)。
   editable?: boolean
 }

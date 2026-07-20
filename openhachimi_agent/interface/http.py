@@ -64,6 +64,8 @@ from openhachimi_agent.transport.api_models import (
     MCPServerItem,
     McpServersResponse,
     McpServersUpdateRequest,
+    PermissionBlacklistResponse,
+    PermissionBlacklistUpdateRequest,
     PromptUpdateRequest,
     RoleSwitchRequest,
     RoleBindingItem,
@@ -864,6 +866,26 @@ def update_config_group(group: str, request: ConfigUpdateRequest, config=Depends
     # 返回最新值(已脱敏),供前端刷新表单 + dirty 复位。
     values, masked = serialize_config_group(fields, raw)
     return {"group": group, "values": values, "masked": masked, **result}
+
+
+# ------------------------------------------------------------------ WebUI 权限设置:黑名单文件
+# GET /permission/blacklist 读取 user/permission-blacklist.json;
+# PUT /permission/blacklist 写回(整覆盖)。文件路径固定,不走 yaml 字段表。
+
+from openhachimi_agent.tools.permission import read_blacklist_file, write_blacklist_file
+
+
+@app.get("/permission/blacklist")
+def get_permission_blacklist(config=Depends(get_config)):
+    data = read_blacklist_file(config.base_dir)
+    return PermissionBlacklistResponse(dangerous_patterns=data.get("dangerous_patterns", []))
+
+
+@app.put("/permission/blacklist")
+def put_permission_blacklist(request: PermissionBlacklistUpdateRequest, config=Depends(get_config)):
+    write_blacklist_file(config.base_dir, request.dangerous_patterns)
+    logger.info("http permission blacklist updated patterns=%d", len(request.dangerous_patterns))
+    return PermissionBlacklistResponse(dangerous_patterns=request.dangerous_patterns)
 
 
 # ------------------------------------------------------------------ WebUI 提示词编辑

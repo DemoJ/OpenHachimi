@@ -244,6 +244,16 @@ RESEARCH_FIELDS: list[dict[str, Any]] = [
      "label": "单后端结果数上限", "description": "每个后端返回的最大结果数(上限 50)"},
 ]
 
+# 权限设置页字段定义。
+# mode 用 select 限定 blacklist/allow_all,改后新会话生效。
+# 黑名单文件固定为 user/permission-blacklist.json,不暴露给用户配置路径。
+PERMISSION_FIELDS: list[dict[str, Any]] = [
+    {"path": "permission.mode", "kind": CONFIG_KIND_SELECT, "group": "permission-main",
+     "label": "权限模式", "options": ["blacklist", "allow_all"],
+     "option_labels": {"blacklist": "黑名单模式", "allow_all": "完全允许模式"},
+     "description": "黑名单模式=危险命令需用户确认后才执行(默认);完全允许模式=所有命令直接放行不询问。改后新会话生效"},
+]
+
 # 路径与日志设置页字段定义(基础设施,低频)。
 # 路径改错可能导致服务找不到资源(角色/记忆/技能/附件);日志级别影响输出粒度。
 # paths.* 用 string(相对路径以项目根为根);logging.level 用 select 限定标准日志级别。
@@ -275,4 +285,5 @@ SETTINGS_FIELD_GROUPS: dict[str, list[dict[str, Any]]] = {
     "scheduler": SCHEDULER_FIELDS,
     "research": RESEARCH_FIELDS,
     "paths-logging": PATHS_LOGGING_FIELDS,
+    "permission": PERMISSION_FIELDS,
 }

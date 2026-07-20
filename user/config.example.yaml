@@ -115,3 +115,7 @@ context:                      # 对话历史上下文压缩(防止长会话爆�
     api_key: ""
     max_tokens: 4096          # 摘要输出 token 上限(单位 token);结构化摘要通常 1-3K,4096 足够
     abort_on_failure: false   # 摘要失败:false=插兜底摘要,true=中止压缩冻结对话
+
+permission:                   # 工具执行权限控制
+  mode: blacklist             # 权限模式:blacklist=危险命令需用户确认后才执行(默认);allow_all=所有命令直接放行不询问
+                              # 黑名单文件固定为 user/permission-blacklist.json,与内置黑名单合并

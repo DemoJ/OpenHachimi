@@ -74,7 +74,29 @@ async def run_command(
         raise ValueError("command 不能为空")
 
     logger.info("tool run_command cwd=%s wait_seconds=%.1f command=%s", cwd, wait_seconds, command)
-    assert_safe_command(command)
+
+    # ── 权限检查 ──
+    permission_config = ctx.deps.config.permission
+    from openhachimi_agent.tools.permission import is_dangerous_command
+
+    if permission_config.mode == "blacklist":
+        if is_dangerous_command(command, ctx.deps.base_dir):
+            # 黑名单模式:危险命令先询问用户确认
+            from openhachimi_agent.tools.clarification import clarify_user
+
+            user_reply = clarify_user(
+                ctx,
+                question=f"检测到危险命令，是否允许执行？\n\n命令: {command}",
+                choices=["允许执行", "拒绝执行"],
+            )
+            # clarify_user 抛 CallDeferred 阻断当前 run;用户回复后 resume 灌回返回值
+            if "允许" not in str(user_reply):
+                return {"error": f"用户拒绝执行危险命令: {command}"}
+            # 用户已确认,跳过 assert_safe_command 的拦截
+        else:
+            # 黑名单模式:非危险命令走原有安全检查(兜底)
+            assert_safe_command(command)
+    # allow_all 模式:完全跳过安全检查
     target_cwd = resolve_workspace_path(ctx.deps.base_dir, cwd)
     if not target_cwd.exists():
         raise FileNotFoundError(f"工作目录不存在：{cwd}")
