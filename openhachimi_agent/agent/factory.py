@@ -63,7 +63,7 @@ def _build_unfinished_reminder(signal: dict | None) -> str | None:
 def _build_reasoning_model_settings(config: AppConfig) -> dict:
     """把 llm_reasoning_effort 配置翻译成 pydantic-ai 的 model_settings。
 
-    值即 openai SDK 官方 reasoning_effort 枚举(none/minimal/low/medium/high/xhigh),
+    值即 openai SDK 官方 reasoning_effort 枚举,并额外支持 max(none/minimal/low/medium/high/xhigh/max),
     原样透传给 OpenAIChatModel。none 也显式发送,行为与官方参数一致;对不支持
     reasoning 的模型由服务端自行处理。
     """

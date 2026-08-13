@@ -5,7 +5,7 @@ from openhachimi_agent.tools import mcp as mcp_module
 from openhachimi_agent.tools.mcp import load_mcp_toolsets
 
 
-class FakeHTTPServer:
+class FakeHTTPTransport:
     calls = []
 
     def __init__(self, url, *, headers=None):
@@ -14,9 +14,15 @@ class FakeHTTPServer:
         self.calls.append((url, headers))
 
 
+class FakeMCPToolset:
+    def __init__(self, *, client):
+        self.client = client
+
+
 def test_load_mcp_toolsets_passes_http_headers(mock_config, monkeypatch):
-    FakeHTTPServer.calls = []
-    monkeypatch.setattr(mcp_module, "MCPServerStreamableHTTP", FakeHTTPServer)
+    FakeHTTPTransport.calls = []
+    monkeypatch.setattr(mcp_module, "StreamableHttpTransport", FakeHTTPTransport)
+    monkeypatch.setattr(mcp_module, "MCPToolset", FakeMCPToolset)
     config = replace(
         mock_config,
         mcp=MCPConfig(
@@ -33,6 +39,6 @@ def test_load_mcp_toolsets_passes_http_headers(mock_config, monkeypatch):
     toolsets = load_mcp_toolsets(config)
 
     assert len(toolsets) == 1
-    assert FakeHTTPServer.calls == [
+    assert FakeHTTPTransport.calls == [
         ("https://example.test/mcp", {"Authorization": "Bearer test-token"})
     ]

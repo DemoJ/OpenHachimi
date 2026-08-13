@@ -350,7 +350,7 @@ def event_item_from_stream_event(event: object) -> StreamEventItem | None:
         )
 
     if isinstance(event, FunctionToolResultEvent):
-        result = event.result
+        result = event.part
         outcome = getattr(result, "outcome", "success")
         logger.info(
             "tool stream result tool_name=%s outcome=%s",

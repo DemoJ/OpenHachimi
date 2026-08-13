@@ -411,7 +411,7 @@ def _load_context_config(raw_config: dict[str, Any], llm_config: dict[str, Any])
         tail_token_budget=_config_int(context_config, "tail_token_budget", 20000, minimum=0),
         anti_thrash=_config_bool(context_config, "anti_thrash", True),
         min_savings_pct=_config_int(context_config, "min_savings_pct", 10, minimum=0),
-        context_length=_config_int(context_config, "context_length", 128, minimum=0),
+        context_length=_config_int(context_config, "context_length", 128_000, minimum=0),
         summary=ContextSummaryConfig(
             model=_config_string(summary_config, "model"),
             base_url=_config_string(summary_config, "base_url") or _config_string(llm_config, "base_url"),
@@ -475,7 +475,7 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
         llm_reasoning_effort=_config_literal(
             llm_config,
             "reasoning_effort",
-            {"none", "minimal", "low", "medium", "high", "xhigh"},
+            {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
             "none",
         ),
         log_dir=_resolve_config_path(

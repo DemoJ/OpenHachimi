@@ -536,7 +536,7 @@ context:
   tail_token_budget: 20000
   anti_thrash: true
   min_savings_pct: 10
-  context_length: 128
+  context_length: 128000
 """
 
 
@@ -566,7 +566,7 @@ def test_serialize_context_floats(tmp_path):
     assert values["context.threshold_percent"] == 0.75
     assert values["context.hard_ceiling_percent"] == 0.90
     assert values["context.enabled"] is True
-    assert values["context.context_length"] == 128
+    assert values["context.context_length"] == 128000
     assert masked == []
 
 

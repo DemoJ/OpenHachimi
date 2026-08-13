@@ -36,7 +36,6 @@ from openhachimi_agent.context.token_estimate import estimate_messages_tokens, e
 logger = logging.getLogger(__name__)
 
 # 内置默认上下文窗口(单位 token)。当传入 context_length 为 0 时使用。
-# 注意:ContextConfig.context_length 以 K 为单位,在 agent_service 边界换算成 token 后传入。
 _DEFAULT_CONTEXT_LENGTH = 128_000
 # 摘要失败冷却时间(秒),避免连续失败刷屏
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 45.0

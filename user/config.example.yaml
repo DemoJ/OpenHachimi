@@ -22,7 +22,7 @@ llm:
   model: gpt-5.2
   base_url: https://your-openai-compatible-server.example/v1
   supports_vision: auto       # 主模型是否支持图片输入：auto 自动按模型名判断；true 强制直传图片；false 使用 vision 辅助模型
-  reasoning_effort: none      # 思考深度，对齐 OpenAI 官方 reasoning_effort 枚举：none 不思考（默认）；minimal/low/medium/high/xhigh 逐级加深，越高越慢越费 token。需模型支持 reasoning 才生效
+  reasoning_effort: none      # 思考深度，对齐 OpenAI 官方 reasoning_effort 枚举并额外支持 max：none 不思考（默认）；minimal/low/medium/high/xhigh/max 逐级加深，越高越慢越费 token。需模型支持 reasoning 才生效
 
 vision:
   enabled: true               # 是否处理图片附件
@@ -108,7 +108,7 @@ context:                      # 对话历史上下文压缩(防止长会话爆�
   tail_token_budget: 20000    # 尾部 token 预算(从末尾向前累计)
   anti_thrash: true           # 反抖动:连续两次压缩节省不足 min_savings_pct% 则停止
   min_savings_pct: 10
-  context_length: 128         # 模型上下文窗口大小,单位 K(128 = 128K tokens);非 128K 模型需按实际填写(如 32K 填 32);0 用内置默认
+  context_length: 128000         # 模型上下文窗口大小,单位 token(128K=128000);非 128K 模型需按实际填写(如 32K 填 32000);0 用内置默认
   summary:                    # 摘要压缩用的辅助模型;留空则用主模型
     model: ""
     base_url: ""

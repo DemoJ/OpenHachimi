@@ -102,8 +102,7 @@ def get_context_compressor(service, session_id: str) -> Any:
         tail_token_budget=cfg.tail_token_budget,
         anti_thrash=cfg.anti_thrash,
         min_savings_pct=cfg.min_savings_pct,
-        # context_length 配置单位为 K,这里换算成 token(128K = 128000)传给压缩引擎
-        context_length=cfg.context_length * 1000 if cfg.context_length else 0,
+        context_length=cfg.context_length,
         abort_on_summary_failure=cfg.summary.abort_on_failure,
         summarizer=summarizer,
     )

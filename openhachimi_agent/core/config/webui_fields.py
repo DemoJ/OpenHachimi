@@ -27,9 +27,9 @@ AI_MODEL_FIELDS: list[dict[str, Any]] = [
     {"path": "llm.supports_vision", "kind": CONFIG_KIND_SELECT, "group": "llm",
      "label": "图片支持", "options": ["auto", "true", "false"],
      "description": "auto 自动按模型名判断;true 强制直传图片;false 使用视觉辅助模型"},
-    {"path": "llm.reasoning_effort", "kind": CONFIG_KIND_SELECT, "group": "llm",
-     "label": "思考深度", "options": ["none", "minimal", "low", "medium", "high", "xhigh"],
-     "description": "对应 reasoning_effort 档位:none=不思考;minimal/low/medium/high/xhigh 逐级加深,越高越慢越费 token。需模型支持 reasoning;改后新会话生效"},
+     {"path": "llm.reasoning_effort", "kind": CONFIG_KIND_SELECT, "group": "llm",
+      "label": "思考深度", "options": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+      "description": "对应 reasoning_effort 档位:none=不思考;minimal/low/medium/high/xhigh/max 逐级加深,越高越慢越费 token。需模型支持 reasoning;改后新会话生效"},
     {"path": "vision.enabled", "kind": CONFIG_KIND_BOOL, "group": "vision",
      "label": "启用图片处理", "description": "是否处理图片附件"},
     {"path": "vision.fallback_enabled", "kind": CONFIG_KIND_BOOL, "group": "vision",
@@ -173,7 +173,7 @@ MEMORY_FIELDS: list[dict[str, Any]] = [
 ]
 
 # 上下文压缩设置页字段定义(高级调参,前端整组默认折叠)。
-# 阈值为相对模型上下文窗口的比例(float);context_length 单位 K(128=128K tokens)。
+# 阈值为相对模型上下文窗口的比例(float);context_length 单位 token(默认 128000=128K)。
 # 这一组"调好了就别动":误调可能导致对话爆窗口或被过度压缩,故前端默认折叠并加警示。
 CONTEXT_FIELDS: list[dict[str, Any]] = [
     {"path": "context.enabled", "kind": CONFIG_KIND_BOOL, "group": "context-advanced",
@@ -195,7 +195,7 @@ CONTEXT_FIELDS: list[dict[str, Any]] = [
     {"path": "context.min_savings_pct", "kind": CONFIG_KIND_INT, "group": "context-advanced",
      "label": "最小节省百分比", "description": "单次压缩应达到的最低节省百分比(配合反抖动)。新会话生效"},
     {"path": "context.context_length", "kind": CONFIG_KIND_INT, "group": "context-advanced",
-     "label": "上下文窗口(K)", "description": "模型上下文窗口大小,单位 K(128=128K tokens)。非 128K 模型需按实际填写(如 32K 填 32);0 用内置默认。必须与模型真实窗口一致,否则压缩阈值计算偏差"},
+     "label": "上下文窗口 (tokens)", "description": "模型上下文窗口大小,单位 token(128K 填 128000)。非 128K 模型需按实际填写(如 32K 填 32000);0 用内置默认。必须与模型真实窗口一致,否则压缩阈值计算偏差"},
 ]
 
 # 任务调度设置页字段定义。

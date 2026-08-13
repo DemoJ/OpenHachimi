@@ -207,7 +207,7 @@ class ContextConfig:
     阈值均为相对模型上下文窗口的比例:
       - threshold_percent: 轮后主压缩触发线(真实 input_tokens 用量)
       - hard_ceiling_percent: 轮内预检触发线(粗略估计,防单轮内爆窗口)
-      - context_length: 模型上下文窗口大小,单位 K(128=128K tokens)
+      - context_length: 模型上下文窗口大小,单位 token(默认 128000=128K)
     """
 
     enabled: bool = True
@@ -219,9 +219,9 @@ class ContextConfig:
     tail_token_budget: int = 20000
     anti_thrash: bool = True
     min_savings_pct: int = 10
-    # 模型上下文窗口大小,单位 K(128 表示 128K tokens)。用于计算压缩触发阈值。
+    # 模型上下文窗口大小,单位 token(默认 128000=128K)。用于计算压缩触发阈值。
     # 0 表示用内置默认(128K)。非 128K 的模型需手动填写真实窗口。
-    context_length: int = 128
+    context_length: int = 128_000
     summary: ContextSummaryConfig = field(default_factory=ContextSummaryConfig)
 
 
@@ -262,9 +262,9 @@ class AppConfig:
     research: ResearchConfig
     vision: VisionConfig
     permission: PermissionConfig = field(default_factory=PermissionConfig)
-    # 思考深度,对齐 openai SDK 官方 ReasoningEffort 枚举(none/minimal/low/medium/high/xhigh)。
+    # 思考深度,对齐 openai SDK 官方 ReasoningEffort 枚举,并额外支持 max。
     # none=不思考(默认);其余档位原样透传 reasoning_effort。需模型支持 reasoning 才生效。
-    llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] = "none"
+    llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "none"
     mcp: MCPConfig = field(default_factory=MCPConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     delegation: DelegationConfig = field(default_factory=DelegationConfig)

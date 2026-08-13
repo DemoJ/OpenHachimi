@@ -2,7 +2,7 @@
 """llm.reasoning_effort 配置解析与 WebUI 字段注册测试。
 
 覆盖:
-- _config_literal 对 6 个合法档位(none/minimal/low/medium/high/xhigh)的解析;
+- _config_literal 对 7 个合法档位(none/minimal/low/medium/high/xhigh/max)的解析;
 - 非法值在加载期抛 ValueError(与 supports_vision/detail 等枚举字段校验风格一致);
 - 默认值为 none(旧 config.yaml 无此字段时向后兼容);
 - AI_MODEL_FIELDS 注册了该 select 字段且选项齐全,保证 WebUI 设置页可调。
@@ -14,12 +14,12 @@ from openhachimi_agent.core.config._helpers import _config_literal
 from openhachimi_agent.core.config.webui_fields import AI_MODEL_FIELDS
 
 # 对齐 openai SDK 官方 ReasoningEffort 枚举;none 为默认(不思考)。
-_VALID_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"]
+_VALID_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 @pytest.mark.parametrize("effort", _VALID_EFFORTS)
 def test_reasoning_effort_parses_each_valid_value(effort):
-    """6 个合法档位都能从 yaml 原样解析。"""
+    """7 个合法档位都能从 yaml 原样解析。"""
     llm_config = {"reasoning_effort": effort}
     assert _config_literal(llm_config, "reasoning_effort", set(_VALID_EFFORTS), "none") == effort
 
@@ -44,7 +44,7 @@ def test_reasoning_effort_is_case_insensitive():
 
 
 def test_webui_registers_reasoning_effort_select_with_all_options():
-    """WebUI「思考深度」下拉已注册且 6 个选项齐全。"""
+    """WebUI「思考深度」下拉已注册且 7 个选项齐全。"""
     field = next(
         (f for f in AI_MODEL_FIELDS if f.get("path") == "llm.reasoning_effort"),
         None,
