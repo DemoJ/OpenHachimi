@@ -175,7 +175,7 @@ def _handle_run_agent_exception(
     role: str,
     actual_session_id: str,
 ) -> None:
-    """TimeoutError / 其它 Exception 分类,写 result_holder + 日志。
+    """TimeoutError / UsageLimitExceeded / 其它 Exception 分类,写 result_holder + 日志。
 
     CancelledError 由 ``run_agent_task`` 自行处理(透传 raise),不进此函数。
     plan 状态机已废,异常不再挂起/失败计划,只记日志 + 写 error。
@@ -198,6 +198,17 @@ def _handle_run_agent_exception(
         else:
             result_holder["error"] = exc
             logger.exception("chat timed out role=%s session_id=%s stream=false", role, actual_session_id)
+        return
+    # 步数保护阀(长程任务防死循环):不是系统故障,用"本轮暂停+可继续"的友好提示
+    # 替代错误抛出;已完成的执行痕迹会走失败兜底落库,下一轮说"继续"即可接续。
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    if isinstance(exc, UsageLimitExceeded):
+        result_holder["usage_limit_pause"] = True
+        logger.warning(
+            "chat paused: request_limit reached role=%s session_id=%s stream=%s",
+            role, actual_session_id, str(stream).lower(),
+        )
         return
     # 兜底:其它异常
     result_holder["error"] = exc
@@ -391,6 +402,23 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
                     yield ChatResponse(output="【任务已被手动中断】", role=state.role, session_id=actual_session_id)
                     return
                 raise
+            if state.result_holder.get("usage_limit_pause"):
+                # 步数保护阀:非流式渠道(TG/scheduled)用 ChatResponse 告知用户现状与继续方式。
+                await _persist_failed_turn_user_message(
+                    service, ctx,
+                    role=state.role, actual_session_id=actual_session_id,
+                    latest_scope=state.inputs.latest_scope,
+                    resolved_channel_code=state.inputs.resolved_channel_code,
+                    user_message=state.message,
+                    attachments=state.inputs.attachment_list,
+                    tool_trace=state.result_holder.get("tool_trace"),
+                )
+                yield ChatResponse(
+                    output="本轮任务已自动执行了较多步骤(达到单次对话步数上限 60),为防止失控已主动暂停。已完成的步骤已保存,请回复\"继续\"接着执行,或告诉我调整方向。",
+                    role=state.role,
+                    session_id=actual_session_id,
+                )
+                return
             if error := state.result_holder.get("error"):
                 raise error
 

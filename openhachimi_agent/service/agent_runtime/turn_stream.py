@@ -71,7 +71,7 @@ async def _iter_post_completion(
     result_holder: dict[str, object],
     session_state: dict[str, object],
 ) -> AsyncIterator[object]:
-    """task 完成后:cancel 检查 → error raise → signal 渲染 → artifacts 去重 yield。"""
+    """task 完成后:cancel 检查 → usage_limit 暂停 → error raise → signal 渲染 → artifacts 去重 yield。"""
     try:
         await task
     except asyncio.CancelledError:
@@ -79,6 +79,16 @@ async def _iter_post_completion(
             yield system_stream_event("\n\n【任务已被手动中断】")
             return
         raise
+
+    # 步数保护阀:长程任务跑满 request_limit(60) 次工具循环后的正常暂停,不是故障。
+    # 给一条系统提示说明现状并指引用户继续;已完成的执行痕迹会走失败兜底落库。
+    if result_holder.get("usage_limit_pause"):
+        yield system_stream_event(
+            "\n\n[System] 本轮任务已自动执行了较多步骤(达到单次对话步数上限 60),"
+            "为防止失控已主动暂停。已完成的步骤已保存,请回复\"继续\"接着执行,"
+            "或告诉我调整方向。\n"
+        )
+        return
 
     if error := result_holder.get("error"):
         raise RuntimeError(f"Agent 调用失败:{redact_exception(error)}") from error

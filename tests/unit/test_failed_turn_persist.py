@@ -415,3 +415,49 @@ async def test_llm_5xx_error_retries(monkeypatch):
     )
     assert result == "ok"
     assert call_count == 2
+
+
+# ── 步数保护阀(UsageLimitExceeded):不抛错,给"暂停+可继续"的友好提示 ────────────
+
+
+@pytest.mark.asyncio
+async def test_usage_limit_pause_yields_friendly_notice():
+    """流式路径:UsageLimitExceeded 不写 error,而是 yield 系统提示并落库痕迹。"""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from openhachimi_agent.service.agent_runtime.turn_stream import _iter_post_completion
+
+    result_holder: dict[str, object] = {}
+    result_holder["usage_limit_pause"] = True  # 模拟 _handle_run_agent_exception 写入
+
+    service = MagicMock()
+    task: asyncio.Future = asyncio.get_event_loop().create_future()
+    task.set_result(None)
+
+    events = []
+    async for event in _iter_post_completion(service, task=task, result_holder=result_holder, session_state={}):
+        events.append(event)
+
+    assert len(events) == 1
+    text = events[0].text
+    assert "步数上限" in text and "继续" in text
+    # 未抛 RuntimeError(错误路径)
+
+
+@pytest.mark.asyncio
+async def test_usage_limit_exceeded_classified_as_pause():
+    """_handle_run_agent_exception 应把 UsageLimitExceeded 归为 usage_limit_pause 而非 error。"""
+    from pydantic_ai.exceptions import UsageLimitExceeded
+
+    from openhachimi_agent.service.agent_runtime.turn import _handle_run_agent_exception
+
+    result_holder: dict[str, object] = {}
+    _handle_run_agent_exception(
+        UsageLimitExceeded("The next request would exceed the request_limit of 60"),
+        session_state={}, deps=MagicMock(), result_holder=result_holder,
+        stream=True, service=MagicMock(config=SimpleNamespace(agent_timeout_seconds=300)),
+        role="default", actual_session_id="s1",
+    )
+    assert result_holder.get("usage_limit_pause") is True
+    assert "error" not in result_holder
