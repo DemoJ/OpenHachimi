@@ -394,6 +394,20 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
             if error := state.result_holder.get("error"):
                 raise error
 
+        if "result" not in state.result_holder:
+            # stall / task 被取消路径:agent task 未产出 result(流式分支已 yield
+            # 系统提示)。本轮视为失败轮,兜底落库用户消息保上下文,正常收尾避免
+            # KeyError 把已提示的失败变成新错误。
+            await _persist_failed_turn_user_message(
+                service, ctx,
+                role=state.role, actual_session_id=actual_session_id,
+                latest_scope=state.inputs.latest_scope,
+                resolved_channel_code=state.inputs.resolved_channel_code,
+                user_message=state.message,
+                attachments=state.inputs.attachment_list,
+            )
+            return
+
         final_output_text, new_history, turn_artifacts = await _finalize_turn_data(
             state, state.result_holder["result"]
         )
