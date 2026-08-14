@@ -478,6 +478,7 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
             {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
             "none",
         ),
+        llm_thinking_field=_config_string(llm_config, "thinking_field").strip(),
         log_dir=_resolve_config_path(
             base_dir,
             _config_string(logging_config, "dir"),

@@ -30,6 +30,8 @@ AI_MODEL_FIELDS: list[dict[str, Any]] = [
      {"path": "llm.reasoning_effort", "kind": CONFIG_KIND_SELECT, "group": "llm",
       "label": "思考深度", "options": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
       "description": "对应 reasoning_effort 档位:none=不思考;minimal/low/medium/high/xhigh/max 逐级加深,越高越慢越费 token。需模型支持 reasoning;改后新会话生效"},
+    {"path": "llm.thinking_field", "kind": CONFIG_KIND_STRING, "group": "llm",
+     "label": "思维链回传字段", "description": "留空=默认(auto,对 OpenAI 官方模型零影响);填 reasoning_content(DeepSeek 系)后多轮工具调用时纯工具轮次也补回传该字段,避免网关 400"},
     {"path": "vision.enabled", "kind": CONFIG_KIND_BOOL, "group": "vision",
      "label": "启用图片处理", "description": "是否处理图片附件"},
     {"path": "vision.fallback_enabled", "kind": CONFIG_KIND_BOOL, "group": "vision",

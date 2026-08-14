@@ -464,6 +464,10 @@ class BrowserLifecycleMixin:
                                 "--disable-gpu",
                                 "--disable-blink-features=AutomationControlled",
                             ])
+                            if not headless:
+                                # 锁屏/闲置的 Wayland 会话下 mutter 不处理新窗口握手,Chrome 会
+                                # 卡死在显示初始化。强制走 X11(Xwayland)规避,窗口仍可见。
+                                args.append("--ozone-platform=x11")
                         if headless:
                             args.extend(["--headless=new"])
                             

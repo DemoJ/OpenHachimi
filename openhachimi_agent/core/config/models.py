@@ -265,6 +265,11 @@ class AppConfig:
     # 思考深度,对齐 openai SDK 官方 ReasoningEffort 枚举,并额外支持 max。
     # none=不思考(默认);其余档位原样透传 reasoning_effort。需模型支持 reasoning 才生效。
     llm_reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "none"
+    # 思维链回传字段名。留空=用 pydantic-ai 默认 auto 模式(对 OpenAI 官方等模型无影响);
+    # 配置如 reasoning_content(DeepSeek/硅基流动等)后启用 field 模式:多轮工具调用时
+    # 纯工具调用轮次也会补空 reasoning_content 字段,满足"thinking mode 必须回传"的
+    # 网关校验,避免 400。仅在目标模型/网关要求回传 reasoning_content 时配置。
+    llm_thinking_field: str = ""
     mcp: MCPConfig = field(default_factory=MCPConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     delegation: DelegationConfig = field(default_factory=DelegationConfig)

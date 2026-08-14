@@ -23,6 +23,7 @@ llm:
   base_url: https://your-openai-compatible-server.example/v1
   supports_vision: auto       # 主模型是否支持图片输入：auto 自动按模型名判断；true 强制直传图片；false 使用 vision 辅助模型
   reasoning_effort: none      # 思考深度，对齐 OpenAI 官方 reasoning_effort 枚举并额外支持 max：none 不思考（默认）；minimal/low/medium/high/xhigh/max 逐级加深，越高越慢越费 token。需模型支持 reasoning 才生效
+  thinking_field: ""          # 思维链回传字段名：留空=默认(auto，对 OpenAI 官方模型零影响)；填 reasoning_content（DeepSeek 系/硅基流动等）后多轮工具调用时纯工具轮次也会补回传该字段，满足网关"thinking mode 必须回传"校验，避免 400
 
 vision:
   enabled: true               # 是否处理图片附件

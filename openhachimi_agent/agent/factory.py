@@ -70,6 +70,24 @@ def _build_reasoning_model_settings(config: AppConfig) -> dict:
     return {"openai_reasoning_effort": config.llm_reasoning_effort}
 
 
+def _build_model_profile(config: AppConfig) -> dict | None:
+    """按配置构建 OpenAIChatModel profile,用于 thinking 字段回传兼容。
+
+    留空(默认)返回 None:pydantic-ai 走 auto 模式,自动按响应里的字段名回传,
+    对 OpenAI 官方模型等零影响;仅在目标网关要求"thinking mode 必须回传
+    reasoning_content"且多轮工具调用会被 400 拒掉时,配置
+    ``llm.thinking_field=reasoning_content`` 启用 field 模式 —— 除按该字段回传
+    思考内容外,pydantic-ai 还会给纯工具调用轮次的 assistant 消息补空字段,
+    满足网关校验。
+    """
+    if not config.llm_thinking_field:
+        return None
+    return {
+        "openai_chat_thinking_field": config.llm_thinking_field,
+        "openai_chat_send_back_thinking_parts": "field",
+    }
+
+
 def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None, run_mode: str = "interactive") -> Agent:
     if not config.openai_api_key:
         raise ValueError("未配置 llm.api_key，请先在 user/config.yaml 中填写 API Key。")
@@ -161,7 +179,11 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     #   3. extra_prompt         — main_agent.md / subagent.md 操作规范
     #   4. @agent.system_prompt — 运行时动态块（config/time/memory/技能索引）
     agent = Agent(
-        OpenAIChatModel(config.model_name, provider=provider),
+        OpenAIChatModel(
+            config.model_name,
+            provider=provider,
+            profile=_build_model_profile(config),
+        ),
         system_prompt=system_prompt + "\n\n" + role_content + "\n\n" + extra_prompt,
         deps_type=AgentDeps,
         toolsets=toolsets,
