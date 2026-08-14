@@ -26,6 +26,7 @@ from openhachimi_agent.service.agent_runtime.context import AgentRunContext
 from openhachimi_agent.service.agent_runtime.context_snapshot import (
     _USER_MESSAGE_METADATA_KEY,
 )
+from openhachimi_agent.service.agent_runtime.streaming import ToolTraceEntry
 from openhachimi_agent.service.agent_runtime.turn_postprocess import (
     _persist_failed_turn_user_message,
 )
@@ -225,3 +226,107 @@ async def test_append_only_does_not_overwrite(store: SessionStore):
     # 第 3 条是兜底落库的
     assert isinstance(reloaded[2], ModelRequest)
     assert "失败轮用户输入" in [getattr(p, "content", None) for p in reloaded[2].parts]
+
+
+# ── 工具执行痕迹:失败时连同中断摘要一起落库 ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_trace_persisted_with_user_message(store: SessionStore):
+    """带 tool_trace 的失败轮:落库 user 消息 + 一条 assistant 中断摘要。
+
+    摘要要含已执行步骤与结果,让下一轮 agent 能接续执行而不是从头重跑。
+    用户消息在前、摘要在后,下一次 load_context 两条都能读到。
+    """
+    sid = _new_sid()
+    prior = [
+        ModelRequest(parts=[UserPromptPart(content="u0")]),
+        ModelResponse(parts=[TextPart(content="r0")]),
+    ]
+    store.save_messages("default", sid, prior, channel="webui")
+    _, history = store.load_context("default", sid)
+
+    trace = [
+        ToolTraceEntry(tool_name="run_command", text="执行命令：gh api ...（cwd=.）", outcome="success"),
+        ToolTraceEntry(tool_name="write_file", text="写入文件 a.py（220 bytes，overwrite=True）", outcome="success"),
+        ToolTraceEntry(tool_name="browser_navigate", text="打开网页：URL：https://example.com", outcome=None),
+    ]
+    ctx = _make_ctx(history=history, message="帮我调研一下")
+    service = _stub_service(store)
+
+    await _persist_failed_turn_user_message(
+        service, ctx,
+        role="default", actual_session_id=sid,
+        latest_scope=None, resolved_channel_code="webui",
+        user_message="帮我调研一下",
+        tool_trace=trace,
+    )
+
+    _, reloaded = store.load_context("default", sid)
+    assert len(reloaded) == 4  # u0, r0, 失败轮 user, 中断摘要
+    fallback = reloaded[-2]
+    summary = reloaded[-1]
+    assert isinstance(fallback, ModelRequest)
+    assert "帮我调研一下" in [getattr(p, "content", None) for p in fallback.parts]
+    assert isinstance(summary, ModelResponse)
+    text_parts = [getattr(p, "content", "") for p in summary.parts if isinstance(p, TextPart)]
+    assert text_parts and len(text_parts) == 1
+    body = text_parts[0]
+    assert "[系统记录]" in body and "上一轮任务执行中断" in body
+    assert "执行命令：gh api ..." in body
+    assert "写入文件 a.py" in body
+    assert "成功" in body and "未返回结果" in body
+    assert "请基于以上进度" in body
+    # metadata 标记该消息为失败轮中断摘要
+    assert summary.metadata.get("openhachimi_failed_trace") == "1"
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_no_trace_keeps_old_behavior(store: SessionStore):
+    """无工具痕迹(模型首轮即失败)时,仍只落库 user 消息,不产生空摘要噪音。"""
+    sid = _new_sid()
+    ctx = _make_ctx(message="帮我总结一下")
+    service = _stub_service(store)
+
+    await _persist_failed_turn_user_message(
+        service, ctx,
+        role="default", actual_session_id=sid,
+        latest_scope=None, resolved_channel_code=None,
+        user_message="帮我总结一下",
+        tool_trace=[],
+    )
+
+    _, reloaded = store.load_context("default", sid)
+    assert len(reloaded) == 1
+    assert isinstance(reloaded[0], ModelRequest)
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_trace_skipped_when_clarify_pending(store: SessionStore):
+    """clarify_user deferred 路径:user 消息与中断摘要都不落库。
+
+    用户回复以 deferred tool result 灌回模型,落独立消息会造成双入口语义错乱。
+    """
+    sid = _new_sid()
+    prior = [ModelRequest(parts=[UserPromptPart(content="原任务")])]
+    store.save_messages("default", sid, prior)
+    _, history = store.load_context("default", sid)
+
+    trace = [ToolTraceEntry(tool_name="run_command", text="执行命令：ls", outcome="success")]
+    ctx = _make_ctx(
+        session_state={"_user_clarification": {"tool_call_id": "call-1", "question": "?"}},
+        history=history,
+        message="用户的澄清回复",
+    )
+    service = _stub_service(store)
+
+    await _persist_failed_turn_user_message(
+        service, ctx,
+        role="default", actual_session_id=sid,
+        latest_scope=None, resolved_channel_code=None,
+        user_message="用户的澄清回复",
+        tool_trace=trace,
+    )
+
+    _, reloaded = store.load_context("default", sid)
+    assert len(reloaded) == 1  # 没有追加任何消息

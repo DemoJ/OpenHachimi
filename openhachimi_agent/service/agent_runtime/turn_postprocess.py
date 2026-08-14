@@ -12,7 +12,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.memory.capture import capture_turn_memories
@@ -25,6 +25,7 @@ from openhachimi_agent.service.agent_runtime.context_snapshot import (
     _stamp_artifacts_metadata,
     _stamp_turn_metadata,
 )
+from openhachimi_agent.service.agent_runtime.streaming import ToolTraceEntry, format_tool_trace
 from openhachimi_agent.transport.api_models import ArtifactRef
 
 
@@ -33,6 +34,9 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# 失败轮次兜底落库的中断摘要 assistant 消息 metadata 标记。
+_FAILED_TRACE_METADATA_KEY = "openhachimi_failed_trace"
 
 
 def _resolve_final_output_text(result: object, result_holder: dict[str, object]) -> str:
@@ -170,6 +174,7 @@ async def _persist_failed_turn_user_message(
     resolved_channel_code: str | None,
     user_message: str,
     attachments: list | None = None,
+    tool_trace: list[ToolTraceEntry] | None = None,
 ) -> None:
     """agent 调用失败兜底:把本轮用户输入落库,避免下一轮丢失上下文。
 
@@ -177,6 +182,12 @@ async def _persist_failed_turn_user_message(
     ``_persist_turn`` 差量落库。但 agent 抛异常时 ``result`` 不可用,该 user 消息
     从未进入历史,下一轮 ``load_context`` 读不到它 → agent 表现为"忘了刚才聊什么"。
     本函数在失败时用一条 ``ModelRequest(UserPromptPart)`` 兜底落库,使下一轮能看到。
+
+    ``tool_trace`` 非空时,再追加一条 assistant 的中断摘要消息(已完成的工具调用
+    及结果),让下一轮 agent 能接续执行而不是从头重跑;摘要只含脱敏的展示文本,
+    不保存工具返回内容。与 user 消息一次 ``save_messages`` 原子落库,续编 order
+    为 user 在前、摘要在后;``new_history[len(history):]`` 差量语义不受影响(见
+    ``_persist_turn`` 注释,pydantic-ai 的 ``all_messages()`` 包含读回的 history)。
 
     幂等:append-only + ``INSERT OR IGNORE`` + ``MAX(turn_index)+1`` 续编;下一轮
     成功时 ``_persist_turn`` 的 ``new_history[len(history):]`` 会自然跳过已落库部分,
@@ -202,7 +213,15 @@ async def _persist_failed_turn_user_message(
     )
     # save_messages 是 append-only 追加语义:只传本轮新增的 user 消息,不能带 history
     # (否则会把已落库的历史再存一遍)。turn_index 由 MAX(turn_index)+1 续编。
-    new_slice = [user_request]
+    new_slice: list[ModelRequest | ModelResponse] = [user_request]
+    trace_text = format_tool_trace(tool_trace or [])
+    if trace_text:
+        new_slice.append(
+            ModelResponse(
+                parts=[TextPart(content=trace_text)],
+                metadata={_FAILED_TRACE_METADATA_KEY: "1"},
+            )
+        )
     try:
         await asyncio.to_thread(
             service.session_store.save_messages,
@@ -222,8 +241,8 @@ async def _persist_failed_turn_user_message(
         return
 
     logger.info(
-        "failed-turn user message persisted role=%s session_id=%s",
-        role, actual_session_id,
+        "failed-turn trace persisted role=%s session_id=%s steps=%d messages=%d",
+        role, actual_session_id, len(tool_trace or []), len(new_slice),
     )
 
 

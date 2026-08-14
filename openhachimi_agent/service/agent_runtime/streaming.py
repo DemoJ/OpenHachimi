@@ -54,6 +54,19 @@ class StreamStats:
     last_chunk_preview: str = ""
 
 
+@dataclass
+class ToolTraceEntry:
+    """单轮内已发生的工具调用痕迹(供失败兜底落库,让下一轮能接续执行)。
+
+    ``text`` 是脱敏后的展示文本(与 UI 工具卡片同款 ``format_tool_call`` 产物);
+    ``outcome`` 在对应的 ``FunctionToolResultEvent`` 到达时补写。
+    """
+
+    tool_name: str
+    text: str
+    outcome: str | None = None
+
+
 class OperationStalledError(TimeoutError):
     def __init__(self, operation: str, stalled_for: float, timeout: int) -> None:
         self.operation = operation
@@ -374,14 +387,70 @@ def _update_operation_from_event(operation_state: OperationState, event: object)
         operation_state.progress()
 
 
+_OUTCOME_ZH: dict[str, str] = {
+    "success": "成功",
+    "failed": "失败",
+    "denied": "被拒绝",
+    "interrupted": "中断",
+}
+
+
+def _record_tool_trace(trace: list[ToolTraceEntry], event: object) -> None:
+    """把单条流式事件落进 trace:工具调用时 append,工具结果返回时补写 outcome。"""
+    if isinstance(event, FunctionToolCallEvent):
+        tool_name = event.part.tool_name
+        if tool_name == "clarify_user":
+            return
+        trace.append(ToolTraceEntry(tool_name=tool_name, text=format_tool_call(tool_name, dict(event.part.args_as_dict() or {}))))
+        return
+    if isinstance(event, FunctionToolResultEvent):
+        result = event.part
+        outcome = str(getattr(result, "outcome", "success"))
+        for entry in reversed(trace):
+            if entry.tool_name == result.tool_name and entry.outcome is None:
+                entry.outcome = outcome
+                return
+
+
+def format_tool_trace(trace: list[ToolTraceEntry]) -> str:
+    """把本轮已发生的工具调用痕迹渲染成一段纯文本(给下一轮模型与 UI 历史用)。
+
+    仅在失败兜底落库时调用:列出已完成的执行步骤及结果,让下一轮 agent 能
+    "接着干"而不是从头重跑。无痕迹时返回空串(调用方据此跳过落库)。
+    """
+    if not trace:
+        return ""
+    steps: list[str] = []
+    pending = 0
+    for entry in trace:
+        if entry.outcome is None:
+            outcome_text = "未返回结果"
+            pending += 1
+        else:
+            outcome_text = _OUTCOME_ZH.get(entry.outcome, entry.outcome)
+        steps.append(f"{len(steps) + 1}. {entry.text}（{outcome_text}）")
+    lines = [
+        "[系统记录] 上一轮任务执行中断，未能在本轮给出最终答复。已完成的执行步骤：",
+        *steps,
+    ]
+    tail = "任务未完成，请基于以上进度直接继续执行，不要重复已完成步骤。"
+    if pending:
+        tail = f"其中 {pending} 个步骤在等待结果时中断（结果未知）。{tail}"
+    lines.append(tail)
+    return "\n".join(lines)
+
+
 def build_stream_event_handler(
     stream_queue: asyncio.Queue[StreamEventItem | object],
     operation_state: OperationState,
     text_buffer: list[str] | None = None,
+    trace: list[ToolTraceEntry] | None = None,
 ) -> Callable[[object, object], Awaitable[None]]:
     async def handle_stream_events(_ctx: object, stream_event: object) -> None:
         async for event in stream_event:  # type: ignore[attr-defined]
             _update_operation_from_event(operation_state, event)
+            if trace is not None:
+                _record_tool_trace(trace, event)
             if item := event_item_from_stream_event(event):
                 if text_buffer is not None and item.type == "text":
                     text_buffer.append(item.text)

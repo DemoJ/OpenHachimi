@@ -1,7 +1,17 @@
 # pyrefly: ignore [missing-import]
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ToolCallPart,
+    ToolReturnPart,
+)
+
 from openhachimi_agent.core.redaction import REDACTED
 from openhachimi_agent.service.agent_runtime.streaming import (
+    ToolTraceEntry,
+    _record_tool_trace,
     format_tool_call,
+    format_tool_trace,
     redact_tool_args,
     summarize_tool_args,
 )
@@ -89,4 +99,79 @@ def test_format_tool_call_create_todos_truncates_long_plan():
     assert "…等 3 项" in text
     # 总项数提示仍出现在标题里
     assert "计划（共 9 项）：" in text
+
+
+# ── 工具执行痕迹收集与渲染(失败轮兜底落库用) ─────────────────────────────────
+
+
+def test_record_tool_trace_collects_calls_and_outcomes():
+    """流式事件 → trace:工具调用 append,结果返回补写 outcome。"""
+    trace: list[ToolTraceEntry] = []
+
+    _record_tool_trace(
+        trace,
+        FunctionToolCallEvent(part=ToolCallPart(tool_name="run_command", args={"command": "ls", "cwd": "."})),
+    )
+    _record_tool_trace(
+        trace,
+        FunctionToolCallEvent(part=ToolCallPart(tool_name="write_file", args={"path": "a.py", "content": "x"})),
+    )
+    # 第一个工具的结果返回
+    _record_tool_trace(
+        trace,
+        FunctionToolResultEvent(
+            part=ToolReturnPart(tool_name="run_command", content="done", outcome="success"),
+        ),
+    )
+
+    assert len(trace) == 2
+    assert trace[0].tool_name == "run_command"
+    assert trace[0].outcome == "success"
+    assert trace[1].tool_name == "write_file"
+    assert trace[1].outcome is None  # 未返回结果
+
+
+def test_record_tool_trace_redacts_sensitive_args():
+    """trace 文本走 format_tool_call 脱敏,密钥不落库。"""
+    trace: list[ToolTraceEntry] = []
+    _record_tool_trace(
+        trace,
+        FunctionToolCallEvent(
+            part=ToolCallPart(tool_name="run_command", args={"command": "curl -H 'Authorization: Bearer secretvalue'"})
+        ),
+    )
+    assert len(trace) == 1
+    assert "secretvalue" not in trace[0].text
+    assert REDACTED in trace[0].text
+
+
+def test_record_tool_trace_skips_clarify_user():
+    """clarify_user 是 deferred 工具,不进入 trace(其输出直接作为回复给用户)。"""
+    trace: list[ToolTraceEntry] = []
+    _record_tool_trace(
+        trace,
+        FunctionToolCallEvent(part=ToolCallPart(tool_name="clarify_user", args={"question": "?"})),
+    )
+    assert trace == []
+
+
+def test_format_tool_trace_renders_steps_and_results():
+    """中断摘要渲染:含已执行步骤与结果,指引下一轮继续执行而非从头重跑。"""
+    trace = [
+        ToolTraceEntry(tool_name="run_command", text="执行命令：gh api ...", outcome="success"),
+        ToolTraceEntry(tool_name="write_file", text="写入文件 a.py", outcome="failed"),
+        ToolTraceEntry(tool_name="browser_navigate", text="打开网页：URL：https://example.com", outcome=None),
+    ]
+    body = format_tool_trace(trace)
+
+    assert "[系统记录]" in body and "上一轮任务执行中断" in body
+    assert "1. 执行命令：gh api ...（成功）" in body
+    assert "2. 写入文件 a.py（失败）" in body
+    assert "3. 打开网页：URL：https://example.com（未返回结果）" in body
+    assert "不要重复已完成步骤" in body
+
+
+def test_format_tool_trace_empty():
+    """无痕迹时返回空串,调用方据此跳过落库。"""
+    assert format_tool_trace([]) == ""
 

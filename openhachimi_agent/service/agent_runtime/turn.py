@@ -396,8 +396,8 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
 
         if "result" not in state.result_holder:
             # stall / task 被取消路径:agent task 未产出 result(流式分支已 yield
-            # 系统提示)。本轮视为失败轮,兜底落库用户消息保上下文,正常收尾避免
-            # KeyError 把已提示的失败变成新错误。
+            # 系统提示)。本轮视为失败轮,兜底落库用户消息 + 执行痕迹保上下文,
+            # 正常收尾避免 KeyError 把已提示的失败变成新错误。
             await _persist_failed_turn_user_message(
                 service, ctx,
                 role=state.role, actual_session_id=actual_session_id,
@@ -405,6 +405,7 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
                 resolved_channel_code=state.inputs.resolved_channel_code,
                 user_message=state.message,
                 attachments=state.inputs.attachment_list,
+                tool_trace=state.result_holder.get("tool_trace"),
             )
             return
 
@@ -470,7 +471,8 @@ async def run_turn(
             # agent 调用失败(CDP 超时 / 模型错误等):正常路径的 _persist_turn 被跳过,
             # 本轮用户输入从未进入历史 → 下一轮 load_context 读不到,agent 表现为
             # "忘了刚才聊什么"。这里在 per-session lock 内(与压缩互斥)兜底落库一条
-            # 用户消息,使下一轮能看到上下文;落库失败只 warn,绝不掩盖原始异常。
+            # 用户消息 + 本轮已执行工具痕迹摘要,使下一轮能看到上下文并接续执行;
+            # 落库失败只 warn,绝不掩盖原始异常。
             # CancelledError / GeneratorExit 不在此捕获:用户主动中断或消费方关闭
             # generator 时,本轮视为放弃,不落库。
             await _persist_failed_turn_user_message(
@@ -479,5 +481,6 @@ async def run_turn(
                 latest_scope=inputs.latest_scope, resolved_channel_code=inputs.resolved_channel_code,
                 user_message=message,
                 attachments=inputs.attachment_list,
+                tool_trace=state.result_holder.get("tool_trace"),
             )
             raise
