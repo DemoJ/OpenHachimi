@@ -109,6 +109,8 @@ BROWSER_FIELDS: list[dict[str, Any]] = [
      "label": "空闲自动关闭(秒)", "description": "浏览器空闲多少秒后自动关闭以释放内存;0=不自动关闭。下次启动浏览器实例时生效"},
     {"path": "app.browser_cdp_wait_seconds", "kind": CONFIG_KIND_INT, "group": "instance",
      "label": "CDP 就绪等待(秒)", "description": "等待 Chrome CDP 调试端口就绪的最大秒数;冷启动慢或端口冲突时可调高。下次启动浏览器实例时生效"},
+    {"path": "app.browser_connect_url", "kind": CONFIG_KIND_STRING, "group": "instance",
+     "label": "外部 CDP 地址", "description": "接管已启动的 Chrome 调试实例(如 http://127.0.0.1:9222);配置后不再自启浏览器。下次启动浏览器实例时生效"},
 ]
 
 # 记忆系统设置页字段定义(功能域最复杂,前端在「记忆」页内再分 5 个子卡片组)。

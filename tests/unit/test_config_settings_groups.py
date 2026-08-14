@@ -217,7 +217,7 @@ def test_browser_group_registered():
     """browser 分组已在 SETTINGS_FIELD_GROUPS 注册,与 BROWSER_FIELDS 同一对象。"""
     assert "browser" in SETTINGS_FIELD_GROUPS
     assert SETTINGS_FIELD_GROUPS["browser"] is BROWSER_FIELDS
-    assert len(BROWSER_FIELDS) == 6
+    assert len(BROWSER_FIELDS) == 7
 
 
 def test_browser_field_paths_under_app():

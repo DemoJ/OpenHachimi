@@ -493,6 +493,7 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
         browser_window_size=_config_string(app_config, "browser_window_size") or None,
         browser_idle_timeout=_config_int(app_config, "browser_idle_timeout", 300, minimum=0),
         browser_cdp_wait_seconds=_config_int(app_config, "browser_cdp_wait_seconds", 45, minimum=5),
+        browser_connect_url=_config_string(app_config, "browser_connect_url") or None,
         telegram_bot_token=_config_string(app_config, "telegram_bot_token") or None,
         telegram_proxy_url=_config_string(app_config, "telegram_proxy_url") or None,
         show_tool_calls=_config_bool(app_config, "show_tool_calls", True),

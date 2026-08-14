@@ -218,6 +218,7 @@ class BrowserManager(BrowserLifecycleMixin):
         except Exception:
             pass
 
+    @auto_heal_retry()
     async def list_tabs(self) -> str:
         """获取并列出当前打开的所有标签页。"""
         async with self._op_lock:
@@ -237,6 +238,7 @@ class BrowserManager(BrowserLifecycleMixin):
 
             return "\n".join(lines)
 
+    @auto_heal_retry()
     async def new_tab(self, url: str = None) -> str:
         """新建一个标签页并将其激活。"""
         async with self._op_lock:
@@ -292,6 +294,7 @@ class BrowserManager(BrowserLifecycleMixin):
 
             return f"已成功切换到标签页 [{tab_index}] {title} - {self._page.url}"
 
+    @auto_heal_retry()
     async def close_tab(self, tab_index: int = None) -> str:
         """关闭指定索引的标签页。如果不传则关闭当前活动的标签页。"""
         async with self._op_lock:
@@ -345,6 +348,7 @@ class BrowserManager(BrowserLifecycleMixin):
             logger.debug("wait_for_load_state '%s' timeout or failed: %s", state, e)
             return False
 
+    @auto_heal_retry()
     async def navigate(self, url: str) -> str:
         """导航到指定网页。"""
         async with self._op_lock:
@@ -379,6 +383,7 @@ class BrowserManager(BrowserLifecycleMixin):
                 logger.error("Navigation failed: %s", e)
                 return f"导航失败：{e}"
 
+    @auto_heal_retry()
     async def get_state(self) -> str:
         """获取当前页面的完整可访问性树（包含元素 ID），供大模型阅读。"""
         async with self._op_lock:
@@ -462,6 +467,7 @@ class BrowserManager(BrowserLifecycleMixin):
                 logger.error("Failed to get state: %s", e)
                 return f"获取页面状态失败：{e}"
 
+    @auto_heal_retry()
     async def extract_content(self, max_chars: int = 60000, include_links: bool = True) -> str:
         """提取当前页面正文、metadata、标题和链接，供研究任务读取。"""
         async with self._op_lock:
@@ -527,6 +533,7 @@ class BrowserManager(BrowserLifecycleMixin):
                 logger.error("Failed to extract page content: %s", e)
                 return f"提取页面正文失败：{e}"
 
+    @auto_heal_retry()
     async def click(self, element_id: int) -> str:
         """点击指定 ID 的元素。"""
         async with self._op_lock:
@@ -557,6 +564,7 @@ class BrowserManager(BrowserLifecycleMixin):
             except Exception as e:
                 return f"点击失败：{e}"
 
+    @auto_heal_retry()
     async def type_text(self, element_id: int, text: str, simulate_typing: bool = False) -> str:
         """在指定 ID 的输入框中输入文本。"""
         async with self._op_lock:

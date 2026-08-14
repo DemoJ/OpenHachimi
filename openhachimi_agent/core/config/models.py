@@ -261,6 +261,9 @@ class AppConfig:
     scheduler: SchedulerConfig
     research: ResearchConfig
     vision: VisionConfig
+    # 直接接管外部已启动的 Chrome 调试实例（如 http://127.0.0.1:9222）；
+    # 配置后不再自行拉起浏览器进程。
+    browser_connect_url: str | None = None
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     # 思考深度,对齐 openai SDK 官方 ReasoningEffort 枚举,并额外支持 max。
     # none=不思考(默认);其余档位原样透传 reasoning_effort。需模型支持 reasoning 才生效。
