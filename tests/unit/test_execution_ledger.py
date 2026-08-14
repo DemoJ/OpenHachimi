@@ -208,3 +208,78 @@ def test_final_verifier_ignores_previous_turn_failed_event(mock_agent_deps):
     mock_agent_deps.session_state["current_turn_ledger_start_seq"] = 1
 
     assert get_final_verification_signal(mock_agent_deps.session_state) is None
+
+
+# ── 工具层超时:超时不杀整轮 run,把超时事实回灌给 LLM ─────────────────────────
+
+
+def test_tool_timeout_seconds_table(mock_agent_deps):
+    """超时阈值按工具类型分类:run_command 动态放宽,其余固定/兜底。"""
+    from openhachimi_agent.agent.execution import tool_timeout_seconds
+
+    config = mock_agent_deps.config
+
+    # run_command:wait_seconds=5 → 下限 90;wait=60 → 90;wait=120(上限) → 150
+    assert tool_timeout_seconds("run_command", {"wait_seconds": 5}, config) == 90
+    assert tool_timeout_seconds("run_command", {"wait_seconds": 60}, config) == 90
+    assert tool_timeout_seconds("run_command", {"wait_seconds": 120}, config) == 150
+    # 非法 wait_seconds 兜底不崩
+    assert tool_timeout_seconds("run_command", {"wait_seconds": "oops"}, config) == 90
+
+    assert tool_timeout_seconds("send_command_input", {}, config) == 60
+    assert tool_timeout_seconds("browser_navigate", {}, config) == 120
+    assert tool_timeout_seconds("web_fetch", {}, config) == 90
+    assert tool_timeout_seconds("read_file", {}, config) == 120
+    # 未列名工具兜底:max(120, idle*3)=180
+    assert tool_timeout_seconds("some_mcp_tool", {}, config) == 180
+
+
+def test_async_tool_timeout_returned_to_llm(mock_agent_deps, monkeypatch):
+    """async 工具超时 → 不抛不杀 run,返回 [工具执行超时] 文案,ledger 记 failed。
+
+    这是"工具超时不应打断 agent 进程"的核心契约:LLM 拿到超时事实后自行决定
+    换工具/调小 wait_seconds 轮询/告知用户。
+    """
+    import asyncio
+
+    import openhachimi_agent.agent.execution as execution_mod
+
+    async def search_text(ctx):
+        await asyncio.sleep(100)  # 模拟卡死
+        return "never"
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    guarded = with_execution_ledger(search_text)
+
+    # 把阈值临时降到 0.1s,避免测试真等 120s
+    monkeypatch.setattr(execution_mod, "tool_timeout_seconds", lambda name, args, config: 0.1)
+
+    result = asyncio.run(guarded(ctx))
+
+    assert "[工具执行超时]" in result
+    assert "search_text" in result
+    assert "command_status" in result  # 引导改用后台轮询
+    ledger = get_execution_ledger(ctx)
+    assert [event["status"] for event in ledger] == ["started", "failed"]
+    assert "timeout" in str(ledger[-1]["result_preview"])
+
+
+def test_async_tool_timeout_does_not_swallow_cancellation(mock_agent_deps):
+    """外部取消(用户中断整轮)产生的 CancelledError 必须透传,不被吞成超时文案。"""
+    import asyncio
+
+    async def browser_navigate(ctx):
+        await asyncio.sleep(100)
+        return "never"
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    guarded = with_execution_ledger(browser_navigate)
+
+    async def run_and_cancel():
+        task = asyncio.ensure_future(guarded(ctx))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await task
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_and_cancel())

@@ -330,3 +330,88 @@ async def test_failed_turn_trace_skipped_when_clarify_pending(store: SessionStor
 
     _, reloaded = store.load_context("default", sid)
     assert len(reloaded) == 1  # 没有追加任何消息
+
+
+# ── LLM 瞬时网络错误自动重试 ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_llm_transient_error_retries(monkeypatch):
+    """RemoteProtocolError 等瞬时错误应触发自动重试,第二次成功则整轮成功。"""
+    import httpx
+
+    import openhachimi_agent.service.agent_runtime.main_agent as main_agent_mod
+
+    call_count = 0
+
+    async def fake_run(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise httpx.RemoteProtocolError("peer closed connection")
+        return "ok"
+
+    monkeypatch.setattr(main_agent_mod, "run_main_agent_once", fake_run)
+    vision = SimpleNamespace(direct_parts=[], text_prefix="", mode="none", consumed_attachment_ids=[], attachment_statuses=[], errors=[])
+
+    result = await main_agent_mod._run_main_with_llm_retry(
+        main_agent=None, message="m", attachments=[], vision_result=vision,
+        history=[], deps=SimpleNamespace(role_name="r", session_id="s"),
+        config=SimpleNamespace(model_name="m"), stream=False, handle_stream_events=None,
+    )
+    assert result == "ok"
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_llm_permanent_error_no_retry(monkeypatch):
+    """4xx 客户端错误不重试,立即抛出。"""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    import openhachimi_agent.service.agent_runtime.main_agent as main_agent_mod
+
+    call_count = 0
+
+    async def fake_run(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise ModelHTTPError(status_code=400, model_name="m", body={"error": "bad request"})
+
+    monkeypatch.setattr(main_agent_mod, "run_main_agent_once", fake_run)
+    vision = SimpleNamespace(direct_parts=[], text_prefix="", mode="none", consumed_attachment_ids=[], attachment_statuses=[], errors=[])
+
+    with pytest.raises(ModelHTTPError):
+        await main_agent_mod._run_main_with_llm_retry(
+            main_agent=None, message="m", attachments=[], vision_result=vision,
+            history=[], deps=SimpleNamespace(role_name="r", session_id="s"),
+            config=SimpleNamespace(model_name="m"), stream=False, handle_stream_events=None,
+        )
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_5xx_error_retries(monkeypatch):
+    """5xx 网关/上游错误视为瞬时错误,触发重试。"""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    import openhachimi_agent.service.agent_runtime.main_agent as main_agent_mod
+
+    call_count = 0
+
+    async def fake_run(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ModelHTTPError(status_code=502, model_name="m", body={"error": "bad gateway"})
+        return "ok"
+
+    monkeypatch.setattr(main_agent_mod, "run_main_agent_once", fake_run)
+    vision = SimpleNamespace(direct_parts=[], text_prefix="", mode="none", consumed_attachment_ids=[], attachment_statuses=[], errors=[])
+
+    result = await main_agent_mod._run_main_with_llm_retry(
+        main_agent=None, message="m", attachments=[], vision_result=vision,
+        history=[], deps=SimpleNamespace(role_name="r", session_id="s"),
+        config=SimpleNamespace(model_name="m"), stream=False, handle_stream_events=None,
+    )
+    assert result == "ok"
+    assert call_count == 2

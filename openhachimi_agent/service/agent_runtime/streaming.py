@@ -466,6 +466,11 @@ def _operation_timeout_seconds(operation_state: OperationState, config: AppConfi
         return max(240, config.agent_timeout_seconds)
     if operation_state.kind == "model":
         return max(180, config.agent_timeout_seconds)
+    if operation_state.kind == "tool":
+        # 工具执行超时已由 execution.with_execution_ledger 的 wait_for 在工具层处理
+        # (超时回灌 LLM 由其决策,不杀整轮)。这里只留一个长兜底,防 wait_for 失效
+        # 的死锁场景(如工具协程忽略 cancel)。
+        return max(600, config.agent_timeout_seconds)
     if name.startswith("browser_"):
         return 120
     if name in {"web_fetch", "web_search", "discover_web_resources"}:

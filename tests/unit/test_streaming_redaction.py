@@ -175,3 +175,39 @@ def test_format_tool_trace_empty():
     """无痕迹时返回空串,调用方据此跳过落库。"""
     assert format_tool_trace([]) == ""
 
+
+# ── watchdog 语义:tool 阶段只留长兜底(超时由工具层 wait_for 回灌 LLM) ─────────
+
+
+def test_watchdog_tool_phase_is_long_fallback_only():
+    """tool 阶段的 watchdog 超时必须是长兜底(>=600s),不再承担具体工具超时。
+
+    具体工具超时(如 run_command wait_seconds=60)已由 execution.with_execution_ledger
+    的 wait_for 在工具层处理并回灌 LLM;watchdog 只防 wait_for 失效的死锁。
+    """
+    from types import SimpleNamespace
+
+    from openhachimi_agent.service.agent_runtime.context import OperationState
+    from openhachimi_agent.service.agent_runtime.streaming import (
+        _operation_timeout_seconds,
+        _update_operation_from_event,
+    )
+
+    config = SimpleNamespace(stream_idle_timeout_seconds=60, agent_timeout_seconds=300)
+
+    state = OperationState()
+    _update_operation_from_event(
+        state,
+        FunctionToolCallEvent(part=ToolCallPart(tool_name="run_command", args={"command": "ls", "wait_seconds": 60})),
+    )
+    # tool 阶段 → 长兜底,不会 60s 误杀
+    assert _operation_timeout_seconds(state, config) == 600
+
+    # model 阶段(LLM 无响应)仍是 180s 兜底
+    _update_operation_from_event(
+        state,
+        FunctionToolResultEvent(part=ToolReturnPart(tool_name="run_command", content="ok")),
+    )
+    assert state.kind == "model"
+    assert _operation_timeout_seconds(state, config) == 300
+

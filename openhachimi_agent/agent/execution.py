@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import time
 from functools import wraps
 from typing import Any, Callable
@@ -12,6 +13,64 @@ from typing import Any, Callable
 
 _LEDGER_LIMIT = 200
 
+_logger = logging.getLogger(__name__)
+
+# run_command 工具内部 wait_seconds 的上限(command.py MAX_RUN_COMMAND_WAIT_SECONDS)。
+# 工具层超时据此给余量,保证 run_command 总能正常返回后台句柄而不是被掐死。
+_RUN_COMMAND_WAIT_LIMIT_SECONDS = 120
+_RUN_COMMAND_TIMEOUT_MARGIN_SECONDS = 30
+
+
+def tool_timeout_seconds(tool_name: str, args: dict[str, object] | None, config: object | None) -> int:
+    """单个工具调用的超时阈值(秒):超时时中断该次调用并把超时事实回灌给 LLM。
+
+    阈值按工具类型分类,与历史上 streaming watchdog 的分类口径一致:
+    - run_command 按模型给出的 wait_seconds 动态放宽(上限 120s + 30s 余量),
+      避免"wait_seconds>60 必被误杀"的历史 bug 在工具层重演;
+    - 浏览器/网络/文件检索类给固定阈值;
+    - 兜底取 max(120, stream_idle_timeout_seconds * 3)。
+
+    这是"工具超时只中断本次调用、由 LLM 决策下一步"语义的唯一权威来源;
+    streaming watchdog 只保留 model/planner 阶段与死锁兜底。
+    """
+    idle = getattr(config, "stream_idle_timeout_seconds", 60) if config is not None else 60
+    if tool_name == "run_command":
+        wait = 0.0
+        if isinstance(args, dict):
+            try:
+                wait = float(args.get("wait_seconds") or 0)
+            except (TypeError, ValueError):
+                wait = 0.0
+        wait = max(0.0, min(wait, float(_RUN_COMMAND_WAIT_LIMIT_SECONDS)))
+        return max(90, int(wait) + _RUN_COMMAND_TIMEOUT_MARGIN_SECONDS)
+    if tool_name in {"send_command_input", "command_status"}:
+        return 60
+    if tool_name.startswith("browser_"):
+        return 120
+    if tool_name in {"web_fetch", "web_search", "discover_web_resources"}:
+        return 90
+    if tool_name in {"read_file", "list_files", "find_files", "search_text", "git_status", "git_diff"}:
+        return 120
+    return max(120, int(idle) * 3)
+
+
+def _format_tool_timeout(tool_name: str, timeout_seconds: int) -> str:
+    """工具超时的回灌文案:如实告知 LLM 发生了什么,并给出可操作的下一步选项。
+
+    与 ``_format_tool_error`` 同一语义层级 —— 失败事实交给 LLM,由它决定
+    换工具/调小 wait_seconds 改后台轮询/如实告知用户,而不是中断整轮 run。
+    """
+    lines = [
+        f"[工具执行超时] 工具 {tool_name} 执行超过 {timeout_seconds} 秒未完成，本次调用已被中断。",
+        "",
+        "请根据情况判断下一步：",
+        "- 若是长时间运行的命令：调小 wait_seconds 让它立即返回后台句柄，再用 command_status 轮询结果；",
+        "- 若是网页/搜索类工具：可能是网络不通或目标无响应，可换用其它工具或数据源；",
+        "- 若是浏览器工具：页面可能卡死，可尝试 browser_get_state 确认状态后换标签页重试；",
+        "- 若确实无法自行恢复，如实告知用户原因。",
+        "不要重复以完全相同的方式重试。",
+    ]
+    return "\n".join(lines)
 
 
 def _summarize(value: object, max_chars: int = 800) -> str:
@@ -271,6 +330,16 @@ def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, ob
     }
 
 
+def _tool_timeout_for_call(ctx: object, tool_name: str, bound_args: dict[str, object]) -> int:
+    """从 ctx.deps.config 取配置,计算本次工具调用的超时阈值。异常时给保守兜底。"""
+    deps = getattr(ctx, "deps", None)
+    config = getattr(deps, "config", None)
+    try:
+        return tool_timeout_seconds(tool_name, bound_args, config)
+    except Exception:
+        return 120
+
+
 def with_execution_ledger(func: Callable) -> Callable:
     """Record tool execution in the in-memory ledger + feed verification state.
 
@@ -278,6 +347,11 @@ def with_execution_ledger(func: Callable) -> Callable:
     ``get_final_verification_signal`` 消费);succeeded 后再调
     ``verification_stop.mark_tool_succeeded`` 按工具语义更新验证状态(编辑类
     置 stale、验证类清 stale),供停止闸门 ``build_verify_on_stop_nudge`` 判定。
+
+    超时语义:async 工具调用被 ``asyncio.wait_for`` 包住,超过
+    ``tool_timeout_seconds`` 阈值时中断本次调用并把超时事实回灌给 LLM(由 LLM
+    决策下一步),而不是像旧 watchdog 那样 cancel 整个 agent run。外部取消
+    (用户中断/整轮终止)产生的 CancelledError 照常透传,不会被吞成超时。
     """
 
     tool_name = getattr(func, "__name__", "unknown_tool")
@@ -288,8 +362,20 @@ def with_execution_ledger(func: Callable) -> Callable:
             session_state = _get_session_state(ctx)
             bound_args = _bind_tool_args(func, ctx, args, kwargs)
             _append_ledger_event(session_state, tool_name=tool_name, status="started", args=bound_args)
+            timeout = _tool_timeout_for_call(ctx, tool_name, bound_args)
             try:
-                result = await func(ctx, *args, **kwargs)
+                result = await asyncio.wait_for(func(ctx, *args, **kwargs), timeout=timeout)
+            except asyncio.TimeoutError:
+                _append_ledger_event(
+                    session_state,
+                    tool_name=tool_name,
+                    status="failed",
+                    args=bound_args,
+                    result=f"timeout after {timeout}s",
+                    violation="",
+                )
+                _logger.warning("tool call timed out tool_name=%s timeout=%ds", tool_name, timeout)
+                return _format_tool_timeout(tool_name, timeout)
             except Exception as exc:
                 status = _exception_ledger_status(exc)
                 _append_ledger_event(

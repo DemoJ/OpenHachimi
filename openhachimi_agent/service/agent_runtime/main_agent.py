@@ -348,6 +348,76 @@ async def _run_main_with_vision_fallback(
         return result
 
 
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """模型调用层面的瞬时网络错误,值得整轮自动重试。
+
+    覆盖:连接被对端中断(RemoteProtocolError,如网关 60s 流式超时掐断)、读写超时、
+    连接失败、以及 5xx 网关/上游错误。4xx 客户端错误(参数问题/权限)不重试。
+    """
+    import httpx
+
+    if isinstance(
+        exc,
+        (
+            httpx.RemoteProtocolError,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+        ),
+    ):
+        return True
+    if isinstance(exc, ModelHTTPError):
+        return bool(getattr(exc, "status_code", None) and exc.status_code >= 500)
+    return False
+
+
+async def _run_main_with_llm_retry(
+    *,
+    main_agent: Any,
+    message: str,
+    attachments: list[AttachmentRef],
+    vision_result: VisionPreprocessResult,
+    history: list[Any],
+    deps: AgentDeps,
+    config: AppConfig,
+    stream: bool,
+    handle_stream_events: Callable[[object, object], Any] | None,
+) -> object:
+    """对模型调用层面的瞬时网络错误做有限次自动重试(最多 2 次,指数退避)。
+
+    长程任务中 LLM 网关偶发断连(如流式超时掐断 chunked 流)会把整轮打失败,
+    用户得手动"继续"。这里把这类错误自动重试,重试成功则用户无感知。工具层错误、
+    4xx、超时(走外层 asyncio.TimeoutError)不在此重试——它们重试无意义或会掩盖真因。
+    """
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            return await _run_main_with_vision_fallback(
+                main_agent=main_agent,
+                message=message,
+                attachments=attachments,
+                vision_result=vision_result,
+                history=history,
+                deps=deps,
+                config=config,
+                stream=stream,
+                handle_stream_events=handle_stream_events,
+            )
+        except Exception as exc:
+            if attempt >= max_retries or not _is_transient_llm_error(exc):
+                raise
+            delay = 2**attempt
+            logger.warning(
+                "llm transient error, retrying %d/%d in %ds role=%s session_id=%s error=%s",
+                attempt + 1, max_retries, delay, deps.role_name, deps.session_id, exc,
+            )
+            await asyncio.sleep(delay)
+    # 理论上不可达(最后一次循环 raise),保险兜底。
+    raise RuntimeError("llm retry loop exhausted unexpectedly")
+
+
 async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) -> ExecutionOutcome:
     """主 agent 单次 run:视觉预处理 → 单次 agent.run → deferred 短路 → verification signal 上抛。
 
@@ -383,7 +453,7 @@ async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) ->
     reset_turn_verification(ctx.session_state)
     preflight_compress_history(ctx)
 
-    result = await _run_main_with_vision_fallback(
+    result = await _run_main_with_llm_retry(
         main_agent=main_agent,
         message=ctx.message,
         attachments=ctx.attachments,
