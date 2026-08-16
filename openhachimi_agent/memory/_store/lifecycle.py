@@ -12,6 +12,7 @@ class LifecycleStoreMixin:
     def archive_decayed_atoms(self, *, now: str | None = None, limit: int = 500) -> int:
         current = now or utc_now_iso()
         with self.connect() as conn:
+            # 原有逻辑:ephemeral 且 access_count=0 的过期 atom 归档
             rows = conn.execute(
                 """
                 SELECT id FROM memory_atoms
@@ -29,6 +30,92 @@ class LifecycleStoreMixin:
                 [(MemoryStatus.ARCHIVED.value, current, atom_id) for atom_id in ids],
             )
             conn.executemany("DELETE FROM memory_atoms_fts WHERE id = ?", [(atom_id,) for atom_id in ids])
+            return len(ids)
+
+    def archive_stale_task_references(self, *, now: str | None = None, limit: int = 200) -> int:
+        """归档过期的任务引用型记忆。
+
+        任务引用记忆(如"[历史任务] 目标: lxh.io")记录的是一次性任务的摘要,
+        随着时间的推移,这些记忆与当前工作的相关性越来越低。超过 7 天未被访问
+        的任务引用应该被归档,避免长期占用召回预算。
+        """
+        current = now or utc_now_iso()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM memory_atoms
+                WHERE status = ? AND memory_type = 'task_reference'
+                  AND last_accessed_at IS NOT NULL
+                  AND last_accessed_at <= datetime(?, '-7 days')
+                LIMIT ?
+                """,
+                (MemoryStatus.ACTIVE.value, current, limit),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            if not ids:
+                return 0
+            conn.executemany(
+                "UPDATE memory_atoms SET status = ?, updated_at = ? WHERE id = ?",
+                [(MemoryStatus.ARCHIVED.value, current, atom_id) for atom_id in ids],
+            )
+            conn.executemany("DELETE FROM memory_atoms_fts WHERE id = ?", [(atom_id,) for atom_id in ids])
+            return len(ids)
+
+    def archive_stale_situational_atoms(self, *, now: str | None = None, limit: int = 500) -> int:
+        """归档过期的 situational 记忆。
+
+        situational 记忆(如"今天临时用一下Python2")默认 30 天衰减,
+        30 天后未被访问则自动归档,避免长期堆积。
+        """
+        current = now or utc_now_iso()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM memory_atoms
+                WHERE status = ? AND stability = 'situational'
+                  AND decay_at IS NOT NULL AND decay_at <= ?
+                  AND (last_accessed_at IS NULL OR last_accessed_at <= datetime(?, '-30 days'))
+                LIMIT ?
+                """,
+                (MemoryStatus.ACTIVE.value, current, current, limit),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            if not ids:
+                return 0
+            conn.executemany(
+                "UPDATE memory_atoms SET status = ?, updated_at = ? WHERE id = ?",
+                [(MemoryStatus.ARCHIVED.value, current, atom_id) for atom_id in ids],
+            )
+            conn.executemany("DELETE FROM memory_atoms_fts WHERE id = ?", [(atom_id,) for atom_id in ids])
+            return len(ids)
+
+    def downgrade_stable_atoms(self, *, now: str | None = None, limit: int = 500) -> int:
+        """长期未访问的 stable 记忆降权(不归档,但降低召回优先级)。
+
+        stable 记忆(如用户长期偏好)理论上长期有效,但如果 90 天未被访问,
+        可能已不再反映用户当前状态。降权处理(score × 0.5)而非直接归档,
+        保留召回可能性但降低优先级。
+        """
+        current = now or utc_now_iso()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM memory_atoms
+                WHERE status = ? AND stability = 'stable'
+                  AND last_accessed_at IS NOT NULL
+                  AND last_accessed_at <= datetime(?, '-90 days')
+                LIMIT ?
+                """,
+                (MemoryStatus.ACTIVE.value, current, limit),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            if not ids:
+                return 0
+            # 不直接归档,而是降低 confidence 实现降权
+            conn.executemany(
+                "UPDATE memory_atoms SET confidence = confidence * 0.5, updated_at = ? WHERE id = ?",
+                [(current, atom_id) for atom_id in ids],
+            )
             return len(ids)
 
     def touch(self, ids: Iterable[str]) -> None:

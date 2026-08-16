@@ -12,7 +12,7 @@ def test_extracts_preference_from_chinese_turn():
     result = extract_memories_from_turn("请记住：以后回答优先使用中文并保持简洁。", "", scope, "turn1")
 
     assert result.memories
-    assert result.memories[0].memory_type == "preference"
+    assert result.memories[0].memory_type == "user_preference"
     assert result.memories[0].stability == "stable"
 
 
@@ -21,7 +21,7 @@ def test_extracts_constraint_from_turn():
 
     result = extract_memories_from_turn("以后不要创建占位实现，必须真的落地。", "", scope, "turn1")
 
-    assert result.memories[0].memory_type == "constraint"
+    assert result.memories[0].memory_type == "user_constraint"
 
 
 def test_secret_is_rejected():
@@ -39,7 +39,7 @@ def test_extracts_implicit_preference():
     result = extract_memories_from_turn("帮我把默认字体改成 14px", "", scope, "turn1")
 
     assert result.memories
-    assert result.memories[0].memory_type == "preference"
+    assert result.memories[0].memory_type == "user_preference"
     assert "implicit" in result.memories[0].tags
 
 
@@ -85,4 +85,4 @@ def test_llm_extraction_degrades_to_rules_on_failure(mock_config, monkeypatch):
     result = extract_memories_from_turn("请记住：以后回答优先使用中文。", "", scope, "turn1", config=config)
 
     assert result.memories
-    assert result.memories[0].memory_type == "preference"
+    assert result.memories[0].memory_type == "user_preference"

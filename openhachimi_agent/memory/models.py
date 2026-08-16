@@ -45,6 +45,18 @@ class MemoryStability(_StringEnum):
     STABLE = "stable"
 
 
+class MemoryType(_StringEnum):
+    """记忆类型枚举:重构后的类型体系,明确区分用户/项目/任务三个维度。"""
+
+    USER_TRAIT = "user_trait"           # 用户自身属性(职业、技能、角色、身份)
+    USER_PREFERENCE = "user_preference" # 用户偏好(喜欢什么、讨厌什么、习惯什么)
+    USER_CONSTRAINT = "user_constraint" # 用户约束(必须、禁止、不要、只能)
+    PROJECT_FACT = "project_fact"       # 项目事实(技术栈、架构、团队、依赖)
+    PROJECT_DECISION = "project_decision" # 项目决策(选型、放弃、变更及原因)
+    TASK_REFERENCE = "task_reference"   # 历史任务引用(原子化摘要,目标+动作)
+    WORKFLOW = "workflow"               # 工作流程(用户的工作方式、协作模式)
+
+
 class MemoryJobStatus(_StringEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -229,6 +241,14 @@ class ExtractedMemory:
     stability: MemoryStability = MemoryStability.SITUATIONAL
     sensitivity: MemorySensitivity = MemorySensitivity.PERSONAL
     source_quote: str = ""
+
+    @property
+    def memory_type_enum(self) -> MemoryType | None:
+        """将字符串类型转为枚举,非法类型返回 None。"""
+        try:
+            return MemoryType(self.memory_type)
+        except ValueError:
+            return None
 
 
 @dataclass

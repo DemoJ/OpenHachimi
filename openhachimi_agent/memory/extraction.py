@@ -16,21 +16,10 @@ from openhachimi_agent.memory.privacy import PrivacyGuard
 
 logger = logging.getLogger(__name__)
 
+# 规则抽取兜底:仅处理明确偏好,且强制原子化拆分。
+# 规则抽取不再是主路径(LLM 才是),只作为 LLM 失败时的降级方案。
 PREFERENCE_MARKERS = ("记住", "以后", "偏好", "喜欢", "不喜欢", "prefer", "preference", "like", "dislike")
 CONSTRAINT_MARKERS = ("必须", "不要", "只能", "要求", "禁止", "must", "should not", "do not")
-# v2 收紧 PROJECT_MARKERS:旧版用"项目/仓库/技术栈/决定/背景/架构/使用"会被系统
-# prompt 命中(里面就有"项目""使用"),导致 system 注入文本被规则抽成 project_context。
-# 新版要求至少一组词同时出现,并且不能是泛词组合。
-PROJECT_KEYWORD_PAIRS = (
-    ("项目", "使用"),
-    ("项目", "技术栈"),
-    ("仓库", "结构"),
-    ("仓库", "决定"),
-    ("我们", "采用"),
-    ("我们", "决定"),
-)
-# 旧 PROJECT_MARKERS 保留为内部参考,但仅在显式 LLM 抽取兜底时使用
-DECISION_MARKERS = ("决定", "选型", "采用", "放弃", "decision", "decide", "choose")
 TEMPORARY_MARKERS = ("今天", "临时", "本周", "这次", "temporary", "today", "this week")
 STABLE_MARKERS = ("以后", "长期", "总是", "偏好", "习惯", "要求", "always", "prefer", "preference")
 DISLIKE_MARKERS = ("不喜欢", "不要", "禁止", "dislike", "do not", "should not")
@@ -82,10 +71,18 @@ def _extract_with_llm(user_message: str, assistant_output: str, config: AppConfi
 
 
 def _extract_with_rules(content: str, guard: PrivacyGuard) -> MemoryExtractionResult:
+    """规则抽取兜底:仅处理明确偏好/约束,且强制原子化拆分。
+
+    规则抽取不再是主路径(LLM 才是),只作为 LLM 失败时的降级方案。
+    拆分策略:按标点/连接词把整段切成子句,每个子句独立判断类型。
+    """
     lowered = content.lower()
-    memory_type = _memory_type(content, lowered)
-    if memory_type is None:
+    # 原子化拆分:按逗号/句号/分号/换行/连接词切分
+    clauses = _split_into_clauses(content)
+    if not clauses:
         return MemoryExtractionResult()
+
+    memories: list[ExtractedMemory] = []
     now = datetime.now(timezone.utc)
     stability = MemoryStability.STABLE if _contains_any(content, lowered, STABLE_MARKERS) else MemoryStability.SITUATIONAL
     valid_until = None
@@ -96,36 +93,58 @@ def _extract_with_rules(content: str, guard: PrivacyGuard) -> MemoryExtractionRe
         decay_at = (now + timedelta(days=1)).isoformat()
     elif stability == MemoryStability.SITUATIONAL:
         decay_at = (now + timedelta(days=30)).isoformat()
-    extracted = ExtractedMemory(
-        memory_type=memory_type,
-        content=content,
-        subject="user",
-        predicate="states",
-        object=content,
-        keywords=_keywords(content),
-        tags=_tags_for(content, lowered, memory_type),
-        confidence=0.86 if stability == MemoryStability.STABLE else 0.74,
-        stability=stability,
-        sensitivity=guard.should_store(content).sensitivity,
-        source_quote=content[:500],
-    )
-    setattr(extracted, "valid_until", valid_until)
-    setattr(extracted, "decay_at", decay_at)
-    return MemoryExtractionResult(memories=[extracted])
+
+    for clause in clauses:
+        clause = clause.strip()
+        if len(clause) < 4:  # 太短无意义
+            continue
+        clause_lowered = clause.lower()
+        memory_type = _memory_type(clause, clause_lowered)
+        if memory_type is None:
+            continue
+        extracted = ExtractedMemory(
+            memory_type=memory_type,
+            content=clause,
+            subject="user",
+            predicate="states",
+            object=clause,
+            keywords=_keywords(clause),
+            tags=_tags_for(clause, clause_lowered, memory_type),
+            confidence=0.74,  # 规则抽取置信度低于 LLM
+            stability=stability,
+            sensitivity=guard.should_store(clause).sensitivity,
+            source_quote=clause[:500],
+        )
+        setattr(extracted, "valid_until", valid_until)
+        setattr(extracted, "decay_at", decay_at)
+        memories.append(extracted)
+
+    return MemoryExtractionResult(memories=memories)
+
+
+def _split_into_clauses(text: str) -> list[str]:
+    """把整段文本按标点/连接词拆成原子化子句。
+
+    示例:
+        "记住：以后用中文回答,要简洁,格式用 markdown,不要废话"
+        -> ["以后用中文回答", "要简洁", "格式用 markdown", "不要废话"]
+    """
+    import re
+    # 先去掉"记住:"这类前缀
+    text = re.sub(r'^记住[::]?\s*', '', text)
+    text = re.sub(r'^请记住[::]?\s*', '', text)
+    # 按常见分隔符切分
+    parts = re.split(r'[,，;；。\n]|(?:并且)|(?:同时)|(?:以及)|(?:还有)', text)
+    return [part.strip() for part in parts if part.strip()]
 
 
 def _memory_type(text: str, lowered: str) -> str | None:
+    """判断子句的记忆类型(新类型体系)。"""
     if _contains_any(text, lowered, CONSTRAINT_MARKERS):
-        return "constraint"
+        return "user_constraint"
     if _contains_any(text, lowered, PREFERENCE_MARKERS) or _contains_any(text, lowered, IMPLICIT_PREFERENCE_MARKERS):
-        return "preference"
-    if _contains_any(text, lowered, DECISION_MARKERS):
-        return "decision"
-    # v2: project_context 仅在同时命中一组明确的"项目陈述"双词时才触发,
-    # 避免被"项目""使用"等宽泛词误中。
-    for word_a, word_b in PROJECT_KEYWORD_PAIRS:
-        if word_a in text and word_b in text:
-            return "project_context"
+        return "user_preference"
+    # 项目事实/决策不再由规则抽取处理——需要上下文理解,交给 LLM
     return None
 
 
@@ -149,7 +168,18 @@ def _llm_extraction_prompt() -> str:
 
 
 def _extracted_from_json(item: dict[str, Any]) -> ExtractedMemory | None:
-    memory_type = str(item.get("memory_type", "fact")).strip() or "fact"
+    memory_type = str(item.get("memory_type", "")).strip()
+    # 新类型体系映射:旧类型名兼容
+    _TYPE_ALIAS = {
+        "preference": "user_preference",
+        "constraint": "user_constraint",
+        "fact": "user_trait",
+        "project_context": "project_fact",
+        "decision": "project_decision",
+    }
+    memory_type = _TYPE_ALIAS.get(memory_type, memory_type)
+    if not memory_type:
+        return None
     content = str(item.get("content", "")).strip()
     if not content:
         return None

@@ -122,6 +122,9 @@ class MemoryScheduler:
     def _run_maintenance(self) -> None:
         self.store.expire_due_atoms()
         self.store.archive_decayed_atoms()
+        self.store.archive_stale_task_references()
+        self.store.archive_stale_situational_atoms()
+        self.store.downgrade_stable_atoms()
 
     def _handle_extract_atoms(self, payload: dict[str, Any]) -> dict[str, int]:
         scope = _scope_from_payload(payload.get("scope", {}))

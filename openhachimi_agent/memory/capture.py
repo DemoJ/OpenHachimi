@@ -44,29 +44,24 @@ def _looks_memorable(user_message: str) -> bool:
     return any(marker in user_message for marker in markers)
 
 
-# LLM 抽取作业入队闸门:正向命中(值得抽)+负向排除(提问/命令噪声)。
-# 是 _looks_memorable 的超集——后者仅驱动同步规则抽取,本函数决定是否
-# 花一次 LLM 调用去抽。普通对话不进 LLM 抽取,从源头止血 L1 泛滥。
-_EXPLICIT_INTENT_MARKERS = (
-    "记住", "以后", "偏好", "习惯", "要求", "纠正", "不要", "禁止",
-    "remember", "prefer", "always", "from now on",
+# LLM 抽取作业入队:所有用户消息都进 LLM 抽取,由 LLM 判断是否为可记忆内容。
+# 移除关键词过滤闸门——LLM 比规则更能理解语义,避免"记住不要停"这类任务指令
+# 被误判为记忆意图,也避免"帮我研究一下"这类隐性任务指令被漏掉。
+# 隐私保护由 PrivacyGuard 在抽取后统一处理,不依赖前置关键词过滤。
+# 任务型指令特征:这类消息虽然可能含"记住"等词,但本质是一次性任务指令,
+# 而非需要长期记忆的偏好或事实。识别后用于规则提取原子化内容,不存原文。
+_TASK_COMMAND_MARKERS = (
+    "深挖", "挖掘", "调研", "搜索", "查找", "分析", "爬取", "抓取", "采集",
+    "必须", "一定", "务必", "记住不要", "不要还", "直到", "挖到", "挖无可挖",
+    "所有事情", "任何事情", "所有信息", "剩余信息", "相关信息",
+    "dig", "research", "search", "find", "analyze", "scrape", "crawl",
+    "must", "until", "exhaust", "everything about",
 )
-_EXPLICIT_STATEMENT_MARKERS = (
-    "我喜欢", "我不喜欢", "默认", "一律", "必须", "只能",
+# 复合任务指令:含"记住"但后面紧跟的是任务执行约束而非记忆意图
+_TASK_CONSTRAINT_PATTERNS = (
+    "记住不要", "记住必须", "记住一定", "记住务必", "记住直到",
+    "记住在", "记住当", "记住如果", "记住对于",
 )
-# 项目事实双词(与 extraction.PROJECT_KEYWORD_PAIRS 同思路,各自独立定义,
-# 避免 capture→extraction 的循环依赖)。命中任一组即视为值得抽取。
-_PROJECT_FACT_PAIRS = (
-    ("项目", "使用"),
-    ("项目", "技术栈"),
-    ("仓库", "结构"),
-    ("仓库", "决定"),
-    ("我们", "采用"),
-    ("我们", "决定"),
-)
-# 提问/请求句式:即使含正向词,本质是"问"或"求",不是陈述事实。
-_QUESTION_PREFIXES = ("怎么", "为什么", "如何", "能不能", "能不能够", "帮我", "请问", "可以吗", "是不是", "有没有")
-_COMMAND_NOISE_MARKERS = ("运行", "执行", "跑一下", "跑一下这个", "帮我跑", "帮我运行")
 
 
 def _is_question_like(text: str) -> bool:
@@ -75,30 +70,54 @@ def _is_question_like(text: str) -> bool:
         return False
     if stripped.endswith(("？", "?")):
         return True
-    return any(stripped.startswith(prefix) for prefix in _QUESTION_PREFIXES)
+    return False
 
 
-def _is_command_noise(text: str) -> bool:
-    return any(marker in text for marker in _COMMAND_NOISE_MARKERS)
+def _is_task_command(text: str) -> bool:
+    """判断文本是否为任务型指令而非需要记忆的事实/偏好。
 
-
-def _is_memorable_turn(user_message: str) -> bool:
-    """判断本轮是否值得进入 LLM 抽取(规则预判闸门)。
-
-    正向命中任一即过闸:显式记忆意图词 / 显式偏好约束陈述 / 项目事实双词。
-    负向排除:提问句式 / 命令噪声——即使混进正向词,本质是请求而非事实。
+    保留用于规则提取原子信息,不再作为 LLM 抽取的过滤闸门。
     """
-    text = user_message.strip()
-    if not text:
-        return False
-    # 负向排除优先:提问/命令噪声直接拦掉
-    if _is_question_like(text) or _is_command_noise(text):
-        return False
-    if any(marker in text for marker in _EXPLICIT_INTENT_MARKERS):
+    lowered = text.lower()
+    task_marker_count = sum(1 for marker in _TASK_COMMAND_MARKERS if marker in text or marker in lowered)
+    if task_marker_count >= 2:
         return True
-    if any(marker in text for marker in _EXPLICIT_STATEMENT_MARKERS):
+    if any(pattern in text for pattern in _TASK_CONSTRAINT_PATTERNS):
         return True
-    return any(word_a in text and word_b in text for word_a, word_b in _PROJECT_FACT_PAIRS)
+    has_command_verb = any(marker in text for marker in ("深挖", "挖掘", "调研", "搜索", "查找", "分析", "dig", "research", "search", "analyze"))
+    has_target = any(char in text for char in (".", "。", "io", "com", "cn", "网站", "博主", "作者", "项目"))
+    if len(text) > 50 and has_command_verb and has_target:
+        return True
+    return False
+
+
+def _extract_atomic_from_task_command(text: str) -> str | None:
+    """从任务型指令中提取原子化的关键信息,而非保存整段原文。
+
+    例如: "深挖关于lxh.io这个网站的任何事情,以及深挖这个网站背后的博主"
+    提取: "用户曾要求调研 lxh.io 网站及其博主相关信息"
+
+    如果无法提取有意义的原子信息,返回 None。
+    """
+    import re
+    # 提取目标对象(域名/网站/人名等)
+    domains = re.findall(r'[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}', text)
+    # 提取动作词
+    actions = []
+    for action in ("深挖", "挖掘", "调研", "搜索", "查找", "分析", "了解"):
+        if action in text:
+            actions.append(action)
+    if not domains and not actions:
+        return None
+    parts = []
+    if domains:
+        parts.append(f"目标: {', '.join(domains[:3])}")
+    if actions:
+        parts.append(f"动作: {', '.join(dict.fromkeys(actions))}")
+    return f"[历史任务] {' | '.join(parts)}"
+
+
+
 
 
 def _looks_like_scheduler_payload(text: str) -> bool:
@@ -232,16 +251,18 @@ def capture_turn_memories(
     if len(clean_user_message.strip()) < config.memory.capture.min_turn_chars:
         return turn_id
 
-    # 规则预判闸门:不值得记忆的轮次(提问/命令/寒暄)不进 LLM 抽取,从源头止血。
-    # min_turn_chars 只挡长度,本闸门挡"是否值得花一次 LLM 调用去抽"。
-    if not _is_memorable_turn(clean_user_message):
-        logger.info(
-            "memory L1 extraction skipped: not memorable role=%s session_id=%s turn_id=%s",
-            scope.role_name,
-            scope.session_id,
-            turn_id,
-        )
-        return turn_id
+    # 任务型指令特殊处理:提取原子化关键信息,而非保存整段原文
+    # 所有用户消息都进 LLM 抽取,由 LLM 判断是否为可记忆内容
+    task_command_atomic = None
+    if _is_task_command(clean_user_message):
+        task_command_atomic = _extract_atomic_from_task_command(clean_user_message)
+        if task_command_atomic:
+            logger.info(
+                "memory task command detected, storing atomic summary role=%s session_id=%s turn_id=%s",
+                scope.role_name,
+                scope.session_id,
+                turn_id,
+            )
 
     payload = {
         "turn_id": turn_id,
@@ -264,8 +285,12 @@ def capture_turn_memories(
             if decision.action == "redact":
                 logger.info("memory candidate redacted role=%s session_id=%s reason=%s", scope.role_name, scope.session_id, decision.reason)
             content = decision.text.strip()
+            # 任务型指令:用原子化摘要替代原文,避免整段命令入库
+            if task_command_atomic:
+                content = task_command_atomic
+                logger.info("memory atom content replaced with atomic summary role=%s session_id=%s", scope.role_name, scope.session_id)
             atom = MemoryAtom(
-                memory_type="preference" if any(word in clean_user_message.lower() for word in ["偏好", "喜欢", "不喜欢", "以后", "要求", "prefer", "preference", "like", "dislike"]) else "project_context",
+                memory_type="task_reference" if task_command_atomic else ("user_preference" if any(word in clean_user_message.lower() for word in ["偏好", "喜欢", "不喜欢", "以后", "要求", "prefer", "preference", "like", "dislike"]) else "user_constraint"),
                 content=content,
                 scope=scope,
                 subject="user",
@@ -274,8 +299,8 @@ def capture_turn_memories(
                 evidence_turn_ids=[turn_id],
                 source_quote=content[:500],
                 keywords=_keywords(content),
-                confidence=0.82,
-                stability=MemoryStability.STABLE if any(word in clean_user_message.lower() for word in ["以后", "偏好", "习惯", "要求", "prefer", "preference"]) else MemoryStability.SITUATIONAL,
+                confidence=0.65 if task_command_atomic else 0.82,
+                stability=MemoryStability.EPHEMERAL if task_command_atomic else (MemoryStability.STABLE if any(word in clean_user_message.lower() for word in ["以后", "偏好", "习惯", "要求", "prefer", "preference"]) else MemoryStability.SITUATIONAL),
                 sensitivity=decision.sensitivity,
             )
             embedding = None

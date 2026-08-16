@@ -10,7 +10,7 @@ from pathlib import Path
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.embeddings import EmbeddingProvider
 from openhachimi_agent.memory.formatting import format_memory_context
-from openhachimi_agent.memory.models import MemoryContext, MemoryScope, MemorySearchResult
+from openhachimi_agent.memory.models import MemoryContext, MemoryScope, MemorySearchResult, MemoryType
 from openhachimi_agent.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,160 @@ def apply_recall_decay(result: MemorySearchResult, *, now: str | None = None) ->
 # v2: scheduler_payload 不应从 L1 召回,避免定时调度 payload 被当成长期事实
 # 注入 system prompt。历史上还有 conversation_context(compressed window 抢救)
 # 类型,但该机制已移除,旧数据清理后该排除项无意义,仅保留 scheduler_payload。
-_EXCLUDED_L1_TYPES = {"scheduler_payload"}
+_EXCLUDED_L1_TYPES = {"scheduler_payload", "task_reference"}
+
+# 任务引用型记忆:虽然已提取原子信息,但召回时仍需降权处理,避免干扰当前任务
+_TASK_REFERENCE_TYPE = "task_reference"
+
+
+def _is_task_reference_relevant(query: str, content: str) -> bool:
+    """判断任务引用型记忆是否与当前查询相关。
+
+    任务引用记忆(如"[历史任务] 目标: lxh.io | 动作: 深挖, 挖掘")只在
+    查询明确涉及相同目标时才应被召回,否则是噪声。
+    """
+    import re
+    # 提取记忆中的目标域名/关键词
+    memory_domains = set(re.findall(r'[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}', content))
+    query_domains = set(re.findall(r'[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}', query))
+    # 域名重叠才认为相关
+    if memory_domains and query_domains and memory_domains & query_domains:
+        return True
+    # 提取记忆中的动作词
+    memory_actions = set(re.findall(r'深挖|挖掘|调研|搜索|查找|分析', content))
+    query_actions = set(re.findall(r'深挖|挖掘|调研|搜索|查找|分析', query))
+    # 动作词重叠且查询包含相似目标才相关
+    if memory_actions and query_actions and memory_actions & query_actions:
+        # 进一步检查是否有共同目标关键词
+        memory_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', content))
+        query_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', query))
+        common = memory_keywords & query_keywords
+        # 排除通用词
+        common = common - {"历史", "任务", "目标", "动作", "用户", "要求", "网站", "信息"}
+        if len(common) >= 2:
+            return True
+    return False
+
+
+def filter_task_reference_noise(results: list[MemorySearchResult], query: str) -> list[MemorySearchResult]:
+    """过滤掉与当前查询无关的任务引用型记忆。
+
+    任务引用记忆是历史任务的摘要(如"[历史任务] 目标: lxh.io"),如果当前
+    查询与那个历史任务无关,这些记忆就是噪声,应该被过滤或大幅降权。
+    """
+    filtered = []
+    for item in results:
+        if item.memory_type == _TASK_REFERENCE_TYPE:
+            if _is_task_reference_relevant(query, item.content):
+                # 相关但降权:任务引用记忆的置信度打折
+                item.score *= 0.3
+                filtered.append(item)
+            # 不相关:直接丢弃,不进入结果
+        else:
+            filtered.append(item)
+    return filtered
+
+
+# 任务意图到记忆类型的映射:不同任务类型召回不同维度的记忆
+INTENT_TYPE_MAP: dict[str, list[str]] = {
+    "coding": [
+        MemoryType.PROJECT_FACT.value,
+        MemoryType.PROJECT_DECISION.value,
+        MemoryType.USER_CONSTRAINT.value,
+        MemoryType.WORKFLOW.value,
+    ],
+    "chat": [
+        MemoryType.USER_TRAIT.value,
+        MemoryType.USER_PREFERENCE.value,
+        MemoryType.USER_CONSTRAINT.value,
+    ],
+    "research": [
+        MemoryType.TASK_REFERENCE.value,
+        MemoryType.PROJECT_FACT.value,
+        MemoryType.USER_PREFERENCE.value,
+    ],
+    "planning": [
+        MemoryType.PROJECT_FACT.value,
+        MemoryType.PROJECT_DECISION.value,
+        MemoryType.WORKFLOW.value,
+        MemoryType.USER_CONSTRAINT.value,
+    ],
+    "general": [
+        MemoryType.USER_PREFERENCE.value,
+        MemoryType.USER_CONSTRAINT.value,
+        MemoryType.PROJECT_FACT.value,
+    ],
+}
+
+
+def infer_task_intent(query: str) -> str:
+    """从查询文本推断任务意图类型。
+
+    基于关键词启发式分类,不追求精确,只做粗粒度过滤:
+    - coding: 代码/编程/调试/报错相关
+    - research: 调研/搜索/分析/深挖相关
+    - planning: 计划/设计/架构/方案相关
+    - chat: 闲聊/问答/建议相关
+    - general: 默认
+    """
+    text = query.lower()
+    coding_terms = ("代码", "编程", "debug", "报错", "error", "bug", "fix", "修复", "实现", "implement", "function", "class", "import", "python", "javascript", "typescript", "react", "vue", "数据库", "sql", "api", "接口", "服务器", "部署", "deploy")
+    research_terms = ("调研", "搜索", "查找", "分析", "深挖", "挖掘", "research", "search", "find", "analyze", " investigate", "study", "了解")
+    planning_terms = ("计划", "规划", "设计", "架构", "方案", "plan", "design", "architecture", "schema", "roadmap", "路线图", "流程", "workflow")
+    chat_terms = ("聊天", "聊聊", "怎么看", "你觉得", "建议", "意见", "看法", "chat", "talk", "discuss", "opinion", "advice")
+
+    scores = {"coding": 0, "research": 0, "planning": 0, "chat": 0}
+    for term in coding_terms:
+        if term in text:
+            scores["coding"] += 1
+    for term in research_terms:
+        if term in text:
+            scores["research"] += 1
+    for term in planning_terms:
+        if term in text:
+            scores["planning"] += 1
+    for term in chat_terms:
+        if term in text:
+            scores["chat"] += 1
+
+    best = max(scores, key=scores.get)
+    if scores[best] == 0:
+        return "general"
+    return best
+
+
+def filter_by_intent(results: list[MemorySearchResult], intent: str) -> list[MemorySearchResult]:
+    """按任务意图过滤记忆类型。
+
+    只保留与当前任务意图相关的记忆类型,减少无关记忆干扰。
+    例如写代码时召回"用户喜欢深色主题"没有意义。
+    """
+    allowed_types = set(INTENT_TYPE_MAP.get(intent, INTENT_TYPE_MAP["general"]))
+    filtered = [item for item in results if item.memory_type in allowed_types]
+    return filtered
+
+
+def deduplicate_by_subject(results: list[MemorySearchResult]) -> list[MemorySearchResult]:
+    """同主题记忆去重:按 subject+predicate 分组,只保留每组最高分。
+
+    避免召回多个相同主题的记忆(如多条"使用中文回答"),只保留最相关的一条。
+    """
+    groups: dict[tuple[str, str], list[MemorySearchResult]] = {}
+    for item in results:
+        key = (item.metadata.get("subject", "user"), item.metadata.get("predicate", "states"))
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(item)
+
+    deduped: list[MemorySearchResult] = []
+    for group in groups.values():
+        # 每组只保留最高分
+        best = max(group, key=lambda x: x.score)
+        deduped.append(best)
+
+    # 重新按分数排序
+    deduped.sort(key=lambda x: x.score, reverse=True)
+    return deduped
 
 
 def select_by_level_budget(
@@ -133,6 +286,13 @@ def recall_memories(config: AppConfig, scope: MemoryScope, query: str) -> Memory
                     len(bm25_results),
                 )
         fused = fuse_results([bm25_results, vector_results], rrf_k=config.memory.recall.rrf_k)
+        # 过滤与当前查询无关的任务引用型记忆(历史任务摘要),避免噪声干扰
+        fused = filter_task_reference_noise(fused, query)
+        # 任务意图感知:按当前查询意图过滤记忆类型
+        intent = infer_task_intent(query)
+        fused = filter_by_intent(fused, intent)
+        # 同主题去重:避免同一偏好被多条记忆重复表达
+        fused = deduplicate_by_subject(fused)
         results = select_by_level_budget(
             fused,
             final_l1_top_k=config.memory.recall.final_l1_top_k,
@@ -141,11 +301,12 @@ def recall_memories(config: AppConfig, scope: MemoryScope, query: str) -> Memory
         )
         store.touch([item.id for item in results])
         logger.info(
-            "memory recall completed role=%s session_id=%s results=%d degraded=%s sources=%s",
+            "memory recall completed role=%s session_id=%s results=%d degraded=%s intent=%s sources=%s",
             scope.role_name,
             scope.session_id,
             len(results),
             str(degraded).lower(),
+            intent,
             sorted({item.source for item in results}),
         )
         return MemoryContext(scope=scope, query=query, results=results, degraded=degraded, reason=reason)

@@ -29,6 +29,9 @@ def consolidate_due_memories(
     current = now or utc_now_iso()
     expired = store.expire_due_atoms(now=current)
     archived = store.archive_decayed_atoms(now=current)
+    stale_tasks = store.archive_stale_task_references(now=current)
+    stale_situational = store.archive_stale_situational_atoms(now=current)
+    downgraded_stable = store.downgrade_stable_atoms(now=current)
     atoms = store.list_atoms_for_consolidation(scope, limit=atom_limit, min_confidence=min_atom_confidence)
     blocks_created, blocks_updated = consolidate_atoms_to_blocks(store, atoms, now=current, min_block_atoms=min_block_atoms, config=config)
     blocks = store.list_blocks_for_profile_consolidation(scope, limit=block_limit)
@@ -37,6 +40,9 @@ def consolidate_due_memories(
         "atoms_scanned": len(atoms),
         "atoms_expired": expired,
         "atoms_archived": archived,
+        "stale_tasks_archived": stale_tasks,
+        "stale_situational_archived": stale_situational,
+        "stable_downgraded": downgraded_stable,
         "blocks_created": blocks_created,
         "blocks_updated": blocks_updated,
         "profiles_created": profiles_created,
