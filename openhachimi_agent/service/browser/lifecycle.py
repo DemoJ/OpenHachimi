@@ -22,7 +22,6 @@ import sys
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import Error as PlaywrightError
-from playwright_stealth import Stealth
 
 from openhachimi_agent.core.config import AppConfig
 from .cdp import fetch_cdp_websocket_url, find_free_port
@@ -30,6 +29,7 @@ from .chrome_process import (
     build_launch_args,
     cleanup_stale_singletons,
     find_chrome_executable,
+    load_or_create_window_size,
     read_devtools_active_port,
     tail_chrome_stderr,
     terminate_browser_process,
@@ -227,8 +227,10 @@ class BrowserLifecycleMixin:
         # 自动转发命令行后悄悄退出，导致 --remote-debugging-port 永远不生效。
         cleanup_stale_singletons(user_data_dir)
 
-        window_size = self.config.browser_window_size or (
-            f"{random.randint(1366, 1920)},{random.randint(768, 1080)}"
+        # 窗口尺寸与 profile 绑定（未显式配置时首次随机、之后复用记录值），
+        # 避免同一档案每次重启尺寸漂移形成自动化指纹。
+        window_size = load_or_create_window_size(
+            user_data_dir, self.config.browser_window_size or None
         )
         args = build_launch_args(self.config, chrome_path, port, user_data_dir, window_size, headless)
 
@@ -293,7 +295,12 @@ class BrowserLifecycleMixin:
         return await self._playwright.chromium.connect_over_cdp(cdp_endpoint)
 
     async def _bind_active_page(self) -> Page:
-        """绑定当前 context 的活动页面（无页面则新建），并注入 stealth。"""
+        """绑定当前 context 的活动页面（无页面则新建）。
+
+        stealth 与 captcha observer 均已提升为 context 级 init script
+        （见 BrowserManager._setup_context_hardening），此处无需再对单页注入，
+        新开标签页 / window.open 弹出页同样被覆盖。
+        """
         pages = self._context.pages
         valid_pages = [p for p in pages if not (".top-chrome" in p.url or "chrome-extension://" in p.url)] if pages else []
         if valid_pages:
@@ -312,14 +319,18 @@ class BrowserLifecycleMixin:
         else:
             page = await self._context.new_page()
 
-        # 注入 stealth 以抹除自动化特征
-        try:
-            await Stealth().apply_stealth_async(page)
-        except Exception as exc:
-            logger.warning("为页面注入 stealth 脚本时发生错误: %s", exc)
-
         logger.info("Playwright 浏览器已启动并绑定到活动页面。")
         return page
+
+    async def _wait_process_exit(self, proc, timeout: float = 5.0) -> bool:
+        """等待进程自行退出（非阻塞轮询），超时返回 False。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if proc.poll() is not None:
+                return True
+            await asyncio.sleep(0.1)
+        return proc.poll() is not None
 
     async def _cleanup_chrome_process(self) -> None:
         """清理 Chrome 进程与端口记录（不触碰 playwright 驱动器，供启动重试用）。"""
@@ -356,12 +367,42 @@ class BrowserLifecycleMixin:
             async with self._lock:
                 if self._page:
                     try:
+                        # 关闭前清除自动化标记，降低指纹暴露
+                        from .dom_scripts import CLEAR_AGENT_MARKS_SCRIPT
+                        await self._page.evaluate(CLEAR_AGENT_MARKS_SCRIPT)
+                    except Exception:
+                        pass
+                    try:
                         await self._page.close()
                     except Exception:
                         pass
                     self._page = None
+                # 清理会话绑定
+                if hasattr(self, "_session_pages"):
+                    self._session_pages.clear()
+
+                # 优雅关闭 Chrome：在断开 Playwright 连接前，先通过 CDP 发送
+                # Browser.close 让 Chrome 自行正常退出（写盘会话数据）。
+                # 直接硬杀进程会导致 Chrome 判定"异常关闭"，下次启动弹
+                # "恢复页面"提示。仅对我们自己拉起的进程生效；
+                # 接管外部实例（browser_connect_url）时只断开连接，不关用户的浏览器。
+                if self._chrome_process and self._browser:
+                    try:
+                        session = await self._browser.new_browser_cdp_session()
+                        await session.send("Browser.close")
+                        logger.info("已通过 CDP 发送 Browser.close，等待 Chrome 正常退出...")
+                        await self._wait_process_exit(self._chrome_process, timeout=5.0)
+                    except Exception as e:
+                        logger.debug("CDP Browser.close 失败（将走进程终止兜底）: %s", e)
+
                 if self._context:
                     try:
+                        # 移除 dialog 处理器，避免关闭期间收到 dismiss 回调
+                        if hasattr(self, "_on_dialog"):
+                            try:
+                                self._context.remove_listener("dialog", self._on_dialog)
+                            except Exception:
+                                pass
                         await self._context.close()
                     except Exception:
                         pass
@@ -383,14 +424,23 @@ class BrowserLifecycleMixin:
                     proc = self._chrome_process
                     try:
                         if proc.poll() is None:
-                            logger.info("终止后台 Chrome 原生进程...")
+                            logger.info("Chrome 未在宽限期内自行退出，强制终止进程...")
                             await asyncio.to_thread(terminate_browser_process, proc)
+                        else:
+                            logger.info("Chrome 已正常退出（exit code=%s）。", proc.returncode)
                     except Exception as exc:
                         logger.error("关闭 Chrome 进程失败: %s", exc)
                     finally:
                         self._chrome_process = None
                 # 清除 CDP 端口记录，避免下次 _ensure_browser 误用已失效端口
                 self._chrome_cdp_port = None
+                # 清理页面元素映射与 dialog 状态
+                if hasattr(self, "_element_mappings"):
+                    self._element_mappings.clear()
+                if hasattr(self, "_active_mapping"):
+                    self._active_mapping = {}
+                if hasattr(self, "_last_dialog"):
+                    self._last_dialog = None
                 if self._chrome_stderr_file:
                     try:
                         self._chrome_stderr_file.close()

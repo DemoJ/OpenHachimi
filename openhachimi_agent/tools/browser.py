@@ -34,7 +34,7 @@ async def browser_navigate(ctx: RunContext[AgentDeps], url: str) -> str:
     if local_path is not None:
         raise_if_processed_vision_attachment(ctx, local_path, tool_name="browser_navigate")
     bm = ctx.deps.browser_manager
-    result = await bm.navigate(url)
+    result = await bm.navigate(url, session_id=getattr(ctx.deps, 'session_id', None))
     return result
 
 
@@ -45,7 +45,7 @@ async def browser_get_state(ctx: RunContext[AgentDeps]) -> str:
     你可以通过阅读这些信息了解页面长什么样，并使用提供的 [ID] 调用 browser_click 或 browser_type。
     """
     bm = ctx.deps.browser_manager
-    result = await bm.get_state()
+    result = await bm.get_state(session_id=getattr(ctx.deps, 'session_id', None))
     return result
 
 
@@ -57,31 +57,38 @@ async def browser_extract_content(ctx: RunContext[AgentDeps], max_chars: int = 6
     遇到 CAPTCHA / 人机验证 / 权限页面时会停止并报告，不会尝试绕过。
     """
     bm = ctx.deps.browser_manager
-    result = await bm.extract_content(max_chars=max_chars, include_links=include_links)
+    result = await bm.extract_content(max_chars=max_chars, include_links=include_links, session_id=getattr(ctx.deps, 'session_id', None))
     return result
 
 
-async def browser_click(ctx: RunContext[AgentDeps], element_id: int) -> str:
+async def browser_click(ctx: RunContext[AgentDeps], element_id: int, description: str = None) -> str:
     """点击浏览器页面中指定 ID 的元素。
     
     参数 `element_id` 必须是之前调用 browser_get_state 获取到的页面状态中元素前的数字 ID。
+    
+    参数 `description`（可选，建议提供）：对该元素的简短描述（如"登录按钮"、"搜索输入框"）。
+    系统会校验描述与元素实际内容是否相符，不符时拒绝点击并提示重新获取页面状态，
+    防止页面变化后点错元素。
     """
     bm = ctx.deps.browser_manager
-    result = await bm.click(element_id)
+    result = await bm.click(element_id, description, session_id=getattr(ctx.deps, 'session_id', None))
     return result
 
 
-async def browser_type(ctx: RunContext[AgentDeps], element_id: int, text: str, simulate_typing: bool = False) -> str:
+async def browser_type(ctx: RunContext[AgentDeps], element_id: int, text: str, simulate_typing: bool = False, description: str = None) -> str:
     """在浏览器页面中指定 ID 的输入框（或文本区域）中输入文本。
     
     参数 `element_id` 必须是之前调用 browser_get_state 获取到的页面状态中元素前的数字 ID。
+    
+    参数 `description`（可选，建议提供）：对该输入框的简短描述（如"搜索框"、"用户名输入"），
+    用于防呆校验，防止页面变化后填错位置。
     
     参数 `simulate_typing` (布尔值):
     - 默认为 False。系统会使用极速且原子的方式瞬间填入文本，这是绝大多数表单和长文本的推荐方式。
     - 设为 True。系统将模拟人类真实的逐字敲击。只有当遇到“必须逐字敲击才会触发下拉联想建议”的动态搜索框（例如搜索引擎主页、实时检索列表）时才使用此选项。
     """
     bm = ctx.deps.browser_manager
-    result = await bm.type_text(element_id, text, simulate_typing)
+    result = await bm.type_text(element_id, text, simulate_typing, description, session_id=getattr(ctx.deps, 'session_id', None))
     return result
 
 
@@ -92,18 +99,96 @@ async def browser_scroll(ctx: RunContext[AgentDeps], direction: str, amount: int
     
     参数：
     - direction: 滚动方向。可选：
-        'down'   — 向下滚动（最常用，向下查看更多内容）
-        'up'     — 向上滚动
-        'bottom' — 直接跳到页面最底部
-        'top'    — 直接跳回页面顶部
+        'down'   - 向下滚动（最常用，向下查看更多内容）
+        'up'     - 向上滚动
+        'bottom' - 直接跳到页面最底部
+        'top'    - 直接跳回页面顶部
     - amount: 滚动像素数（仅 up/down 有效，默认 600 约一屏）
     - element_id: 可选。如果明确知道需要滚动的区域（如侧边栏、弹窗列表）而非整个页面，可以传入该容器内部任意已知元素的 ID，系统会自动寻找最近的可滚动祖先并滚动它。如果不传，则默认全局滚动。
     
     滚动完成后必须调用 browser_get_state 查看新视口中的内容。
     """
     bm = ctx.deps.browser_manager
-    result = await bm.scroll(direction, amount, element_id)
+    result = await bm.scroll(direction, amount, element_id, session_id=getattr(ctx.deps, 'session_id', None))
     return result
+
+
+async def browser_press_key(ctx: RunContext[AgentDeps], key: str, element_id: int | None = None) -> str:
+    """在当前页面按下键盘键（最常见用途：输入搜索词后按 Enter 提交）。
+
+    参数：
+    - key: 键名。常用：'Enter'（提交/搜索）、'Tab'、'Escape'（关闭弹窗）、
+      'ArrowDown'/'ArrowUp'（选择下拉建议）、'Backspace'。
+      组合键用 '+' 连接，如 'Control+A'。
+    - element_id: 可选。传入则先聚焦该元素再按键；不传则对当前聚焦位置/页面直接按键。
+
+    在搜索框输入文本后，通常直接调用 browser_press_key('Enter', 搜索框ID) 即可提交，
+    无需寻找搜索按钮。
+    """
+    bm = ctx.deps.browser_manager
+    return await bm.press_key(key, element_id, session_id=getattr(ctx.deps, 'session_id', None))
+
+
+async def browser_select_option(ctx: RunContext[AgentDeps], element_id: int, option: str) -> str:
+    """选择原生 <select> 下拉框的选项。
+
+    参数：
+    - element_id: browser_get_state 中输出的 select 元素 ID。
+    - option: 选项的可见文本（如"每月"）或 value 值。失败时返回全部可用选项列表。
+
+    自定义下拉组件（非原生 select）不支持本工具，请用 browser_click 展开后点击选项。
+    """
+    bm = ctx.deps.browser_manager
+    return await bm.select_option(element_id, option, session_id=getattr(ctx.deps, 'session_id', None))
+
+
+async def browser_hover(ctx: RunContext[AgentDeps], element_id: int) -> str:
+    """悬停到指定 ID 的元素上（用于展开悬停菜单、查看悬浮提示）。
+
+    悬停后若出现新菜单，需再调用 browser_get_state 获取新元素。
+    """
+    bm = ctx.deps.browser_manager
+    return await bm.hover(element_id, session_id=getattr(ctx.deps, 'session_id', None))
+
+
+async def browser_go_back(ctx: RunContext[AgentDeps]) -> str:
+    """浏览器后退一步（返回上一页，等价于浏览器的后退按钮）。"""
+    bm = ctx.deps.browser_manager
+    return await bm.go_back(session_id=getattr(ctx.deps, 'session_id', None))
+
+
+async def browser_go_forward(ctx: RunContext[AgentDeps]) -> str:
+    """浏览器前进一步（撤销一次后退）。"""
+    bm = ctx.deps.browser_manager
+    return await bm.go_forward(session_id=getattr(ctx.deps, 'session_id', None))
+
+
+async def browser_wait_for(ctx: RunContext[AgentDeps], text: str | None = None, seconds: float = 3.0, timeout: float = 10.0) -> str:
+    """等待页面出现指定文本，或等待固定时间（供懒加载/动画收敛后重新读取页面）。
+
+    参数：
+    - text: 等待页面出现该文本（不区分大小写），出现后立即返回。
+    - seconds: 不传 text 时，固定等待的秒数（0.1 ~ 10）。
+    - timeout: 等待 text 的最大秒数，超时不报错并提示。
+
+    典型用法：browser_click 后页面在加载中，browser_wait_for(text="登录成功") 确认结果，
+    或 browser_scroll 触发懒加载后 browser_wait_for(seconds=2) 再 browser_get_state。
+    """
+    bm = ctx.deps.browser_manager
+    return await bm.wait_for(text=text, seconds=seconds, timeout=timeout, session_id=getattr(ctx.deps, 'session_id', None))
+
+
+async def browser_screenshot(ctx: RunContext[AgentDeps], question: str = None) -> str:
+    """截取当前页面视口的截图。适合 DOM 状态无法描述的场景（canvas/地图/复杂视觉布局/验证码）。
+
+    参数：
+    - question: 可选。针对截图的问题（如"这个图表显示了什么趋势"），
+      配置了视觉模型时会返回针对该问题的回答。
+
+    返回截图保存路径；配置视觉模型时附带画面描述。
+    """
+    bm = ctx.deps.browser_manager
+    return await bm.screenshot(question, session_id=getattr(ctx.deps, 'session_id', None))
 
 
 async def browser_list_tabs(ctx: RunContext[AgentDeps]) -> str:
@@ -113,7 +198,7 @@ async def browser_list_tabs(ctx: RunContext[AgentDeps]) -> str:
     当需要知道当前打开了哪些页面，或者需要切换、关闭页面前，应调用此工具。
     """
     bm = ctx.deps.browser_manager
-    return await bm.list_tabs()
+    return await bm.list_tabs(session_id=getattr(ctx.deps, 'session_id', None))
 
 
 async def browser_new_tab(ctx: RunContext[AgentDeps], url: str = None) -> str:
@@ -123,7 +208,7 @@ async def browser_new_tab(ctx: RunContext[AgentDeps], url: str = None) -> str:
     使用此工具可以保留原页面的情况下，在新的标签页中打开链接或进行搜索。
     """
     bm = ctx.deps.browser_manager
-    return await bm.new_tab(url)
+    return await bm.new_tab(url, session_id=getattr(ctx.deps, 'session_id', None))
 
 
 async def browser_switch_tab(ctx: RunContext[AgentDeps], tab_index: int) -> str:
@@ -133,7 +218,7 @@ async def browser_switch_tab(ctx: RunContext[AgentDeps], tab_index: int) -> str:
     切换后，该页面将变为活动状态，后续的操作（如点击、输入、获取状态）都将作用于此页面。
     """
     bm = ctx.deps.browser_manager
-    return await bm.switch_tab(tab_index)
+    return await bm.switch_tab(tab_index, session_id=getattr(ctx.deps, 'session_id', None))
 
 
 async def browser_close_tab(ctx: RunContext[AgentDeps], tab_index: int = None) -> str:
@@ -143,4 +228,4 @@ async def browser_close_tab(ctx: RunContext[AgentDeps], tab_index: int = None) -
     关闭后，如果有其他打开的标签页，会自动切换到最新的一个。如果全部关闭了，需要再调用 browser_new_tab 或 browser_navigate 重新打开页面。
     """
     bm = ctx.deps.browser_manager
-    return await bm.close_tab(tab_index)
+    return await bm.close_tab(tab_index, session_id=getattr(ctx.deps, 'session_id', None))

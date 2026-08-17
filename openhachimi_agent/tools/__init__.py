@@ -2,7 +2,9 @@
 
 from openhachimi_agent.tools.browser import (
     browser_click, browser_extract_content, browser_get_state, browser_navigate, browser_scroll, browser_type,
-    browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab
+    browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab,
+    browser_press_key, browser_select_option, browser_hover,
+    browser_go_back, browser_go_forward, browser_wait_for, browser_screenshot,
 )
 from openhachimi_agent.tools.command import run_command
 from openhachimi_agent.tools.editing import make_directory, replace_in_file, write_file
@@ -54,6 +56,13 @@ __all__ = [
     "browser_new_tab",
     "browser_switch_tab",
     "browser_close_tab",
+    "browser_press_key",
+    "browser_select_option",
+    "browser_hover",
+    "browser_go_back",
+    "browser_go_forward",
+    "browser_wait_for",
+    "browser_screenshot",
     "create_todos",
     "update_todo",
     "get_todos",

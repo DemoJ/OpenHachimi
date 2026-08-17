@@ -8,7 +8,9 @@ from openhachimi_agent.tools.artifacts import publish_artifact
 from openhachimi_agent.tools.attachments import inspect_image
 from openhachimi_agent.tools.browser import (
     browser_click, browser_extract_content, browser_get_state, browser_navigate, browser_scroll, browser_type,
-    browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab
+    browser_list_tabs, browser_new_tab, browser_switch_tab, browser_close_tab,
+    browser_press_key, browser_select_option, browser_hover,
+    browser_go_back, browser_go_forward, browser_wait_for, browser_screenshot,
 )
 from openhachimi_agent.tools.command import command_status, run_command, send_command_input
 from openhachimi_agent.tools.editing import delete_path, make_directory, replace_in_file, write_file
@@ -49,9 +51,16 @@ _BROWSER_TOOLS = [
     browser_navigate,
     browser_click,
     browser_type,
+    browser_press_key,
+    browser_select_option,
+    browser_hover,
     browser_scroll,
+    browser_wait_for,
     browser_get_state,
     browser_extract_content,
+    browser_screenshot,
+    browser_go_back,
+    browser_go_forward,
     browser_list_tabs,
     browser_new_tab,
     browser_switch_tab,
@@ -129,6 +138,8 @@ _MUTATION_FUNCS = {
     write_file, make_directory, replace_in_file, delete_path, publish_artifact,
     run_command, send_command_input,
     browser_navigate, browser_click, browser_type, browser_scroll,
+    browser_press_key, browser_select_option, browser_hover,
+    browser_go_back, browser_go_forward,
     browser_new_tab, browser_switch_tab, browser_close_tab,
     install_skill,
     remember, forget_memory,

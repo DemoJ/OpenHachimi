@@ -10,7 +10,7 @@ class FakeBrowserManager:
     def __init__(self):
         self.urls = []
 
-    async def navigate(self, url: str) -> str:
+    async def navigate(self, url: str, **kwargs) -> str:
         self.urls.append(url)
         return f"navigated:{url}"
 

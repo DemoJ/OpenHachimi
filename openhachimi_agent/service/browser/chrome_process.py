@@ -8,6 +8,7 @@ stderr 尾部读取、进程组终止。
 import glob
 import logging
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -138,15 +139,42 @@ def build_launch_args(
         args.extend([
             "--no-sandbox",
             "--disable-gpu",
-            "--disable-blink-features=AutomationControlled",
         ])
-        # Wayland 优先：不传 --ozone-platform，由 Chrome 自动选择——
+        # Wayland 优先：不传 --ozone-platform，由 Chrome 自动选择--
         # WAYLAND_DISPLAY 存活时原生 Wayland，否则自动落回 X11。
         # （历史问题：锁屏/闲置时 mutter 不处理新窗口握手，X11/Wayland 都会卡死，
         # 已由 browser_process_env 的锁屏检测提前拦截并引导用户解锁。）
     if headless:
         args.extend(["--headless=new"])
     return args
+
+
+def load_or_create_window_size(user_data_dir: Path, override: str | None = None) -> str:
+    """窗口尺寸与 profile 绑定持久化（反指纹）。
+
+    同一 user-data-dir 的窗口尺寸必须稳定：浏览器重启后尺寸漂移
+    （今天 1440x900、明天 1680x1050）是明显的自动化特征。
+    - 显式配置了 browser_window_size 时以配置为准，不持久化随机值；
+    - 否则首次随机生成并写入 profile，后续每次复用记录值。
+    """
+    if override:
+        return override
+    marker = user_data_dir / "window_size"
+    try:
+        if marker.exists():
+            recorded = marker.read_text(encoding="utf-8").strip()
+            if recorded and "x" in recorded:
+                w, h = recorded.split("x", 1)
+                if w.isdigit() and h.isdigit():
+                    return f"{w},{h}"  # 记录用 x 分隔，Chrome 参数用逗号
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        size = f"{random.randint(1366, 1920)},{random.randint(768, 1080)}"
+        # 内部存储用 x 分隔（与 Chrome 参数逗号区分），返回时统一逗号格式
+        w, h = size.split(",")
+        marker.write_text(f"{w}x{h}", encoding="utf-8")
+        return size
+    except OSError:
+        return f"{random.randint(1366, 1920)},{random.randint(768, 1080)}"
 
 
 def read_devtools_active_port(user_data_dir) -> tuple[int, str] | None:
