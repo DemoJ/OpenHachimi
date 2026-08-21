@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -13,7 +14,17 @@ from pathlib import Path
 from typing import Any, Dict
 
 from openhachimi_agent.core.config import AppConfig
-from openhachimi_agent.interface.weixin.ilink_client import TYPING_STATUS_CANCEL, TYPING_STATUS_START, WeixinClient
+from openhachimi_agent.interface.weixin import media as weixin_media
+from openhachimi_agent.interface.weixin.ilink_client import (
+    ITEM_FILE,
+    ITEM_IMAGE,
+    ITEM_TEXT,
+    ITEM_VIDEO,
+    ITEM_VOICE,
+    TYPING_STATUS_CANCEL,
+    TYPING_STATUS_START,
+    WeixinClient,
+)
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.storage.attachments import AttachmentError, AttachmentStorage
 from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
@@ -25,11 +36,6 @@ _ACCOUNT_REL_PATH = Path(".memory") / "weixin_account.json"
 _ACCOUNT_WATCH_INTERVAL_SECONDS = 5.0
 _MEDIA_BATCH_DELAY_SECONDS = 3.0
 _RECENT_MEDIA_TTL_SECONDS = 10 * 60.0
-ITEM_TEXT = 1
-ITEM_IMAGE = 2
-ITEM_VOICE = 3
-ITEM_VIDEO = 4
-ITEM_FILE = 5
 _MEDIA_KIND_BY_TYPE = {
     ITEM_IMAGE: "image",
     ITEM_VIDEO: "video",
@@ -293,7 +299,7 @@ def _format_size(size_bytes: int | None) -> str:
 def _format_artifact_notice(artifacts: list[ArtifactRef]) -> str:
     if not artifacts:
         return ""
-    lines = ["微信渠道暂不能直接上传生成文件，已生成以下文件："]
+    lines = ["以下生成文件未能通过微信发送，可从本地路径获取："]
     for artifact in artifacts:
         detail = f"- {artifact.filename} ({_format_size(artifact.size_bytes)})：{artifact.local_path}"
         if artifact.download_url:
@@ -302,6 +308,35 @@ def _format_artifact_notice(artifacts: list[ArtifactRef]) -> str:
             detail += f"；{artifact.description}"
         lines.append(detail)
     return "\n".join(lines)
+
+
+_MD_STRUCTURAL_LINE_RE = re.compile(r"^(#{1,6}\s|[-*+]\s|\d+[.)]\s|>|\||```)")
+
+
+def _is_md_structural_line(line: str) -> bool:
+    return bool(_MD_STRUCTURAL_LINE_RE.match(line.lstrip()))
+
+
+def _ensure_weixin_line_breaks(text: str) -> str:
+    """iLink 微信客户端按 Markdown 渲染文本消息：单个换行会被折叠成空格，
+    只有空行才产生换行。把相邻普通文本行之间的单换行升级为空行，保证逐行
+    显示；代码块内部保持原样，列表/标题/表格/引用等 Markdown 结构行之间的
+    单换行本身语义正确，也不做改写。"""
+    lines = text.splitlines()
+    out: list[str] = []
+    in_fence = False
+    for index, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+        out.append(line)
+        if in_fence or index + 1 >= len(lines):
+            continue
+        nxt = lines[index + 1]
+        if not line.strip() or not nxt.strip():
+            continue
+        if not (_is_md_structural_line(line) and _is_md_structural_line(nxt)):
+            out.append("")
+    return "\n".join(out)
 
 
 class WeixinChannel:
@@ -449,6 +484,15 @@ class WeixinChannel:
             text_content = "\n".join(part for part in [text_content, *prepared.media_hints] if part).strip()
         return text_content
 
+    async def _send_text(self, prepared: _PreparedWeixinMessage, text: str) -> None:
+        """微信出站文本统一入口：先做 Markdown 换行适配再发送。"""
+        await self.client.send_message(
+            to_user_id=prepared.to_user,
+            text=_ensure_weixin_line_breaks(text),
+            context_token=prepared.context_token,
+            client_id=f"openhachimi-{uuid.uuid4().hex[:8]}",
+        )
+
     def _prune_recent_media(self, session_key: str, now: float | None = None) -> list[_RecentMediaEntry]:
         self._ensure_media_context_state()
         now = time.monotonic() if now is None else now
@@ -584,13 +628,7 @@ class WeixinChannel:
                 )
             if outcome is not None:
                 reply = outcome.message or "已完成。"
-                client_id = f"openhachimi-{uuid.uuid4().hex[:8]}"
-                await self.client.send_message(
-                    to_user_id=prepared.to_user,
-                    text=reply,
-                    context_token=prepared.context_token,
-                    client_id=client_id,
-                )
+                await self._send_text(prepared, reply)
                 logger.info(
                     "微信命令已分派 来自 %s kind=%s text=%s",
                     prepared.from_user,
@@ -647,20 +685,34 @@ class WeixinChannel:
                 except Exception as e:
                     logger.debug("取消 typing 指示器失败: %s", e)
 
-        client_id = f"openhachimi-{uuid.uuid4().hex[:8]}"
-        artifact_notice = _format_artifact_notice(response.artifacts)
-        reply_text = response.output
-        if artifact_notice:
-            reply_text = "\n\n".join(part for part in [reply_text, artifact_notice] if part.strip())
-        if not reply_text.strip():
-            reply_text = "已完成。"
-        await self.client.send_message(
-            to_user_id=prepared.to_user,
-            text=reply_text,
-            context_token=prepared.context_token,
-            client_id=client_id,
-        )
+        reply_text = (response.output or "").strip() or "已完成。"
+        await self._send_text(prepared, reply_text)
         logger.info("已回复微信消息给 %s", prepared.to_user)
+        await self._send_artifacts(prepared, response.artifacts)
+
+    async def _send_artifacts(self, prepared: _PreparedWeixinMessage, artifacts: list[ArtifactRef]) -> None:
+        if not artifacts:
+            return
+        failed: list[ArtifactRef] = []
+        for artifact in artifacts:
+            try:
+                path = weixin_media.resolve_artifact_path(self.config.base_dir, artifact.local_path)
+                if not path.is_file():
+                    raise FileNotFoundError(f"文件不存在：{path}")
+                await weixin_media.send_artifact(
+                    self.client,
+                    to_user_id=prepared.to_user,
+                    context_token=prepared.context_token,
+                    path=path,
+                    filename=artifact.filename,
+                )
+                logger.info("已通过微信发送生成文件 %s 给 %s", artifact.filename, prepared.to_user)
+            except Exception as exc:
+                logger.warning("微信发送生成文件失败 filename=%s: %s", artifact.filename, exc)
+                failed.append(artifact)
+        notice = _format_artifact_notice(failed)
+        if notice:
+            await self._send_text(prepared, notice)
 
     async def _handle_message(self, msg: Dict[str, Any]):
         try:

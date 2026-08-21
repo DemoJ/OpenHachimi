@@ -30,17 +30,29 @@ EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode"
 EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"
 EP_GET_CONFIG = "ilink/bot/getconfig"
 EP_SEND_TYPING = "ilink/bot/sendtyping"
+EP_GET_UPLOAD_URL = "ilink/bot/getuploadurl"
 
 TYPING_STATUS_START = 1
 TYPING_STATUS_CANCEL = 2
 
+# getuploadurl 的 media_type 枚举（与 item type 是两套编号）
+MEDIA_TYPE_IMAGE = 1
+MEDIA_TYPE_VIDEO = 2
+MEDIA_TYPE_FILE = 3
+MEDIA_TYPE_VOICE = 4
+
 LONG_POLL_TIMEOUT_MS = 35_000
 API_TIMEOUT_MS = 15_000
 MEDIA_TIMEOUT_MS = 20_000
+UPLOAD_TIMEOUT_SECONDS = 120.0
 
 MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
 ITEM_TEXT = 1
+ITEM_IMAGE = 2
+ITEM_VOICE = 3
+ITEM_FILE = 4
+ITEM_VIDEO = 5
 _WEIXIN_CDN_ALLOWLIST = frozenset(
     {
         "novac2c.cdn.weixin.qq.com",
@@ -79,6 +91,28 @@ def _headers(token: Optional[str], body: str) -> Dict[str, str]:
 
 def _cdn_download_url(encrypted_query_param: str) -> str:
     return f"{WEIXIN_CDN_BASE_URL.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
+
+
+def _cdn_upload_url(upload_param: str, filekey: str) -> str:
+    return (
+        f"{WEIXIN_CDN_BASE_URL.rstrip('/')}/upload"
+        f"?encrypted_query_param={quote(upload_param, safe='')}"
+        f"&filekey={quote(filekey, safe='')}"
+    )
+
+
+def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len] * pad_len)
+
+
+def _aes_padded_size(size: int) -> int:
+    return ((size + 1 + 15) // 16) * 16
+
+
+def _aes128_ecb_encrypt(plaintext: bytes, key: bytes) -> bytes:
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return encryptor.update(_pkcs7_pad(plaintext)) + encryptor.finalize()
 
 
 def _assert_weixin_cdn_url(url: str) -> None:
@@ -220,6 +254,72 @@ class WeixinClient:
         if len(data) > max_size_bytes:
             raise RuntimeError(f"media exceeds {max_size_bytes} bytes after decrypt")
         return data, content_type
+
+    async def get_upload_url(
+        self,
+        *,
+        to_user_id: str,
+        media_type: int,
+        filekey: str,
+        rawsize: int,
+        rawfilemd5: str,
+        filesize: int,
+        aeskey_hex: str,
+    ) -> dict[str, Any]:
+        """请求 iLink 媒体上传凭证。"""
+        return await self._api_post(
+            EP_GET_UPLOAD_URL,
+            {
+                "filekey": filekey,
+                "media_type": media_type,
+                "to_user_id": to_user_id,
+                "rawsize": rawsize,
+                "rawfilemd5": rawfilemd5,
+                "filesize": filesize,
+                "no_need_thumb": True,
+                "aeskey": aeskey_hex,
+            },
+            API_TIMEOUT_MS,
+        )
+
+    async def upload_ciphertext(self, *, ciphertext: bytes, upload_url: str) -> str:
+        """上传 AES 加密后的媒体密文，返回下载凭证 encrypted_query_param。
+
+        下载凭证取自 CDN 响应头 x-encrypted-param（upload_full_url 查询参数里
+        携带的是上传凭证，不能混用）。CDN 只接受 POST。
+        """
+        response = await self.client.post(
+            upload_url,
+            content=ciphertext,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"WeChat CDN upload HTTP {response.status_code}: {response.text[:200]}")
+        encrypted_param = response.headers.get("x-encrypted-param", "").strip()
+        if not encrypted_param:
+            raise RuntimeError("WeChat CDN upload response missing x-encrypted-param header")
+        return encrypted_param
+
+    async def send_media_message(
+        self,
+        to_user_id: str,
+        item: dict[str, Any],
+        context_token: str | None,
+        client_id: str,
+    ) -> dict[str, Any]:
+        """发送携带单个媒体 item 的消息（图片/视频/文件/语音）。"""
+        message: dict[str, Any] = {
+            "from_user_id": "",
+            "to_user_id": to_user_id,
+            "client_id": client_id,
+            "message_type": MSG_TYPE_BOT,
+            "message_state": MSG_STATE_FINISH,
+            "item_list": [item],
+        }
+        if context_token:
+            message["context_token"] = context_token
+        return await self._api_post(EP_SEND_MESSAGE, {"msg": message}, API_TIMEOUT_MS)
 
     async def get_typing_ticket(self, to_user_id: str) -> Optional[str]:
         """获取打字状态票据，用于发送"正在输入"指示器。"""

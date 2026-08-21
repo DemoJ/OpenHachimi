@@ -90,10 +90,15 @@ def _build_turn_deps(
     session_state: dict[str, object],
     *,
     run_mode: str,
+    actual_session_id: str,
 ) -> tuple[AgentDeps, MemoryScope, object]:
-    """构造 MemoryScope / recall / deps,并按 run_mode 注入子 agent 委派挂载点。"""
+    """构造 MemoryScope / recall / deps,并按 run_mode 注入子 agent 委派挂载点。
+
+    ``actual_session_id`` 必须传 load_context 解析后的会话 ID:微信等渠道
+    允许调用方传 session_id=None 由存储层新建会话,若这里误用原始值,
+    记忆库(memory_turns.session_id NOT NULL)写入会直接失败。
+    """
     role = inputs.role
-    actual_session_id = inputs.session_id
     memory_scope = MemoryScope(
         tenant_id="local",
         user_id="local",

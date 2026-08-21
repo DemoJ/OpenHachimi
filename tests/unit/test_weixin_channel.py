@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from openhachimi_agent.interface.weixin import channel as weixin_channel
-from openhachimi_agent.interface.weixin.channel import WeixinChannel, _extract_text_content
+from openhachimi_agent.interface.weixin.channel import (
+    WeixinChannel,
+    _ensure_weixin_line_breaks,
+    _extract_text_content,
+)
 from openhachimi_agent.storage.attachments import AttachmentStorage
 from openhachimi_agent.transport.api_models import ArtifactRef
 
@@ -49,6 +53,56 @@ def test_extract_text_content_includes_voice_transcription():
 
 def test_extract_text_content_ignores_voice_without_transcription():
     assert _extract_text_content([{"type": 3, "voice_item": {"voice_url": "https://example.com/a.silk"}}]) == ""
+
+
+def test_ensure_weixin_line_breaks_separates_plain_lines():
+    assert _ensure_weixin_line_breaks("第一行\n第二行") == "第一行\n\n第二行"
+
+
+def test_ensure_weixin_line_breaks_keeps_existing_blank_lines():
+    text = "第一行\n\n第二行"
+    assert _ensure_weixin_line_breaks(text) == text
+
+
+def test_ensure_weixin_line_breaks_keeps_code_fence_intact():
+    text = "说明如下\n```python\nprint('a')\nprint('b')\n```\n结束"
+    formatted = _ensure_weixin_line_breaks(text)
+    assert "print('a')\nprint('b')" in formatted
+    assert formatted.startswith("说明如下\n\n")
+    assert formatted.endswith("\n\n结束")
+
+
+def test_ensure_weixin_line_breaks_keeps_markdown_lists_tight():
+    text = "- 项目一\n- 项目二\n1. 步骤一\n2. 步骤二"
+    assert _ensure_weixin_line_breaks(text) == text
+
+
+def test_ensure_weixin_line_breaks_separates_list_from_plain_text():
+    assert _ensure_weixin_line_breaks("- 列表项\n普通正文") == "- 列表项\n\n普通正文"
+
+
+def test_ensure_weixin_line_breaks_formats_new_session_reply():
+    lines = [
+        "✨ 新对话已准备好",
+        "",
+        "✅ 上一段对话已保存",
+        "📝 已为你开启一段全新的上下文",
+        "",
+        "━━ 当前配置 ━━",
+        "🤖 模型:hachimi",
+        "🌐 模型服务:http://10.8.8.13:3002/v1",
+        "🎭 角色:default",
+        "🧩 会话:20260821-123906-3ec0d74a",
+        "",
+        "💬 直接输入内容并回车,即可继续对话。",
+    ]
+    formatted = _ensure_weixin_line_breaks("\n".join(lines))
+    non_blank = [line for line in formatted.splitlines() if line.strip()]
+    assert non_blank[0] == "✨ 新对话已准备好"
+    assert non_blank[-1] == "💬 直接输入内容并回车,即可继续对话。"
+    for prev, nxt in zip(formatted.splitlines(), formatted.splitlines()[1:]):
+        if prev.strip() and nxt.strip():
+            raise AssertionError(f"相邻非空行之间缺少空行: {prev!r} -> {nxt!r}")
 
 
 @pytest.mark.asyncio
@@ -332,7 +386,7 @@ async def test_text_after_image_reuses_recent_image_context(mock_config):
 
 
 @pytest.mark.asyncio
-async def test_handle_message_mentions_artifacts_when_weixin_upload_is_unavailable(mock_config):
+async def test_artifact_notice_falls_back_to_text_when_upload_unavailable(mock_config):
     class FakeService:
         async def send_message(self, **kwargs):
             return SimpleNamespace(
@@ -371,9 +425,80 @@ async def test_handle_message_mentions_artifacts_when_weixin_upload_is_unavailab
         }
     )
 
+    assert len(client.sent) == 2
     assert "文件已生成" in client.sent[0]["text"]
-    assert "report.pdf" in client.sent[0]["text"]
-    assert "/artifacts/art_1/download" in client.sent[0]["text"]
+    assert "report.pdf" not in client.sent[0]["text"]
+    assert "未能通过微信发送" in client.sent[1]["text"]
+    assert "report.pdf" in client.sent[1]["text"]
+    assert "/artifacts/art_1/download" in client.sent[1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_artifacts_are_sent_as_weixin_media_messages(mock_config, tmp_path):
+    artifact_file = tmp_path / "photo.png"
+    artifact_file.write_bytes(PNG_BYTES)
+
+    class FakeService:
+        async def send_message(self, **kwargs):
+            return SimpleNamespace(
+                output="图片已生成",
+                artifacts=[
+                    ArtifactRef(
+                        id="art_2",
+                        filename="photo.png",
+                        content_type="image/png",
+                        size_bytes=len(PNG_BYTES),
+                        local_path=artifact_file.relative_to(mock_config.base_dir).as_posix(),
+                        download_url="/artifacts/art_2/download",
+                    )
+                ],
+            )
+
+    class FakeWeixinClient:
+        def __init__(self):
+            self.sent = []
+            self.media_messages = []
+
+        async def get_typing_ticket(self, to_user_id):
+            return None
+
+        async def send_message(self, **kwargs):
+            self.sent.append(kwargs)
+            return {}
+
+        async def get_upload_url(self, **kwargs):
+            return {"upload_full_url": "https://novac2c.cdn.weixin.qq.com/c2c/upload?x=1"}
+
+        async def upload_ciphertext(self, *, ciphertext, upload_url):
+            return "dl-param"
+
+        async def send_media_message(self, to_user_id, item, context_token, client_id):
+            self.media_messages.append(
+                {"to_user_id": to_user_id, "item": item, "context_token": context_token}
+            )
+            return {}
+
+    client = FakeWeixinClient()
+    channel = make_channel(mock_config, service=FakeService(), client=client)
+
+    await channel._handle_message(
+        {
+            "message_type": 1,
+            "from_user_id": "wxid_user",
+            "context_token": "ctx",
+            "item_list": [{"type": 1, "text_item": {"text": "画一张图"}}],
+        }
+    )
+
+    assert len(client.sent) == 1
+    assert "图片已生成" in client.sent[0]["text"]
+    assert "未能通过微信发送" not in client.sent[0]["text"]
+    assert len(client.media_messages) == 1
+    media = client.media_messages[0]
+    assert media["to_user_id"] == "wxid_user"
+    assert media["context_token"] == "ctx"
+    assert media["item"]["type"] == 2
+    assert media["item"]["image_item"]["media"]["encrypt_query_param"] == "dl-param"
 
 
 @pytest.mark.asyncio

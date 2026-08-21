@@ -482,7 +482,9 @@ async def run_turn(
         await service._maybe_reload_mcp_toolsets()
         session_state = service._session_states.setdefault(actual_session_id, {})
         session_state["turn_artifacts"] = []
-        deps, memory_scope, memory_context = _build_turn_deps(service, inputs, session_state, run_mode=run_mode)
+        deps, memory_scope, memory_context = _build_turn_deps(
+            service, inputs, session_state, run_mode=run_mode, actual_session_id=actual_session_id,
+        )
         ctx, stream_queue, stream_stats, result_holder = _build_run_context(
             service, inputs, history, deps, session_state, stream=stream, message=message,
         )
