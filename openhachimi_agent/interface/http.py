@@ -100,6 +100,45 @@ from openhachimi_agent.memory.scheduler import MemoryScheduler
 
 logger = logging.getLogger(__name__)
 
+# SSE 客户端断开后转入后台排空的 drain 任务登记。
+# 事件循环对 task 只持弱引用,不在模块级(GC 根)登记的话任务可能被 GC 中途
+# 回收;done 回调自动摘除,不累积。
+_SSE_DRAIN_TASKS: set[asyncio.Task] = set()
+
+
+def _detach_stream_to_background(iterator: object, *, role: str | None, session_id: str | None) -> None:
+    """SSE 客户端断开(刷新页面/关页/网络抖动)时,把 run_turn 的迭代器交给后台
+    任务排空到完成。
+
+    直接随 sse_generator 一起关闭迭代器会向 run_turn 抛 GeneratorExit,整轮
+    agent 被取消、中间产出全部丢弃——用户回来什么也看不到。排空则让本轮继续
+    执行并正常落库(_persist_turn),用户回来刷新即可看到完整结果;/stop 仍可
+    随时取消(service._running_tasks 不依赖消费方)。
+    """
+
+    async def _drain() -> None:
+        drained = 0
+        try:
+            async for _event in iterator:  # type: ignore[union-attr]
+                drained += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "background stream drain ended with error role=%s session_id=%s drained=%d",
+                role, session_id, drained,
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "background stream drain completed role=%s session_id=%s drained=%d",
+                role, session_id, drained,
+            )
+
+    task = asyncio.create_task(_drain())
+    _SSE_DRAIN_TASKS.add(task)
+    task.add_done_callback(_SSE_DRAIN_TASKS.discard)
+
 
 def get_service(request: Request) -> AgentService:
     return request.app.state.service
@@ -584,22 +623,27 @@ def chat_stream(
                 )
                 event_count += 1
 
-            async for event in service.stream_events(
+            # 持有迭代器引用:客户端断开时把它交给后台 drain 任务继续排空,
+            # 而不是随 sse_generator 一起被关闭(那会取消整轮 agent 执行)。
+            event_iterator = service.stream_events(
                 api_request.message,
                 api_request.role,
                 resolved_session_id,
                 attachments=api_request.attachments,
                 channel_context=channel_context,
-            ):
-                # 每发出一个事件前检查客户端是否已断开，
-                # 避免后端在无人消费的 stream 上继续运行。
+            )
+            async for event in event_iterator:
+                # 每发出一个事件前检查客户端是否已断开。
                 if await http_request.is_disconnected():
                     logger.warning(
-                        "sse stream closing reason=client_disconnected "
+                        "sse stream detached to background reason=client_disconnected "
                         "event_count=%d role=%s session_id=%s",
                         event_count,
                         api_request.role,
                         resolved_session_id,
+                    )
+                    _detach_stream_to_background(
+                        event_iterator, role=api_request.role, session_id=resolved_session_id
                     )
                     return
 

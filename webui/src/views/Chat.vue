@@ -14,44 +14,33 @@
           <button class="btn" @click="onLogout">退出</button>
         </div>
       </header>
-      <MessageList :messages="store.messages" />
+      <MessageList :messages="store.visibleMessages" />
       <ChatInput :generating="store.isGenerating" @send="onSend" @stop="onStop" />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount } from 'vue'
+import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import Sidebar from '../components/Sidebar.vue'
 import MessageList from '../components/MessageList.vue'
 import ChatInput from '../components/ChatInput.vue'
-import { useChatStore } from '../store'
+import { useChatStore, type LiveTurn } from '../store'
 import { chatStream } from '../sse'
 import { post, getToken, getSessionMessages, type AttachmentRef } from '../api'
 
 const router = useRouter()
 const store = useChatStore()
-// 当前正在进行的 SSE 流。切换会话/角色/卸载组件前都要 abort，
-// 否则后端会看到"上一次的流还在跑"，而前端组件状态已经被换掉了。
-let abortCtrl: AbortController | null = null
-
-function abortCurrentStream(reason: string) {
-  if (abortCtrl && !abortCtrl.signal.aborted) {
-    console.info('[Chat] aborting in-flight stream', { reason })
-    abortCtrl.abort()
-  }
-  abortCtrl = null
-}
 
 /**
  * 流结束后从后端拉一次完整历史，把后端权威的 timestamp / tokens / prefix
  * 回填到本地乐观渲染的消息上，让"展开运行时上下文"按钮、回复时间与 token 计数
  * 都无需用户刷新页面就能出现。
  *
- * 新会话首条消息时 store.currentSessionId 来自 SSE 首个 type=session 事件的
- * onSession 回调；如果回调未触发（理论上不该发生），这里只记日志并返回，
- * 不再回退到 sessions[0] —— 那是渠道隔离前的兜底，会跨渠道挑错会话。
+ * 正常完成的轮次在 onDone 里已经 completeTurn 物化进 store.messages，
+ * 所以这里对齐的是 store.messages 的尾部（本轮消息）；按 role 从后往前匹配。
+ * 若流结束时会话已被切走，这里同步的只是当前会话，历史信息同样无害。
  */
 async function syncMessagesFromServer() {
   const sid = store.currentSessionId
@@ -115,20 +104,18 @@ onMounted(async () => {
   }
 })
 
-onBeforeUnmount(() => {
-  abortCurrentStream('component-unmount')
-})
+// 注意:组件卸载/切会话/切角色时不再 abort 进行中的 SSE —— 轮次状态挂在
+// store 的 liveTurns(按 session 缓冲),切回来由 visibleMessages 还原完整
+// 回复过程。真正需要断流的只有登出(store.logout 会 abort 所有轮次)。
 
 function onRoleChanged() {
-  // 切角色后 Sidebar 已经重置了 messages / currentSessionId，
-  // 这里必须把旧流断掉，否则旧流的 chunk 会污染新会话视图。
-  abortCurrentStream('role-changed')
-  store.setGenerating(false)
+  // 切角色:Sidebar 已重置 currentSessionId/messages。旧角色会话的流式轮次
+  // 继续在后台缓冲(轮次对象独立于视图,不会污染新视图),完成时正常落库。
 }
 
 function onSessionLoaded() {
-  abortCurrentStream('session-loaded')
-  store.setGenerating(false)
+  // 切换/新建会话:旧轮次挂在它自己的 session key 下继续流式,
+  // 切回来时 visibleMessages = 落库历史 + 该轮次缓冲,回复过程完整可见。
 }
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -146,8 +133,7 @@ async function onChannelChange(e: Event) {
   const target = e.target as HTMLSelectElement
   const channel = target.value
   if (channel === store.currentChannel) return
-  abortCurrentStream('channel-changed')
-  store.setGenerating(false)
+  // 切渠道不中断旧渠道的流式轮次,它们继续后台缓冲。
   await store.setCurrentChannel(channel)
 }
 
@@ -159,99 +145,101 @@ async function onSend(text: string, attachments: AttachmentRef[]) {
     return
   }
 
-  // 用户实时输入的消息没有运行时前缀，prefix 留空；
-  // timestamp 本地乐观打一次，流结束后 syncMessagesFromServer 会用后端权威值覆盖。
-  store.messages.push({
-    role: 'user',
-    content: text,
-    prefix: '',
-    timestamp: new Date().toISOString(),
-    tokens: null,
-    attachments: attachments.length > 0 ? attachments : null,
-  })
-  store.setGenerating(true)
-  abortCtrl = new AbortController()
-  const ctrl = abortCtrl
-  console.info('[Chat] send', { chars: text.length, role: store.currentRole, attachments: attachments.length })
+  const turn = store.startTurn(text, attachments)
+  if (!turn) {
+    console.warn('[Chat] onSend ignored: startTurn rejected')
+    return
+  }
+  const ctrl = turn.abort!
+  // 发送时刻的快照:空白页直发时 sessionId 为 null,由 SSE 首事件回填真实 id。
+  const sessionId = store.currentSessionId
+  const role = store.currentRole
+  const channel = store.currentChannel
+  console.info('[Chat] send', { chars: text.length, role, attachments: attachments.length })
 
   try {
-    await chatStream(text, store.currentRole, {
+    await chatStream(text, role, {
       onChunk(t, temporary) {
         if (temporary) {
           // 临时事件是工具调用提示（如"🖥️ 执行命令：npm test"），
           // 不计入消息正文，但用它驱动"思考中/活动中"指示器，
           // 让 Agent 在首句产出前的规划与工具调用对用户可见。
-          store.setActivity(t)
+          // 工具调用同时意味着上一段正文已结束(一个 ModelResponse),
+          // 封口当前气泡,让下一段正文开新气泡,与后端落库划分一致。
+          store.sealTurn(turn)
+          store.setTurnActivity(turn, t)
           return
         }
         // 收到首个正文 chunk 后清掉活动状态条，
         // 让打字机光标接管"生成中"的视觉反馈。
-        if (store.activity) store.setActivity(null)
-        store.appendAssistantChunk(t)
+        if (turn.activity) store.setTurnActivity(turn, null)
+        store.appendTurnChunk(turn, t)
       },
       onSession(sid) {
-        // 后端首事件:把空白页直发自动新建的 session_id 回填到 store,
-        // 后续 /stop、syncMessagesFromServer 都能直接拿到正确 id。
+        // 后端首事件:空白页直发自动新建的 session_id。
+        // 轮次缓冲迁移到真实 key;用户还停在空白页时同步选中该会话
+        // (已经切去看别的会话则不打扰,后台跑完后 sidebar 刷新可见)。
+        store.bindTurnSession(turn, sid)
         if (!store.currentSessionId) {
           console.info('[Chat] session bound from stream', { sid })
           store.setCurrentSession(sid)
         }
       },
       onArtifact(artifact) {
-        // agent 生成的产物文件:附加到当前 assistant 消息上供前端渲染。
+        // agent 生成的产物文件:附加到当前轮次的 assistant 消息上供前端渲染。
         console.info('[Chat] artifact received', { id: artifact.id, filename: artifact.filename })
-        store.appendArtifact(artifact)
+        store.appendTurnArtifact(turn, artifact)
       },
       onDone() {
         console.info('[Chat] stream done')
-        store.setGenerating(false)
-        // 刷新会话列表 + 回填本轮 prefix / timestamp / tokens。
-        // 用户实时输入的消息是乐观渲染（prefix=''、本地 timestamp），但后端 turn.run_turn
-        // 会注入 system_context、并把权威 timestamp + ModelResponse.usage 持久化。
-        // 流结束后拉一次完整历史，把这些 metadata 回填到本轮消息上：
-        // - user：补 prefix（运行时上下文）+ 校正 timestamp
-        // - assistant：补 timestamp + token 用量
+        store.finishTurn(turn)
+        // done 事件在后端 _persist_turn 之后发出,本轮消息已全部落库:
+        // 正在查看 → 乐观消息物化进 messages(视图无跳变),随后回填 meta;
+        // 已切走 → 丢弃缓冲,切回时 loadMessages 拉权威历史。
+        // aborted 时不物化:中断轮次的内容没落库,保留缓冲给用户看。
+        if (!ctrl.signal.aborted) store.completeTurn(turn)
         store.refreshSessions().then(() => syncMessagesFromServer()).catch((err) => {
           console.warn('[Chat] post-stream refresh failed', err)
         })
       },
       onError(err) {
         const msg = err instanceof Error ? err.message : String(err)
-        // user-abort（停止按钮 / 切换会话 / 组件卸载）不应展示成错误
+        // user-abort（停止按钮 / 删除会话 / 登出）不应展示成错误
         const isAbort = msg.toLowerCase().includes('abort') || ctrl.signal.aborted
         if (!isAbort) {
           console.error('[Chat] stream error', msg)
-          store.appendAssistantChunk(`\n\n**[错误]** ${msg}`)
+          store.finishTurn(turn, msg)
         } else {
           console.info('[Chat] stream aborted by user/route')
+          // 中断的轮次保留已缓冲的部分回复(未落库,切走时由 store 清扫)
+          store.finishTurn(turn)
         }
-        store.setGenerating(false)
       },
-    }, ctrl.signal, { sessionId: store.currentSessionId, channel: store.currentChannel, attachments })
+    }, ctrl.signal, { sessionId, channel, attachments })
   } catch (err) {
     console.warn('[Chat] chatStream threw', err)
-    store.setGenerating(false)
-  } finally {
-    // 仅当当前 controller 还是这次启动的那个时清空（避免 onSend 已经被下次调用覆盖）
-    if (abortCtrl === ctrl) abortCtrl = null
+    store.finishTurn(turn)
   }
 }
 
 async function onStop() {
-  console.info('[Chat] stop requested')
-  abortCurrentStream('user-stop')
-  if (store.currentSessionId) {
+  const turn: LiveTurn | null = store.currentLiveTurn
+  console.info('[Chat] stop requested', { sid: turn?.sessionId })
+  if (!turn) return
+  turn.abort?.abort()
+  const sid = turn.sessionId || store.currentSessionId
+  if (sid) {
     try {
-      await post('/stop', { session_id: store.currentSessionId })
+      await post('/stop', { session_id: sid })
     } catch (err) {
       console.warn('[Chat] /stop request failed', err)
     }
   }
-  store.setGenerating(false)
+  // abort 触发的 onError 会 finishTurn;这里兜底再标一次(幂等)。
+  store.finishTurn(turn)
 }
 
 function onLogout() {
-  abortCurrentStream('logout')
   store.logout()
   router.replace('/login')
 }

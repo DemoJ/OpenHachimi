@@ -188,39 +188,39 @@ async function onLoadSession(session_id: string) {
   }
 }
 
-// 删除会话:点 × 只打开确认弹窗(记下待删 session_id),真正删除在 confirmDelete。
-// pendingDelete 非 null 即弹窗打开;deleting 期间禁用弹窗按钮,防止删一半被中断。
-// deleteError 非空时弹窗切到"错误提示"态(标题/文案/按钮文案都变,确认即关闭)。
-const pendingDelete = ref<string | null>(null)
-const deleting = ref(false)
-const deleteError = ref('')
+  // 删除会话:点 × 只打开确认弹窗(记下待删 session_id),真正删除在 confirmDelete。
+  // pendingDelete 非 null 即弹窗打开;deleting 期间禁用弹窗按钮,防止删一半被中断。
+  // deleteError 非空时弹窗切到"错误提示"态(标题/文案/按钮文案都变,确认即关闭)。
+  const pendingDelete = ref<string | null>(null)
+  const deleting = ref(false)
+  const deleteError = ref('')
 
-function onDeleteSession(session_id: string) {
-  pendingDelete.value = session_id
-  deleteError.value = ''
-}
-
-function closeDialog() {
-  if (deleting.value) return
-  pendingDelete.value = null
-  deleteError.value = ''
-}
-
-async function confirmDelete() {
-  const session_id = pendingDelete.value
-  if (!session_id || deleting.value) return
-  deleting.value = true
-  deleteError.value = ''
-  // 删除当前会话且正在流式生成时,先中断后台任务,避免向已删除会话写回消息
-  // (消息表 ON DELETE CASCADE 已清空,后台 run_turn 写回会重建空行造成脏数据)。
-  if (session_id === store.currentSessionId && store.isGenerating) {
-    try {
-      await stop(session_id)
-      store.setGenerating(false)
-    } catch (e) {
-      console.error(e)
-    }
+  function onDeleteSession(session_id: string) {
+    pendingDelete.value = session_id
+    deleteError.value = ''
   }
+
+  function closeDialog() {
+    if (deleting.value) return
+    pendingDelete.value = null
+    deleteError.value = ''
+  }
+
+  async function confirmDelete() {
+    const session_id = pendingDelete.value
+    if (!session_id || deleting.value) return
+    deleting.value = true
+    deleteError.value = ''
+    // 该会话还有生成中的轮次(含后台流式)时,先中断后台任务,避免向已删除会话写回消息
+    // (消息表 ON DELETE CASCADE 已清空,后台 run_turn 写回会重建空行造成脏数据)。
+    // store.deleteSession 会同步 abort 本地 SSE 连接并清掉轮次缓冲。
+    if (store.isSessionGenerating(session_id)) {
+      try {
+        await stop(session_id)
+      } catch (e) {
+        console.error(e)
+      }
+    }
   try {
     await store.deleteSession(session_id)
     // 删除的是当前会话 → store 已把它置空、清消息;通知父组件进入空白态。
