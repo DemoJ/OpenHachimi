@@ -346,17 +346,15 @@ def get_session_messages(service, role_name: str | None = None, session_id: str 
     if not resolved_session_id:
         raise ValueError("session_id 不能为空")
 
-    # 展示用「完整原始消息序列 + 折叠占位条」:append-only 后原始消息永不删,
-    # session_compressions 记录每次压缩的折叠区间。遍历 turn_index,落入折叠区间
-    # [head_end_turn+1, tail_start_turn-1] 的消息跳过,在区间起始位置插一个 fold 占位条;
-    # summary 不进消息流(用户点展开时另调 get_folded_messages 取回原始消息)。
+    # 展示用「完整原始消息序列 + 压缩标记」:压缩只影响喂给模型的运行时上下文,
+    # WebUI 消息流永远返回全部原始消息(append-only,永不删)。session_compressions
+    # 记录每次压缩的折叠区间 [head_end_turn+1, tail_start_turn-1],仅在区间起始
+    # 位置插一条 fold 标记作分隔提示,不隐藏、不替换任何消息。
     compressions = service.session_store.list_compressions(role, resolved_session_id)
-    # 区间按起始 turn_index 排,便于遍历时一次性建立「当前是否在折叠区间」状态
     fold_ranges = [
         {
             "compression_id": c["compression_id"],
             "lo": c["head_end_turn"] + 1,
-            "hi": c["tail_start_turn"] - 1,
             "count": c["tail_start_turn"] - c["head_end_turn"] - 1,
             "summary_excerpt": summary_excerpt(c["summary_text"]),
             "head_end_turn": c["head_end_turn"],
@@ -366,37 +364,30 @@ def get_session_messages(service, role_name: str | None = None, session_id: str 
         if c["tail_start_turn"] - c["head_end_turn"] - 1 > 0
     ]
     fold_starts = {f["lo"] for f in fold_ranges}
-    fold_set = set()
-    for f in fold_ranges:
-        fold_set.update(range(f["lo"], f["hi"] + 1))
 
     from openhachimi_agent.transport.api_models import MessageItem
 
-    # 直接按 turn_index 读原始行 + 折叠判定,不走 extract_text_parts 的视图路径
-    # —— 视图会跳过折叠区间,但展示恰恰要把折叠条插入到该位置。
+    # 直接按 turn_index 读原始行,不走 extract_text_parts 的视图路径
+    # —— 视图按运行时上下文组装(含折叠),展示恰恰要完整消息 + 标记条。
     safe_role = role
-    rows, has_more = service.session_store._load_message_rows(safe_role, resolved_session_id, limit=limit, before_turn=before_turn)
-    total = service.session_store.count_messages(safe_role, resolved_session_id)
+    rows, _has_more = service.session_store._load_message_rows(safe_role, resolved_session_id, limit=limit, before_turn=before_turn)
     messages: list[MessageItem] = []
     folded_seen: set[int] = set()
-    next_before_turn = rows[0][0] if rows and has_more else None
 
     for turn_idx, msg in rows:
-        if turn_idx in fold_set:
-            # 落在折叠区间:跳过原始消息,在区间起始处插一个占位条
-            if turn_idx in fold_starts and turn_idx not in folded_seen:
-                fold_info = next(f for f in fold_ranges if f["lo"] == turn_idx)
-                messages.append(MessageItem(
-                    role="user", content="", fold={
-                        "compression_id": fold_info["compression_id"],
-                        "dropped_count": fold_info["count"],
-                        "summary_excerpt": fold_info["summary_excerpt"],
-                        "head_end_turn": fold_info["head_end_turn"],
-                        "tail_start_turn": fold_info["tail_start_turn"],
-                    },
-                ))
-                folded_seen.add(turn_idx)
-            continue
+        if turn_idx in fold_starts and turn_idx not in folded_seen:
+            # 压缩区间起点:插一条标记(仅提示此处对话被压缩为摘要提供给 AI)
+            fold_info = next(f for f in fold_ranges if f["lo"] == turn_idx)
+            messages.append(MessageItem(
+                role="user", content="", fold={
+                    "compression_id": fold_info["compression_id"],
+                    "compressed_count": fold_info["count"],
+                    "summary_excerpt": fold_info["summary_excerpt"],
+                    "head_end_turn": fold_info["head_end_turn"],
+                    "tail_start_turn": fold_info["tail_start_turn"],
+                },
+            ))
+            folded_seen.add(turn_idx)
         parts = extract_text_parts(service, [msg], role=role)
         for p in parts:
             messages.append(MessageItem(**p))
