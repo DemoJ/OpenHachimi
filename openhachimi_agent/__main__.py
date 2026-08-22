@@ -198,7 +198,7 @@ def _rotate_http_api_token() -> None:
     旧令牌随重启立即失效，避免长期不变的令牌泄露后被无限期利用。
     轮换失败不阻塞重启（服务沿用旧令牌），只给出警告。
     """
-    from openhachimi_agent.core.config import load_raw_config, mask_secret, rotate_http_api_token
+    from openhachimi_agent.core.config import load_raw_config, rotate_http_api_token
 
     try:
         config = load_config()
@@ -215,8 +215,9 @@ def _rotate_http_api_token() -> None:
         _warn(str(exc))
         _warn("本次重启将沿用旧令牌。")
         return
-    # 只显示掩码：完整 token 打到控制台会进终端回滚/共享会话记录。
-    _ok(f"已轮换访问令牌（HTTP API Token）：{mask_secret(new_token)}（完整值见 user/config.yaml）")
+    # 完整展示新令牌:轮换后旧令牌立即失效,用户需要直接复制新值登录
+    # WebUI/CLI,不应再被迫去翻配置文件(应用户要求,不做掩码)。
+    _ok(f"已轮换访问令牌（HTTP API Token）：{new_token}")
 
 
 def cmd_restart(_args: argparse.Namespace) -> None:
