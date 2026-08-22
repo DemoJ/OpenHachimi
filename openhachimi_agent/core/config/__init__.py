@@ -50,6 +50,7 @@ from openhachimi_agent.core.config.persistence import (
     _replace_or_insert_app_kv,
     _replace_or_insert_http_api_token,
     persist_server_endpoint,
+    rotate_http_api_token,
 )
 from openhachimi_agent.core.config.webui_fields import (
     AI_MODEL_FIELDS,
@@ -115,6 +116,7 @@ __all__ = [
     "ROLES_CONFIG_FILE_NAME",
     "load_raw_config",
     "persist_server_endpoint",
+    "rotate_http_api_token",
     "_ensure_http_api_token",
     "_replace_or_insert_app_kv",
     "_replace_or_insert_http_api_token",

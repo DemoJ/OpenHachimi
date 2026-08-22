@@ -95,3 +95,22 @@ def _ensure_http_api_token(config_path: Path, raw_config: dict[str, Any]) -> str
             f"无法写入 HTTP API Token 到配置文件：{config_path}。请修复文件权限或手动添加 app.http_api_token。"
         ) from exc
     return token
+
+
+def rotate_http_api_token(config_path: Path, raw_config: dict[str, Any]) -> str:
+    """生成新 HTTP API Token 并写回配置文件，返回新令牌。
+
+    供 `hachimi restart` 在重启服务前调用：每次重启轮换一次令牌，
+    旧令牌（可能已泄露或残留在终端记录/浏览器存储里）随服务重启立即失效。
+    与 `_ensure_http_api_token` 的差异：无条件生成新值，不读旧值。
+    """
+    token = secrets.token_urlsafe(32)
+    # 同步更新调用方的内存视图,与磁盘写回结果保持一致(persist_server_endpoint 同款约定)
+    raw_config.setdefault("app", {})["http_api_token"] = token
+    try:
+        _replace_or_insert_http_api_token(config_path, token, raw_config)
+    except OSError as exc:
+        raise OSError(
+            f"无法写入新的 HTTP API Token 到配置文件：{config_path}。请修复文件权限后重试。"
+        ) from exc
+    return token

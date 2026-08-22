@@ -1,6 +1,6 @@
 import yaml
 
-from openhachimi_agent.core.config import _ensure_http_api_token
+from openhachimi_agent.core.config import _ensure_http_api_token, rotate_http_api_token
 
 
 def test_ensure_http_api_token_generates_when_missing(tmp_path):
@@ -57,3 +57,52 @@ def test_ensure_http_api_token_keeps_existing_token(tmp_path):
 
     assert token == original
     assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_rotate_http_api_token_replaces_existing(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "app:\n"
+        "  http_api_token: old-token  # 自动生成\n"
+        "  default_role: default\n",
+        encoding="utf-8",
+    )
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    new_token = rotate_http_api_token(config_path, raw_config)
+
+    text = config_path.read_text(encoding="utf-8")
+    saved = yaml.safe_load(text)
+    assert new_token
+    assert new_token != "old-token"
+    # 内存 raw_config 与磁盘文件都换成新令牌
+    assert raw_config["app"]["http_api_token"] == new_token
+    assert saved["app"]["http_api_token"] == new_token
+    # 行内注释保留
+    assert "# 自动生成" in text
+
+
+def test_rotate_http_api_token_inserts_when_missing(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "app:\n"
+        "  default_role: default\n",
+        encoding="utf-8",
+    )
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    token = rotate_http_api_token(config_path, raw_config)
+
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert token
+    assert saved["app"]["http_api_token"] == token
+
+
+def test_rotate_http_api_token_generates_distinct_tokens(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("app:\n  http_api_token: a\n", encoding="utf-8")
+
+    first = rotate_http_api_token(config_path, {})
+    second = rotate_http_api_token(config_path, {})
+
+    assert first != second

@@ -129,7 +129,7 @@ _COMMAND_HELP: tuple[tuple[str, str], ...] = (
     ("hachimi status",      "查看后台服务状态"),
     ("hachimi start",       "启动后台服务"),
     ("hachimi stop",        "停止后台服务"),
-    ("hachimi restart",     "重启后台服务"),
+    ("hachimi restart",     "重启后台服务（并轮换访问令牌）"),
     ("hachimi log",         "实时查看服务日志（Ctrl-C 退出，-n N 显示最近 N 行）"),
     ("hachimi config",      "用编辑器打开配置文件"),
     ("hachimi serve",       "在前台运行 HTTP 服务（调试用）"),
@@ -192,10 +192,40 @@ def cmd_stop(_args: argparse.Namespace) -> None:
     _ok("服务已停止。")
 
 
+def _rotate_http_api_token() -> None:
+    """重启前轮换 HTTP API Token：生成新令牌写回配置文件，服务重启后即用新令牌。
+
+    旧令牌随重启立即失效，避免长期不变的令牌泄露后被无限期利用。
+    轮换失败不阻塞重启（服务沿用旧令牌），只给出警告。
+    """
+    from openhachimi_agent.core.config import load_raw_config, mask_secret, rotate_http_api_token
+
+    try:
+        config = load_config()
+    except Exception as exc:
+        _warn(f"读取配置失败，本次跳过访问令牌轮换：{exc}")
+        return
+    config_path = config.config_path
+    if not config_path.exists():
+        _warn("配置文件不存在，本次跳过访问令牌轮换。")
+        return
+    try:
+        new_token = rotate_http_api_token(config_path, load_raw_config(config_path))
+    except OSError as exc:
+        _warn(str(exc))
+        _warn("本次重启将沿用旧令牌。")
+        return
+    # 只显示掩码：完整 token 打到控制台会进终端回滚/共享会话记录。
+    _ok(f"已轮换访问令牌（HTTP API Token）：{mask_secret(new_token)}（完整值见 user/config.yaml）")
+
+
 def cmd_restart(_args: argparse.Namespace) -> None:
-    """重启后台服务。"""
+    """重启后台服务。每次重启前轮换 HTTP API Token。"""
     _require_systemd()
     _info(f"正在重启 {SERVICE_NAME} 服务...")
+    # 先写新令牌再重启：新起的 serve 进程读到的就是新令牌，
+    # 旧进程持有的旧令牌随之失效。之后 _print_access_info 重读配置展示新令牌掩码。
+    _rotate_http_api_token()
     _systemctl("restart", SERVICE_NAME, check=True)
     _ok("服务已重启。")
     host, port = _deployed_endpoint()
@@ -632,7 +662,7 @@ def main() -> None:
     sub.add_parser("status",  help="查看后台服务状态")
     sub.add_parser("start",   help="启动后台服务")
     sub.add_parser("stop",    help="停止后台服务")
-    sub.add_parser("restart", help="重启后台服务")
+    sub.add_parser("restart", help="重启后台服务（每次重启自动轮换访问令牌）")
 
     log_p = sub.add_parser("log", help="实时查看服务日志（Ctrl-C 退出）")
     log_p.add_argument("-n", "--lines", type=int, default=None, metavar="N",
