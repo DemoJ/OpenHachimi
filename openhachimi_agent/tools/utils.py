@@ -52,6 +52,27 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"(?<!-)\bgit\s+reset\s+--hard\b",
     r"(?<!-)\bgit\s+clean\b",
     r"(?<!-)\bshutdown\b",
+    # 下载即执行(curl/wget 下载后直接管道给 shell/解释器执行)
+    r"\b(?:curl|wget)\b[^|;&]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b",
+    r"\|\s*(?:sudo\s+)?(?:python3?|node)\b",
+    r"\|\s*(?:sudo\s+)?iex\b",
+    # 解释器内联执行代码(-c/-e/encodedcommand),常被用于绕过命令名黑名单
+    r"\bpython3?\b[^|;&]*\s-c\s",
+    r"\bnode\b[^|;&]*\s(?:-e|--eval)\s",
+    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^|;&]*\s-(?:command|enc|encodedcommand)\b",
+    # 磁盘破坏
+    r"(?<!-)\bdd\b",
+    r"(?<!-)\bshred\b",
+    r"\bmkfs(?:\.\w+)?\b",
+    r"\bwipefs\b",
+    r"\bfind\b[^|;&]*\s-delete\b",
+    # 外连/反弹 shell 常用载体
+    r"(?<!-)\bssh\b(?!-)",
+    r"\b(?:nc|ncat|netcat)\b(?!-)",
+    r"/dev/tcp/",
+    # 持久化:写 ssh 授权键 / 改 crontab
+    r"authorized_keys",
+    r"(?<!-)\bcrontab\b(?!-)",
 ]
 
 WINDOWS_DANGEROUS_COMMAND_PATTERNS = [
@@ -62,6 +83,12 @@ WINDOWS_DANGEROUS_COMMAND_PATTERNS = [
     r"(?:^|[;&|]\s*)(?:cmd(?:\.exe)?\s+/c\s+)?format(?:\s|$)",
     r"(?<!-)\brestart-computer\b",
     r"(?<!-)\bstop-process\b",
+    # 计划任务/注册表持久化与常见 LOLBin 下载执行
+    r"\bschtasks\b(?!-)",
+    r"\bmshta\b(?!-)",
+    r"\bbitsadmin\b(?!-)",
+    r"\bcertutil\b[^|;&]*-urlcache",
+    r"\breg(?:\.exe)?\s+add\b",
 ]
 
 logger = logging.getLogger(__name__)

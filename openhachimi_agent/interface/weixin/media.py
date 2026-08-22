@@ -35,7 +35,14 @@ def resolve_artifact_path(base_dir: Path, local_path: str) -> Path:
     path = Path(local_path)
     if not path.is_absolute():
         path = base_dir / path
-    return path
+    resolved = path.resolve()
+    # 防御纵深:artifact.local_path 若被污染成工作区外绝对路径,会读任意文件并
+    # 上传到微信 CDN —— 与 Telegram 渠道保持一致的 contain 校验。
+    try:
+        resolved.relative_to(base_dir.resolve())
+    except ValueError as exc:
+        raise ValueError(f"artifact 路径不在工作区内：{local_path}") from exc
+    return resolved
 
 
 def media_type_for(filename: str) -> int:

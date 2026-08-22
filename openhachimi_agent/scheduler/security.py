@@ -21,13 +21,26 @@ _THREAT_PATTERNS = [
     (r"system\s+prompt\s+override", "system_prompt_override"),
     (r"disregard\s+(your|all|any)\s+(instructions|rules|guidelines)", "disregard_rules"),
     (r"do\s+not\s+tell\s+the\s+user", "deception"),
-    (r"cat\s+[^\n]*(\.env|credentials|\.netrc|id_rsa|private[_-]?key)", "read_secrets"),
+    (r"(?:cat|type|get-content|head|tail|less|more|读取|查看|打开)\s*[^\n]*(\.env|credentials|\.netrc|id_rsa|private[_-]?key)", "read_secrets"),
+    (r"(?:cat|type|get-content|head|tail|less|more|读取|查看|打开)\s*[^\n]*(\.ssh|\.netrc|\.aws|\.gnupg)", "read_secrets"),
+    (r"(?:cat|type|get-content|read|head|tail|读取|查看)\s*[^\n]*(config\.ya?ml|config\.yml|sessions\.sqlite3)", "read_secrets"),
+    (r"(?:token|api[_-]?key|appsecret|password|passwd|credential)[^\n]{0,80}(?:telegram|wechat|微信|http|url|webhook|email|mail|发送|发给|send|post|upload)", "secret_exfiltration"),
+    (r"(?:telegram|wechat|微信|webhook)[^\n]{0,80}(?:token|api[_-]?key|appsecret|password|passwd|credential)", "secret_exfiltration"),
     (r"authorized_keys", "ssh_backdoor"),
     (r"/etc/sudoers|visudo", "sudoers_modification"),
     (r"rm\s+-rf\s+/", "destructive_root_rm"),
     (r"drop\s+database|truncate\s+table", "destructive_database"),
     (r"curl\s+[^\n]*(\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?)", "secret_exfiltration"),
     (r"wget\s+[^\n]*(\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?)", "secret_exfiltration"),
+    # 下载即执行 / 内联代码执行:无人值守下没有确认兜底
+    (r"(?:curl|wget)[^\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b", "download_execute"),
+    (r"(?:curl|wget)[^\n]*\|\s*(?:sudo\s+)?(?:python3?|node)\b", "download_execute"),
+    (r"\|\s*(?:sudo\s+)?iex\b", "download_execute"),
+    (r"python3?\s+(?:-\S+\s+)*-c\b", "inline_code_execution"),
+    (r"node\s+(?:-\S+\s+)*(?:-e\b|--eval\b)", "inline_code_execution"),
+    (r"(?:powershell|pwsh)[^\n]*\s-(?:enc|encodedcommand)\b", "inline_code_execution"),
+    # 持久化载体
+    (r"\bschtasks\b|\bcrontab\b|\bbitsadmin\b|\bmshta\b", "persistence"),
 ]
 
 _INVISIBLE_CHARS = {"​", "‌", "‍", "⁠", "﻿", "‪", "‫", "‬", "‭", "‮"}

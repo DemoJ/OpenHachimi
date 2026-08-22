@@ -112,7 +112,10 @@ def _print_access_info(host: str, port: int) -> None:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
     token = _configured_token()
     if token:
-        _ok(f"访问令牌（HTTP API Token）：{token}")
+        from openhachimi_agent.core.config.webui_io import mask_secret
+
+        # 只显示掩码:完整 token 打到控制台会进终端回滚/共享会话记录。
+        _ok(f"访问令牌（HTTP API Token）：{mask_secret(token)}（完整值见 user/config.yaml）")
     else:
         _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
     print()
@@ -134,6 +137,7 @@ _COMMAND_HELP: tuple[tuple[str, str], ...] = (
     ("hachimi update",      "更新到最新版本（--force 强制重装依赖）"),
     ("hachimi uninstall",   "卸载后台守护服务（--purge 清虚拟环境）"),
     ("hachimi schedule",    "管理定时任务（add/list/pause/resume/remove/run/inbox/logs）"),
+    ("hachimi clean-secrets", "扫描并清理历史数据中的明文密钥（自动备份）"),
     ("hachimi weixin",      "微信原生扫码登录配置"),
     ("hachimi -V",          "查看当前版本"),
 )
@@ -236,6 +240,47 @@ def cmd_config(_args: argparse.Namespace) -> None:
     os.execvp(editor, [editor, str(config_path)])
 
 
+def cmd_clean_secrets(args: argparse.Namespace) -> None:
+    """扫描并清理持久化数据（会话/长期记忆/定时任务库）中的历史明文密钥。"""
+    from openhachimi_agent.storage.clean_secrets import clean_all_databases, collect_database_paths
+
+    try:
+        config = load_config()
+    except Exception as exc:
+        _err(f"加载配置失败：{exc}")
+        sys.exit(1)
+
+    paths = collect_database_paths(config)
+    existing = [p for p in paths if p.exists()]
+    if not existing:
+        _warn("未找到任何数据库文件，无需清理。")
+        return
+
+    _info("将扫描以下数据库，重写其中命中的明文密钥（清理前自动备份）：")
+    for path in existing:
+        print(f"  {path}")
+    _info("建议先停止后台服务（hachimi stop）再执行，避免清理期间服务并发写入。")
+    if not args.yes:
+        try:
+            reply = input("继续执行清理？[y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            reply = ""
+        if reply.strip().lower() not in ("y", "yes"):
+            _info("已取消。")
+            return
+
+    results = clean_all_databases(config)
+    if not results:
+        _ok("未发现需要清理的明文密钥。")
+        return
+    for db, stats in results.items():
+        _ok(f"{db}:")
+        for table, count in stats.items():
+            print(f"    {table}: 重写 {count} 行")
+    _warn("备份文件后缀为 .pre-clean-secrets.bak，确认服务正常后可删除。")
+    _warn("曾明文落盘的密钥（API key / bot token）建议尽快轮换——清理无法撤回此前的暴露。")
+
+
 def cmd_install(_args: argparse.Namespace) -> None:
     """安装 Playwright 浏览器驱动（chromium）。"""
     _info("正在安装 Playwright 浏览器驱动（chromium）...")
@@ -320,7 +365,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
     else:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
     if config.http_api_token:
-        _ok(f"访问令牌（HTTP API Token）：{config.http_api_token}")
+        from openhachimi_agent.core.config.webui_io import mask_secret
+
+        _ok(f"访问令牌（HTTP API Token）：{mask_secret(config.http_api_token)}（完整值见 user/config.yaml）")
     else:
         _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
     # uvicorn.run 进入阻塞前先打印一次可用命令，便于在 serve 调试模式下了解管理入口。
@@ -509,6 +556,8 @@ def main() -> None:
     # ── 配置与工具 ────────────────────────────────────────────────────────────
     sub.add_parser("config",  help="用编辑器打开配置文件")
     sub.add_parser("install", help="安装 Playwright 浏览器驱动（chromium）")
+    clean_p = sub.add_parser("clean-secrets", help="扫描并清理历史数据中的明文密钥（自动备份，-y 跳过确认）")
+    clean_p.add_argument("-y", "--yes", action="store_true", help="跳过交互确认，直接执行")
     update_p = sub.add_parser("update",  help="检查并更新到最新版本")
     update_p.add_argument("--force", action="store_true", help="即使代码已是最新，也重新安装依赖")
 
@@ -574,6 +623,7 @@ def main() -> None:
         "restart":   cmd_restart,
         "log":       cmd_log,
         "config":    cmd_config,
+        "clean-secrets": cmd_clean_secrets,
         "install":   cmd_install,
         "update":    cmd_update,
         "uninstall": cmd_uninstall,

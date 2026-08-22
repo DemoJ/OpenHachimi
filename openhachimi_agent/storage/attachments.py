@@ -32,6 +32,9 @@ MIME_EXTENSIONS = {
     "application/pdf": ".pdf",
 }
 IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+# 含脚本/可内联执行的网页附件,入库即构成存储型 XSS 素材,无条件拒绝
+# (即使配置了 MIME 白名单也拒绝:content_type 由客户端上报,不可信)。
+DANGEROUS_EXTENSIONS = {".html", ".htm", ".xhtml", ".svg", ".xht", ".hta"}
 
 
 class AttachmentError(ValueError):
@@ -59,6 +62,13 @@ class AttachmentStorage:
             win_path = PureWindowsPath(filename)
             if raw_path.is_absolute() or win_path.is_absolute() or len(raw_path.parts) > 1 or len(win_path.parts) > 1:
                 raise AttachmentError("附件文件名不能包含路径")
+            extension = Path(PureWindowsPath(filename).name).suffix.lower()
+            if extension in DANGEROUS_EXTENSIONS:
+                raise AttachmentError(f"不支持的附件类型：{extension} 可内联执行网页内容，禁止上传")
+        if self.allowed_mime_types and content_type:
+            normalized = content_type.split(";", 1)[0].strip().lower()
+            if normalized not in self.allowed_mime_types:
+                raise AttachmentError(f"不支持的附件类型：{normalized} 不在允许列表内")
 
     def sanitize_filename(self, filename: str | None, content_type: str | None) -> str:
         candidate = (filename or "attachment").strip().replace("\x00", "")

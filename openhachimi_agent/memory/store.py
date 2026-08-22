@@ -41,6 +41,13 @@ class MemoryStore(
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # 库内含对话记忆,收紧为仅属主可读写(Windows 下 chmod 基本无效,静默忽略)。
+        try:
+            import os
+
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
         self.vector_index = SQLiteVectorShardIndex()
         self.sqlite_vec_index = SQLiteVecIndex()
         self._local = threading.local()

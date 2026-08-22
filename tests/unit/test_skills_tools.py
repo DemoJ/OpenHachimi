@@ -34,6 +34,15 @@ def _write_skill(skill_dir, frontmatter: str, body: str):
     return skill
 
 
+@pytest.fixture(autouse=True)
+def _auto_approve_remote_installs(monkeypatch):
+    """远程安装的人工确认钩子默认自动放行,单测聚焦安装逻辑本身。
+
+    确认行为(拒绝时短路)由 test_security_hardening 单独覆盖。
+    """
+    monkeypatch.setattr(skills_tools, "_confirm_remote_install", lambda ctx, source: True)
+
+
 def _make_ctx(skills_dir):
     return SimpleNamespace(deps=SimpleNamespace(skills_dirs=[skills_dir]))
 

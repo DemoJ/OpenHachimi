@@ -323,6 +323,19 @@ def _is_git_source(source_url: str) -> bool:
     return path.endswith(".git") or host == "github.com" or host.endswith(".github.com")
 
 
+def _confirm_remote_install(ctx: RunContext[AgentDeps], source: str) -> bool:
+    """远程技能安装前经用户确认。独立成钩子便于测试替换。"""
+    from openhachimi_agent.tools.clarification import clarify_user
+
+    user_reply = clarify_user(
+        ctx,
+        question=f"即将从远程来源安装技能：{source}\n"
+        f"技能指令会进入 Agent 上下文并持续生效,请确认来源可信。是否允许?",
+        choices=["允许安装", "拒绝安装"],
+    )
+    return "允许" in str(user_reply)
+
+
 def install_skill(
     ctx: RunContext[AgentDeps],
     source_path_or_url: str,
@@ -345,6 +358,16 @@ def install_skill(
     Returns:
         A success message with the installation result, or an error message if it fails.
     """
+    # 远程来源安装需用户确认:技能的 SKILL.md 指令会持续注入 agent 上下文,
+    # 来源不可信等同持久化提示词注入(sha256 校验是可选的,git 源无校验)。
+    # 廉价拒绝(scheme 非法/http 未放行)先于确认,不打扰用户。
+    if _has_url_scheme(source_path_or_url):
+        parsed = urlsplit(source_path_or_url)
+        scheme = parsed.scheme.lower()
+        would_proceed = scheme == "https" or (scheme == "http" and allow_http)
+        if would_proceed and not _confirm_remote_install(ctx, source_path_or_url):
+            return f"用户拒绝安装技能：{source_path_or_url}"
+
     user_skills_dir = ctx.deps.base_dir / "user" / "skills"
     return install_skill_from_source(
         user_skills_dir, source_path_or_url,

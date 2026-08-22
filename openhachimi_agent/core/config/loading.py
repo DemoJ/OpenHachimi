@@ -295,6 +295,7 @@ def _load_scheduler_config(base_dir: Path, raw_config: dict[str, Any]) -> Schedu
             prompt_scan_enabled=_config_bool(security_config, "prompt_scan_enabled", True),
             allow_scheduler_mutation_in_scheduled_runs=_config_bool(security_config, "allow_scheduler_mutation_in_scheduled_runs", False),
             allow_interactive_tools_in_scheduled_runs=_config_bool(security_config, "allow_interactive_tools_in_scheduled_runs", False),
+            allow_dangerous_tools_in_scheduled_runs=_config_bool(security_config, "allow_dangerous_tools_in_scheduled_runs", False),
         ),
     )
 

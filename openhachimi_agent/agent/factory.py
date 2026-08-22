@@ -165,6 +165,22 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
             ]
             base_main_toolset = FunctionToolset(tools=filtered_tools)
 
+        if run_mode == "scheduled" and not getattr(
+            getattr(config.scheduler, "security", None), "allow_dangerous_tools_in_scheduled_runs", False
+        ):
+            # 定时任务无人值守执行:默认剔除高危工具(命令执行/文件写入删除/技能安装)。
+            # 无人值守场景没有用户确认兜底,任务提示词可能被外部消息注入,
+            # 只保留只读、检索与报告产出类工具;确有需要可经配置放开。
+            restricted = {
+                "run_command", "send_command_input",
+                "write_file", "replace_in_file", "delete_path", "install_skill",
+            }
+            trimmed_tools = [
+                t for t in base_main_toolset.tools
+                if getattr(t, "__name__", "") not in restricted and getattr(t, "name", "") not in restricted
+            ]
+            base_main_toolset = FunctionToolset(tools=trimmed_tools)
+
         toolsets = [base_main_toolset, dynamic_toolset] + mcp_instances
         if run_mode == "scheduled":
             # 定时任务无人值守:复用主 agent + 主 prompt,额外注入 scheduled_executor

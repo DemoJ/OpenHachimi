@@ -143,6 +143,34 @@ def _resolve_update_ref(project_root: Path) -> GitRef | None:
     return _upstream_ref(project_root) or _default_remote_ref(project_root)
 
 
+# 更新链路会 git reset --hard 并重装依赖(pip install -e . / npm install 会执行
+# 安装脚本),remote 指向非官方仓库时必须人工确认,防止 remote 被篡改后一键执行恶意代码。
+_OFFICIAL_REPO_URLS = {
+    "https://github.com/demoj/openhachimi",
+}
+
+
+def _normalize_repo_url(url: str) -> str:
+    return url.strip().lower().rstrip("/").removesuffix(".git")
+
+
+def _remote_url(project_root: Path, remote: str) -> str | None:
+    try:
+        return _git_output(project_root, "remote", "get-url", remote).strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _confirm_unofficial_remote(remote_url: str) -> bool:
+    print(f"[!] 更新源不是官方仓库：{remote_url}")
+    print("    更新会强制同步远端代码并重新安装依赖(执行安装脚本),来源不可信时等同于在本机执行任意代码。")
+    try:
+        reply = input("确认继续从该远端更新？[y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return reply.strip().lower() in ("y", "yes")
+
+
 def _fetch(project_root: Path, ref: GitRef) -> bool:
     print(f"正在拉取远端信息：{ref.remote} {ref.branch} ...")
     remote_tracking_ref = f"refs/remotes/{ref.remote}/{ref.branch}"
@@ -212,6 +240,12 @@ def run_update(*, force: bool = False) -> None:
         print("[x] 未检测到 Git remote，无法自动更新。")
         print("  请先为仓库配置远端，例如：git remote add origin <repo-url>")
         return
+
+    remote_url = _remote_url(project_root, update_ref.remote)
+    if remote_url and _normalize_repo_url(remote_url) not in _OFFICIAL_REPO_URLS:
+        if not _confirm_unofficial_remote(remote_url):
+            print("[x] 已取消更新。")
+            return
 
     if not _fetch(project_root, update_ref):
         return

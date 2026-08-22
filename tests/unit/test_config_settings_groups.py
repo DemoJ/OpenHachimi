@@ -615,7 +615,7 @@ def _write_scheduler_config(tmp_path, text=_SCHEDULER_SAMPLE_YAML):
 def test_scheduler_group_registered():
     assert "scheduler" in SETTINGS_FIELD_GROUPS
     assert SETTINGS_FIELD_GROUPS["scheduler"] is SCHEDULER_FIELDS
-    assert len(SCHEDULER_FIELDS) == 11  # main6 + delivery2 + security3
+    assert len(SCHEDULER_FIELDS) == 12  # main6 + delivery2 + security4
 
 
 def test_scheduler_delivery_default_mode_is_select():

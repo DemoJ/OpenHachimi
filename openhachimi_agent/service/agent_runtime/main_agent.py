@@ -223,8 +223,10 @@ def _build_main_agent(role: str, run_mode: str, get_agent: Callable[..., Any]) -
 
     单一主 agent 持全套工具(含 create_todos / clarify_user / delegate_task);scheduled
     模式由 ``_build_base_agent`` 内部注入 scheduled_executor prompt 实现(build_main_agent
-    透传 run_mode),scheduler 写工具的拦截由 scheduler 工具自身的
-    ``ensure_scheduler_mutation_allowed`` 在 run_mode=scheduled 时负责,无需此处裁剪。
+    透传 run_mode);scheduler 写工具的拦截由 scheduler 工具自身的
+    ``ensure_scheduler_mutation_allowed`` 在 run_mode=scheduled 时负责;高危工具
+    (命令执行/文件写入删除/技能安装)默认也在此模式下被 factory 裁剪,除非配置
+    ``scheduler.security.allow_dangerous_tools_in_scheduled_runs`` 显式放开。
     """
     return get_agent(role, "main", run_mode=run_mode)
 

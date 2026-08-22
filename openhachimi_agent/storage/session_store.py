@@ -47,6 +47,7 @@ from openhachimi_agent.core.identifiers import (
     validate_role_name,
     validate_session_id,
 )
+from openhachimi_agent.core.redaction import redact_persisted_data
 
 if TYPE_CHECKING:
     from openhachimi_agent.tools.planning import TodoState
@@ -115,6 +116,13 @@ class SessionStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # 库内含会话原文,收紧为仅属主可读写(Windows 下 chmod 基本无效,静默忽略)。
+        try:
+            import os
+
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
         self._init_db()
 
     # ── 连接 / schema ────────────────────────────────────────────────────
@@ -461,7 +469,8 @@ class SessionStore:
     ) -> int:
         """追加写入会话消息历史 + 更新指针 / 渠道元数据,返回本次写入的起始 turn_index。
 
-        实现采用 ``append-only`` —— 原始消息一旦写入永不删除。turn_index 从
+        实现采用 ``append-only`` —— 原始消息脱敏后(见 ``core.redaction``)一旦
+        写入永不删除。turn_index 从
         ``MAX(turn_index)+1`` 起续编(空表从 0 起),用 ``INSERT OR IGNORE`` 按主键
         ``(role, session_id, turn_index)`` 去重,保证幂等可重入。``append=False``
         兼容旧的「全量覆盖」语义(DELETE+从 0 重编),仅压缩链重建等极端路径用,
@@ -484,6 +493,10 @@ class SessionStore:
         arr = json.loads(arr_bytes) if arr_bytes else []
         if not isinstance(arr, list):
             raise ValueError("ModelMessagesTypeAdapter.dump_json 返回非数组,无法存储")
+        # 落库前脱敏:会话历史可能包含用户让 Agent 读取的配置文件原文,
+        # 不脱敏会把活跃 API key/Token 明文持久化到 SQLite。用结构安全版本
+        # (redact_persisted_data)保持 pydantic_ai 消息结构可回解析。
+        arr = [redact_persisted_data(msg_obj) for msg_obj in arr]
 
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")

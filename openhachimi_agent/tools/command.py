@@ -11,6 +11,7 @@ from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.core.redaction import redact_text
 from openhachimi_agent.tools.utils import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     assert_safe_command,
@@ -47,9 +48,9 @@ def _record_verify_evidence(
     try:
         store.record_verification_evidence(
             ctx.deps.session_id,
-            command=command,
+            command=redact_text(command),
             cwd=cwd,
-            output_summary=_summarize_output(output),
+            output_summary=_summarize_output(redact_text(output)),
             is_running=is_running,
         )
     except Exception:  # noqa: BLE001
@@ -73,7 +74,9 @@ async def run_command(
     if not command.strip():
         raise ValueError("command 不能为空")
 
-    logger.info("tool run_command cwd=%s wait_seconds=%.1f command=%s", cwd, wait_seconds, command)
+    # 日志中的命令须脱敏:命令可能内嵌 token/密钥(如 export API_KEY=...),
+    # 日志会轮转落盘保留。
+    logger.info("tool run_command cwd=%s wait_seconds=%.1f command=%s", cwd, wait_seconds, redact_text(command))
 
     # ── 权限检查 ──
     permission_config = ctx.deps.config.permission

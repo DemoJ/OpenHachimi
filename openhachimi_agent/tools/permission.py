@@ -17,28 +17,17 @@ import platform
 import re
 from pathlib import Path
 
+from openhachimi_agent.tools.utils import (
+    DANGEROUS_COMMAND_PATTERNS,
+    WINDOWS_DANGEROUS_COMMAND_PATTERNS,
+)
+
 logger = logging.getLogger(__name__)
 
-# 内置危险命令黑名单(与 tools/utils.py 中的 assert_safe_command 保持一致,
-# 但这里用于"询问后放行"而非"直接拒绝")。
-_BUILTIN_DANGEROUS_COMMAND_PATTERNS = [
-    r"(?<!-)\brm\b",
-    r"(?<!-)\bunlink\b",
-    r"(?<!-)\brmdir\b",
-    r"(?<!-)\bgit\s+reset\s+--hard\b",
-    r"(?<!-)\bgit\s+clean\b",
-    r"(?<!-)\bshutdown\b",
-]
-
-_BUILTIN_WINDOWS_DANGEROUS_COMMAND_PATTERNS = [
-    r"(?<!-)\bremove-item\b",
-    r"(?<!-)\bdel\b",
-    r"(?<!-)\berase\b",
-    r"(?<!-)\brd\b",
-    r"(?:^|[;&|]\s*)(?:cmd(?:\.exe)?\s+/c\s+)?format(?:\s|$)",
-    r"(?<!-)\brestart-computer\b",
-    r"(?<!-)\bstop-process\b",
-]
+# 内置危险命令黑名单直接复用 tools/utils.py(assert_safe_command 的直拒名单),
+# 两处由同一份定义保证一致;此处用于"询问后放行"而非"直接拒绝"。
+_BUILTIN_DANGEROUS_COMMAND_PATTERNS = DANGEROUS_COMMAND_PATTERNS
+_BUILTIN_WINDOWS_DANGEROUS_COMMAND_PATTERNS = WINDOWS_DANGEROUS_COMMAND_PATTERNS
 
 # 用户自定义黑名单文件固定路径(相对项目根)。
 BLACKLIST_FILE_RELATIVE_PATH = "user/permission-blacklist.json"

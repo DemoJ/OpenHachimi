@@ -318,8 +318,11 @@ app = FastAPI(title="OpenHachimi Agent", lifespan=lifespan)
 
 @app.middleware("http")
 async def require_http_api_token(request: Request, call_next):
-    if request.url.path == "/health" or request.url.path.startswith("/ui"):
-        return await call_next(request)
+    path = request.url.path
+    if path == "/health" or path == "/ui" or path.startswith("/ui/"):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        return response
 
     config = getattr(request.app.state, "config", None)
     token = getattr(config, "http_api_token", None)
@@ -328,26 +331,27 @@ async def require_http_api_token(request: Request, call_next):
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {token}"
-    if hmac.compare_digest(auth, expected):
-        return await call_next(request)
+    authorized = hmac.compare_digest(auth, expected)
 
     # GET 下载端点支持 query 参数传 token(<img>/<a> 标签无法设 Authorization header)
-    if request.method == "GET":
-        path = request.url.path
+    if not authorized and request.method == "GET":
         if path.startswith("/attachments/download") or path.startswith("/artifacts/"):
             query_token = request.query_params.get("token", "")
-            if query_token and hmac.compare_digest(query_token, token):
-                return await call_next(request)
+            authorized = bool(query_token) and hmac.compare_digest(query_token, token)
 
-    return JSONResponse(status_code=401, content={"detail": "未授权"})
+    if not authorized:
+        return JSONResponse(status_code=401, content={"detail": "未授权"})
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    from openhachimi_agent.core.version import get_version
-
+    # 无鉴权端点,不暴露版本号等指纹信息。
     logger.debug("health check")
-    return {"status": "ok", "version": get_version()}
+    return {"status": "ok"}
 
 
 @app.get("/state")
@@ -747,7 +751,9 @@ def download_attachment(
         raise HTTPException(status_code=403, detail="附件路径不在允许目录内")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="附件文件不存在")
-    return FileResponse(target)
+    # 必须显式传 filename:starlette 据此设置 Content-Disposition: attachment,
+    # 否则 .html 等附件会被浏览器在 WebUI 同源下内联渲染,构成存储型 XSS。
+    return FileResponse(target, filename=target.name)
 
 
 @app.get("/artifacts/{artifact_id}/download")
@@ -1090,6 +1096,29 @@ def delete_skill(request: SkillDeleteRequest, config=Depends(get_config)):
 # 原子写防中途损坏)。type 由 command/url 派生。改后需重启进程(mcp_manager 启动期建连)。
 
 
+def _mask_secret_mapping(mapping: dict[str, str] | None) -> dict[str, str]:
+    """env/headers 整体掩码(值常含 API key/Authorization,不应明文回显)。"""
+    from openhachimi_agent.core.config.webui_io import mask_secret
+
+    return {k: (mask_secret(v) if isinstance(v, str) else v) for k, v in (mapping or {}).items()}
+
+
+def _restore_masked_mapping(
+    incoming: dict[str, str] | None, current: dict[str, str] | None
+) -> dict[str, str]:
+    """用户把 GET 返回的掩码值原样提交时保留原值,防止掩码覆盖真实密钥。"""
+    from openhachimi_agent.core.config.webui_io import mask_secret
+
+    cur = current or {}
+    result: dict[str, str] = {}
+    for key, value in (incoming or {}).items():
+        if isinstance(value, str) and key in cur and value == mask_secret(str(cur[key])):
+            result[key] = cur[key]
+        else:
+            result[key] = value
+    return result
+
+
 @app.get("/mcp")
 def get_mcp_servers(config=Depends(get_config)):
     cfg = get_mcp_config(config.user_dir)
@@ -1100,8 +1129,8 @@ def get_mcp_servers(config=Depends(get_config)):
             command=srv.command,
             args=list(srv.args),
             url=srv.url,
-            env=srv.env,
-            headers=srv.headers,
+            env=_mask_secret_mapping(srv.env),
+            headers=_mask_secret_mapping(srv.headers),
         )
         for name, srv in cfg.servers.items()
     ]
@@ -1110,6 +1139,7 @@ def get_mcp_servers(config=Depends(get_config)):
 
 @app.put("/mcp")
 def update_mcp_servers(request: McpServersUpdateRequest, config=Depends(get_config)):
+    existing_cfg = get_mcp_config(config.user_dir)
     servers: dict[str, MCPServerConfig] = {}
     seen: set[str] = set()
     for it in request.servers:
@@ -1119,16 +1149,24 @@ def update_mcp_servers(request: McpServersUpdateRequest, config=Depends(get_conf
         if name in seen:
             raise HTTPException(status_code=400, detail=f"MCP 服务器名称重复: {name}")
         seen.add(name)
+        existing = existing_cfg.servers.get(name)
         if it.type == "stdio":
             if not it.command or not it.command.strip():
                 raise HTTPException(status_code=400, detail=f"stdio 服务器 {name} 缺少 command")
             servers[name] = MCPServerConfig(
-                type="stdio", command=it.command, args=list(it.args), env=it.env
+                type="stdio",
+                command=it.command,
+                args=list(it.args),
+                env=_restore_masked_mapping(it.env, getattr(existing, "env", None) if existing else None),
             )
         else:
             if not it.url or not it.url.strip():
                 raise HTTPException(status_code=400, detail=f"http 服务器 {name} 缺少 url")
-            servers[name] = MCPServerConfig(type="http", url=it.url, headers=it.headers)
+            servers[name] = MCPServerConfig(
+                type="http",
+                url=it.url,
+                headers=_restore_masked_mapping(it.headers, getattr(existing, "headers", None) if existing else None),
+            )
     try:
         write_mcp_config(config.user_dir, servers)
     except OSError as exc:
@@ -1139,7 +1177,7 @@ def update_mcp_servers(request: McpServersUpdateRequest, config=Depends(get_conf
     items = [
         MCPServerItem(
             name=name, type=srv.type, command=srv.command, args=list(srv.args),
-            url=srv.url, env=srv.env, headers=srv.headers,
+            url=srv.url, env=_mask_secret_mapping(srv.env), headers=_mask_secret_mapping(srv.headers),
         )
         for name, srv in cfg.servers.items()
     ]

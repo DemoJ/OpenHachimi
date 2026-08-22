@@ -229,6 +229,8 @@ SCHEDULER_FIELDS: list[dict[str, Any]] = [
      "label": "允许任务内改调度", "description": "定时任务执行中是否允许调用调度相关工具改动任务表。关闭更安全。改后需重启进程"},
     {"path": "scheduler.security.allow_interactive_tools_in_scheduled_runs", "kind": CONFIG_KIND_BOOL, "group": "scheduler-security",
      "label": "允许任务内交互工具", "description": "定时任务执行中是否允许调用交互类工具。关闭更安全。改后需重启进程"},
+    {"path": "scheduler.security.allow_dangerous_tools_in_scheduled_runs", "kind": CONFIG_KIND_BOOL, "group": "scheduler-security",
+     "label": "允许任务内危险工具", "description": "定时任务执行中是否允许命令执行/文件写入删除/技能安装等高危工具。关闭更安全（无人值守任务将只保留只读与报告类工具）。改后需重启进程"},
 ]
 
 # 联网研究设置页字段定义。

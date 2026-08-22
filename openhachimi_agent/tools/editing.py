@@ -135,10 +135,24 @@ def delete_path(
 
     logger.info("tool delete_path path=%s", path)
     target_path = resolve_workspace_path(ctx.deps.base_dir, path, ctx.deps.skills_dirs)
-    
+
     if not target_path.exists():
         return {"message": f"路径不存在，跳过删除：{path}", "deleted": False}
-        
+
+    # 目录级删除(rmtree,波及全部子内容且不可撤销)必须先经用户确认;
+    # 单文件删除是 agent 日常操作,不打断。
+    if target_path.is_dir() and not target_path.is_symlink():
+        from openhachimi_agent.tools.clarification import clarify_user
+
+        normalized = normalize_relative_path(ctx.deps.base_dir, target_path)
+        user_reply = clarify_user(
+            ctx,
+            question=f"delete_path 将递归删除目录 {normalized}（含全部子内容，不可撤销），是否允许？",
+            choices=["允许删除", "拒绝删除"],
+        )
+        if "允许" not in str(user_reply):
+            return {"error": f"用户拒绝删除目录：{path}"}
+
     try:
         if target_path.is_file() or target_path.is_symlink():
             try:

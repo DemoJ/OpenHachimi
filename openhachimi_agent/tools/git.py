@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
@@ -53,6 +54,9 @@ def git_diff(
 
     command = ["git", "diff"]
     if ref:
+        if ref.startswith("-"):
+            # 防参数注入:形如 --output=<path> 的 ref 可让 git 把 diff 写到任意路径。
+            raise ModelRetry(f"git_diff 的 ref 不能以 - 开头：{ref}")
         command.append(ref)
     elif staged:
         command.append("--cached")

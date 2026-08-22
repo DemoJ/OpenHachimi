@@ -20,11 +20,26 @@ SENSITIVE_KEY_PARTS = (
     "token",
 )
 SENSITIVE_VALUE_PATTERNS = (
+    # Bearer 必须最先处理:否则下面的键值模式会把 "Bearer" 当作
+    # Authorization 键的值吞掉,反而泄露其后的真实 token。
     re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|authorization|cookie)(\s*[:=]\s*)([^\s'\";&]+)"),
+    # 注意:键名前缀(如 access_token/client_secret/appsecret)必须也能命中,
+    # 因此键名前不能用 \b —— 下划线是 word 字符,\b 会挡住 "access_token" 里的 "token"。
+    # 键与值两侧的可选引号用于命中 JSON 文本("token": "xxx")形态。
+    # 强敏感键:任意长度值都脱敏(短密码也是密码)。
+    re.compile(
+        r"(?i)([\"']?(?:api[_-]?key|apikey|passwords?|passwd|secrets?|authorization|cookies?|credentials?)[\"']?)(\s*[:=]\s*)[\"']?([^\s'\";&]+)"
+    ),
+    # 弱敏感键(token 子串太常见):值 >=8 字符才脱敏,
+    # 避免 _max_output_tokens: 4096 这类普通配置项被误伤。
+    re.compile(r"(?i)([\"']?tokens?[\"']?)(\s*[:=]\s*)[\"']?([^\s'\";&]{8,})"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{12,}"),
     re.compile(r"\bAKIA[0-9A-Z]{12,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
+    # Telegram bot token 裸格式: <bot_id>:<hash>
+    re.compile(r"(?<![0-9])[0-9]{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
 )
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 
@@ -55,15 +70,39 @@ def redact_text(text: object, max_chars: int | None = None) -> str:
     redacted = str(text)
     redacted = _URL_RE.sub(lambda match: redact_url(match.group(0)), redacted)
     for pattern in SENSITIVE_VALUE_PATTERNS:
-        if pattern.pattern.startswith("(?i)\\b(Bearer"):
-            redacted = pattern.sub(r"\1" + REDACTED, redacted)
-        elif "api" in pattern.pattern and "authorization" in pattern.pattern:
+        if pattern.groups >= 3:
+            # 键值形态:保留键名与分隔符,只替换值。
             redacted = pattern.sub(lambda match: f"{match.group(1)}{match.group(2)}{REDACTED}", redacted)
+        elif pattern.groups == 1:
+            redacted = pattern.sub(r"\1" + REDACTED, redacted)
         else:
             redacted = pattern.sub(REDACTED, redacted)
     if max_chars is not None and len(redacted) > max_chars:
         return redacted[: max_chars - 3] + "..."
     return redacted
+
+
+def redact_persisted_data(value: object) -> object:
+    """结构化脱敏,用于落库/清库等必须保持结构可回解析的场景。
+
+    与 ``redact_tool_args`` 的区别:后者会把敏感键下的任意类型值(含 int)
+    整体替换,破坏 pydantic_ai 消息结构(如 usage.input_tokens 计数);
+    本函数只替换敏感键下的 ``str`` 值,其余类型原样保留。
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                REDACTED
+                if isinstance(item, str) and item and is_sensitive_key(key)
+                else redact_persisted_data(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_persisted_data(item) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
 
 
 def redact_tool_args(args: object) -> object:

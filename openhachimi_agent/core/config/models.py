@@ -105,6 +105,7 @@ class SchedulerSecurityConfig:
     prompt_scan_enabled: bool = True
     allow_scheduler_mutation_in_scheduled_runs: bool = False
     allow_interactive_tools_in_scheduled_runs: bool = False
+    allow_dangerous_tools_in_scheduled_runs: bool = False
 
 
 @dataclass(frozen=True)
