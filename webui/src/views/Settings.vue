@@ -84,6 +84,12 @@
           </div>
         </div>
 
+        <div v-else-if="currentGroup === 'schedules'" class="settings-content">
+          <!-- 定时任务管理:任务清单的创建/暂停/恢复/删除。SchedulesCard 自管加载,
+               每次操作直接落盘并刷新,不接入本页 dirty/保存条(与 roles 模型一致)。 -->
+          <SchedulesCard />
+        </div>
+
         <div v-else-if="currentGroup === 'roles'" class="settings-content">
           <!-- 角色管理:小卡片列表 + 编辑弹窗。RolesCard 自管加载与保存(弹窗内直接落盘,
                无全局 dirty/保存条),与 prompts/skills/mcp 的"顶部保存条"模型不同。 -->
@@ -231,6 +237,7 @@ import RolesCard from '../components/RolesCard.vue'
 import SkillsCard from '../components/SkillsCard.vue'
 import McpServersCard from '../components/McpServersCard.vue'
 import MemoryManageDialog from '../components/MemoryManageDialog.vue'
+import SchedulesCard from '../components/SchedulesCard.vue'
 import { getConfigGroup, updateConfigGroup } from '../api'
 import type { ConfigField as ConfigFieldType } from '../api'
 
@@ -271,6 +278,7 @@ const groups = [
   { id: 'memory', label: '记忆系统', icon: '🧠' },
   { id: 'context', label: '上下文压缩', icon: '✂️' },
   { id: 'scheduler', label: '任务调度', icon: '⏰' },
+  { id: 'schedules', label: '定时任务', icon: '🗓️' },
   { id: 'research', label: '联网研究', icon: '🔎' },
   { id: 'permission', label: '权限设置', icon: '🔐' },
   { id: 'paths-logging', label: '路径与日志', icon: '📁' },
@@ -483,7 +491,8 @@ async function loadConfig() {
   // 特殊分组分支走各自子组件自管加载,这里跳过避免空 getConfigGroup 调用。
   // roles 同属特殊分组(数据走 /roles-config,不在 yaml 字段表),漏判会 fallthrough
   // 到 getConfigGroup('roles') → 后端 /config/{group} 查不到该组返回 404。
-  if (currentGroup.value === 'prompts' || currentGroup.value === 'skills' || currentGroup.value === 'mcp' || currentGroup.value === 'roles') {
+  // schedules 的数据走 /schedules CRUD,由 SchedulesCard 自管,同样跳过。
+  if (currentGroup.value === 'prompts' || currentGroup.value === 'skills' || currentGroup.value === 'mcp' || currentGroup.value === 'roles' || currentGroup.value === 'schedules') {
     fields.value = []
     snapshot.value = {}
     form.value = {}

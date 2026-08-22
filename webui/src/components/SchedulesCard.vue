@@ -1,37 +1,33 @@
 <template>
-  <div class="schedules-page">
-    <header class="header">
-      <button class="btn" @click="goBack">← 返回</button>
-      <div class="brand">定时任务</div>
-      <button class="btn btn-primary" @click="openCreate">+ 新建任务</button>
-    </header>
-
-    <div class="schedules-body">
-      <div v-if="loading" class="status-line"><span class="activity-spinner" /> 加载中…</div>
-      <div v-else-if="errorText" class="status-line error">{{ errorText }} <button class="btn" @click="load">重试</button></div>
-      <div v-else-if="tasks.length === 0" class="status-line">
-        暂无定时任务。点击右上角"新建任务"，或在对话里让 Agent 创建（"每天早上 9 点提醒我…"）。
-      </div>
-
-      <div v-for="t in tasks" :key="t.id" class="task-card" :class="{ paused: t.status === 'paused' }">
-        <div class="task-head">
-          <span class="task-name">{{ t.name }}</span>
-          <span class="task-status" :class="`task-status--${t.status}`">{{ statusLabel(t.status) }}</span>
-          <span v-if="t.running" class="task-status task-status--running">运行中</span>
-        </div>
-        <div class="task-prompt" :title="t.prompt">{{ t.prompt }}</div>
-        <div class="task-meta">
-          <span>{{ scheduleLabel(t) }}</span>
-          <span v-if="t.next_run_at">下次：{{ formatTime(t.next_run_at) }}</span>
-          <span v-if="t.last_status">上次：{{ t.last_status }}{{ t.last_error ? `（${t.last_error}）` : '' }}</span>
-        </div>
-        <div class="task-actions">
-          <button v-if="t.status === 'enabled'" class="btn" @click="onPause(t)">暂停</button>
-          <button v-else-if="t.status === 'paused'" class="btn" @click="onResume(t)">恢复</button>
-          <button class="btn btn-danger" @click="onRemove(t)">删除</button>
-        </div>
-      </div>
+  <div class="schedules-card">
+    <div class="schedules-toolbar">
+      <button type="button" class="btn btn-primary" @click="openCreate">+ 新建任务</button>
     </div>
+
+    <div v-if="loading" class="status-line"><span class="activity-spinner" /> 加载中…</div>
+    <div v-else-if="errorText" class="status-line error">{{ errorText }} <button class="btn" @click="load">重试</button></div>
+    <div v-else-if="tasks.length === 0" class="status-line">
+      暂无定时任务。点击上方"新建任务"，或在对话里让 Agent 创建（"每天早上 9 点提醒我…"）。
+    </div>
+
+    <section v-for="t in tasks" :key="t.id" class="task-card" :class="{ paused: t.status === 'paused' }">
+      <div class="task-head">
+        <span class="task-name">{{ t.name }}</span>
+        <span class="task-status" :class="`task-status--${t.status}`">{{ statusLabel(t.status) }}</span>
+        <span v-if="t.running" class="task-status task-status--running">运行中</span>
+      </div>
+      <div class="task-prompt" :title="t.prompt">{{ t.prompt }}</div>
+      <div class="task-meta">
+        <span>{{ scheduleLabel(t) }}</span>
+        <span v-if="t.next_run_at">下次：{{ formatTime(t.next_run_at) }}</span>
+        <span v-if="t.last_status">上次：{{ t.last_status }}{{ t.last_error ? `（${t.last_error}）` : '' }}</span>
+      </div>
+      <div class="task-actions">
+        <button v-if="t.status === 'enabled'" class="btn" @click="onPause(t)">暂停</button>
+        <button v-else-if="t.status === 'paused'" class="btn" @click="onResume(t)">恢复</button>
+        <button class="btn btn-danger" @click="onRemove(t)">删除</button>
+      </div>
+    </section>
 
     <!-- 新建任务弹窗 -->
     <div v-if="showCreate" class="modal-overlay" @click.self="showCreate = false">
@@ -86,15 +82,12 @@
 
 <script setup lang="ts">
 import { onMounted, ref, computed } from 'vue'
-import { useRouter } from 'vue-router'
-import ConfirmDialog from '../components/ConfirmDialog.vue'
+import ConfirmDialog from './ConfirmDialog.vue'
 import {
   listSchedules, createSchedule, pauseSchedule, resumeSchedule, removeSchedule,
   type ScheduleTask,
 } from '../api'
-import { getToken } from '../api'
 
-const router = useRouter()
 const tasks = ref<ScheduleTask[]>([])
 const loading = ref(false)
 const errorText = ref('')
@@ -118,14 +111,6 @@ const exprPlaceholder = computed(() => {
   if (form.value.schedule_type === 'interval') return '30m / 2h / 86400'
   return '2026-08-23T09:00:00'
 })
-
-function goBack() {
-  if (!getToken()) {
-    router.replace('/login')
-    return
-  }
-  router.push('/chat')
-}
 
 async function load() {
   loading.value = true
@@ -234,34 +219,10 @@ function onRemove(t: ScheduleTask) {
 </script>
 
 <style scoped>
-.schedules-page {
+.schedules-toolbar {
   display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-.header {
-  height: var(--header-height, 52px);
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 var(--sp-lg, 16px);
-  border-bottom: 1px solid var(--hairline, #212327);
-}
-.brand {
-  flex: 1;
-  font-size: 14px;
-  letter-spacing: 0.4px;
-}
-.schedules-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: var(--sp-lg, 16px);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-width: 760px;
-  width: 100%;
-  margin: 0 auto;
+  justify-content: flex-end;
+  margin-bottom: var(--sp-md);
 }
 .status-line {
   color: var(--body-mid, #7d8187);
@@ -274,8 +235,9 @@ function onRemove(t: ScheduleTask) {
 .status-line.error { color: #ff8589; }
 .task-card {
   border: 1px solid var(--hairline, #212327);
-  border-radius: 10px;
-  padding: 12px 14px;
+  border-radius: var(--radius-sm, 8px);
+  padding: var(--sp-md, 12px) var(--sp-lg, 16px);
+  margin-bottom: var(--sp-md);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -339,7 +301,7 @@ function onRemove(t: ScheduleTask) {
   max-height: 86vh;
   overflow-y: auto;
 }
-.modal h3 { margin: 0; font-size: 15px; }
+.modal h3 { margin: 0; font-size: 15px; font-weight: 400; }
 .field {
   display: flex;
   flex-direction: column;

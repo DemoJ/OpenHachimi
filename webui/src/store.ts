@@ -196,6 +196,29 @@ export const useChatStore = defineStore('chat', {
         this.sessionsLoading = false
       }
     },
+    // SSE 首事件绑定真实 session 后立刻让侧栏可见:空白页直发时后端在建流的
+    // 瞬间就建好了会话行,但前端要等 onDone 后的 refreshSessions 才拉得到——
+    // 生成期间新会话不在列表里,用户一旦切走就找不到入口切回来。这里本地乐观
+    // 插入消除空窗:preview 用刚发送的文本(此刻消息还没落库,后端列表里该行
+    // preview 为空),权威数据仍由流结束后的 refreshSessions 回填。
+    ensureSessionVisible(sessionId: string, preview?: string, role?: string) {
+      if (!sessionId) return
+      const existing = this.sessions.find((s) => s.session_id === sessionId)
+      if (existing) {
+        if (preview && !existing.preview) existing.preview = preview.slice(0, 80)
+        return
+      }
+      this.sessions.unshift({
+        session_id: sessionId,
+        role: role || this.currentRole,
+        created_at: null,
+        mtime: Math.floor(Date.now() / 1000),
+        preview: preview ? preview.slice(0, 80) : '',
+        message_count: 0,
+        channel: this.currentChannel,
+      })
+      this.sessionsTotal += 1
+    },
     async deleteSession(session_id: string) {
       // 删除指定会话。调用方(Sidebar)负责:该会话还在生成时先 /stop 后端任务,
       // 以及 confirm 二次确认。这里只管落库 + 本地态同步。

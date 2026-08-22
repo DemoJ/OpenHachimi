@@ -66,10 +66,9 @@
       </div>
     </div>
 
-    <!-- 侧栏底部:设置与定时任务入口。纯文字风格,弱化到几乎融入侧栏,
+    <!-- 侧栏底部:设置入口。纯文字风格,弱化到几乎融入侧栏,
          默认低对比,仅 hover 时有轻微反馈,不喧宾夺主。 -->
     <div class="sidebar-footer">
-      <button class="btn-settings" @click="onSchedules">定时任务</button>
       <button class="btn-settings" @click="onSettings">设置</button>
     </div>
 
@@ -101,10 +100,6 @@ const emit = defineEmits<{ (e: 'role-changed' | 'session-loaded'): void }>()
 
 function onSettings() {
   router.push('/settings/ai-models')
-}
-
-function onSchedules() {
-  router.push('/schedules')
 }
 
 // 无限滚动:监听 sessionsContainer 滚动区内 loadMoreSentinel 进入视口,

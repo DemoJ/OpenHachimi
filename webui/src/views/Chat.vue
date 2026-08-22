@@ -203,6 +203,9 @@ async function onSend(text: string, attachments: AttachmentRef[]) {
           console.info('[Chat] session bound from stream', { sid })
           store.setCurrentSession(sid)
         }
+        // 新会话不等 AI 回复完才进侧栏:SSE 首事件一到就乐观插入,
+        // 生成期间也能随时切走再切回来。
+        store.ensureSessionVisible(sid, text, turn.role)
         // /role 等命令改变了角色:同步 currentRole 并刷新会话列表
         if (role && role !== store.currentRole) {
           console.info('[Chat] role changed via command', { role })
