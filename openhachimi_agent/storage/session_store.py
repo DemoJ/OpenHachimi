@@ -220,6 +220,18 @@ class SessionStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_compressions_session
                     ON session_compressions(role, session_id, compression_id DESC);
+
+                -- 产物持久化:此前产物只在内存注册表(_artifact_records),服务重启后
+                -- /artifacts/{id}/download 404,历史回放里的产物链接全部失效。
+                -- artifact_json 是完整 ArtifactRef;下载端点按 id 回查并复用
+                -- resolve_workspace_path 校验,不引入任意路径读取面。
+                CREATE TABLE IF NOT EXISTS session_artifacts (
+                    id            TEXT PRIMARY KEY,
+                    role          TEXT NOT NULL,
+                    session_id    TEXT NOT NULL,
+                    created_at    TEXT NOT NULL,
+                    artifact_json TEXT NOT NULL
+                );
                 """
             )
 
@@ -466,6 +478,7 @@ class SessionStore:
         channel: str | None = None,
         scope_key: str | None = None,
         append: bool = True,
+        update_pointer: bool = True,
     ) -> int:
         """追加写入会话消息历史 + 更新指针 / 渠道元数据,返回本次写入的起始 turn_index。
 
@@ -555,16 +568,20 @@ class SessionStore:
                         for idx, msg_obj in enumerate(arr)
                     ],
                 )
-            conn.execute(
-                """
-                INSERT INTO session_pointers (role, scope, session_id, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(role, scope) DO UPDATE SET
+            # update_pointer=False 用于定时任务(scheduled)轮次:消息带着渠道
+            # scope 落库,但不更新 (role, scope) 的"最新会话"指针——否则任务跑完
+            # 后,该渠道用户的下一条闲聊会续进定时任务的会话里。
+            if update_pointer:
+                conn.execute(
+                    """
+                    INSERT INTO session_pointers (role, scope, session_id, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(role, scope) DO UPDATE SET
                     session_id = excluded.session_id,
                     updated_at = excluded.updated_at
-                """,
-                (safe_role, safe_scope, safe_sid, now),
-            )
+                    """,
+                    (safe_role, safe_scope, safe_sid, now),
+                )
 
         logger.debug(
             "message history saved role=%s session_id=%s messages=%d start_turn=%d append=%s scope=%s channel=%s",
@@ -970,6 +987,61 @@ class SessionStore:
             }
             for row in rows
         ]
+
+    # ── 产物持久化 ───────────────────────────────────────────────────────
+
+    def save_artifacts(self, role: str, session_id: str, artifacts: list) -> None:
+        """把本轮产物(ArtifactRef 列表)持久化,供服务重启后下载端点回查。
+
+        INSERT OR REPLACE 按 artifact.id 幂等;写入失败由调用方兜底(旁路,不阻断主流程)。
+        """
+        from openhachimi_agent.transport.api_models import ArtifactRef
+
+        safe_role = validate_role_name(role)
+        safe_sid = validate_session_id(session_id, allow_legacy=False)
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for artifact in artifacts:
+                if not isinstance(artifact, ArtifactRef):
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO session_artifacts
+                        (id, role, session_id, created_at, artifact_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact.id,
+                        safe_role,
+                        safe_sid,
+                        now,
+                        artifact.model_dump_json(),
+                    ),
+                )
+
+    def get_artifact_by_id(self, artifact_id: str) -> object | None:
+        """按 id 回查持久化产物;内存注册表未命中时下载端点的兜底。返回 ArtifactRef 或 None。"""
+        from openhachimi_agent.transport.api_models import ArtifactRef
+
+        if not artifact_id or len(artifact_id) > 128 or not all(c.isalnum() or c == "-" for c in artifact_id):
+            return None
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT artifact_json FROM session_artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+        except Exception:  # noqa: BLE001 — 表不存在(旧库)等场景静默降级为 None
+            logger.debug("artifact lookup failed id=%s", artifact_id, exc_info=True)
+            return None
+        if row is None:
+            return None
+        try:
+            return ArtifactRef.model_validate_json(row["artifact_json"])
+        except Exception:  # noqa: BLE001
+            logger.debug("artifact json parse failed id=%s", artifact_id, exc_info=True)
+            return None
 
     # ── TODO state(原 .memory/todos/{sid}.json) ─────────────────────────
 

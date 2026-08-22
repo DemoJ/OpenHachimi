@@ -39,6 +39,7 @@ from openhachimi_agent.scheduler.delivery import (
     DeliverySenderRegistry,
     InboxDeliverySender,
     TelegramDeliverySender,
+    WeixinDeliverySender,
     deliver_scheduled_run,
 )
 from openhachimi_agent.scheduler.service import ScheduledTaskService, run_to_dict, task_to_dict
@@ -252,7 +253,9 @@ async def lifespan(app: FastAPI):
             if telegram_sender is not None:
                 app.state.delivery_registry.register(TelegramDeliverySender(telegram_sender))
 
-            async with weixin_lifespan(app):
+            async with weixin_lifespan(app) as weixin_broker:
+                if weixin_broker is not None:
+                    app.state.delivery_registry.register(WeixinDeliverySender(weixin_broker))
                 if config.scheduler.enabled and config.scheduler.db_path is not None:
                     app.state.schedule_store = ScheduledTaskStore(config.scheduler.db_path)
 
@@ -662,6 +665,12 @@ def chat_stream(
                     payload["tool_icon"] = event.tool_icon
                 if event.artifact:
                     payload["artifact"] = event.artifact.model_dump(mode="json")
+                if getattr(event, "choices", None):
+                    payload["choices"] = list(event.choices)
+                if getattr(event, "session_id", None):
+                    payload["session_id"] = event.session_id
+                if getattr(event, "role", None):
+                    payload["role"] = event.role
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                 event_count += 1
 
@@ -759,6 +768,9 @@ def download_attachment(
 @app.get("/artifacts/{artifact_id}/download")
 def download_artifact(artifact_id: str, service: AgentService = Depends(get_service)):
     artifact = service.get_artifact(artifact_id)
+    if artifact is None:
+        # 内存注册表未命中(服务重启后):回查持久化产物表。
+        artifact = service.session_store.get_artifact_by_id(artifact_id)
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact 不存在")
     try:

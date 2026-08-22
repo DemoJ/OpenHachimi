@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.error import HTTPError
 
 import uvicorn
 
@@ -223,13 +224,14 @@ def cmd_config(_args: argparse.Namespace) -> None:
         _info("请先运行 `hachimi deploy` 完成初始部署。")
         sys.exit(1)
 
-    # 按优先级选择编辑器
+    # 按优先级选择编辑器(notepad 兜底:Windows 官方部署路径下常见无 vim/nano)
     editor = (
         os.environ.get("EDITOR")
         or os.environ.get("VISUAL")
         or shutil.which("nano")
         or shutil.which("vim")
         or shutil.which("vi")
+        or (shutil.which("notepad") if platform.system() == "Windows" else None)
     )
     if not editor:
         _err("未找到可用的文本编辑器，请设置 $EDITOR 环境变量。")
@@ -305,7 +307,12 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
     if args.purge:
         actions.append("删除虚拟环境（.venv）")
     if args.remove_all:
-        actions += ["删除虚拟环境（.venv）", "删除整个项目目录"]
+        actions += [
+            "删除虚拟环境（.venv）",
+            "删除整个项目目录",
+            "  ⚠ 项目目录内包含你的全部对话记录(.memory)、配置与 API Key(user/)、"
+            "定时任务(.scheduler)——删除前请自行备份,删除后无法恢复",
+        ]
         args.purge = True  # remove_all 隐含 purge
 
     print("将执行以下操作：")
@@ -354,6 +361,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
     """在前台直接运行 HTTP 服务（调试用）。"""
     config = load_config()
     configure_logging(config)
+    from openhachimi_agent.interface.cli import _preflight_config_warnings
+
+    for warning in _preflight_config_warnings(config):
+        print(f"⚠️  {warning}\n")
     # 命令行 --host/--port 显式指定时覆盖配置文件 app.server_host/server_port。
     host = args.host if args.host is not None else config.server_host
     port = args.port if args.port is not None else config.server_port
@@ -383,7 +394,11 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 def cmd_cli(_args: argparse.Namespace) -> None:
     """进入 CLI 对话模式。"""
-    asyncio.run(run_embedded_cli())
+    try:
+        asyncio.run(run_embedded_cli())
+    except KeyboardInterrupt:
+        # Ctrl-C 应干净退出而不是吐 KeyboardInterrupt traceback。
+        print("\n已退出对话。")
 
 
 def cmd_weixin(_args: argparse.Namespace) -> None:
@@ -392,18 +407,68 @@ def cmd_weixin(_args: argparse.Namespace) -> None:
     weixin_main()
 
 
+def _local_timezone_name() -> str:
+    """返回本机时区的 IANA 名(如 Asia/Shanghai);无法可靠取到时退回 UTC。
+
+    候选顺序:TZ 环境变量 → tzlocal(若装了) → 系统 tzname。
+    每个候选都用 ZoneInfo 校验——Windows 的 tzname 是"中国标准时间"这类
+    本地化名,不是 IANA 名,直接用会被 ZoneInfo 拒收。
+    """
+    import time as _time
+
+    candidates: list[str] = []
+    tz_env = os.getenv("TZ", "").strip()
+    if tz_env:
+        candidates.append(tz_env)
+    try:
+        from tzlocal import get_localzone_name  # type: ignore[import-not-found]
+
+        name = get_localzone_name()
+        if name:
+            candidates.append(name)
+    except ImportError:
+        pass
+    names = getattr(_time, "tzname", None) or []
+    candidates.extend(n for n in names if n)
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        for name in candidates:
+            try:
+                ZoneInfo(name)
+                return name
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    return "UTC"
+
+
 def _print_schedule(task: dict[str, object]) -> None:
     status = task.get("status", "enabled")
     status_text = "启用" if status == "enabled" else ("暂停" if status == "paused" else "已删除")
     running = "，运行中" if task.get("running") else ""
+    # 枚举中文化:此前直接透出 enabled/origin/delivered 等英文原值。
+    delivery_mode_map = {
+        "origin": "来源渠道", "inbox": "收件箱", "explicit": "指定目标",
+        "platform_home": "主渠道", "all": "全部", "none": "不投递",
+    }
+    mode = str(task.get("delivery_mode", "origin"))
     print(f"{task['id']}  {task['name']}  [{task['schedule_type']} {task['schedule_expr']}]  {status_text}{running}")
     print(f"  下次运行：{task.get('next_run_at') or '-'}")
     print(f"  角色/会话：{task.get('role') or '-'} / {task.get('session_id') or '-'}")
-    print(f"  投递模式：{task.get('delivery_mode', 'origin')}")
+    print(f"  投递模式：{delivery_mode_map.get(mode, mode)}")
     if task.get("last_status"):
         print(f"  上次状态：{task.get('last_status')} {task.get('last_error') or ''}".rstrip())
     if task.get("last_delivery_status"):
-        print(f"  上次投递：{task.get('last_delivery_status')} {task.get('last_delivery_error') or ''}".rstrip())
+        delivery_map = {
+            "delivered": "已投递", "failed": "投递失败", "skipped": "跳过",
+            "fallback_delivered": "已回落收件箱", "fallback_failed": "回落失败",
+            "partial": "部分成功", "not_required": "无需投递", "resolved_empty": "无目标",
+        }
+        ds = str(task.get("last_delivery_status"))
+        print(f"  上次投递：{delivery_map.get(ds, ds)} {task.get('last_delivery_error') or ''}".rstrip())
 
 
 def cmd_schedule(args: argparse.Namespace) -> None:
@@ -427,7 +492,9 @@ def cmd_schedule(args: argparse.Namespace) -> None:
                 "schedule_expr": schedule_expr,
                 "role": args.role,
                 "session_id": args.session_id,
-                "timezone": args.timezone,
+                # 默认用本机系统时区:中文用户几乎都期望"早上 9 点"按本地时间,
+                # 此前默认 UTC 极易踩坑(--once 被当 UTC 解析,差 8 小时)。
+                "timezone": args.timezone or _local_timezone_name(),
                 "timeout_seconds": args.timeout,
                 "delivery_mode": args.delivery_mode,
                 "origin": {
@@ -484,8 +551,19 @@ def cmd_schedule(args: argparse.Namespace) -> None:
             if not runs:
                 _info("暂无定时任务收件箱消息。")
                 return
+            delivery_map = {
+                "delivered": "已投递", "failed": "投递失败", "skipped": "跳过",
+                "fallback_delivered": "已回落收件箱", "fallback_failed": "回落失败",
+                "partial": "部分成功", "not_required": "无需投递", "resolved_empty": "无目标",
+            }
+            status_map = {"succeeded": "成功", "failed": "失败", "timeout": "超时", "running": "运行中"}
             for run in runs:
-                print(f"{run['id']}  {run['status']}  {run['started_at']}  {run.get('delivery_status') or '-'}")
+                ds = str(run.get("delivery_status") or "-")
+                st = str(run.get("status", ""))
+                print(
+                    f"{run['id']}  {status_map.get(st, st)}  {run['started_at']}  "
+                    f"{'-' if ds == '-' else delivery_map.get(ds, ds)}"
+                )
                 if run.get("error"):
                     print(f"  错误：{run['error']}")
                 if run.get("output"):
@@ -497,16 +575,25 @@ def cmd_schedule(args: argparse.Namespace) -> None:
             if not runs:
                 _info("暂无运行记录。")
                 return
+            status_map = {"succeeded": "成功", "failed": "失败", "timeout": "超时", "running": "运行中"}
             for run in runs:
-                print(f"{run['id']}  {run['status']}  {run['started_at']}  {run.get('duration_ms') or '-'}ms")
+                st = str(run.get("status", ""))
+                print(f"{run['id']}  {status_map.get(st, st)}  {run['started_at']}  {run.get('duration_ms') or '-'}ms")
                 if run.get("error"):
                     print(f"  错误：{run['error']}")
                 if run.get("output"):
                     print(f"  输出：{str(run['output'])[:500]}")
             return
     except Exception as exc:
-        _err(f"定时任务命令失败：{exc}")
-        _info(f"请确认后台服务已启动：{server_url}")
+        # 服务端 400 等校验错误会带中文 detail;直接打印异常只会看到
+        # "HTTP Error 400: Bad Request",真正的校验原因被吞掉。
+        from openhachimi_agent.interface.cli import error_detail
+
+        detail = error_detail(exc) if isinstance(exc, HTTPError) else str(exc)
+        _err(f"定时任务命令失败：{detail}")
+        if not isinstance(exc, HTTPError):
+            # 只有非 HTTP 错误(连接失败等)才提示检查服务。
+            _info(f"请确认后台服务已启动：{server_url}")
         sys.exit(1)
 
     _err("请指定 schedule 子命令。")
@@ -591,7 +678,11 @@ def main() -> None:
     schedule_add.add_argument("--once", help="一次性运行时间，例如 2026-05-27T10:30:00+08:00")
     schedule_add.add_argument("--interval", help="循环间隔，例如 10m、2h、86400")
     schedule_add.add_argument("--cron", help="cron 表达式，例如 '0 9 * * *'")
-    schedule_add.add_argument("--timezone", default="UTC", help="时区，默认 UTC")
+    schedule_add.add_argument(
+        "--timezone",
+        default=None,
+        help="任务时区，默认取本机系统时区（如 Asia/Shanghai）。--once 时间与 cron 都按该时区解释",
+    )
     schedule_add.add_argument("--role", default=None, help="使用的角色")
     schedule_add.add_argument("--session-id", default=None, help="使用的会话 ID")
     schedule_add.add_argument("--timeout", type=int, default=None, help="单次执行超时时间（秒）")
@@ -638,7 +729,10 @@ def main() -> None:
         _dispatch[args.command](args)
     else:
         # 无子命令 → 默认进入 CLI 对话
-        asyncio.run(run_embedded_cli())
+        try:
+            asyncio.run(run_embedded_cli())
+        except KeyboardInterrupt:
+            print("\n已退出对话。")
 
 
 if __name__ == "__main__":

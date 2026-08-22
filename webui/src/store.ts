@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { markRaw } from 'vue'
 import type { SessionSummary, MessageItem, StateResponse, AttachmentRef, ArtifactRef } from './api'
 import { fetchRoles, listSessions, fetchState, fetchChannels, getSessionMessages, deleteSession } from './api'
-import { getToken, clearToken } from './api'
+import { getToken, clearToken, ApiError } from './api'
 
 // 空白页直发场景,SSE session 事件回来之前轮次还没有真实 session_id,
 // 用这个哨兵 key 暂存在 liveTurns 里,绑定后再迁移到真实 key。
@@ -51,6 +51,9 @@ interface ChatStoreState {
   messagesHasMore: boolean
   messagesNextBeforeTurn: number | null
   messagesLoading: boolean
+  // clarify_user 的待选追问(带 choices 时非空):驱动输入框上方的可点选项条。
+  // 用户点选或自由输入发送后清除;新轮次开始时也清除。
+  clarification: { question: string; choices: string[] } | null
 }
 
 const SESSIONS_PAGE_SIZE = 50
@@ -74,6 +77,7 @@ export const useChatStore = defineStore('chat', {
     messagesHasMore: false,
     messagesNextBeforeTurn: null,
     messagesLoading: false,
+    clarification: null,
   }),
   getters: {
     authenticated: (state) => !!state.token,
@@ -150,11 +154,16 @@ export const useChatStore = defineStore('chat', {
         this.sessions = sessionsRes.sessions
         this.sessionsTotal = sessionsRes.total ?? sessionsRes.sessions.length
         return r
-      } catch {
-        // 不清空 token，让上层决定如何处理。
-
-        throw new Error('获取初始化数据失败')
-
+      } catch (err) {
+        // 不清空 token，让上层决定如何处理。错误分型提示,方便用户排查
+        // (token 错 / 服务没启动 / 其他服务端错误)。
+        if (err instanceof ApiError && err.status === 401) {
+          throw new Error('访问令牌无效，请检查 user/config.yaml 的 app.http_api_token')
+        }
+        if (err instanceof ApiError && err.status === 0) {
+          throw new Error('无法连接服务器，请确认后台服务已启动')
+        }
+        throw new Error(`初始化失败：${err instanceof Error ? err.message : String(err)}`)
       }
     },
     async refreshSessions(role?: string) {
@@ -292,6 +301,8 @@ export const useChatStore = defineStore('chat', {
       const key = this.currentSessionId ?? PENDING_TURN_KEY
       const existing = this.liveTurns[key]
       if (existing?.generating) return null
+      // 新一轮开始,旧的追问选项作废
+      this.clarification = null
       if (existing) {
         // 上一轮已结束(错误/中断留下的缓冲)但用户还没切走:先物化再开新一轮,
         // 否则覆盖 liveTurns[key] 会把那轮的正文直接丢掉。
@@ -359,6 +370,13 @@ export const useChatStore = defineStore('chat', {
     setTurnActivity(turn: LiveTurn, text: string | null) {
       turn.activity = text
     },
+    // clarify_user 追问到达(带预设选项):记录供输入框上方渲染可点选项条。
+    setClarification(question: string, choices: string[]) {
+      this.clarification = { question, choices }
+    },
+    clearClarification() {
+      this.clarification = null
+    },
     appendTurnArtifact(turn: LiveTurn, artifact: ArtifactRef) {
       // 把 agent 生成的产物附加到轮次最后一条 assistant 消息上。
       // 若还没有 assistant 消息(理论上不该发生),创建一条空消息。
@@ -395,7 +413,14 @@ export const useChatStore = defineStore('chat', {
       turn.generating = false
       turn.activity = null
       turn.sealed = false
-      if (errorMessage) this.appendTurnChunk(turn, `\n\n**[错误]** ${errorMessage}`)
+      if (errorMessage) {
+        // 后端在客户端断开时会把任务转后台继续执行并落库(见 http.py 的
+        // detach 逻辑),提示用户稍后回来能看到完整结果,而不是以为全丢了。
+        this.appendTurnChunk(
+          turn,
+          `\n\n**[连接中断]** ${errorMessage}\n\n任务可能仍在后台执行。稍等片刻后刷新页面或切回本会话，可查看已生成的完整结果。`,
+        )
+      }
     },
     // 正常完成:此时后端已把本轮全部消息落库(done 事件在 _persist_turn 之后)。
     // 正在查看该会话 → 把乐观消息物化进 messages(视图不变,后续 meta 回填);

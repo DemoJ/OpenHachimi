@@ -445,9 +445,12 @@ class AgentService:
             if isinstance(event, StreamEventItem):
                 if event.type == "tool" and not self.config.show_tool_calls:
                     continue
-                # 运行时状态提示(planner heartbeat / replan / 视觉模型 / 最终验证补齐等)
-                # 对最终用户没有帮助,只会让 Telegram / 前端的对话流变得嘈杂。
-                # 统一在 stream 出口屏蔽掉,内部仍走日志可查。
+                # system 专表内部运行时状态(planner heartbeat / replan / 视觉模型 /
+                # 最终验证补齐等),对最终用户没有帮助,统一在 stream 出口屏蔽,
+                # 内部仍走日志可查。
+                # notice(步数暂停/手动中断/stall/验证未通过)与 clarification(追问选项)
+                # 是面向用户的提示,必须放行——此前与 system 一刀切过滤,导致
+                # 步数上限暂停时流"无声结束"、用户不知道要回复"继续"。
                 if event.type == "system":
                     continue
                 yield event

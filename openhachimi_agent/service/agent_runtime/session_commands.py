@@ -89,19 +89,18 @@ def new_session(service, role_name: str | None = None, latest_scope: str | None 
     lines = [
         "✨ 新对话已准备好",
         "",
-        "✅ 上一段对话已保存",
-        "📝 已为你开启一段全新的上下文",
+        "上一段对话已保存,已为你开启一段全新的上下文。",
         "",
         "━━ 当前配置 ━━",
-        f"🤖 模型:{service.config.model_name}",
+        f"模型：{service.config.model_name}",
     ]
     if service.config.openai_base_url:
-        lines.append(f"🌐 模型服务:{service.config.openai_base_url}")
+        lines.append(f"模型服务：{service.config.openai_base_url}")
     lines.extend([
-        f"🎭 角色:{role}",
-        f"🧩 会话:{session_id}",
+        f"角色：{role}",
+        f"会话：{session_id}",
         "",
-        "💬 直接输入内容并回车,即可继续对话。",
+        "直接输入内容并回车，即可继续对话。",
     ])
     return CommandResponse(
         message="\n".join(lines),

@@ -85,16 +85,30 @@ async def run_command(
     if permission_config.mode == "blacklist":
         if is_dangerous_command(command, ctx.deps.base_dir):
             # 黑名单模式:危险命令先询问用户确认
-            from openhachimi_agent.tools.clarification import clarify_user
+            from openhachimi_agent.tools.clarification import (
+                format_choices_hint,
+                interpret_confirmation,
+            )
 
+            confirm_choices = ["允许执行", "拒绝执行"]
+            # 确认文案里命令须脱敏:聊天渠道里命令全文(可能内嵌密钥)会对群成员可见。
+            question_command = redact_text(command)
             user_reply = clarify_user(
                 ctx,
-                question=f"检测到危险命令，是否允许执行？\n\n命令: {command}",
-                choices=["允许执行", "拒绝执行"],
+                question=(
+                    f"检测到危险命令，是否允许执行？\n\n命令: {question_command}\n\n"
+                    f"{format_choices_hint(confirm_choices)}"
+                ).strip(),
+                choices=confirm_choices,
             )
-            # clarify_user 抛 CallDeferred 阻断当前 run;用户回复后 resume 灌回返回值
-            if "允许" not in str(user_reply):
-                return {"error": f"用户拒绝执行危险命令: {command}"}
+            # clarify_user 抛 CallDeferred 阻断当前 run;用户回复后 resume 灌回返回值。
+            # 匹配:否定词一票否决("不允许"不会误放行),序号/选项文字/同义词均支持,
+            # 识别不了按拒绝处理(安全默认)。
+            allowed = interpret_confirmation(
+                user_reply, affirmative=confirm_choices[0], negative=confirm_choices[1]
+            )
+            if not allowed:
+                return {"error": f"用户未确认，已拒绝执行危险命令: {question_command}（回复 1 或\"允许执行\"可放行）"}
             # 用户已确认,跳过 assert_safe_command 的拦截
         else:
             # 黑名单模式:非危险命令走原有安全检查(兜底)

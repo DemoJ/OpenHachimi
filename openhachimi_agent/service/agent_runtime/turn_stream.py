@@ -26,7 +26,7 @@ from openhachimi_agent.service.agent_runtime.streaming import (
     StreamEventItem,
     StreamStats,
     consume_stream_queue,
-    system_stream_event,
+    notice_stream_event,
 )
 from openhachimi_agent.service.agent_runtime.turn_postprocess import _collect_turn_artifacts
 from openhachimi_agent.service.agent_runtime.turn_render import (
@@ -56,12 +56,12 @@ def _stall_event(
     stalled_detail = {"operation": exc.operation, "stalled_for": exc.stalled_for, "timeout": exc.timeout}
     if has_active_todos(session_state):
         suspend_current_plan(session_state, reason="operation_stalled", detail=stalled_detail, deps=deps)
-        return system_stream_event(
-            "\n\n[System] 当前任务已暂停:"
+        return notice_stream_event(
+            "\n\n[系统] 当前任务已暂停:"
             f"{exc} 旧计划已挂起,不会影响下一轮对话;"
             "如需恢复,请明确说明\"继续刚才的任务\"。"
         )
-    return system_stream_event(f"\n\n[System] 当前任务未完成:{exc} 未生成可恢复计划,下一轮将重新理解用户请求。")
+    return notice_stream_event(f"\n\n[系统] 当前任务未完成:{exc} 未生成可恢复计划,下一轮将重新理解用户请求。")
 
 
 async def _iter_post_completion(
@@ -76,15 +76,15 @@ async def _iter_post_completion(
         await task
     except asyncio.CancelledError:
         if task.cancelled():
-            yield system_stream_event("\n\n【任务已被手动中断】")
+            yield notice_stream_event("\n\n[系统] 任务已被手动中断。")
             return
         raise
 
     # 步数保护阀:长程任务跑满 request_limit(60) 次工具循环后的正常暂停,不是故障。
     # 给一条系统提示说明现状并指引用户继续;已完成的执行痕迹会走失败兜底落库。
     if result_holder.get("usage_limit_pause"):
-        yield system_stream_event(
-            "\n\n[System] 本轮任务已自动执行了较多步骤(达到单次对话步数上限 60),"
+        yield notice_stream_event(
+            "\n\n[系统] 本轮任务已自动执行了较多步骤(达到单次对话步数上限 60),"
             "为防止失控已主动暂停。已完成的步骤已保存,请回复\"继续\"接着执行,"
             "或告诉我调整方向。\n"
         )
@@ -96,7 +96,7 @@ async def _iter_post_completion(
         if signal_value := result_holder.get(signal_key):
             rendered = _format_signal_for_user(signal_key, signal_value)
             if rendered:
-                yield system_stream_event(f"\n\n{rendered}\n")
+                yield notice_stream_event(f"\n\n{rendered}\n")
     turn_artifacts = _collect_turn_artifacts(session_state)
     service.register_artifacts(turn_artifacts)
     seen_artifacts: set[str] = set()
@@ -177,6 +177,17 @@ async def _yield_stream_terminal(
             role, actual_session_id, len(terminal_text), str(is_clarify_deferred).lower(),
         )
         yield StreamEventItem(type="text", text=terminal_text)
+
+    clarify_choices = result_holder.get("clarification_choices")
+    if isinstance(clarify_choices, list) and clarify_choices:
+        # 追问带预设选项:额外发 clarification 事件,WebUI 渲染成可点选项条;
+        # 纯文本渠道靠问题文本里已附的编号提示,无需消费本事件。
+        yield StreamEventItem(
+            type="clarification",
+            text=str(result_holder.get("clarification_question") or ""),
+            choices=[str(c) for c in clarify_choices],
+            counted_as_output=False,
+        )
 
     logger.info(
         "chat finished role=%s session_id=%s output_chars=%d chunks=%d first_chunk_ms=%s history_messages=%d duration_ms=%.0f stream=true",

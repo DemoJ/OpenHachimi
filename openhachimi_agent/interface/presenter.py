@@ -9,7 +9,7 @@ from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.transport.api_models import ArtifactRef
 
 
-PresenterActionType = Literal["tool", "text", "system", "artifact"]
+PresenterActionType = Literal["tool", "text", "system", "notice", "artifact", "clarification"]
 
 
 @dataclass
@@ -18,6 +18,7 @@ class PresenterAction:
     text: str
     final: bool = False
     artifact: ArtifactRef | None = None
+    choices: list[str] | None = None
 
 
 class ToolProgressPresenter:
@@ -51,6 +52,12 @@ class ToolProgressPresenter:
             actions.append(PresenterAction(type="text", text=event.text))
         elif event.type == "system":
             actions.append(PresenterAction(type="system", text=event.text))
+        elif event.type == "notice":
+            actions.append(PresenterAction(type="notice", text=event.text))
+        elif event.type == "clarification":
+            actions.append(
+                PresenterAction(type="clarification", text=event.text, choices=event.choices)
+            )
         elif event.type == "artifact":
             actions.append(PresenterAction(type="artifact", text=event.text, artifact=event.artifact))
         return actions

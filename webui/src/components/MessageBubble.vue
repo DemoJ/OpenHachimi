@@ -6,6 +6,11 @@
         <span v-if="formattedTime" class="meta-time" :title="rawTimeTitle">{{ formattedTime }}</span>
         <span v-if="tokenLabel" class="meta-tokens" :title="tokenTitle">{{ tokenLabel }}</span>
         <button
+          class="toggle-btn copy-btn"
+          title="复制消息原文"
+          @click="copyContent"
+        >{{ copied ? '已复制' : '复制' }}</button>
+        <button
           v-if="hasPrefix"
           class="toggle-btn"
           @click="expanded = !expanded"
@@ -93,6 +98,15 @@
       </div>
     </div>
 
+    <!-- 工具调用痕迹:历史回放时展示"Agent 做过什么"(流式期间由活动条实时展示)。
+         默认折叠,点击展开明细;无内容时不渲染。 -->
+    <details v-if="toolCalls.length && !streaming" class="tool-calls">
+      <summary>🔧 执行了 {{ toolCalls.length }} 个工具调用</summary>
+      <div class="tool-call-list">
+        <div v-for="(line, i) in toolCalls" :key="i" class="tool-call-line">{{ line }}</div>
+      </div>
+    </details>
+
     <!-- 大图预览灯箱 -->
     <div v-if="lightboxSrc" class="lightbox" @click="closeLightbox">
       <img :src="lightboxSrc" class="lightbox-img" @click.stop />
@@ -115,12 +129,27 @@ const props = defineProps<{
   tokens?: { input: number; output: number; total: number; cache_read?: number } | null
   attachments?: AttachmentRef[] | null
   artifacts?: ArtifactRef[] | null
+  tool_calls?: string[] | null
 }>()
 
 // prefix 由后端拆好（按哨兵分隔符），无前缀就是空串。无需任何启发式。
 const hasPrefix = computed(() => props.role === 'user' && !!props.prefix && props.prefix.length > 0)
 
 const expanded = ref(false)
+
+// 复制消息原文:复制 markdown 源文本而非渲染后的 HTML。
+const copied = ref(false)
+let copiedTimer: number | undefined
+async function copyContent() {
+  try {
+    await navigator.clipboard.writeText(props.content || '')
+    copied.value = true
+    window.clearTimeout(copiedTimer)
+    copiedTimer = window.setTimeout(() => { copied.value = false }, 2000)
+  } catch (err) {
+    console.warn('[MessageBubble] copy failed', err)
+  }
+}
 
 const renderedContent = computed(() => renderMarkdown(props.content || ''))
 const renderedPrefix = computed(() => renderMarkdown(props.prefix || ''))
@@ -142,6 +171,9 @@ const artifactImages = computed(() =>
 const artifactFiles = computed(() =>
   (props.artifacts || []).filter(a => !isArtifactImage(a)),
 )
+
+// 历史回放的工具调用摘要(后端从 ToolCallPart 渲染注入)。
+const toolCalls = computed(() => props.tool_calls || [])
 
 const lightboxSrc = ref('')
 function previewImage(att: AttachmentRef) {
@@ -425,5 +457,36 @@ const tokenTitle = computed<string>(() => {
 @keyframes cursor-blink {
   0%, 50% { opacity: 1; }
   51%, 100% { opacity: 0; }
+}
+</style>
+
+<style scoped>
+.tool-calls {
+  margin-top: 8px;
+  border: 1px solid var(--hairline, #212327);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.tool-calls summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  color: var(--body-mid, #7d8187);
+  user-select: none;
+}
+.tool-calls summary:hover { color: var(--ink, #ededed); }
+.tool-call-list {
+  border-top: 1px solid var(--hairline, #212327);
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.tool-call-line {
+  color: var(--body-mid, #aaa);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
 }
 </style>

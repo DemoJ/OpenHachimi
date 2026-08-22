@@ -23,7 +23,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { getToken, setToken } from '../api'
+import { getToken, setToken, clearToken } from '../api'
 import { useChatStore } from '../store'
 
 const token = ref('')
@@ -62,12 +62,16 @@ async function onLogin() {
   }
   loading.value = true
   error.value = ''
-  setToken(token.value.trim())
+  const candidate = token.value.trim()
+  // 验证失败即清除:此前输错的 token 会留在 localStorage,下次进登录页
+  // 还会自动登录再失败一轮。(请求需要先写入 token 才能带 Authorization 头。)
+  setToken(candidate)
   try {
     await store.loadInit()
-    store.setToken(token.value.trim())
+    store.setToken(candidate)
     router.push('/chat')
   } catch (e) {
+    clearToken()
     error.value = (e as Error).message || '访问令牌（HTTP API Token）无效或服务器无响应'
   } finally {
     loading.value = false

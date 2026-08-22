@@ -273,6 +273,10 @@ class MessageItem(BaseModel):
     # assistant 消息携带的产物列表(ArtifactRef 的 dict 形式)。由 turn_postprocess
     # 持久化到 ModelResponse.metadata,经 extract_text_parts 反序列化注入。无产物时 None。
     artifacts: list[dict[str, Any]] | None = None
+    # assistant 消息本轮执行过的工具调用摘要(已脱敏展示文本,如"🖥️ 执行命令：npm test")。
+    # 由 extract_text_parts 从 ToolCallPart 渲染,供前端折叠展示"Agent 做过什么";
+    # 仅展示层,不影响喂给模型的历史。无工具调用或旧会话时为 None。
+    tool_calls: list[str] | None = None
 
 
 class SessionMessagesResponse(BaseModel):

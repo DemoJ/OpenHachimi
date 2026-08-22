@@ -154,11 +154,19 @@ def _finalize_outcome(
     if isinstance(getattr(outcome.result, "output", None), DeferredToolRequests):
         pending = session_state.get("_user_clarification") or {}
         question_text = pending.get("question") or "需要你提供更多信息以继续。"
-        result_holder["clarification_question"] = question_text
-        # 多选模式:把 choices 透传给前端渲染可点选项(无 choices 时为开放问答)。
+        # 多选模式:选项以两种形式到达用户——
+        # 1. 问题文本尾部附编号提示(全渠道可用,回复序号即可,如"1");
+        # 2. 流式渠道额外下发 type="clarification" 事件(带 choices),供前端渲染可点选项。
         choices = pending.get("choices")
         if isinstance(choices, list) and choices:
+            from openhachimi_agent.tools.clarification import format_choices_hint
+
+            result_holder["clarification_question"] = (
+                f"{question_text}\n\n{format_choices_hint(list(choices))}".strip()
+            )
             result_holder["clarification_choices"] = list(choices)
+        else:
+            result_holder["clarification_question"] = question_text
     elif outcome.final_verification_signal:
         result_holder["final_verification_signal"] = outcome.final_verification_signal
     # 正常完成:无额外动作
@@ -196,7 +204,15 @@ def _handle_run_agent_exception(
                 role, actual_session_id, service.config.agent_timeout_seconds,
             )
         else:
-            result_holder["error"] = exc
+            # 非流式(微信/定时任务)此前存裸 TimeoutError,渠道侧只能显示空信息。
+            result_holder["error"] = TimeoutError(
+                "Agent 执行超时:"
+                f"{service.config.agent_timeout_seconds}s 内没有完成。"
+                f"模型={service.config.model_name},"
+                f"base_url={redact_text(service.config.openai_base_url or '默认')}。"
+                "常见原因:模型服务无响应、工具调用卡住、浏览器/网络代理不可用。"
+                "可尝试把任务拆成更小的步骤分别发送。"
+            )
             logger.exception("chat timed out role=%s session_id=%s stream=false", role, actual_session_id)
         return
     # 步数保护阀(长程任务防死循环):不是系统故障,用"本轮暂停+可继续"的友好提示
@@ -333,6 +349,8 @@ async def _finalize_turn_data(
         resolved_channel_code=state.inputs.resolved_channel_code, message=state.message, history=state.history,
         attachments=state.inputs.attachment_list,
         artifacts=turn_artifacts,
+        # scheduled 轮次不更新渠道 scope 的最新会话指针(防劫持闲聊上下文)
+        update_pointer=state.run_mode != "scheduled",
     )
     await _maybe_compress_post_turn(
         service, ctx.context_compressor,
@@ -412,6 +430,7 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
                     user_message=state.message,
                     attachments=state.inputs.attachment_list,
                     tool_trace=state.result_holder.get("tool_trace"),
+                    update_pointer=state.run_mode != "scheduled",
                 )
                 yield ChatResponse(
                     output="本轮任务已自动执行了较多步骤(达到单次对话步数上限 60),为防止失控已主动暂停。已完成的步骤已保存,请回复\"继续\"接着执行,或告诉我调整方向。",
@@ -434,6 +453,7 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
                 user_message=state.message,
                 attachments=state.inputs.attachment_list,
                 tool_trace=state.result_holder.get("tool_trace"),
+                update_pointer=state.run_mode != "scheduled",
             )
             return
 
@@ -512,5 +532,6 @@ async def run_turn(
                 user_message=message,
                 attachments=inputs.attachment_list,
                 tool_trace=state.result_holder.get("tool_trace"),
+                update_pointer=run_mode != "scheduled",
             )
             raise

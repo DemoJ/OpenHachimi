@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 
 from pydantic_ai import RunContext
@@ -33,6 +34,74 @@ from pydantic_ai.exceptions import CallDeferred
 from openhachimi_agent.core.deps import AgentDeps
 
 logger = logging.getLogger(__name__)
+
+# ── 用户确认回复解析 ─────────────────────────────────────────────────────
+# 供 run_command/delete_path/install_skill 等高危确认场景判断用户答复。
+# 此前用 `"允许" not in reply` 子串判断,"不允许"会误放行、"可以/好"会误拒绝。
+
+_NEGATIVE_WORDS = ("不允许", "不要", "别", "勿", "拒绝", "取消", "算了", "否", "no", "don't", "dont", "deny", "reject", "cancel", "stop")
+_AFFIRMATIVE_WORDS = ("允许", "同意", "确认", "可以", "好的", "好", "行", "是", "嗯", "ok", "okay", "yes", "allow", "approve", "confirm", "continue", "go")
+
+
+def _normalize_reply(reply: object) -> str:
+    text = str(reply or "").strip().lower()
+    # 全角数字/字母 → 半角,支持中文输入法下的 "１"。
+    width_table = str.maketrans("０１２３４５６７８９", "0123456789")
+    return text.translate(width_table)
+
+
+def match_user_choice(reply: object, choices: list[str] | None) -> str | None:
+    """把用户的自由回复匹配到某个预设选项,返回选项文本;无法识别返回 None。
+
+    匹配顺序(先命中先返回):
+    1. 数字序号:"1"/"1."/"选项1" → 第 N 个选项(1 起);
+    2. 完整包含某个选项文本(或被选项包含),长选项优先(避免"允许"抢先于"允许执行");
+    3. 都不中 → None(调用方应按"未确认"处理并向用户说明可选回复)。
+    """
+    text = _normalize_reply(reply)
+    if not text or not choices:
+        return None
+
+    seq_match = re.search(r"(?:选项)?([1-9])\s*[).、]?\s*$|^(?:第)?([1-9])\s*[).、]?$", text)
+    if seq_match:
+        digit = seq_match.group(1) or seq_match.group(2)
+        idx = int(digit) - 1
+        if 0 <= idx < len(choices):
+            return choices[idx]
+
+    for choice in sorted(choices, key=len, reverse=True):
+        normalized = choice.strip().lower()
+        if normalized and (normalized in text or text in normalized):
+            return choice
+    return None
+
+
+def interpret_confirmation(reply: object, *, affirmative: str, negative: str) -> bool:
+    """判断高危确认的答复是否为"允许"。
+
+    优先级:否定词一票否决 > 序号/选项文本匹配 > 肯定同义词 > 默认拒绝。
+    - "不允许"/"不允许执行"含否定词,即使包含"允许执行"字样也必须判否;
+    - "1"/"允许执行" 选中肯定项; "2"/"拒绝执行"/"取消" 判否;
+    - "可以/好的/ok/yes" 等同义词判允许;
+    - 识别不了按 False 处理(安全默认),调用方应告知可选回复方式。
+    """
+    text = _normalize_reply(reply)
+    if not text:
+        return False
+    if any(word in text for word in _NEGATIVE_WORDS):
+        return False
+    matched = match_user_choice(text, [affirmative, negative])
+    if matched is not None:
+        return matched == affirmative
+    return any(word in text for word in _AFFIRMATIVE_WORDS)
+
+
+def format_choices_hint(choices: list[str] | None) -> str:
+    """把选项渲染成编号提示行,供 CLI/渠道等纯文本端展示。"""
+    if not choices:
+        return ""
+    lines = "、".join(f"{i}）{c}" for i, c in enumerate(choices, 1))
+    return f"（回复序号或对应文字：{lines}）"
 
 # 最多 4 个预设选项(对齐 Hermes clarify_tool.MAX_CHOICES)。UI 渲染成可点选行,
 # 第 5 个"其它(自行输入)"由前端自动追加。超过 4 个截断保留前 4 个。

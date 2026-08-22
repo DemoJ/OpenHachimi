@@ -37,13 +37,24 @@ SIGNAL_LABELS: tuple[tuple[str, str], ...] = (
 
 @dataclass
 class StreamEventItem:
-    type: Literal["text", "tool", "system", "artifact"]
+    # type 语义:
+    # - text/tool: 流式正文与工具进度;
+    # - notice: 面向用户的运行时提示(步数暂停/手动中断/stall/验证未通过),
+    #   会透传到所有渠道,必须对最终用户有意义;
+    # - system: 内部运行时状态(planner heartbeat 等),在 stream_events 出口被过滤;
+    # - artifact / clarification: 产物下发 / clarify_user 追问(choices 供前端渲染可点选项);
+    # - session: 命令执行后回传最新 session_id/role,供前端同步
+    #   (否则 /new、/role 之后下一条消息仍发往旧会话旧角色)。
+    type: Literal["text", "tool", "system", "notice", "artifact", "clarification", "session"]
     text: str
     tool_name: str | None = None
     tool_icon: str | None = None
     temporary: bool = False
     counted_as_output: bool = True
     artifact: ArtifactRef | None = None
+    choices: list[str] | None = None
+    session_id: str | None = None
+    role: str | None = None
 
 
 @dataclass
@@ -515,6 +526,11 @@ async def _cancel_stalled_task(task: asyncio.Task, exc: OperationStalledError) -
 
 def system_stream_event(text: str) -> StreamEventItem:
     return StreamEventItem(type="system", text=text, counted_as_output=False)
+
+
+def notice_stream_event(text: str) -> StreamEventItem:
+    """面向用户的运行时提示:所有渠道可见(区别于会被过滤的内部 system 事件)。"""
+    return StreamEventItem(type="notice", text=text, counted_as_output=False)
 
 
 async def consume_stream_queue(

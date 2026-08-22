@@ -106,6 +106,7 @@ async def _save_turn_messages(
     latest_scope: str | None,
     resolved_channel_code: str | None,
     history: list,
+    update_pointer: bool = True,
 ) -> None:
     """更新压缩器 token 用量,并把本轮新增差量(new_history[len(history):])追加落库。
 
@@ -130,6 +131,7 @@ async def _save_turn_messages(
         channel=resolved_channel_code,
         scope_key=latest_scope,
         append=True,
+        update_pointer=update_pointer,
     )
 
 
@@ -147,6 +149,7 @@ async def _persist_turn(
     history: list,
     attachments: list | None = None,
     artifacts: list | None = None,
+    update_pointer: bool = True,
 ) -> list:
     """构造本轮系统级上下文快照并打 metadata,再差量追加落库。返回 new_history。
 
@@ -160,7 +163,17 @@ async def _persist_turn(
         service, ctx, result, new_history,
         role=role, actual_session_id=actual_session_id, latest_scope=latest_scope,
         resolved_channel_code=resolved_channel_code, history=history,
+        update_pointer=update_pointer,
     )
+    if artifacts:
+        # 产物持久化:内存注册表服务重启即丢;落库后下载端点按 id 回查,
+        # 历史回放里的产物链接在重启后依然可用(旁路,失败不影响主流程)。
+        try:
+            await asyncio.to_thread(
+                service.session_store.save_artifacts, role, actual_session_id, artifacts
+            )
+        except Exception:
+            logger.debug("artifact persistence failed", exc_info=True)
     return new_history
 
 
@@ -175,6 +188,7 @@ async def _persist_failed_turn_user_message(
     user_message: str,
     attachments: list | None = None,
     tool_trace: list[ToolTraceEntry] | None = None,
+    update_pointer: bool = True,
 ) -> None:
     """agent 调用失败兜底:把本轮用户输入落库,避免下一轮丢失上下文。
 
@@ -232,6 +246,7 @@ async def _persist_failed_turn_user_message(
             channel=resolved_channel_code,
             scope_key=latest_scope,
             append=True,
+            update_pointer=update_pointer,
         )
     except Exception:
         logger.warning(

@@ -215,12 +215,47 @@ def extract_text_parts(
                 if isinstance(part, TextPart):
                     text = str(part.content).strip()
                     if text:
-                        result.append({
+                        item = {
                             "role": "assistant", "content": text, "prefix": "",
                             "timestamp": ts_iso, "tokens": tokens_dict,
                             "artifacts": artifacts_list,
-                        })
+                        }
+                        # 同一 ModelResponse 里的工具调用摘要挂到展示消息上
+                        # (tool_calls 在 parts 循环外收集,见下方)。
+                        turn_tool_calls = _collect_tool_calls(msg)
+                        if turn_tool_calls:
+                            item["tool_calls"] = turn_tool_calls
+                        result.append(item)
     return result
+
+
+def _collect_tool_calls(msg: ModelResponse) -> list[str]:
+    """把 ModelResponse 里的 ToolCallPart 渲染成脱敏展示文本(历史回放用)。
+
+    只影响 WebUI 展示("Agent 做过什么"),不参与喂给模型的上下文。
+    格式化复用流式工具卡片的 format_tool_call(含参数脱敏与中文动作名)。
+    """
+    from pydantic_ai.messages import ToolCallPart
+
+    from openhachimi_agent.service.agent_runtime.streaming import format_tool_call
+
+    lines: list[str] = []
+    for part in getattr(msg, "parts", ()):
+        if not isinstance(part, ToolCallPart):
+            continue
+        args = part.args
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"args": args}
+        if not isinstance(args, dict):
+            args = {}
+        try:
+            lines.append(format_tool_call(part.tool_name, args))
+        except Exception:  # noqa: BLE001 — 展示层兜底,不让格式化失败炸掉历史读取
+            logger.debug("tool call formatting failed tool=%s", part.tool_name, exc_info=True)
+    return lines
 
 
 def list_sessions(

@@ -1,5 +1,11 @@
 <template>
   <div class="mcp-content">
+    <!-- 保存失败横幅:提示但不替换编辑器,未保存内容不丢失 -->
+    <div v-if="saveError && !loading" class="save-error-banner">
+      <span>保存失败：{{ saveError }}</span>
+      <button class="btn" @click="saveError = ''">关闭</button>
+    </div>
+
     <div v-if="loading" class="mcp-loading">
       <span class="activity-spinner" />
       <span>加载 MCP 配置中…</span>
@@ -119,6 +125,7 @@ const snapshotJson = ref('')
 
 const loading = ref(false)
 const loadError = ref('')
+const saveError = ref('')
 const saving = ref(false)
 const justSaved = ref(false)
 
@@ -195,6 +202,7 @@ function touch() {}
 async function loadMcp() {
   loading.value = true
   loadError.value = ''
+  saveError.value = ''
   try {
     const res = await getMcpServers()
     form.value = res.servers.map(serverToForm)
@@ -235,20 +243,20 @@ async function save() {
   for (const s of form.value) {
     const name = s.name.trim()
     if (!name) {
-      loadError.value = '存在空名称的 MCP 服务器'
+      saveError.value = '存在空名称的 MCP 服务器'
       return
     }
     if (seen.has(name)) {
-      loadError.value = `MCP 服务器名称重复: ${name}`
+      saveError.value = `MCP 服务器名称重复: ${name}`
       return
     }
     seen.add(name)
     if (s.type === 'stdio' && !s.command.trim()) {
-      loadError.value = `stdio 服务器 ${name} 缺少 command`
+      saveError.value = `stdio 服务器 ${name} 缺少 command`
       return
     }
     if (s.type === 'http' && !s.url.trim()) {
-      loadError.value = `http 服务器 ${name} 缺少 url`
+      saveError.value = `http 服务器 ${name} 缺少 url`
       return
     }
   }
@@ -271,7 +279,8 @@ async function save() {
     justSaved.value = true
     setTimeout(() => { justSaved.value = false }, 2500)
   } catch (e) {
-    loadError.value = (e as Error).message || '保存失败'
+    // 保存失败写 saveError 横幅;写 loadError 会把整个编辑器替换成错误页,丢失未保存内容。
+    saveError.value = (e as Error).message || '保存失败'
   } finally {
     saving.value = false
   }
@@ -429,5 +438,21 @@ loadMcp()
   font-size: 12px;
   line-height: 18px;
   color: var(--body-mid);
+}
+</style>
+
+<style scoped>
+.save-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid rgba(229, 72, 77, 0.4);
+  border-radius: 8px;
+  background: rgba(229, 72, 77, 0.08);
+  color: #ff8589;
+  font-size: 13px;
 }
 </style>

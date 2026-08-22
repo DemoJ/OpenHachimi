@@ -142,16 +142,26 @@ def delete_path(
     # 目录级删除(rmtree,波及全部子内容且不可撤销)必须先经用户确认;
     # 单文件删除是 agent 日常操作,不打断。
     if target_path.is_dir() and not target_path.is_symlink():
-        from openhachimi_agent.tools.clarification import clarify_user
+        from openhachimi_agent.tools.clarification import (
+            format_choices_hint,
+            interpret_confirmation,
+            clarify_user,
+        )
 
+        confirm_choices = ["允许删除", "拒绝删除"]
         normalized = normalize_relative_path(ctx.deps.base_dir, target_path)
         user_reply = clarify_user(
             ctx,
-            question=f"delete_path 将递归删除目录 {normalized}（含全部子内容，不可撤销），是否允许？",
-            choices=["允许删除", "拒绝删除"],
+            question=(
+                f"delete_path 将递归删除目录 {normalized}（含全部子内容，不可撤销），是否允许？\n\n"
+                f"{format_choices_hint(confirm_choices)}"
+            ).strip(),
+            choices=confirm_choices,
         )
-        if "允许" not in str(user_reply):
-            return {"error": f"用户拒绝删除目录：{path}"}
+        if not interpret_confirmation(
+            user_reply, affirmative=confirm_choices[0], negative=confirm_choices[1]
+        ):
+            return {"error": f"用户未确认，已拒绝删除目录：{path}"}
 
     try:
         if target_path.is_file() or target_path.is_symlink():

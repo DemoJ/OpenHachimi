@@ -336,12 +336,6 @@ def _parse_inline_formatting(text: str) -> str:
     return "".join(result)
 
 
-def _live_text(text: str) -> str:
-    if len(text) <= _MAX_MSG_LEN - 2:
-        return text
-    return "…\n" + text[-(_MAX_MSG_LEN - 4):]
-
-
 async def _keep_typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
@@ -459,7 +453,7 @@ class TelegramBot:
         return outcome
 
     async def _reply_outcome(self, update: Update, outcome: CommandOutcome) -> None:
-        """按 outcome.kind 选合适的 emoji 前缀并发送。"""
+        """按 outcome.kind 选合适的 emoji 前缀并发送(长结果分片,防超 4096 被整条拒收)。"""
         if not outcome.message:
             return
         prefix_map = {
@@ -473,7 +467,8 @@ class TelegramBot:
             "exit": "",
         }
         prefix = prefix_map.get(outcome.kind, "")
-        await update.message.reply_text(f"{prefix}{outcome.message}")
+        for part in _split_long_text(f"{prefix}{outcome.message}"):
+            await update.message.reply_text(part)
 
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """/start 命令：欢迎语 + 新建会话(通过 registry 分派以保持单一来源)。"""
@@ -505,6 +500,15 @@ class TelegramBot:
             return
         message_text = update.message.text or ""
         await self._dispatch_via_registry(update, message_text)
+
+    async def handle_unsupported_media(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """语音/视频/贴纸等暂不支持的类型:明确告知,避免用户以为消息丢失。"""
+        if update.message is None:
+            return
+        await update.message.reply_text(
+            "⚠️ 暂不支持处理该消息类型（语音/视频/贴纸）。\n"
+            "请发送文字、图片或文件；语音消息可先用输入法转成文字再发送。"
+        )
 
     async def _download_attachments(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[AttachmentRef]:
         message = update.message
@@ -734,6 +738,11 @@ class TelegramBot:
             async def finalize_tool_segment() -> None:
                 nonlocal current_tool_text, tool_messages
                 await render_tool_messages()
+                # 清理过渡性工具进度消息:工具行只是过程展示,残留多段会让
+                # 长任务后的聊天窗口很难读;删除失败(旧消息/无权限)静默忽略。
+                for msg in tool_messages:
+                    with contextlib.suppress(Exception):
+                        await msg.delete()
                 current_tool_text = ""
                 tool_messages = []
                 presenter.reset_tools()
@@ -769,7 +778,7 @@ class TelegramBot:
                             answer_text += action.text
                             if time.monotonic() - last_answer_edit_time >= _EDIT_INTERVAL:
                                 await render_answer_messages(final=False)
-                        elif action.type == "system":
+                        elif action.type == "system" or action.type == "notice":
                             if current_tool_text:
                                 await finalize_tool_segment()
                             system_text += action.text
@@ -858,6 +867,14 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
     app.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(r"^/start(\s|$)"), bot.cmd_dispatch))
     # 普通消息处理器(非命令),支持文本、图片与文档,设置为 block=False 以免阻塞后续的 /stop 等命令
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, bot.handle_message, block=False))
+    # 不支持的消息类型(语音/视频/贴纸等):给出明确提示,不再像石沉大海
+    app.add_handler(
+        MessageHandler(
+            (filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.STICKER),
+            bot.handle_unsupported_media,
+            block=False,
+        )
+    )
 
     # 启动 Bot(连接失败时不阻断 HTTP 服务,仅记录错误)
     try:

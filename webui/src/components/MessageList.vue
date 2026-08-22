@@ -1,17 +1,19 @@
 <template>
-  <div class="messages-container" ref="containerRef">
+  <div class="messages-container" ref="containerRef" @scroll="onScroll" aria-live="polite">
     <div class="messages-list">
       <!-- 无限滚动触发哨兵 -->
       <div v-if="store.messagesHasMore" ref="loadMoreSentinel" class="load-more-sentinel" style="text-align: center; padding: 12px; color: var(--body-mid);">
         <span v-if="store.messagesLoading">加载中...</span>
         <span v-else>滚动加载更多</span>
       </div>
-      <template v-for="(m, idx) in messages" :key="idx">
+      <template v-for="(m, idx) in messages" :key="messageKey(m, idx)">
         <!-- 压缩标记条：该段对话被压缩为摘要提供给 AI 时显示。
-              仅作分隔提示，原始消息始终完整渲染在消息流中。 -->
+              可点击展开被折叠的原始消息。 -->
         <FoldCard
           v-if="m.fold"
           :fold="m.fold"
+          :session-id="store.currentSessionId"
+          :role="store.currentRole"
         />
         <MessageBubble
           v-else
@@ -23,6 +25,7 @@
           :streaming="isStreaming(idx)"
           :attachments="m.attachments"
           :artifacts="m.artifacts"
+          :tool-calls="m.tool_calls"
         />
       </template>
       <!-- 空状态:脱离消息流,垂直水平居中于容器中央。
@@ -46,6 +49,9 @@
         <span class="activity-text">{{ activity }}</span>
       </div>
     </div>
+
+    <!-- 回到底部浮标:用户上翻离开底部时出现(生成期间不再强制拉回底部) -->
+    <button v-if="showJumpButton" class="jump-bottom" title="回到底部" @click="jumpToBottom">↓</button>
   </div>
 </template>
 
@@ -82,15 +88,22 @@ function isStreaming(idx: number): boolean {
   )
 }
 
-// 滚动触发器：消息内容、生成态、活动文案任一变化都滚到底
-const scrollTrigger = computed(
-  () =>
-    props.messages.map((m) => m.content).join('|') +
-    '|' +
-    (generating.value ? 'g' : '') +
-    '|' +
-    (activity.value || ''),
-)
+// 滚动触发器:此前用 join(全部 content) 触发,长会话每个 chunk 都要
+// O(总字符) 重新拼接。改为"消息条数 + 尾条内容长度 + 状态"的轻量签名,
+// 行为等价(任何新内容都会改变签名),计算量 O(1)。
+const scrollTrigger = computed(() => {
+  const last = props.messages[props.messages.length - 1]
+  return `${props.messages.length}:${last ? last.content.length : 0}:${last?.role ?? ''}:${
+    generating.value ? 'g' : ''
+  }:${activity.value || ''}`
+})
+
+// 稳定的消息 key:用索引会在向上翻页 prepend 后让 Vue 复用错位的组件实例
+// (例如"展开上下文"的 expanded 状态跳到别的消息上)。timestamp+role+长度
+// 组合在会话内基本唯一,且 prepend 不改变既有消息的 key。
+function messageKey(m: MessageItem, idx: number): string {
+  return `${m.timestamp ?? 't'}:${m.role}:${m.content.length}:${idx}`
+}
 
 const loadMoreSentinel = ref<HTMLElement | null>(null)
 let observer: IntersectionObserver | null = null
@@ -154,13 +167,37 @@ async function loadOlderMessages() {
 }
 
 let wasAtBottom = false
+const showJumpButton = ref(false)
+
+function onScroll() {
+  const el = containerRef.value
+  if (!el) return
+  wasAtBottom = Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 100
+  showJumpButton.value = !wasAtBottom
+}
+
+function jumpToBottom() {
+  const el = containerRef.value
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+  wasAtBottom = true
+  showJumpButton.value = false
+}
+
+// 切换会话/角色后滚到底:此前依赖 wasAtBottom 判断,用户在旧会话处于上翻
+// 位置时新会话会停在中部。currentSessionId 只在切换时变化(流式 chunk 不会触发)。
+watch(
+  () => store.currentSessionId,
+  () => {
+    nextTick(() => jumpToBottom())
+  },
+)
+
 watch(
   scrollTrigger,
   () => {
     if (!containerRef.value) return
-    const el = containerRef.value
-    // 距离底部 100px 以内认为是在底部附近
-    wasAtBottom = Math.abs(el.scrollHeight - el.scrollTop - el.clientHeight) < 100
+    onScroll()
   },
   { flush: 'pre' }
 )
@@ -170,12 +207,35 @@ watch(
   async () => {
     if (isPrepending) return
     await nextTick()
-    if (containerRef.value) {
-      if (generating.value || wasAtBottom) {
-        containerRef.value.scrollTop = containerRef.value.scrollHeight
-      }
+    const el = containerRef.value
+    if (!el) return
+    // 只在用户本来就在底部附近时跟随滚动。生成期间强制拉回底部会
+    // 打断用户回看长回复的上文(wasAtBottom 由最近的 scroll/trigger 更新)。
+    if (wasAtBottom) {
+      el.scrollTop = el.scrollHeight
     }
   },
   { flush: 'post' },
 )
 </script>
+
+<style scoped>
+.jump-bottom {
+  position: absolute;
+  right: 20px;
+  bottom: 16px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--pill-border, rgba(255, 255, 255, 0.14));
+  background: var(--canvas-soft, #1a1c20);
+  color: var(--ink, #ededed);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+}
+.jump-bottom:hover { border-color: var(--pill-border-hover, rgba(255, 255, 255, 0.3)); }
+</style>

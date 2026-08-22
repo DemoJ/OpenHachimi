@@ -208,6 +208,21 @@ def main() -> None:
     # 步骤 5：初始化配置文件
     write_config_if_missing(project_root)
 
+    # API Key 未填时先停一停:直接带占位配置启动服务,渠道/WebUI 一连上就报模型错误。
+    config_path = project_root / "user" / "config.yaml"
+    if not args.skip_daemon and config_path.exists():
+        content = config_path.read_text(encoding="utf-8")
+        if "sk-xxxxxxxx" in content and sys.stdin.isatty():
+            print()
+            print("  [提醒] 配置文件里的 API Key 还是示例值，建议现在填写：")
+            print(f"    {config_path}")
+            try:
+                input("  填好后按回车继续部署（或直接回车跳过，稍后编辑并重启服务）：")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                print("  已取消。编辑配置后可重新运行本脚本，或加 --skip-daemon 只装不启动。")
+                return
+
     # 步骤 6：部署后台守护
     if not args.skip_daemon:
         deploy_daemon(project_root, args.host, args.port)

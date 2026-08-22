@@ -1,8 +1,10 @@
 <template>
-  <div class="chat-layout">
+  <div class="chat-layout" :class="{ 'sidebar-open': sidebarOpen }">
     <Sidebar @role-changed="onRoleChanged" @session-loaded="onSessionLoaded" />
+    <div v-if="sidebarOpen" class="sidebar-overlay" @click="sidebarOpen = false"></div>
     <div class="main-area">
       <header class="header">
+        <button class="btn menu-btn" title="会话列表" @click="sidebarOpen = !sidebarOpen">☰</button>
         <div class="brand">{{ store.currentRole || '加载中…' }}</div>
         <div style="display: flex; gap: 12px; align-items: center;">
           <label class="channel-picker">
@@ -15,13 +17,25 @@
         </div>
       </header>
       <MessageList :messages="store.visibleMessages" />
+      <!-- clarify_user 追问的预设选项:点击即发送选项文本,比手打回复省事 -->
+      <div v-if="store.clarification && !store.isGenerating" class="clarify-bar">
+        <span class="clarify-question">{{ store.clarification.question }}</span>
+        <div class="clarify-choices">
+          <button
+            v-for="(choice, i) in store.clarification.choices"
+            :key="i"
+            class="btn clarify-choice"
+            @click="onClarifyChoice(choice)"
+          >{{ choice }}</button>
+        </div>
+      </div>
       <ChatInput :generating="store.isGenerating" @send="onSend" @stop="onStop" />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Sidebar from '../components/Sidebar.vue'
 import MessageList from '../components/MessageList.vue'
@@ -32,6 +46,8 @@ import { post, getToken, getSessionMessages, type AttachmentRef } from '../api'
 
 const router = useRouter()
 const store = useChatStore()
+// 移动端抽屉开关(<768px 时侧栏收进抽屉,顶栏 ☰ 呼出)。
+const sidebarOpen = ref(false)
 
 /**
  * 流结束后从后端拉一次完整历史，把后端权威的 timestamp / tokens / prefix
@@ -116,6 +132,8 @@ function onRoleChanged() {
 function onSessionLoaded() {
   // 切换/新建会话:旧轮次挂在它自己的 session key 下继续流式,
   // 切回来时 visibleMessages = 落库历史 + 该轮次缓冲,回复过程完整可见。
+  // 移动端:选中会话后收起抽屉。
+  sidebarOpen.value = false
 }
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -138,13 +156,13 @@ async function onChannelChange(e: Event) {
 }
 
 async function onSend(text: string, attachments: AttachmentRef[]) {
-  // 防御：理论上 ChatInput 已经在 generating=true 时禁用了发送，
+  // 防御：理论上 ChatInput 已经在 generating=true 时排队而非发送，
   // 这里再兜底一次，防止异常路径下产生并发流。
   if (store.isGenerating) {
     console.warn('[Chat] onSend ignored: still generating')
     return
   }
-
+  store.clearClarification()
   const turn = store.startTurn(text, attachments)
   if (!turn) {
     console.warn('[Chat] onSend ignored: startTurn rejected')
@@ -175,15 +193,26 @@ async function onSend(text: string, attachments: AttachmentRef[]) {
         if (turn.activity) store.setTurnActivity(turn, null)
         store.appendTurnChunk(turn, t)
       },
-      onSession(sid) {
-        // 后端首事件:空白页直发自动新建的 session_id。
-        // 轮次缓冲迁移到真实 key;用户还停在空白页时同步选中该会话
-        // (已经切去看别的会话则不打扰,后台跑完后 sidebar 刷新可见)。
+      onSession(sid, _channel, _autoCreated, role) {
+        // 后端首事件:空白页直发自动新建的 session_id;命令(/new、/role)执行后
+        // 的 session 事件携带变更后的指向。轮次缓冲迁移到真实 key;用户还停在
+        // 空白页(或仍在本轮所属会话)时同步选中,已切走则不打扰。
         store.bindTurnSession(turn, sid)
-        if (!store.currentSessionId) {
+        const stillHere = sessionId === null ? !store.currentSessionId : store.currentSessionId === sessionId
+        if (stillHere && store.currentSessionId !== sid) {
           console.info('[Chat] session bound from stream', { sid })
           store.setCurrentSession(sid)
         }
+        // /role 等命令改变了角色:同步 currentRole 并刷新会话列表
+        if (role && role !== store.currentRole) {
+          console.info('[Chat] role changed via command', { role })
+          store.currentRole = role
+          store.refreshSessions(role).catch((err) => console.warn('[Chat] refresh sessions failed', err))
+        }
+      },
+      onClarification(question, choices) {
+        console.info('[Chat] clarification received', { choices })
+        store.setClarification(question, choices)
       },
       onArtifact(artifact) {
         // agent 生成的产物文件:附加到当前轮次的 assistant 消息上供前端渲染。
@@ -232,11 +261,18 @@ async function onStop() {
     try {
       await post('/stop', { session_id: sid })
     } catch (err) {
+      // 停止请求失败要告知用户:本地 SSE 已断,但后端任务可能仍在跑。
       console.warn('[Chat] /stop request failed', err)
+      store.appendTurnChunk(turn, '\n\n*停止请求发送失败，后端任务可能仍在执行；可稍后重试或刷新查看。*')
     }
   }
   // abort 触发的 onError 会 finishTurn;这里兜底再标一次(幂等)。
   store.finishTurn(turn)
+}
+
+function onClarifyChoice(choice: string) {
+  console.info('[Chat] clarify choice selected', { choice })
+  onSend(choice, [])
 }
 
 function onLogout() {
@@ -246,6 +282,29 @@ function onLogout() {
 </script>
 
 <style scoped>
+/* clarify 选项条:追问 + 可点选项,出现在输入框上方 */
+.clarify-bar {
+  padding: var(--sp-sm) var(--sp-lg);
+  border-top: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+}
+.clarify-question {
+  font-size: 12px;
+  color: var(--body-mid);
+  max-height: 60px;
+  overflow: hidden;
+}
+.clarify-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-sm);
+}
+.clarify-choice {
+  font-size: 13px;
+  cursor: pointer;
+}
 .channel-picker {
   display: inline-flex;
   align-items: center;

@@ -142,7 +142,13 @@ def _extract_text_content(items: list[Dict[str, Any]]) -> str:
 
 def _message_session_keys(msg: Dict[str, Any], from_user: str) -> tuple[str, str, str]:
     group_id = msg.get("group_id", "")
-    session_key = group_id if group_id else from_user
+    # 群聊会话按"群+发送者"隔离:全群共享一个会话会导致成员上下文互相污染、
+    # 危险命令确认被任意成员答复(与 Telegram 渠道的按用户隔离语义对齐)。
+    # 回复目标(to_user)仍是群,即回复发到群里。
+    if group_id:
+        session_key = f"{group_id}:{from_user}"
+    else:
+        session_key = from_user
     safe_session_key = session_key.replace("@", "_at_").replace("-", "_")
     return session_key, f"wx_{safe_session_key}", group_id if group_id else from_user
 
@@ -365,6 +371,9 @@ class WeixinChannel:
         self._pending_media_tasks: dict[str, asyncio.Task] = {}
         self._recent_media: dict[str, list[_RecentMediaEntry]] = {}
         self._media_context_lock = asyncio.Lock()
+        # 每个 scope 当前生效的角色(渠道内 /role 切换的结果)。
+        # 不跟踪的话普通消息硬编码 default 角色,微信里 /role 切换完全无效。
+        self._role_overrides: dict[str, str] = {}
 
     @property
     def account_path(self) -> Path:
@@ -385,6 +394,9 @@ class WeixinChannel:
             self._recent_media = {}
         if not hasattr(self, "_media_context_lock"):
             self._media_context_lock = asyncio.Lock()
+        if not hasattr(self, "_role_overrides"):
+            # 渠道内 /role 切换的覆盖表(测试可能绕过 __init__ 构造实例,惰性兜底)
+            self._role_overrides = {}
 
     async def _download_media_attachments(
         self,
@@ -607,13 +619,18 @@ class WeixinChannel:
             return
 
         self._record_recent_media(prepared.session_key, prepared.attachments)
+        self._ensure_media_context_state()
 
         channel_context = {
             "type": "weixin",
             "platform": "weixin",
             "channel_code": "weixin",
             "session_scope_key": prepared.scope_key,
+            # to_user/context_token 供定时任务投递回微信使用(存入 task.origin)。
+            "to_user": prepared.to_user,
+            "context_token": prepared.context_token,
         }
+        current_role = self._role_overrides.get(prepared.scope_key, self.config.default_role_name)
 
         # 优先命令分派:命中即直接回复并返回,不进 LLM、不写入对话历史。
         # 微信只在用户消息没有附件时尝试,避免媒体场景下误识别。
@@ -627,6 +644,9 @@ class WeixinChannel:
                     channel="weixin",
                 )
             if outcome is not None:
+                if outcome.role:
+                    # /role 切换:记录到 scope 覆盖表,后续普通消息沿用新角色。
+                    self._role_overrides[prepared.scope_key] = outcome.role
                 reply = outcome.message or "已完成。"
                 await self._send_text(prepared, reply)
                 logger.info(
@@ -667,12 +687,19 @@ class WeixinChannel:
         try:
             response = await self.service.send_message(
                 message=text_content,
-                role=self.config.default_role_name,
+                role=current_role,
                 session_id=None,
                 attachments=prepared.attachments,
                 channel_context=channel_context,
                 channel="weixin",
             )
+        except Exception as exc:
+            # 兜底:agent 超时/模型报错此前只写日志,微信用户发消息后永远收不到回音。
+            logger.exception("微信消息处理失败 来自 %s", prepared.from_user)
+            error_text = self._format_error_reply(exc)
+            with suppress(Exception):
+                await self._send_text(prepared, error_text)
+            return
         finally:
             if typing_task:
                 typing_task.cancel()
@@ -686,9 +713,41 @@ class WeixinChannel:
                     logger.debug("取消 typing 指示器失败: %s", e)
 
         reply_text = (response.output or "").strip() or "已完成。"
-        await self._send_text(prepared, reply_text)
-        logger.info("已回复微信消息给 %s", prepared.to_user)
-        await self._send_artifacts(prepared, response.artifacts)
+        try:
+            await self._send_text(prepared, reply_text)
+            logger.info("已回复微信消息给 %s", prepared.to_user)
+        except Exception:
+            logger.exception("微信回复发送失败 给 %s", prepared.to_user)
+            with suppress(Exception):
+                await self._send_text(prepared, "⚠️ 回复内容过长或发送失败，请稍后重试或让我分段输出。")
+            return
+        with suppress(Exception):
+            await self._send_artifacts(prepared, response.artifacts)
+
+    @staticmethod
+    def _format_error_reply(exc: BaseException) -> str:
+        """把 agent 执行异常转成给微信用户看的简短文案。"""
+        import asyncio as _asyncio
+
+        if isinstance(exc, _asyncio.TimeoutError) or "超时" in str(exc):
+            return (
+                "⚠️ 本次处理超时了。任务可能过于复杂，请尝试：\n"
+                "1）把任务拆成更小的步骤分别发送；\n"
+                "2）稍后重试。"
+            )
+        text = str(exc) or exc.__class__.__name__
+        if len(text) > 200:
+            text = text[:200] + "…"
+        return f"⚠️ 处理消息时出错：{text}\n请稍后重试，或换一种描述方式。"
+
+    async def send_delivery_text(self, to_user: str, context_token: str, text: str) -> None:
+        """供定时任务投递(WeixinDeliverySender)发送文本到指定微信目标。"""
+        await self.client.send_message(
+            to_user_id=to_user,
+            text=_ensure_weixin_line_breaks(text),
+            context_token=context_token,
+            client_id=f"openhachimi-{uuid.uuid4().hex[:8]}",
+        )
 
     async def _send_artifacts(self, prepared: _PreparedWeixinMessage, artifacts: list[ArtifactRef]) -> None:
         if not artifacts:
@@ -847,26 +906,70 @@ async def _stop_channel_task(channel_task: asyncio.Task | None, channel: WeixinC
             await channel.client.close()
 
 
+class _WeixinDeliveryBroker:
+    """把投递请求路由到当前在线的 WeixinChannel 实例。
+
+    supervisor 启停渠道时更新 self.channel;lifespan 把 broker 交给
+    WeixinDeliverySender,渠道重启无需重新注册。
+    """
+
+    def __init__(self) -> None:
+        self.channel: WeixinChannel | None = None
+
+    async def __call__(self, to_user: str, context_token: str, text: str) -> None:
+        channel = self.channel
+        if channel is None or not channel.client.token:
+            raise RuntimeError("微信渠道未在线（未登录或已掉线）")
+        await channel.send_delivery_text(to_user, context_token, text)
+
+
 async def _weixin_channel_supervisor(
     service: AgentService,
     config: AppConfig,
     poll_interval: float = _ACCOUNT_WATCH_INTERVAL_SECONDS,
+    broker: _WeixinDeliveryBroker | None = None,
 ) -> None:
     account_path = _account_file(config)
     channel: WeixinChannel | None = None
     channel_task: asyncio.Task | None = None
     active_signature: tuple[int, int] | None = None
     failed_signature: tuple[int, int] | None = None
+    restart_attempts = 0
     missing_logged = False
+
+    def _clear_broker() -> None:
+        if broker is not None:
+            broker.channel = None
 
     try:
         while True:
             signature = _account_signature(account_path)
 
             if channel_task is not None and channel_task.done():
+                ran_seconds = 0.0
+                if channel is not None and getattr(channel, "started_at", None):
+                    ran_seconds = time.monotonic() - channel.started_at
                 await _stop_channel_task(channel_task, channel)
+                _clear_broker()
+                # 渠道任务退出:区分"刚启动就死"(连续快速失败,退避重试)与
+                # "运行一段时间后偶发退出"(立即重启)。同一签名连续失败 3 次
+                # 后进入长退避,避免死循环刷日志。
                 if signature is not None and signature == active_signature:
-                    failed_signature = signature
+                    if ran_seconds > 60:
+                        restart_attempts = 0
+                    restart_attempts += 1
+                    if restart_attempts > 3:
+                        failed_signature = signature
+                        logger.error(
+                            "微信渠道连续失败 %d 次,暂停自动重启;重新登录(hachimi weixin)后恢复。", restart_attempts
+                        )
+                    else:
+                        backoff = min(60.0, restart_attempts * 10.0)
+                        logger.warning(
+                            "微信渠道异常退出(运行 %.0fs),%.0fs 后自动重启(第 %d 次)。",
+                            ran_seconds, backoff, restart_attempts,
+                        )
+                        await asyncio.sleep(backoff)
                 channel = None
                 channel_task = None
                 active_signature = None
@@ -875,10 +978,12 @@ async def _weixin_channel_supervisor(
                 if channel_task is not None:
                     logger.info("微信账号文件已移除，正在停止微信渠道：%s", account_path)
                     await _stop_channel_task(channel_task, channel)
+                    _clear_broker()
                     channel = None
                     channel_task = None
                     active_signature = None
                     failed_signature = None
+                    restart_attempts = 0
                 if not missing_logged:
                     logger.info(
                         "微信账号文件不存在 (%s)，微信渠道暂未启动；服务将持续监听登录状态。",
@@ -890,20 +995,26 @@ async def _weixin_channel_supervisor(
                 if channel_task is not None and signature != active_signature:
                     logger.info("检测到微信账号文件更新，正在重启微信渠道：%s", account_path)
                     await _stop_channel_task(channel_task, channel)
+                    _clear_broker()
                     channel = None
                     channel_task = None
                     active_signature = None
                     failed_signature = None
+                    restart_attempts = 0
 
                 if channel_task is None and signature != failed_signature:
                     logger.info("检测到微信账号文件 (%s)，正在启动微信渠道...", account_path)
                     channel = WeixinChannel(service, config)
+                    channel.started_at = time.monotonic()
                     channel_task = asyncio.create_task(channel.run_loop())
                     active_signature = signature
+                    if broker is not None:
+                        broker.channel = channel
 
             await asyncio.sleep(poll_interval)
     finally:
         await _stop_channel_task(channel_task, channel)
+        _clear_broker()
 
 
 @asynccontextmanager
@@ -911,9 +1022,12 @@ async def weixin_lifespan(app):
     config: AppConfig = app.state.config
     service: AgentService = app.state.service
 
-    supervisor_task = asyncio.create_task(_weixin_channel_supervisor(service, config))
+    # broker 暴露给投递系统,使微信渠道创建的定时任务可以把结果发回微信。
+    broker = _WeixinDeliveryBroker()
+    app.state.weixin_delivery_broker = broker
+    supervisor_task = asyncio.create_task(_weixin_channel_supervisor(service, config, broker=broker))
 
-    yield
+    yield broker
 
     supervisor_task.cancel()
     with suppress(asyncio.CancelledError):

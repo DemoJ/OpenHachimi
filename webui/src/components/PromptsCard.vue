@@ -1,5 +1,11 @@
 <template>
   <div class="prompts-content">
+    <!-- 保存失败横幅:提示但不替换编辑器,未保存内容不丢失 -->
+    <div v-if="saveError && !loading" class="save-error-banner">
+      <span>保存失败：{{ saveError }}</span>
+      <button class="btn" @click="saveError = ''">关闭</button>
+    </div>
+
     <div v-if="loading" class="prompts-loading">
       <span class="activity-spinner" />
       <span>加载提示词中…</span>
@@ -66,6 +72,7 @@ const restoredBuiltins = ref<Set<string>>(new Set())
 
 const loading = ref(false)
 const loadError = ref('')
+const saveError = ref('')
 const saving = ref(false)
 const justSaved = ref(false)
 
@@ -87,6 +94,7 @@ const anyDirty = computed(() => prompts.value.some((p) => isDirty(p.name)))
 async function loadPrompts() {
   loading.value = true
   loadError.value = ''
+  saveError.value = ''
   try {
     const res = await getPrompts()
     prompts.value = res.prompts
@@ -134,6 +142,7 @@ async function save() {
   if (!anyDirty.value || saving.value) return
   saving.value = true
   loadError.value = ''
+  saveError.value = ''
   try {
     for (const p of prompts.value) {
       if (!isDirty(p.name)) continue
@@ -148,7 +157,8 @@ async function save() {
     justSaved.value = true
     setTimeout(() => { justSaved.value = false }, 2500)
   } catch (e) {
-    loadError.value = (e as Error).message || '保存失败'
+    // 保存失败写 saveError 横幅;写 loadError 会把整个编辑器替换成错误页,丢失未保存内容。
+    saveError.value = (e as Error).message || '保存失败'
   } finally {
     saving.value = false
   }
@@ -292,5 +302,21 @@ loadPrompts()
   font-size: 12px;
   line-height: 18px;
   color: var(--body-mid);
+}
+</style>
+
+<style scoped>
+.save-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid rgba(229, 72, 77, 0.4);
+  border-radius: 8px;
+  background: rgba(229, 72, 77, 0.08);
+  color: #ff8589;
+  font-size: 13px;
 }
 </style>

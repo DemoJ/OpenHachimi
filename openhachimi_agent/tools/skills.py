@@ -325,15 +325,25 @@ def _is_git_source(source_url: str) -> bool:
 
 def _confirm_remote_install(ctx: RunContext[AgentDeps], source: str) -> bool:
     """远程技能安装前经用户确认。独立成钩子便于测试替换。"""
-    from openhachimi_agent.tools.clarification import clarify_user
+    from openhachimi_agent.tools.clarification import (
+        clarify_user,
+        format_choices_hint,
+        interpret_confirmation,
+    )
 
+    confirm_choices = ["允许安装", "拒绝安装"]
     user_reply = clarify_user(
         ctx,
-        question=f"即将从远程来源安装技能：{source}\n"
-        f"技能指令会进入 Agent 上下文并持续生效,请确认来源可信。是否允许?",
-        choices=["允许安装", "拒绝安装"],
+        question=(
+            f"即将从远程来源安装技能：{source}\n"
+            f"技能指令会进入 Agent 上下文并持续生效,请确认来源可信。是否允许?\n\n"
+            f"{format_choices_hint(confirm_choices)}"
+        ).strip(),
+        choices=confirm_choices,
     )
-    return "允许" in str(user_reply)
+    return interpret_confirmation(
+        user_reply, affirmative=confirm_choices[0], negative=confirm_choices[1]
+    )
 
 
 def install_skill(

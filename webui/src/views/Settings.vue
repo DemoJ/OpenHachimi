@@ -32,6 +32,13 @@
       </header>
 
       <div class="settings-body">
+        <!-- 保存失败横幅:只提示不替换表单——此前保存报错复用 loadError 槽位,
+             整个编辑中的表单被错误页换掉,用户改了一半的内容全部丢失。 -->
+        <div v-if="saveError && !loading" class="save-error-banner">
+          <span>保存失败：{{ saveError }}</span>
+          <button class="btn" @click="saveError = ''">关闭</button>
+        </div>
+
         <div v-if="loading" class="settings-loading">
           <span class="activity-spinner" />
           <span>加载配置中…</span>
@@ -333,6 +340,7 @@ const showMemoryDialog = ref(false)
 
 const loading = ref(false)
 const loadError = ref('')
+const saveError = ref('')
 const saving = ref(false)
 const justSaved = ref(false)
 
@@ -506,6 +514,7 @@ async function loadConfig() {
 async function onSave() {
   if (!dirty.value || saving.value) return
   saving.value = true
+  saveError.value = ''
   loadError.value = ''
   try {
     // 只提交发生变化的字段;secret 脱敏态的值(等于快照)自然不会被包含。
@@ -523,7 +532,8 @@ async function onSave() {
     justSaved.value = true
     setTimeout(() => { justSaved.value = false }, 2500)
   } catch (e) {
-    loadError.value = (e as Error).message || '保存失败'
+    // 保存失败:横幅提示,保留表单与用户已改的内容(写 loadError 会吞掉整个表单)。
+    saveError.value = (e as Error).message || '保存失败'
   } finally {
     saving.value = false
   }
@@ -929,5 +939,21 @@ loadBlacklist()
 .memory-manage-btn {
   align-self: flex-start;
   padding: var(--sp-xs) var(--sp-lg);
+}
+</style>
+
+<style scoped>
+.save-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid rgba(229, 72, 77, 0.4);
+  border-radius: 8px;
+  background: rgba(229, 72, 77, 0.08);
+  color: #ff8589;
+  font-size: 13px;
 }
 </style>

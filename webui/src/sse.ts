@@ -11,19 +11,25 @@ export interface SSEPayload {
   error?: string
   // type === "session" 时携带:后端把空白页直发场景下自动新建的 session_id 在
   // 首事件回传给前端,让 store.currentSessionId 立即同步,避免落到 sessions[0] 兜底。
+  // 命令(/new、/role 等)改变会话/角色时也会发 session 事件,携带最新指向。
   session_id?: string
+  role?: string
   channel?: string
   auto_created?: boolean
   // type === "artifact" 时携带:agent 生成的产物文件(AgentRef 的 JSON)。
   artifact?: ArtifactRef
+  // type === "clarification" 时携带:clarify_user 追问的预设选项,
+  // 供渲染可点选项条(点击即发送选项文本)。
+  choices?: string[]
 }
 
 export interface SSECallbacks {
   onChunk: (text: string, temporary: boolean) => void
   onDone: () => void
   onError: (err: string | Error) => void
-  onSession?: (sessionId: string, channel?: string, autoCreated?: boolean) => void
+  onSession?: (sessionId: string, channel?: string, autoCreated?: boolean, role?: string) => void
   onArtifact?: (artifact: ArtifactRef) => void
+  onClarification?: (question: string, choices: string[]) => void
 }
 
 /**
@@ -120,9 +126,16 @@ export async function chatStream(
             return
           }
           if (data.type === 'session' && data.session_id) {
-            // 后端首事件:把空白页直发自动新建的 session_id 同步给前端 store。
-            console.info('[SSE] session bound', { sid: data.session_id, channel: data.channel, autoCreated: data.auto_created })
-            callbacks.onSession?.(data.session_id, data.channel, data.auto_created)
+            // 后端首事件:把空白页直发自动新建的 session_id 同步给前端 store;
+            // 命令执行后的 session 事件携带变更后的 session/role 指向。
+            console.info('[SSE] session bound', { sid: data.session_id, channel: data.channel, autoCreated: data.auto_created, role: data.role })
+            callbacks.onSession?.(data.session_id, data.channel, data.auto_created, data.role)
+            return
+          }
+          if (data.type === 'clarification' && data.choices?.length) {
+            // clarify_user 追问带预设选项:渲染成可点选项条。
+            console.info('[SSE] clarification received', { choices: data.choices })
+            callbacks.onClarification?.(data.text || '', data.choices)
             return
           }
           if (data.type === 'artifact' && data.artifact) {
@@ -132,6 +145,8 @@ export async function chatStream(
             return
           }
           if (data.text !== undefined) {
+            // notice(步数暂停/手动中断等系统提示)与普通 text 一样并入
+            // assistant 气泡正文——它们是面向用户的重要提示。
             chunkCount += 1
             callbacks.onChunk(data.text, !!data.temporary)
           }

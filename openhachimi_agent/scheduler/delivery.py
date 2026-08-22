@@ -174,6 +174,53 @@ class CliDeliverySender:
             )
 
 
+class WeixinDeliverySender:
+    """微信投递：经在线的 WeixinChannel 发送。
+
+    target 需含 to_user 与 context_token(任务创建时的 channel_context 存入
+    task.origin 时携带)。渠道未在线或 token 过期时返回 failed,由 fallback
+    落入 inbox。
+    """
+
+    def __init__(self, sender: Any) -> None:
+        self._sender = sender
+
+    @property
+    def type(self) -> str:
+        return "weixin"
+
+    def canonical_key(self, target: dict[str, Any]) -> str:
+        to_user = target.get("to_user", "")
+        return f"weixin:{to_user}"
+
+    async def send(self, target: dict[str, Any], message: DeliveryMessage) -> DeliveryResult:
+        to_user = target.get("to_user")
+        if not to_user:
+            return DeliveryResult(
+                target=target,
+                canonical_key=self.canonical_key(target),
+                status="failed",
+                error="to_user is required",
+            )
+        context_token = target.get("context_token", "")
+        try:
+            await self._sender(to_user, context_token, message.format_text())
+            return DeliveryResult(
+                target=target,
+                canonical_key=self.canonical_key(target),
+                status="delivered",
+                delivered_at=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            logger.exception("weixin delivery failed to_user=%s", to_user)
+            return DeliveryResult(
+                target=target,
+                canonical_key=self.canonical_key(target),
+                status="failed",
+                error=str(exc),
+            )
+
+
 class DeliverySenderRegistry:
     """发送者注册表。"""
 

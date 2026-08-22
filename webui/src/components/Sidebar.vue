@@ -12,7 +12,11 @@
           v-for="r in store.roles"
           :key="r"
           :class="{ active: r === store.currentRole }"
+          role="button"
+          :tabindex="0"
+          :aria-pressed="r === store.currentRole"
           @click="onSwitchRole(r)"
+          @keydown.enter.prevent="onSwitchRole(r)"
         >{{ r }}</li>
       </ul>
     </div>
@@ -26,7 +30,11 @@
         :key="s.session_id"
         class="session-item"
         :class="{ active: s.session_id === store.currentSessionId }"
+        role="button"
+        :tabindex="0"
+        :aria-pressed="s.session_id === store.currentSessionId"
         @click="onLoadSession(s.session_id)"
+        @keydown.enter.prevent="onLoadSession(s.session_id)"
       >
         <div class="preview-row">
           <span class="preview">{{ s.preview || '(空会话)' }}</span>
@@ -58,9 +66,10 @@
       </div>
     </div>
 
-    <!-- 侧栏底部:居中设置入口。纯文字风格,弱化到几乎融入侧栏,
+    <!-- 侧栏底部:设置与定时任务入口。纯文字风格,弱化到几乎融入侧栏,
          默认低对比,仅 hover 时有轻微反馈,不喧宾夺主。 -->
     <div class="sidebar-footer">
+      <button class="btn-settings" @click="onSchedules">定时任务</button>
       <button class="btn-settings" @click="onSettings">设置</button>
     </div>
 
@@ -92,6 +101,10 @@ const emit = defineEmits<{ (e: 'role-changed' | 'session-loaded'): void }>()
 
 function onSettings() {
   router.push('/settings/ai-models')
+}
+
+function onSchedules() {
+  router.push('/schedules')
 }
 
 // 无限滚动:监听 sessionsContainer 滚动区内 loadMoreSentinel 进入视口,

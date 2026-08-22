@@ -311,10 +311,15 @@ async def _handle_start(
     channel_context: dict[str, object] | None,
     channel: str,
 ) -> CommandOutcome:
-    """Telegram /start:新建会话 + 欢迎(具体欢迎文案由 telegram 渠道在 outcome 之外补充)。"""
+    """Telegram /start:恢复已有会话(无则新建) + 欢迎。
+
+    此前无条件 new_session——Telegram 用户习惯性重开对话就按 /start,
+    上下文会被意外重置。想开新会话请显式 /new。
+    (具体欢迎文案由 telegram 渠道在 outcome 之外补充。)
+    """
     latest_scope = _scope_from_context(channel_context)
     resolved_role = service._normalize_role(role)  # noqa: SLF001
-    resp = service.new_session(resolved_role, latest_scope=latest_scope)
+    resp = service.latest_session(resolved_role, latest_scope=latest_scope)
     return CommandOutcome(
         message=resp.message,
         kind="start",

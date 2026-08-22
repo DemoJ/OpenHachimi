@@ -66,7 +66,7 @@ def _format_signal_for_user(signal_key: str, signal_value: object) -> str:
                 latest_failures.append(issue)
 
         if unfinished_items:
-            lines.append("[System] 有 TODO 尚未完成:")
+            lines.append("[系统] 有 TODO 尚未完成:")
             for item in unfinished_items[:5]:
                 status = item.get("status", "?")
                 desc = str(item.get("description", "") or "").strip()
@@ -81,6 +81,6 @@ def _format_signal_for_user(signal_key: str, signal_value: object) -> str:
             detail = str(lf.get("detail", "") or "").strip()
             if len(detail) > 200:
                 detail = detail[:197] + "..."
-            lines.append(f"[System] 最近一次工具调用未成功:`{tool_name}` —— {detail}" if detail else f"[System] 最近一次工具调用未成功:`{tool_name}`")
+            lines.append(f"[系统] 最近一次工具调用未成功:`{tool_name}` —— {detail}" if detail else f"[系统] 最近一次工具调用未成功:`{tool_name}`")
 
     return "\n".join(lines)

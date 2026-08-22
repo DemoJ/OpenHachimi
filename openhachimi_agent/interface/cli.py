@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 import threading
 from functools import lru_cache
 from typing import AsyncIterator, Protocol
@@ -33,6 +34,11 @@ from openhachimi_agent.memory.recall import get_memory_store
 from openhachimi_agent.memory.scheduler import MemoryScheduler
 
 logger = logging.getLogger(__name__)
+
+# 启用 input() 的行编辑与历史(上下方向键翻历史)。Linux/macOS 需要 import 才生效;
+# Windows 的 pyreadline3 未装时静默降级为原始输入。
+with contextlib.suppress(ImportError):
+    import readline  # noqa: F401
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
 
@@ -295,7 +301,7 @@ async def _render_stream_message(backend: CliBackend, message: str, role: str, s
             for action in presenter.handle_event(event):
                 if action.type == "tool":
                     print(f"\n[工具] {action.text}", flush=True)
-                elif action.type in {"text", "system"}:
+                elif action.type in {"text", "system", "notice"}:
                     print(action.text, end="", flush=True)
         else:
             print(event, end="", flush=True)
@@ -312,8 +318,8 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
         current_role, current_session_id = await backend.latest_session(current_role)
         state = await backend.get_state()
     except Exception as exc:
-        print(f"初始化失败:{exc}")
-        return
+        print(f"初始化失败：{exc}")
+        raise SystemExit(1) from exc
 
     print_welcome(state, server_url, current_role, current_session_id)
     input_queue: asyncio.Queue[object] = asyncio.Queue()
@@ -329,6 +335,10 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
         if outcome.message:
             print(f"{prefix}{outcome.message}")
         return current_role, current_session_id
+
+    # 流式执行期间到达的普通消息排队存放,任务结束后自动合并为一条发送。
+    # 此前直接丢弃——多行粘贴时除第一行外全部静默丢失。
+    pending_inputs: list[str] = []
 
     try:
         while True:
@@ -391,7 +401,12 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
                         print(f"\n哈基米 > 命令执行失败:{exc}")
                         continue
                     if outcome is None:
-                        print("\n哈基米 > 当前任务执行中,可输入 /stop 或 /new 抢占;普通消息请稍后再发。")
+                        pending_inputs.append(interrupt_input)
+                        print(
+                            f"\n哈基米 > 当前任务执行中，已记录你的输入"
+                            f"（共 {len(pending_inputs)} 条），任务结束后自动发送；"
+                            "也可输入 /stop 或 /new 抢占。"
+                        )
                         continue
                     if outcome.kind in {"stop", "new_session", "exit"}:
                         _apply_outcome(outcome, prefix="\n")
@@ -402,22 +417,58 @@ async def run_interactive_loop(backend: CliBackend, server_url: str, current_rol
                     # 其它命令(/help、/roles 等)在抢占态下不打断流,仅提示
                     print(f"\n哈基米 > 当前任务执行中,{outcome.message}")
             except Exception as exc:
-                print(f"\n哈基米 > 调用模型时出错:{exc}")
+                print(f"\n哈基米 > 调用模型时出错：{exc}")
                 if not stream_task.done():
                     await _cancel_task(stream_task)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                if not stream_task.done():
+                    await _cancel_task(stream_task)
+                print("\n已退出对话。")
+                raise SystemExit(0)
             finally:
                 if pending_input_task is not None and not pending_input_task.done():
                     pending_input_task.cancel()
+
+            # 任务结束(完成或被抢占)后排空积压输入:合并为一条消息自动发送。
+            if pending_inputs:
+                queued = "\n".join(pending_inputs)
+                count = len(pending_inputs)
+                pending_inputs.clear()
+                print(f"\n哈基米 > 自动发送任务期间记录的 {count} 条输入…")
+                input_queue.put_nowait(queued)
 
             print("\n")
     finally:
         stdin_task.cancel()
 
 
+def _preflight_config_warnings(config) -> list[str]:
+    """启动前检查常见配置陷阱,返回警告文案列表(空 = 配置正常)。"""
+    warnings: list[str] = []
+    api_key = (config.openai_api_key or "").strip()
+    if not api_key or api_key == "sk-xxxxxxxx":
+        warnings.append(
+            "llm.api_key 未配置（user/config.yaml 的 llm 段）。"
+            "现在可以进入对话，但发送第一条消息会调用失败。"
+        )
+    base_url = (config.openai_base_url or "").strip()
+    if base_url and ("example" in base_url or "your-openai" in base_url):
+        warnings.append(
+            f"llm.base_url 看起来是示例占位值：{base_url}。"
+            "所有请求都会解析失败——请改成真实服务地址，或删除该行使用官方默认。"
+        )
+    return warnings
+
+
 async def run_embedded_cli() -> None:
     config = load_config()
     configure_logging(config)
     logger.info("starting embedded cli")
+
+    for warning in _preflight_config_warnings(config):
+        print(f"⚠️  {warning}")
+        print("   配置文件：user/config.yaml（编辑后重新启动生效）\n")
+
     service = AgentService(config)
     await service.start()
     backend = EmbeddedBackend(service)

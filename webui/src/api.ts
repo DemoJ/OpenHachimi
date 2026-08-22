@@ -12,6 +12,16 @@ export function clearToken(): void {
   localStorage.removeItem(TOKEN_KEY)
 }
 
+// 带 status 的错误:调用方可区分 401(令牌无效)/网络异常/服务端 5xx,
+// 给出不同的用户提示,而不是一句笼统的"获取初始化数据失败"。
+export class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const token = getToken()
   const headers: Record<string, string> = {
@@ -20,15 +30,21 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
   }
-  const res = await fetch(path, { ...options, headers })
+  let res: Response
+  try {
+    res = await fetch(path, { ...options, headers })
+  } catch {
+    // fetch 网络层失败(服务未启动/断网)抛 TypeError,不带 status
+    throw new ApiError('无法连接服务器', 0)
+  }
   if (res.status === 401) {
     clearToken()
     window.location.hash = '#/login'
-    throw new Error('未授权')
+    throw new ApiError('未授权', 401)
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
-    throw new Error(body.detail || `请求失败: ${res.status}`)
+    throw new ApiError(body.detail || `请求失败: ${res.status}`, res.status)
   }
   return res.json()
 }
@@ -150,8 +166,11 @@ export interface MessageItem {
   // 用户消息携带的附件列表。仅 user 消息有值;无附件时为 null。
   attachments?: AttachmentRef[] | null
   // assistant 消息携带的产物列表(agent 生成的文件)。流式期间通过 SSE artifact 事件收集;
-  // 历史回放时为 null(产物仅存于内存缓存,不持久化到消息 metadata)。
+  // 历史回放时由后端从消息 metadata 反序列化注入。
   artifacts?: ArtifactRef[] | null
+  // assistant 消息本轮执行过的工具调用摘要(已脱敏展示文本)。历史回放时由后端
+  // 从 ToolCallPart 渲染注入;流式期间为空(过程由活动条实时展示)。
+  tool_calls?: string[] | null
 }
 
 export interface SessionMessagesResponse {
@@ -473,28 +492,46 @@ export function deleteMemories(ids: string[]) {
 // ---------------------------------------------------------------- 附件上传/下载
 // WebUI 文件收发:/attachments/upload 接收 multipart 文件,返回 AttachmentRef;
 // /attachments/download?path=... 按 local_path 下载附件。
-export function uploadAttachment(file: File): Promise<AttachmentRef> {
+// 用 XHR 而非 fetch:fetch 拿不到上传进度回调,大文件只能干等。
+export function uploadAttachment(
+  file: File,
+  onProgress?: (percent: number) => void,
+): Promise<AttachmentRef> {
   const token = getToken()
   const form = new FormData()
   form.append('file', file)
-  // 不能手动设 Content-Type,浏览器会自动设 multipart boundary
-  const headers: Record<string, string> = {}
-  if (token) headers['Authorization'] = `Bearer ${token}`
-  return fetch('/attachments/upload', {
-    method: 'POST',
-    headers,
-    body: form,
-  }).then(async (res) => {
-    if (res.status === 401) {
-      clearToken()
-      window.location.hash = '#/login'
-      throw new Error('未授权')
-    }
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      throw new Error(body.detail || `上传失败: ${res.status}`)
-    }
-    return res.json() as Promise<AttachmentRef>
+  return new Promise<AttachmentRef>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/attachments/upload')
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+    })
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 401) {
+        clearToken()
+        window.location.hash = '#/login'
+        reject(new ApiError('未授权', 401))
+        return
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let detail = `上传失败: ${xhr.status}`
+        try {
+          detail = JSON.parse(xhr.responseText)?.detail || detail
+        } catch { /* ignore */ }
+        reject(new ApiError(detail, xhr.status))
+        return
+      }
+      try {
+        resolve(JSON.parse(xhr.responseText) as AttachmentRef)
+      } catch (err) {
+        reject(new ApiError('上传响应解析失败', xhr.status))
+      }
+    })
+    xhr.addEventListener('error', () => reject(new ApiError('网络错误，上传失败', 0)))
+    xhr.send(form)
   })
 }
 
@@ -518,4 +555,63 @@ export function artifactDownloadUrl(downloadUrl: string): string {
 // 判断产物是否为图片(用于决定渲染缩略图还是文件链接)。
 export function isArtifactImage(artifact: ArtifactRef): boolean {
   return (artifact.content_type || '').startsWith('image/')
+}
+
+// ---------------------------------------------------------------- 定时任务管理
+// 与后端 /schedules CRUD 对齐,供"任务"页使用。
+export interface ScheduleTask {
+  id: string
+  name: string
+  prompt: string
+  schedule_type: 'once' | 'interval' | 'cron'
+  schedule_expr: string
+  status: string                      // enabled / paused / deleted
+  next_run_at: string | null
+  last_run_at: string | null
+  last_status: string | null
+  last_error: string | null
+  role: string | null
+  session_id: string | null
+  delivery_mode: string | null
+  running?: boolean
+}
+
+export interface ScheduleCreateRequest {
+  name: string
+  prompt: string
+  schedule_type: 'once' | 'interval' | 'cron'
+  schedule_expr: string
+  timezone?: string | null
+  role?: string | null
+  delivery_mode?: string
+  paused?: boolean
+}
+
+export function listSchedules(includeDeleted = false) {
+  return get<ScheduleTask[]>(`/schedules?include_deleted=${includeDeleted}`)
+}
+
+export function createSchedule(payload: ScheduleCreateRequest) {
+  return post<ScheduleTask>('/schedules', payload)
+}
+
+export function pauseSchedule(id: string) {
+  return post<ScheduleTask>(`/schedules/${encodeURIComponent(id)}/pause`)
+}
+
+export function resumeSchedule(id: string) {
+  return post<ScheduleTask>(`/schedules/${encodeURIComponent(id)}/resume`)
+}
+
+export function removeSchedule(id: string) {
+  return request<{ ok?: boolean; message?: string }>(`/schedules/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
+}
+
+// 被压缩折叠段的原始消息:FoldCard 点击展开时按需拉取。
+export function getFoldedMessages(sessionId: string, compressionId: number) {
+  return get<SessionMessagesResponse>(
+    `/sessions/${encodeURIComponent(sessionId)}/messages/folded/${compressionId}`,
+  )
 }

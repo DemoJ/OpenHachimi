@@ -17,8 +17,8 @@
           />
           <span v-else class="att-chip-icon">{{ fileIcon(att.name) }}</span>
           <span class="att-chip-name">{{ att.name }}</span>
-          <span v-if="att.status === 'uploading'" class="att-chip-status">上传中…</span>
-          <span v-if="att.status === 'error'" class="att-chip-status att-chip-error-text">失败</span>
+          <span v-if="att.status === 'uploading'" class="att-chip-status">上传中{{ att.progress !== null && att.progress !== undefined ? ` ${att.progress}%` : '…' }}</span>
+          <span v-if="att.status === 'error'" class="att-chip-status att-chip-error-text" :title="att.errorText || ''">失败{{ att.errorText ? `：${att.errorText}` : '' }}</span>
           <button
             v-if="!generating"
             class="att-chip-remove"
@@ -32,8 +32,7 @@
         <textarea
           v-model="text"
           ref="taRef"
-          :placeholder="generating ? '生成中…' : '说点什么（Enter 发送，Shift+Enter 换行）'"
-          :disabled="generating"
+          :placeholder="generating ? '生成中…（可先输入，回车排队，生成结束自动发送）' : '说点什么（Enter 发送，Shift+Enter 换行）'"
           @keydown="onKey"
           @input="autoResize"
           @paste="onPaste"
@@ -63,6 +62,13 @@
       </div>
     </div>
 
+    <!-- 生成期间的排队草稿:任务结束后自动发送 -->
+    <div v-if="queuedText !== null" class="queue-bar">
+      <span class="queue-label">生成结束后自动发送：</span>
+      <span class="queue-text">{{ queuedText }}</span>
+      <button class="queue-remove" title="取消排队" @click="queuedText = null">×</button>
+    </div>
+
     <!-- 大图预览灯箱 -->
     <div v-if="lightboxUrl" class="lightbox" @click="lightboxUrl = ''">
       <img :src="lightboxUrl" class="lightbox-img" @click.stop />
@@ -72,19 +78,23 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, computed } from 'vue'
+import { ref, watch, nextTick, computed, onMounted, onUnmounted } from 'vue'
 import { uploadAttachment, type AttachmentRef } from '../api'
 
 const text = ref('')
 const taRef = ref<HTMLTextAreaElement | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const lightboxUrl = ref('')
+// 生成期间回车发送的消息先进排队,任务结束后自动发出(不再丢弃或禁输入)。
+const queuedText = ref<string | null>(null)
 
 interface PendingAttachment {
   name: string
   status: 'uploading' | 'done' | 'error'
   ref?: AttachmentRef
   previewUrl?: string
+  progress?: number | null
+  errorText?: string
 }
 
 const pendingAttachments = ref<PendingAttachment[]>([])
@@ -129,26 +139,30 @@ function onDrop(e: DragEvent) {
 
 function handleFiles(files: File[]) {
   for (const file of files) {
-    const pending: PendingAttachment = {
-      name: file.name,
-      status: 'uploading',
-    }
-    if (file.type.startsWith('image/')) {
-      pending.previewUrl = URL.createObjectURL(file)
-    }
-    pendingAttachments.value.push(pending)
-    const idx = pendingAttachments.value.length - 1
-    uploadAttachment(file)
-      .then((ref) => {
-        pendingAttachments.value[idx].status = 'done'
-        pendingAttachments.value[idx].ref = ref
+      const pending: PendingAttachment = {
+        name: file.name,
+        status: 'uploading',
+        progress: null,
+      }
+      if (file.type.startsWith('image/')) {
+        pending.previewUrl = URL.createObjectURL(file)
+      }
+      pendingAttachments.value.push(pending)
+      const idx = pendingAttachments.value.length - 1
+      uploadAttachment(file, (percent) => {
+        pendingAttachments.value[idx].progress = percent
       })
-      .catch((err) => {
-        console.warn('[ChatInput] upload failed', file.name, err)
-        pendingAttachments.value[idx].status = 'error'
-      })
+        .then((ref) => {
+          pendingAttachments.value[idx].status = 'done'
+          pendingAttachments.value[idx].ref = ref
+        })
+        .catch((err) => {
+          console.warn('[ChatInput] upload failed', file.name, err)
+          pendingAttachments.value[idx].status = 'error'
+          pendingAttachments.value[idx].errorText = err instanceof Error ? err.message : String(err)
+        })
+    }
   }
-}
 
 function removeAttachment(idx: number) {
   const att = pendingAttachments.value[idx]
@@ -193,11 +207,38 @@ function onStop() {
 }
 
 function onKey(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault()
-    onSend()
+  if (e.key !== 'Enter' || e.shiftKey) return
+  // 中文输入法:候选词确认的 Enter 不能触发发送(isComposing 在部分浏览器
+  // 上为 false,需要额外看 keyCode 229 这个历史兼容值)。
+  if (e.isComposing || e.keyCode === 229) return
+  e.preventDefault()
+  if (props.generating) {
+    // 生成中:消息进排队区,任务结束后自动发送,不打断也不丢弃。
+    if (canSend.value) {
+      queuedText.value = text.value.trim()
+      text.value = ''
+    }
+    return
   }
+  onSend()
 }
+
+// 生成结束:自动发出排队中的草稿。
+watch(() => props.generating, (generating) => {
+  if (!generating && queuedText.value !== null) {
+    const queued = queuedText.value
+    queuedText.value = null
+    text.value = queued
+    nextTick(() => onSend())
+  }
+})
+
+// 灯箱支持 Esc 关闭(此前只能点遮罩/×,键盘用户无法退出)。
+function onWindowKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && lightboxUrl.value) lightboxUrl.value = ''
+}
+onMounted(() => window.addEventListener('keydown', onWindowKeydown))
+onUnmounted(() => window.removeEventListener('keydown', onWindowKeydown))
 
 // 自动撑高：随内容调整高度，最高 160px（与 CSS max-height 对应），超出后内部滚动
 function autoResize() {
@@ -212,3 +253,31 @@ watch(text, () => {
   nextTick(autoResize)
 })
 </script>
+<style scoped>
+.queue-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm, 8px);
+  padding: 6px var(--sp-lg, 16px);
+  border-top: 1px solid var(--hairline, #212327);
+  font-size: 12px;
+  color: var(--body-mid, #7d8187);
+}
+.queue-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink, #ededed);
+}
+.queue-remove {
+  background: none;
+  border: none;
+  color: var(--body-mid, #7d8187);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+}
+.queue-remove:hover { color: var(--ink, #ededed); }
+</style>
