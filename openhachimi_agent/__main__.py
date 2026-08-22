@@ -105,8 +105,8 @@ def _configured_token() -> str | None:
 def _print_access_info(host: str, port: int, show_token: bool = True) -> None:
     """打印服务访问地址（API + WebUI）与访问令牌。前端未构建时给出构建提示。
 
-    show_token=False 时跳过令牌行：restart 流程里轮换步骤已完整打印过新令牌，
-    再显示一遍掩码版纯属重复。
+    show_token=False 时跳过整个令牌区块（含"未读取到"警告）：restart 流程里
+    轮换步骤已完整打印过新令牌，再显示一遍纯属重复。
     """
     print()
     _ok(f"API   地址：http://{host}:{port}")
@@ -115,12 +115,13 @@ def _print_access_info(host: str, port: int, show_token: bool = True) -> None:
         _ok(f"WebUI 地址：{url}")
     else:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
-    token = _configured_token() if show_token else None
-    if token:
-        # 完整展示:用户需要直接复制令牌登录 WebUI/CLI(应用户要求,不做掩码)。
-        _ok(f"访问令牌（HTTP API Token）：{token}")
-    else:
-        _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
+    if show_token:
+        token = _configured_token()
+        if token:
+            # 完整展示:用户需要直接复制令牌登录 WebUI/CLI(应用户要求,不做掩码)。
+            _ok(f"访问令牌（HTTP API Token）：{token}")
+        else:
+            _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
     print()
 
 
