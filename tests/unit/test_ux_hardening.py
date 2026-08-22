@@ -215,3 +215,39 @@ class TestToolCallsInHistory:
         parts = extract_text_parts(SimpleNamespace(), [msg])
         joined = json.dumps(parts, ensure_ascii=False)
         assert "sk-secret123456789" not in joined
+
+
+# ── Telegram 不支持媒体过滤器(版本兼容) ─────────────────────────────────────
+
+
+class TestUnsupportedMediaFilter:
+    def _make_update(self, **message_kwargs):
+        import datetime as dt
+
+        import telegram
+
+        chat = telegram.Chat(id=1, type="private")
+        msg = telegram.Message(message_id=1, date=dt.datetime.now(), chat=chat, **message_kwargs)
+        return telegram.Update(update_id=1, message=msg)
+
+    def test_filter_builds_without_attribute_error(self):
+        # 回归:filters.STICKER 在 PTB 22.x 不存在,曾让服务启动即崩(status=3)。
+        from openhachimi_agent.interface.telegram import _unsupported_media_filter
+
+        assert _unsupported_media_filter() is not None
+
+    def test_voice_video_sticker_match_but_text_not(self):
+        from openhachimi_agent.interface.telegram import _unsupported_media_filter
+        import telegram
+
+        f = _unsupported_media_filter()
+        voice = telegram.Voice(file_id="x", file_unique_id="x", duration=1)
+        video = telegram.Video(file_id="x", file_unique_id="x", width=1, height=1, duration=1)
+        sticker = telegram.Sticker(
+            file_id="x", file_unique_id="x", width=1, height=1,
+            is_animated=False, is_video=False, type="regular",
+        )
+        assert bool(f.check_update(self._make_update(voice=voice)))
+        assert bool(f.check_update(self._make_update(video=video)))
+        assert bool(f.check_update(self._make_update(sticker=sticker)))
+        assert not bool(f.check_update(self._make_update(text="hi")))

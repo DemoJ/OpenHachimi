@@ -336,6 +336,22 @@ def _parse_inline_formatting(text: str) -> str:
     return "".join(result)
 
 
+def _unsupported_media_filter():
+    """语音/视频/贴纸等暂不支持类型的消息过滤器。
+
+    贴纸过滤器在不同 python-telegram-bot 版本里命名不同(Sticker.ALL / STICKER),
+    用 getattr 兼容;某一项取不到就跳过该项——注册期 AttributeError 会让
+    整个 HTTP 服务起不来(教训:filters.STICKER 在 PTB 22.x 不存在)。
+    """
+    combined = filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE
+    sticker = getattr(filters, "STICKER", None)
+    if sticker is None:
+        sticker = getattr(getattr(filters, "Sticker", None), "ALL", None)
+    if sticker is not None:
+        combined = combined | sticker
+    return combined
+
+
 async def _keep_typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None:
@@ -869,11 +885,7 @@ async def telegram_lifespan(config: AppConfig, service: AgentService) -> AsyncIt
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, bot.handle_message, block=False))
     # 不支持的消息类型(语音/视频/贴纸等):给出明确提示,不再像石沉大海
     app.add_handler(
-        MessageHandler(
-            (filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.STICKER),
-            bot.handle_unsupported_media,
-            block=False,
-        )
+        MessageHandler(_unsupported_media_filter(), bot.handle_unsupported_media, block=False)
     )
 
     # 启动 Bot(连接失败时不阻断 HTTP 服务,仅记录错误)
