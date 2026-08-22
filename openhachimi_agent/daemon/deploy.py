@@ -44,9 +44,8 @@ def print_endpoints(host: str, port: int, token: str | None = None) -> None:
     else:
         print("  WebUI 地址：（前端未构建，运行 `cd webui && npm run build` 后重启服务）")
     if token:
-        from openhachimi_agent.core.config.webui_io import mask_secret
-
-        print(f"  访问令牌（HTTP API Token）：{mask_secret(token)}（完整值见 user/config.yaml）")
+        # 完整展示:用户需要直接复制令牌登录 WebUI/CLI(应用户要求,不做掩码)。
+        print(f"  访问令牌（HTTP API Token）：{token}")
     else:
         print("  访问令牌（HTTP API Token）：（未配置，请检查配置文件 app.http_api_token）")
 

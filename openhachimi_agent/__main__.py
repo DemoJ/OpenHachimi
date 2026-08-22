@@ -102,8 +102,12 @@ def _configured_token() -> str | None:
         return None
 
 
-def _print_access_info(host: str, port: int) -> None:
-    """打印服务访问地址（API + WebUI）与访问令牌。前端未构建时给出构建提示。"""
+def _print_access_info(host: str, port: int, show_token: bool = True) -> None:
+    """打印服务访问地址（API + WebUI）与访问令牌。前端未构建时给出构建提示。
+
+    show_token=False 时跳过令牌行：restart 流程里轮换步骤已完整打印过新令牌，
+    再显示一遍掩码版纯属重复。
+    """
     print()
     _ok(f"API   地址：http://{host}:{port}")
     url = webui_url(host, port)
@@ -111,12 +115,10 @@ def _print_access_info(host: str, port: int) -> None:
         _ok(f"WebUI 地址：{url}")
     else:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
-    token = _configured_token()
+    token = _configured_token() if show_token else None
     if token:
-        from openhachimi_agent.core.config.webui_io import mask_secret
-
-        # 只显示掩码:完整 token 打到控制台会进终端回滚/共享会话记录。
-        _ok(f"访问令牌（HTTP API Token）：{mask_secret(token)}（完整值见 user/config.yaml）")
+        # 完整展示:用户需要直接复制令牌登录 WebUI/CLI(应用户要求,不做掩码)。
+        _ok(f"访问令牌（HTTP API Token）：{token}")
     else:
         _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
     print()
@@ -230,7 +232,8 @@ def cmd_restart(_args: argparse.Namespace) -> None:
     _systemctl("restart", SERVICE_NAME, check=True)
     _ok("服务已重启。")
     host, port = _deployed_endpoint()
-    _print_access_info(host, port)
+    # 新令牌已在轮换步骤完整打印,这里不再重复显示掩码版。
+    _print_access_info(host, port, show_token=False)
     _info("使用 `hachimi status` 确认运行状态。")
     _print_commands_help()
 
@@ -407,9 +410,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
     else:
         _warn("WebUI 未构建，/ui 不可用。运行 `cd webui && npm run build` 后重启服务。")
     if config.http_api_token:
-        from openhachimi_agent.core.config.webui_io import mask_secret
-
-        _ok(f"访问令牌（HTTP API Token）：{mask_secret(config.http_api_token)}（完整值见 user/config.yaml）")
+        # 完整展示:用户需要直接复制令牌登录 WebUI/CLI(应用户要求,不做掩码)。
+        _ok(f"访问令牌（HTTP API Token）：{config.http_api_token}")
     else:
         _warn("未读取到访问令牌（HTTP API Token），请检查配置文件 app.http_api_token。")
     # uvicorn.run 进入阻塞前先打印一次可用命令，便于在 serve 调试模式下了解管理入口。
