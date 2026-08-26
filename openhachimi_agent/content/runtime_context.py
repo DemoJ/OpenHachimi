@@ -20,13 +20,20 @@
 公开 API
 ========
 - :func:`build_system_dynamic_block(deps)` —— 给所有 agent(planner/executor)用,
-  返回 ``[时间] + [TaskFrame 摘要] + [记忆召回]``。
+  返回 ``[记忆召回] + [时间]``。
 - :func:`build_executor_extra_dynamic_block(deps)` —— 仅 main agent 用,
   返回 ``[执行接力规则?] + [产物落点引导] + [技能索引]``。
 - :func:`build_volatile_prefix(deps)` —— 兼容旧测试的 thin wrapper。
 
 key 设计原则:user-prompt 只承载用户原始消息 + 附件;其它一切系统级运行时
 上下文走 system_prompt 动态注入。
+
+**缓存友好排序**:system prompt 按 token 前缀命中 KV cache,越靠前的内容越要
+稳定。因此易变块必须整体垫在 system prompt 末尾,且按"易变程度"升序排列:
+executor 专用块(技能索引/TODO 接力,随会话状态变化)< 记忆召回(随记忆写入
+变化)< 时间(每次调用都变)。factory.py 的钩子注册顺序与这里各函数内部的块
+顺序都遵循该原则,``service.agent_runtime.context_snapshot`` 的快照拼装顺序
+须与之一致。
 """
 
 from __future__ import annotations
@@ -280,9 +287,11 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
 def build_system_dynamic_block(deps: AgentDeps | None) -> str:
     """构造**每轮**应该追加到 system prompt 末尾的通用动态段(所有 agent 通用)。
 
-    输出顺序:``[时间] [记忆召回]``。任一块为空或异常则跳过;整体以空行分隔。
-    当 deps 为 None / 异常时返回空字符串,保证 agent 构建期间(deps 还没准备好)
-    的安全。
+    输出顺序:``[记忆召回] [时间]``。时间是最易变的内容,必须放在整个 system
+    prompt 的绝对末尾(本函数在 factory.py 中最后注册);记忆块比技能索引等
+    半稳定块更易变但比时间稳定,垫在时间之前。任一块为空或异常则跳过;整体以
+    空行分隔。当 deps 为 None / 异常时返回空字符串,保证 agent 构建期间(deps
+    还没准备好)的安全。
 
     Hermes 式重构后不再注入 TaskFrame 摘要 —— router 已废,主 agent 自主决定
     是否建 todo,TaskFrame 不再作为硬约束写进 system prompt。
@@ -292,12 +301,12 @@ def build_system_dynamic_block(deps: AgentDeps | None) -> str:
         # 等无 deps 路径下仍能感知当下时间。
         return _time_block()
     blocks: list[str] = []
-    time_block = _time_block()
-    if time_block:
-        blocks.append(time_block)
     memory_block = _memory_block(deps)
     if memory_block:
         blocks.append(memory_block)
+    time_block = _time_block()
+    if time_block:
+        blocks.append(time_block)
     return "\n\n".join(blocks)
 
 

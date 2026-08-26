@@ -99,6 +99,69 @@ def test_build_system_dynamic_block_handles_none_deps():
     assert isinstance(block, str)
 
 
+# ── 缓存友好排序:记忆在前、时间收尾 ───────────────────────────────────────
+
+
+def test_build_system_dynamic_block_memory_before_time(mock_config):
+    """<memory-context> 必须出现在时间块之前,时间行是整段动态块的最后一行。
+
+    时间每轮必变、记忆随写入变化;越易变的内容越靠后,前面的稳定主体才能
+    最大化 KV cache 前缀命中。此测试守护 build_system_dynamic_block 内部的
+    ``[记忆][时间]`` 顺序。
+    """
+    from openhachimi_agent.memory.models import (
+        MemoryContext,
+        MemoryScope,
+        MemorySearchResult,
+    )
+
+    ctx = MemoryContext(
+        scope=MemoryScope(session_id="s1"),
+        query="q",
+        results=[
+            MemorySearchResult(
+                id="m1",
+                level="L1",
+                content="用户偏好深色主题",
+                score=0.9,
+                memory_type="user_preference",
+                confidence=0.9,
+                updated_at="2026-01-01T00:00:00+00:00",
+            )
+        ],
+    )
+    deps = AgentDeps(config=mock_config, session_id="s1", session_state={}, memory_context=ctx)
+    block = build_system_dynamic_block(deps)
+
+    pos_mem = block.find("<memory-context>")
+    pos_time = block.find("[系统环境] 当前真实时间:")
+    assert pos_mem != -1
+    assert pos_time != -1
+    assert pos_mem < pos_time
+    # 时间块之后不得再出现记忆块(记忆必须整体垫在时间之前)
+    assert "<memory-context>" not in block[pos_time:]
+
+
+def test_main_agent_hook_registration_order_puts_runtime_block_last(mock_config, tmp_path):
+    """factory 注册顺序:_executor_extra_block 先于 _runtime_dynamic_block 注册。
+
+    pydantic-ai 按注册顺序拼接 system prompt;技能索引/TODO 接力(半稳定)必须
+    在记忆/时间之前注册,_runtime_dynamic_block 必须是最后一个钩子。
+    """
+    from openhachimi_agent.agent.factory import build_main_agent
+
+    role_file = mock_config.roles_dir / "default.md"
+    role_file.write_text("# default\n\n测试用角色。\n", encoding="utf-8")
+
+    agent = build_main_agent(mock_config, "default")
+    hook_names = [runner.function.__name__ for runner in agent._system_prompt_functions]
+
+    assert "_executor_extra_block" in hook_names
+    assert "_runtime_dynamic_block" in hook_names
+    assert hook_names.index("_executor_extra_block") < hook_names.index("_runtime_dynamic_block")
+    assert hook_names[-1] == "_runtime_dynamic_block"
+
+
 # ── executor 专用按需块 ───────────────────────────────────────────────────────
 
 

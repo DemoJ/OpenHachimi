@@ -189,11 +189,15 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         else:
             extra_prompt = load_system_prompt("agents/main_agent")
 
-    # 最终 system prompt 顺序（从上到下）:
+    # 最终 system prompt 顺序（从上到下,按 KV cache 前缀命中率优化）:
     #   1. base.md              — 系统人格、核心原则、安全边界
     #   2. role_content         — 角色设定（用户级 user/roles/<name>.md）
     #   3. extra_prompt         — main_agent.md / subagent.md 操作规范
-    #   4. @agent.system_prompt — 运行时动态块（config/time/memory/技能索引）
+    #   4. @agent.system_prompt — config 块 + executor 专用按需块(半稳定)
+    #   5. @agent.system_prompt — 记忆召回(随记忆写入变化)
+    #   6. @agent.system_prompt — 当前时间(每轮必变)
+    # 越靠前越稳定、越靠后越易变:前面几乎不变的主体可完整命中前缀缓存,
+    # 每轮失效的只有末尾几十~几百 token。
     agent = Agent(
         OpenAIChatModel(
             config.model_name,
@@ -361,7 +365,27 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     def _config_prompt(ctx: RunContext[AgentDeps]) -> str:
         return render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")}) + "\n"
 
-    # 每轮易变运行时上下文（当前时间 / TaskFrame 摘要 / 长期记忆召回 / 命中技能定义）
+    # 主 agent 额外的按需块(TODO 接力 / direct-mode / 技能索引):
+    # 把过去恒定写在 executor.md 里的几大段策略按 session 状态按需注入,并永远
+    # 附上一份"技能索引"(name + 一句话用途,按 category 分组),让主模型自主
+    # 决定要不要调 get_skill_instructions 拉某个 skill 的全文。subagent 各自的
+    # 角色文档已经明确职责,这套块不在它身上注册。
+    #
+    # 注册顺序即 system prompt 拼装顺序:此块必须先于 _runtime_dynamic_block
+    # 注册 —— 技能索引/TODO 接力随会话状态变化,但比记忆/时间稳定;按"越易变
+    # 越靠后"排列才能最大化 KV cache 前缀命中(见文件顶部最终顺序注释)。
+    if agent_type == "main":
+        @agent.system_prompt
+        def _executor_extra_block(ctx: RunContext[AgentDeps]) -> str:
+            try:
+                from openhachimi_agent.content.runtime_context import build_executor_extra_dynamic_block
+
+                return build_executor_extra_dynamic_block(ctx.deps)
+            except Exception:  # noqa: BLE001
+                logger.exception("executor extra dynamic block failed")
+                return ""
+
+    # 每轮易变运行时上下文（长期记忆召回 / 当前时间）
     # 通过 pydantic-ai 的 @agent.system_prompt 动态钩子注入 system prompt 末尾。
     #
     # 之所以放 system prompt 而不是 user-prompt：
@@ -373,6 +397,9 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     #   的代价。
     # - 动态钩子每次 run 都重新计算，跨天/跨长会话仍能拿到当下时间和当下记忆，
     #   不会出现"几天后模型还以为是几天前"的问题。
+    #
+    # 此钩子必须是最后一个注册的 system prompt 钩子:记忆块垫底、时间块收尾,
+    # 保证每轮必变的时间位于整个 system prompt 的绝对末尾,失效面最小。
     @agent.system_prompt
     def _runtime_dynamic_block(ctx: RunContext[AgentDeps]) -> str:
         try:
@@ -382,22 +409,6 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         except Exception:  # noqa: BLE001  动态注入失败不应阻断 agent run
             logger.exception("runtime dynamic block failed")
             return ""
-
-    # 主 agent 额外的按需块(TODO 接力 / direct-mode / 技能索引):
-    # 把过去恒定写在 executor.md 里的几大段策略按 session 状态按需注入,并永远
-    # 附上一份"技能索引"(name + 一句话用途,按 category 分组),让主模型自主
-    # 决定要不要调 get_skill_instructions 拉某个 skill 的全文。subagent 各自的
-    # 角色文档已经明确职责,这套块不在它身上注册。
-    if agent_type == "main":
-        @agent.system_prompt
-        def _executor_extra_block(ctx: RunContext[AgentDeps]) -> str:
-            try:
-                from openhachimi_agent.content.runtime_context import build_executor_extra_dynamic_block
-
-                return build_executor_extra_dynamic_block(ctx.deps)
-            except Exception:  # noqa: BLE001
-                logger.exception("executor extra dynamic block failed")
-                return ""
 
     return agent
 
