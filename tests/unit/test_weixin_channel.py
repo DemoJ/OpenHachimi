@@ -640,8 +640,8 @@ async def test_stream_reply_sends_complete_text_segment_on_tool_boundary(mock_co
         }
     )
 
-    # 对齐 hermes weixin:tool 不发消息,仅 flush 前一段 text 并继续累积
-    # long_text 应完整发出,tool 被静默,后续文本与前一段合并或下一段发出
-    assert len(client.sent) >= 1
-    assert client.sent[0]["text"] == long_text
+    # B 方案:全量聚合,tool 静默,所有 text 聚合为一条
+    assert len(client.sent) == 1
+    assert long_text in client.sent[0]["text"]
+    assert "后续文本" in client.sent[0]["text"]
     assert all("read_file" not in s["text"] for s in client.sent)

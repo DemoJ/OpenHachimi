@@ -875,62 +875,24 @@ class WeixinChannel:
         current_role: str,
         channel_context: dict[str, Any],
     ) -> None:
-        """流式消费 agent 事件并按"事件类型边界"分段推送给微信。
+        """对齐 hermes B 方案:微信单轮聚合发送,不超过 10 条。
 
-        对齐 hermes gateway/platforms/weixin.py:个人微信不支持消息编辑,
-        为规避 iLink 10 条后 -2 限频,微信不发送 tool 进度(其他渠道如
-        Telegram/WebUI 仍通过 ToolProgressPresenter 展示)。
-        仅 flush 完整语义段:
-        - text 累积到 answer_buffer,遇到 notice/artifact/clarification 时 flush
-        - tool 仅用于 flush 前一段 text 并重置,本身不发消息
-        - notice/system 进 notice_buffer
-        - clarification/artifact 立即单独发
-        收尾时 flush 残余缓冲;全程无输出时回退 "已完成。"。
-
-        弹性:单条发送失败(限流/上下文失效)不中断整轮,记日志后继续后续段,
-        且超过 10 条后 iLink 易限流,已有的 _send_text 含重试+回退+熔断。
+        * Hermes gateway/platforms/weixin.py 默认 compact 打包,全量文本
+          仅在结束时按 2000 字符块打包发送;工具进度完全不发(其他渠道
+          Telegram/WebUI 仍展示)。
+        * 本实现:流式期间仅累积 text/notice/clarification,tool 仅重置
+          presenter;结束时将全文按 _split_weixin_text 打包为 ≤10 条,
+          artifact 另计,超限时截断并在末条附提示。
+        * 单条发送走 _send_text 的 1.5s 节流 + 4 次重试 + -2 熔断 + -14
+          无 token 回退,避免 10 条内再次限流。
         """
         presenter = ToolProgressPresenter(mode="conversation")
-        answer_buffer: list[str] = []
-        notice_buffer: list[str] = []
-        sent_any = False
+        text_parts: list[str] = []
+        notice_parts: list[str] = []
+        clarification_text: str | None = None
+        clarification_choices: list[str] | None = None
+        artifacts_collected: list[ArtifactRef] = []
         sent_artifact_paths: set[str] = set()
-        send_index = 0
-
-        async def send_long_text(text: str) -> None:
-            """整段发送,超过单条上限时按 _split_weixin_text 在换行/句末优先切。
-
-            单段失败不抛异常,记日志后继续——避免 10 条后某条限流导致整轮静默。
-            """
-            nonlocal sent_any, send_index
-            stripped = text.strip()
-            if not stripped:
-                return
-            parts = _split_weixin_text(stripped)
-            for part in parts:
-                send_index += 1
-                preview = part[:80].replace("\n", " ")
-                logger.info("微信流式发送 #%d 给 %s 长度=%d 预览=%s", send_index, prepared.to_user, len(part), preview)
-                try:
-                    await self._send_text(prepared, part)
-                    sent_any = True
-                except Exception as e:
-                    # 已在 _send_text 内重试+回退,仍失败则记日志但不中断后续段
-                    logger.exception("微信流式发送 #%d 失败,跳过继续后续段: %s", send_index, e)
-                    # 仍标记 sent_any,避免最后误发"已完成。"
-                    sent_any = True
-
-        async def flush_answer() -> None:
-            text = "".join(answer_buffer)
-            answer_buffer.clear()
-            if text.strip():
-                await send_long_text(text)
-
-        async def flush_notice() -> None:
-            text = "".join(notice_buffer)
-            notice_buffer.clear()
-            if text.strip():
-                await send_long_text(text)
 
         async for event in self.service.stream_events(
             text_content,
@@ -944,57 +906,96 @@ class WeixinChannel:
                 continue
             for action in presenter.handle_event(event):
                 if action.type == "tool":
-                    # 对齐 hermes weixin:不发送 tool 进度,仅把已累积的完整段发掉
-                    # 并重置 presenter,避免 finalize 再发。其他渠道(Telegram 等)
-                    # 仍保留 tool 展示,此处仅微信静默。
-                    await flush_answer()
-                    await flush_notice()
+                    # B 方案:微信不发 tool,仅重置(对齐 hermes)
                     presenter.reset_tools()
-                    # 不发 tool summary,仅 debug 保留
                     logger.debug("微信跳过 tool 进度 %s", action.text[:120])
                 elif action.type == "text":
-                    answer_buffer.append(action.text)
+                    text_parts.append(action.text)
                 elif action.type == "notice":
-                    # notice 必须立即送达,先 flush 前面的段,再立即发本段。
-                    await flush_answer()
-                    notice_buffer.append(action.text)
-                    await flush_notice()
+                    notice_parts.append(action.text)
                 elif action.type == "system":
-                    # system 事件在 stream_events 已被过滤,不会到这里;
-                    # 但 Presenter 支持该类型,兜底累积到 notice。
-                    notice_buffer.append(action.text)
+                    notice_parts.append(action.text)
                 elif action.type == "clarification":
-                    await flush_answer()
-                    await flush_notice()
-                    question = action.text.strip()
-                    if action.choices:
-                        from openhachimi_agent.tools.clarification import format_choices_hint
-                        question = f"{question}\n\n{format_choices_hint(list(action.choices))}".strip()
-                    if question:
-                        await send_long_text(question)
+                    clarification_text = action.text.strip()
+                    clarification_choices = action.choices
                 elif action.type == "artifact" and action.artifact:
-                    await flush_answer()
-                    await flush_notice()
-                    artifact = action.artifact
-                    if artifact.local_path in sent_artifact_paths:
-                        continue
-                    sent_artifact_paths.add(artifact.local_path)
-                    try:
-                        await self._send_artifacts(prepared, [artifact])
-                    except Exception as e:
-                        logger.exception("微信 artifact 发送失败 %s: %s", artifact.filename, e)
+                    if action.artifact.local_path not in sent_artifact_paths:
+                        sent_artifact_paths.add(action.artifact.local_path)
+                        artifacts_collected.append(action.artifact)
+
+        presenter.finalize()  # 清理状态,不发
+
+        # 组装终局文本: text + notice + clarification 按序拼接
+        final_blocks: list[str] = []
+        text_content_final = "".join(text_parts).strip()
+        if text_content_final:
+            final_blocks.append(text_content_final)
+        notice_content = "".join(notice_parts).strip()
+        if notice_content:
+            final_blocks.append(notice_content)
+        if clarification_text:
+            q = clarification_text
+            if clarification_choices:
+                from openhachimi_agent.tools.clarification import format_choices_hint
+                q = f"{q}\n\n{format_choices_hint(list(clarification_choices))}".strip()
+            final_blocks.append(q)
+        final_text = "\n\n".join(b for b in final_blocks if b).strip()
+
+        sent_any = False
+        send_index = 0
+
+        async def _send_with_budget(text: str) -> None:
+            nonlocal sent_any, send_index
+            if not text.strip():
+                return
+            parts = _split_weixin_text(text)
+            for part in parts:
+                # 预算:文本 + artifact 合计 ≤10,预留 artifact 位置
+                remaining_budget = 10 - len(artifacts_collected) - send_index
+                if remaining_budget <= 0:
+                    logger.warning("微信已达 10 条上限,截断剩余文本 len=%d", len(part))
+                    break
+                if send_index >= 9 and len(parts) > remaining_budget:
+                    # 最后一条附截断提示,避免静默丢弃
+                    part = part[: _WEIXIN_MAX_MSG_CHARS - 60] + "\n\n…（内容过长，已截断，请回复“继续”查看后续）"
+                send_index += 1
+                preview = part[:80].replace("\n", " ")
+                logger.info("微信聚合发送 #%d/10 给 %s 长度=%d 预览=%s", send_index, prepared.to_user, len(part), preview)
+                try:
+                    await self._send_text(prepared, part)
+                    sent_any = True
+                except Exception as e:
+                    logger.exception("微信聚合发送 #%d 失败: %s", send_index, e)
                     sent_any = True
 
-        # 收尾:微信不发 tool 汇总(对齐 hermes),仅 flush 正文/通知
-        presenter.finalize()  # 清理 presenter 状态,不发消息
-        await flush_answer()
-        await flush_notice()
+        # 文本打包发送(预算内)
+        await _send_with_budget(final_text)
+
+        # 附件发送:每 artifact 一条,计入预算
+        for artifact in artifacts_collected:
+            if send_index >= 10:
+                logger.warning("微信 10 条已满,跳过 artifact %s", artifact.filename)
+                # 降级为文本提示
+                notice = _format_artifact_notice([artifact])
+                if notice and send_index < 10:
+                    await _send_with_budget(notice)
+                break
+            try:
+                await self._send_artifacts(prepared, [artifact])
+                send_index += 1
+                sent_any = True
+                logger.info("微信已发送 artifact %s #%d/10", artifact.filename, send_index)
+            except Exception as e:
+                logger.exception("微信 artifact 发送失败 %s: %s", artifact.filename, e)
+                sent_any = True
+
         if not sent_any:
             try:
                 await self._send_text(prepared, "已完成。")
+                sent_any = True
             except Exception as e:
                 logger.exception("微信兜底发送失败: %s", e)
-        logger.info("微信流式完成 给 %s 共发送 %d 段", prepared.to_user, send_index)
+        logger.info("微信聚合完成 给 %s 共发送 %d/10 段 文本块=%d artifact=%d", prepared.to_user, send_index, len(final_blocks), len(artifacts_collected))
 
     @staticmethod
     def _format_error_reply(exc: BaseException) -> str:
