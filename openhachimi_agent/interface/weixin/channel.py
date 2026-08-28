@@ -38,10 +38,10 @@ _ACCOUNT_REL_PATH = Path(".memory") / "weixin_account.json"
 _ACCOUNT_WATCH_INTERVAL_SECONDS = 5.0
 _MEDIA_BATCH_DELAY_SECONDS = 3.0
 _RECENT_MEDIA_TTL_SECONDS = 10 * 60.0
-# 流式发送节流:微信不支持编辑消息,只能通过新发消息分段。
-# 正文累积到 _STREAM_TEXT_MIN_CHARS 或距上次发送超过 _STREAM_FLUSH_INTERVAL 即发出。
-_STREAM_TEXT_MIN_CHARS = 500
-_STREAM_FLUSH_INTERVAL = 3.0
+# 微信单条消息长度兜底上限。iLink 未公布官方上限,取与 Telegram 一致的 4096。
+# 分段主边界是"事件类型切换"(text→tool / text→notice / text→artifact),
+# 只在单个完整段本身超过此上限时才在换行处优先切分。
+_WEIXIN_MAX_MSG_CHARS = 4096
 _MEDIA_KIND_BY_TYPE = {
     ITEM_IMAGE: "image",
     ITEM_VIDEO: "video",
@@ -349,6 +349,40 @@ def _ensure_weixin_line_breaks(text: str) -> str:
         if not (_is_md_structural_line(line) and _is_md_structural_line(nxt)):
             out.append("")
     return "\n".join(out)
+
+
+def _split_weixin_text(text: str, max_chars: int = _WEIXIN_MAX_MSG_CHARS) -> list[str]:
+    """把一段完整文本切成多条不超 max_chars 的消息。
+
+    微信流式分段的主边界是"事件类型切换"——一段 LLM 文本/一段工具摘要/
+    一段通知天然各自成消息,不会从中间切开。仅当该完整段本身就超过
+    max_chars 时才兜底切分,切点优先取段落空行,其次换行,再其次句末标点,
+    最后硬切。逻辑对齐 Telegram._split_long_text。
+    """
+    if len(text) <= max_chars:
+        return [text]
+    parts: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        cut = window.rfind("\n\n")
+        if cut < max_chars // 2:
+            cut = window.rfind("\n")
+        if cut < max_chars // 2:
+            sentence_ends = [
+                window.rfind(p)
+                for p in ("。", "！", "？", "；", ". ", "! ", "? ", "; ")
+            ]
+            cut = max(sentence_ends)
+            if cut >= max_chars // 2:
+                cut += 1  # 包含标点本身
+        if cut < max_chars // 2:
+            cut = max_chars
+        parts.append(remaining[:cut].rstrip("\n"))
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        parts.append(remaining)
+    return parts
 
 
 class WeixinChannel:
@@ -718,42 +752,42 @@ class WeixinChannel:
         current_role: str,
         channel_context: dict[str, Any],
     ) -> None:
-        """流式消费 agent 事件并按节流策略分段推送给微信。
+        """流式消费 agent 事件并按"事件类型边界"分段推送给微信。
 
-        微信不支持编辑/删除已发消息,只能通过新发实现"过一会就发一条":
-        - tool 事件由 ToolProgressPresenter 累积,刷新时整段摘要新发一条;
-        - text 事件累积到 answer_buffer,达到 _STREAM_TEXT_MIN_CHARS 或距上次
-          发送超过 _STREAM_FLUSH_INTERVAL 即切一条;
-        - notice/system/clarification/artifact 立即单独发;
-        - 收尾时 flush 残余缓冲,全程无输出时回退到 "已完成。"。
+        对齐 Telegram 的分段策略:每段是一条**完整**的同类型内容,不按字符数
+        或时间硬切。仅在事件类型切换时 flush 当前段:
+        - text 事件累积到 answer_buffer,遇到 tool/notice/artifact/clarification
+          时整段 flush 成一条(或多条,仅当整段超过 _WEIXIN_MAX_MSG_CHARS);
+        - tool 事件由 ToolProgressPresenter 累积为汇总,遇切换时整段发出;
+        - notice/system 进 notice_buffer,逻辑同 text;
+        - clarification/artifact 立即单独发。
+        收尾时 flush 残余缓冲;全程无输出时回退 "已完成。"。
         """
         presenter = ToolProgressPresenter(mode="conversation")
         answer_buffer: list[str] = []
         notice_buffer: list[str] = []
-        last_flush = time.monotonic()
         sent_any = False
         sent_artifact_paths: set[str] = set()
 
-        async def flush_answer() -> None:
-            nonlocal last_flush, sent_any
-            text = "".join(answer_buffer).strip()
-            if not text:
-                answer_buffer.clear()
+        async def send_long_text(text: str) -> None:
+            """整段发送,超过单条上限时按 _split_weixin_text 在换行/句末优先切。"""
+            nonlocal sent_any
+            stripped = text.strip()
+            if not stripped:
                 return
-            answer_buffer.clear()
-            last_flush = time.monotonic()
-            await self._send_text(prepared, text)
+            for part in _split_weixin_text(stripped):
+                await self._send_text(prepared, part)
             sent_any = True
 
+        async def flush_answer() -> None:
+            text = "".join(answer_buffer)
+            answer_buffer.clear()
+            await send_long_text(text)
+
         async def flush_notice() -> None:
-            nonlocal sent_any
-            text = "".join(notice_buffer).strip()
-            if not text:
-                notice_buffer.clear()
-                return
+            text = "".join(notice_buffer)
             notice_buffer.clear()
-            await self._send_text(prepared, text)
-            sent_any = True
+            await send_long_text(text)
 
         async for event in self.service.stream_events(
             text_content,
@@ -767,26 +801,25 @@ class WeixinChannel:
                 continue
             for action in presenter.handle_event(event):
                 if action.type == "tool":
-                    # 工具行是过程展示:先把已累积正文/通知发掉,保持时间序,
-                    # 再把当前工具汇总作为一条新消息发出去。
+                    # 类型切换:text/notice → tool。先把已累积的完整段发掉,
+                    # 再发当前工具汇总。发送后立即 reset_tools,避免 finalize
+                    # 阶段又把同一批工具行重发一遍(微信无法像 TG 那样删消息)。
                     await flush_answer()
                     await flush_notice()
                     summary = action.text.strip()
                     if summary:
-                        await self._send_text(prepared, summary)
-                        sent_any = True
+                        await send_long_text(summary)
+                    presenter.reset_tools()
                 elif action.type == "text":
                     answer_buffer.append(action.text)
-                    buffered = sum(len(p) for p in answer_buffer)
-                    idle = time.monotonic() - last_flush
-                    if buffered >= _STREAM_TEXT_MIN_CHARS or idle >= _STREAM_FLUSH_INTERVAL:
-                        await flush_answer()
                 elif action.type == "notice":
-                    # notice 面向用户必须立即送达(步数暂停/中断/验证未通过等)。
+                    # notice 必须立即送达,先 flush 前面的段,再立即发本段。
                     await flush_answer()
                     notice_buffer.append(action.text)
                     await flush_notice()
                 elif action.type == "system":
+                    # system 事件在 stream_events 已被过滤,不会到这里;
+                    # 但 Presenter 支持该类型,兜底累积到 notice。
                     notice_buffer.append(action.text)
                 elif action.type == "clarification":
                     await flush_answer()
@@ -796,8 +829,7 @@ class WeixinChannel:
                         from openhachimi_agent.tools.clarification import format_choices_hint
                         question = f"{question}\n\n{format_choices_hint(list(action.choices))}".strip()
                     if question:
-                        await self._send_text(prepared, question)
-                        sent_any = True
+                        await send_long_text(question)
                 elif action.type == "artifact" and action.artifact:
                     await flush_answer()
                     await flush_notice()
@@ -811,8 +843,7 @@ class WeixinChannel:
         # 收尾:工具摘要 final、剩余正文/通知 flush。
         for action in presenter.finalize():
             if action.type == "tool" and action.text.strip():
-                await self._send_text(prepared, action.text.strip())
-                sent_any = True
+                await send_long_text(action.text)
         await flush_answer()
         await flush_notice()
         if not sent_any:

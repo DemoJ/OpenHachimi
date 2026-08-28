@@ -553,3 +553,94 @@ async def test_weixin_supervisor_starts_channel_when_account_file_appears(mock_c
             await task
 
     await asyncio.wait_for(stopped.wait(), timeout=1)
+
+
+def test_split_weixin_text_keeps_short_text_untouched():
+    from openhachimi_agent.interface.weixin.channel import _split_weixin_text
+
+    text = "第一段话。\n\n第二段话。"
+    assert _split_weixin_text(text, max_chars=100) == [text]
+
+
+def test_split_weixin_text_prefers_paragraph_breaks():
+    from openhachimi_agent.interface.weixin.channel import _split_weixin_text
+
+    para_a = "甲" * 40
+    para_b = "乙" * 40
+    para_c = "丙" * 40
+    text = f"{para_a}\n\n{para_b}\n\n{para_c}"
+
+    parts = _split_weixin_text(text, max_chars=90)
+
+    assert len(parts) == 2
+    # 第一段结束在段落空行,不从句子中间劈开
+    assert parts[0] == f"{para_a}\n\n{para_b}" or parts[0] == para_a
+    assert all(not p.startswith("\n") for p in parts)
+
+
+def test_split_weixin_text_falls_back_to_sentence_end_when_no_newline():
+    from openhachimi_agent.interface.weixin.channel import _split_weixin_text
+
+    sentence_a = "这是第一句话。" * 10  # 70 字符
+    sentence_b = "这是第二句话。" * 10
+    text = sentence_a + sentence_b
+
+    parts = _split_weixin_text(text, max_chars=90)
+
+    assert len(parts) >= 2
+    # 首段应以句末标点收尾,而不是从词中间断
+    assert parts[0].endswith("。")
+
+
+def test_split_weixin_text_hard_cut_when_no_safe_boundary():
+    from openhachimi_agent.interface.weixin.channel import _split_weixin_text
+
+    text = "一" * 5000  # 5000 字符无换行无标点
+
+    parts = _split_weixin_text(text, max_chars=4096)
+
+    assert len(parts) == 2
+    assert parts[0] == "一" * 4096
+    assert parts[1] == "一" * (5000 - 4096)
+
+
+@pytest.mark.asyncio
+async def test_stream_reply_sends_complete_text_segment_on_tool_boundary(mock_config):
+    """text 段中间不按字符/时间切——只有遇到 tool 事件才整段 flush。"""
+    from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+
+    long_text = "这是完整的一段话,不应该被切碎。" * 30  # 远大于旧 500 字符阈值
+
+    class FakeService:
+        async def stream_events(self, message, role, session_id, **kwargs):
+            yield StreamEventItem(type="text", text=long_text)
+            yield StreamEventItem(type="tool", text="调用 read_file")
+
+    class FakeWeixinClient:
+        def __init__(self):
+            self.sent = []
+
+        async def get_typing_ticket(self, to_user_id):
+            return None
+
+        async def send_message(self, **kwargs):
+            self.sent.append(kwargs)
+            return {}
+
+    client = FakeWeixinClient()
+    channel = make_channel(mock_config, service=FakeService(), client=client)
+
+    await channel._handle_message(
+        {
+            "message_type": 1,
+            "from_user_id": "wxid_user",
+            "context_token": "ctx",
+            "item_list": [{"type": 1, "text_item": {"text": "你好"}}],
+        }
+    )
+
+    # 期望:第一条 = 完整 text 段,第二条 = 完整 tool 段。
+    # 没有任何一条是从 long_text 中间截出来的"半句话"。
+    assert len(client.sent) == 2
+    assert client.sent[0]["text"] == long_text
+    assert "read_file" in client.sent[1]["text"]
