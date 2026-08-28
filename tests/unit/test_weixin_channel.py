@@ -111,9 +111,10 @@ async def test_handle_voice_only_message_reaches_agent_service(mock_config):
         def __init__(self):
             self.calls = []
 
-        async def send_message(self, **kwargs):
-            self.calls.append(kwargs)
-            return SimpleNamespace(output="收到", artifacts=[])
+        async def stream_events(self, message, role, session_id, **kwargs):
+            self.calls.append({"message": message, "role": role, "session_id": session_id, **kwargs})
+            from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+            yield StreamEventItem(type="text", text="收到")
 
     class FakeWeixinClient:
         def __init__(self):
@@ -240,9 +241,10 @@ async def test_handle_image_only_message_reaches_agent_with_attachment(mock_conf
         def __init__(self):
             self.calls = []
 
-        async def send_message(self, **kwargs):
-            self.calls.append(kwargs)
-            return SimpleNamespace(output="图里有内容", artifacts=[])
+        async def stream_events(self, message, role, session_id, **kwargs):
+            self.calls.append({"message": message, "role": role, "session_id": session_id, **kwargs})
+            from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+            yield StreamEventItem(type="text", text="图里有内容")
 
     class FakeWeixinClient:
         def __init__(self):
@@ -289,9 +291,10 @@ async def test_image_then_text_within_batch_window_merges_once(mock_config):
         def __init__(self):
             self.calls = []
 
-        async def send_message(self, **kwargs):
-            self.calls.append(kwargs)
-            return SimpleNamespace(output="合并好了", artifacts=[])
+        async def stream_events(self, message, role, session_id, **kwargs):
+            self.calls.append({"message": message, "role": role, "session_id": session_id, **kwargs})
+            from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+            yield StreamEventItem(type="text", text="合并好了")
 
     class FakeWeixinClient:
         def __init__(self):
@@ -343,9 +346,10 @@ async def test_text_after_image_reuses_recent_image_context(mock_config):
         def __init__(self):
             self.calls = []
 
-        async def send_message(self, **kwargs):
-            self.calls.append(kwargs)
-            return SimpleNamespace(output="看到了", artifacts=[])
+        async def stream_events(self, message, role, session_id, **kwargs):
+            self.calls.append({"message": message, "role": role, "session_id": session_id, **kwargs})
+            from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+            yield StreamEventItem(type="text", text="看到了")
 
     class FakeWeixinClient:
         def __init__(self):
@@ -388,19 +392,20 @@ async def test_text_after_image_reuses_recent_image_context(mock_config):
 @pytest.mark.asyncio
 async def test_artifact_notice_falls_back_to_text_when_upload_unavailable(mock_config):
     class FakeService:
-        async def send_message(self, **kwargs):
-            return SimpleNamespace(
-                output="文件已生成",
-                artifacts=[
-                    ArtifactRef(
-                        id="art_1",
-                        filename="report.pdf",
-                        content_type="application/pdf",
-                        size_bytes=2048,
-                        local_path=".tmp/artifacts/art_1/report.pdf",
-                        download_url="/artifacts/art_1/download",
-                    )
-                ],
+        async def stream_events(self, message, role, session_id, **kwargs):
+            from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+            yield StreamEventItem(type="text", text="文件已生成")
+            yield StreamEventItem(
+                type="artifact",
+                text="",
+                artifact=ArtifactRef(
+                    id="art_1",
+                    filename="report.pdf",
+                    content_type="application/pdf",
+                    size_bytes=2048,
+                    local_path=".tmp/artifacts/art_1/report.pdf",
+                    download_url="/artifacts/art_1/download",
+                ),
             )
 
     class FakeWeixinClient:
@@ -439,19 +444,20 @@ async def test_artifacts_are_sent_as_weixin_media_messages(mock_config, tmp_path
     artifact_file.write_bytes(PNG_BYTES)
 
     class FakeService:
-        async def send_message(self, **kwargs):
-            return SimpleNamespace(
-                output="图片已生成",
-                artifacts=[
-                    ArtifactRef(
-                        id="art_2",
-                        filename="photo.png",
-                        content_type="image/png",
-                        size_bytes=len(PNG_BYTES),
-                        local_path=artifact_file.relative_to(mock_config.base_dir).as_posix(),
-                        download_url="/artifacts/art_2/download",
-                    )
-                ],
+        async def stream_events(self, message, role, session_id, **kwargs):
+            from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
+            yield StreamEventItem(type="text", text="图片已生成")
+            yield StreamEventItem(
+                type="artifact",
+                text="",
+                artifact=ArtifactRef(
+                    id="art_2",
+                    filename="photo.png",
+                    content_type="image/png",
+                    size_bytes=len(PNG_BYTES),
+                    local_path=artifact_file.relative_to(mock_config.base_dir).as_posix(),
+                    download_url="/artifacts/art_2/download",
+                ),
             )
 
     class FakeWeixinClient:

@@ -250,6 +250,8 @@ async def run_main_agent_once(
         run_kwargs["event_stream_handler"] = handle_stream_events
         return await main_agent.run(run_message, **run_kwargs)
 
+    if config.agent_timeout_seconds <= 0:
+        return await main_agent.run(run_message, **run_kwargs)
     return await asyncio.wait_for(
         main_agent.run(run_message, **run_kwargs),
         timeout=config.agent_timeout_seconds,

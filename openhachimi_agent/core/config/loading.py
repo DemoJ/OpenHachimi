@@ -512,7 +512,9 @@ def load_config() -> "AppConfig":  # noqa: F821 — AppConfig 经 __init__.py re
         http_api_token=http_api_token,
         server_host=_config_string(app_config, "server_host", "127.0.0.1") or "127.0.0.1",
         server_port=_config_int(app_config, "server_port", 8765, minimum=1),
-        agent_timeout_seconds=300,
+        # 非流式(微信/定时任务)整轮超时。复杂任务多轮工具调用容易超过 5 分钟,
+        # 默认从 300 提到 1800;0 = 禁用整轮超时(不推荐,卡死时无法兜底)。
+        agent_timeout_seconds=_config_int(app_config, "agent_timeout_seconds", 1800, minimum=0),
         stream_idle_timeout_seconds=_config_int(app_config, "stream_idle_timeout_seconds", 60),
         memory=_load_memory_config(base_dir, raw_config, llm_config),
         scheduler=_load_scheduler_config(base_dir, raw_config),

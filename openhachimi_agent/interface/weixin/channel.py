@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from openhachimi_agent.core.config import AppConfig
+from openhachimi_agent.interface.presenter import ToolProgressPresenter
 from openhachimi_agent.interface.weixin import media as weixin_media
 from openhachimi_agent.interface.weixin.ilink_client import (
     ITEM_FILE,
@@ -26,6 +27,7 @@ from openhachimi_agent.interface.weixin.ilink_client import (
     WeixinClient,
 )
 from openhachimi_agent.service.agent_service import AgentService
+from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 from openhachimi_agent.storage.attachments import AttachmentError, AttachmentStorage
 from openhachimi_agent.transport.api_models import ArtifactRef, AttachmentRef
 
@@ -36,6 +38,10 @@ _ACCOUNT_REL_PATH = Path(".memory") / "weixin_account.json"
 _ACCOUNT_WATCH_INTERVAL_SECONDS = 5.0
 _MEDIA_BATCH_DELAY_SECONDS = 3.0
 _RECENT_MEDIA_TTL_SECONDS = 10 * 60.0
+# 流式发送节流:微信不支持编辑消息,只能通过新发消息分段。
+# 正文累积到 _STREAM_TEXT_MIN_CHARS 或距上次发送超过 _STREAM_FLUSH_INTERVAL 即发出。
+_STREAM_TEXT_MIN_CHARS = 500
+_STREAM_FLUSH_INTERVAL = 3.0
 _MEDIA_KIND_BY_TYPE = {
     ITEM_IMAGE: "image",
     ITEM_VIDEO: "video",
@@ -685,14 +691,7 @@ class WeixinChannel:
                 logger.debug("启动 typing 指示器失败: %s", e)
 
         try:
-            response = await self.service.send_message(
-                message=text_content,
-                role=current_role,
-                session_id=None,
-                attachments=prepared.attachments,
-                channel_context=channel_context,
-                channel="weixin",
-            )
+            await self._stream_reply(prepared, text_content, current_role, channel_context)
         except Exception as exc:
             # 兜底:agent 超时/模型报错此前只写日志,微信用户发消息后永远收不到回音。
             logger.exception("微信消息处理失败 来自 %s", prepared.from_user)
@@ -712,17 +711,112 @@ class WeixinChannel:
                 except Exception as e:
                     logger.debug("取消 typing 指示器失败: %s", e)
 
-        reply_text = (response.output or "").strip() or "已完成。"
-        try:
-            await self._send_text(prepared, reply_text)
-            logger.info("已回复微信消息给 %s", prepared.to_user)
-        except Exception:
-            logger.exception("微信回复发送失败 给 %s", prepared.to_user)
-            with suppress(Exception):
-                await self._send_text(prepared, "⚠️ 回复内容过长或发送失败，请稍后重试或让我分段输出。")
-            return
-        with suppress(Exception):
-            await self._send_artifacts(prepared, response.artifacts)
+    async def _stream_reply(
+        self,
+        prepared: _PreparedWeixinMessage,
+        text_content: str,
+        current_role: str,
+        channel_context: dict[str, Any],
+    ) -> None:
+        """流式消费 agent 事件并按节流策略分段推送给微信。
+
+        微信不支持编辑/删除已发消息,只能通过新发实现"过一会就发一条":
+        - tool 事件由 ToolProgressPresenter 累积,刷新时整段摘要新发一条;
+        - text 事件累积到 answer_buffer,达到 _STREAM_TEXT_MIN_CHARS 或距上次
+          发送超过 _STREAM_FLUSH_INTERVAL 即切一条;
+        - notice/system/clarification/artifact 立即单独发;
+        - 收尾时 flush 残余缓冲,全程无输出时回退到 "已完成。"。
+        """
+        presenter = ToolProgressPresenter(mode="conversation")
+        answer_buffer: list[str] = []
+        notice_buffer: list[str] = []
+        last_flush = time.monotonic()
+        sent_any = False
+        sent_artifact_paths: set[str] = set()
+
+        async def flush_answer() -> None:
+            nonlocal last_flush, sent_any
+            text = "".join(answer_buffer).strip()
+            if not text:
+                answer_buffer.clear()
+                return
+            answer_buffer.clear()
+            last_flush = time.monotonic()
+            await self._send_text(prepared, text)
+            sent_any = True
+
+        async def flush_notice() -> None:
+            nonlocal sent_any
+            text = "".join(notice_buffer).strip()
+            if not text:
+                notice_buffer.clear()
+                return
+            notice_buffer.clear()
+            await self._send_text(prepared, text)
+            sent_any = True
+
+        async for event in self.service.stream_events(
+            text_content,
+            current_role,
+            session_id=None,
+            attachments=prepared.attachments,
+            channel_context=channel_context,
+            channel="weixin",
+        ):
+            if not isinstance(event, StreamEventItem):
+                continue
+            for action in presenter.handle_event(event):
+                if action.type == "tool":
+                    # 工具行是过程展示:先把已累积正文/通知发掉,保持时间序,
+                    # 再把当前工具汇总作为一条新消息发出去。
+                    await flush_answer()
+                    await flush_notice()
+                    summary = action.text.strip()
+                    if summary:
+                        await self._send_text(prepared, summary)
+                        sent_any = True
+                elif action.type == "text":
+                    answer_buffer.append(action.text)
+                    buffered = sum(len(p) for p in answer_buffer)
+                    idle = time.monotonic() - last_flush
+                    if buffered >= _STREAM_TEXT_MIN_CHARS or idle >= _STREAM_FLUSH_INTERVAL:
+                        await flush_answer()
+                elif action.type == "notice":
+                    # notice 面向用户必须立即送达(步数暂停/中断/验证未通过等)。
+                    await flush_answer()
+                    notice_buffer.append(action.text)
+                    await flush_notice()
+                elif action.type == "system":
+                    notice_buffer.append(action.text)
+                elif action.type == "clarification":
+                    await flush_answer()
+                    await flush_notice()
+                    question = action.text.strip()
+                    if action.choices:
+                        from openhachimi_agent.tools.clarification import format_choices_hint
+                        question = f"{question}\n\n{format_choices_hint(list(action.choices))}".strip()
+                    if question:
+                        await self._send_text(prepared, question)
+                        sent_any = True
+                elif action.type == "artifact" and action.artifact:
+                    await flush_answer()
+                    await flush_notice()
+                    artifact = action.artifact
+                    if artifact.local_path in sent_artifact_paths:
+                        continue
+                    sent_artifact_paths.add(artifact.local_path)
+                    await self._send_artifacts(prepared, [artifact])
+                    sent_any = True
+
+        # 收尾:工具摘要 final、剩余正文/通知 flush。
+        for action in presenter.finalize():
+            if action.type == "tool" and action.text.strip():
+                await self._send_text(prepared, action.text.strip())
+                sent_any = True
+        await flush_answer()
+        await flush_notice()
+        if not sent_any:
+            await self._send_text(prepared, "已完成。")
 
     @staticmethod
     def _format_error_reply(exc: BaseException) -> str:
