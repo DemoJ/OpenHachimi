@@ -38,10 +38,16 @@ _ACCOUNT_REL_PATH = Path(".memory") / "weixin_account.json"
 _ACCOUNT_WATCH_INTERVAL_SECONDS = 5.0
 _MEDIA_BATCH_DELAY_SECONDS = 3.0
 _RECENT_MEDIA_TTL_SECONDS = 10 * 60.0
-# 微信单条消息长度兜底上限。iLink 未公布官方上限,取与 Telegram 一致的 4096。
-# 分段主边界是"事件类型切换"(text→tool / text→notice / text→artifact),
-# 只在单个完整段本身超过此上限时才在换行处优先切分。
-_WEIXIN_MAX_MSG_CHARS = 4096
+# 对齐 hermes gateway/platforms/weixin.py: Hermes 微信实测限频点在连续发送后,
+# 通过单条 2000 字符 + 1.5s 间隔 + 4 次重试 + 熔断窗口 来规避 10 条后静默。
+_WEIXIN_MAX_MSG_CHARS = 2000  # hermes WeixinAdapter.MAX_MESSAGE_LENGTH
+_WEIXIN_SEND_MIN_INTERVAL = 1.5  # hermes send_chunk_delay_seconds 1.5
+_WEIXIN_SEND_MAX_RETRIES = 4  # hermes send_chunk_retries 4
+_WEIXIN_RATE_LIMIT_ERRCODE = -2
+_WEIXIN_SESSION_EXPIRED_ERRCODE = -14
+_WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD = 1  # 30s 内 1 次限频即熔断
+_WEIXIN_RATE_LIMIT_CIRCUIT_WINDOW = 30.0
+_WEIXIN_RATE_LIMIT_CIRCUIT_OPEN = 30.0
 _MEDIA_KIND_BY_TYPE = {
     ITEM_IMAGE: "image",
     ITEM_VIDEO: "video",
@@ -414,6 +420,10 @@ class WeixinChannel:
         # 每个 scope 当前生效的角色(渠道内 /role 切换的结果)。
         # 不跟踪的话普通消息硬编码 default 角色,微信里 /role 切换完全无效。
         self._role_overrides: dict[str, str] = {}
+        # 对齐 hermes WeixinAdapter:全局出站锁 + 限频熔断,避免 10 条后被 iLink -2 限流打断
+        self._send_text_gate = asyncio.Lock()
+        self._rate_limit_circuit_until = 0.0
+        self._rate_limit_events: list[float] = []
 
     @property
     def account_path(self) -> Path:
@@ -437,6 +447,12 @@ class WeixinChannel:
         if not hasattr(self, "_role_overrides"):
             # 渠道内 /role 切换的覆盖表(测试可能绕过 __init__ 构造实例,惰性兜底)
             self._role_overrides = {}
+        if not hasattr(self, "_send_text_gate"):
+            self._send_text_gate = asyncio.Lock()
+        if not hasattr(self, "_rate_limit_circuit_until"):
+            self._rate_limit_circuit_until = 0.0
+        if not hasattr(self, "_rate_limit_events"):
+            self._rate_limit_events: list[float] = []
 
     async def _download_media_attachments(
         self,
@@ -536,14 +552,121 @@ class WeixinChannel:
             text_content = "\n".join(part for part in [text_content, *prepared.media_hints] if part).strip()
         return text_content
 
+    def _rate_limit_cooldown_remaining(self) -> float:
+        return max(0.0, self._rate_limit_circuit_until - time.monotonic())
+
+    def _reset_rate_limit_circuit(self) -> None:
+        self._rate_limit_events.clear()
+        self._rate_limit_circuit_until = 0.0
+
+    def _record_rate_limit_event(self) -> bool:
+        now = time.monotonic()
+        window_start = now - _WEIXIN_RATE_LIMIT_CIRCUIT_WINDOW
+        self._rate_limit_events = [ts for ts in self._rate_limit_events if ts >= window_start]
+        self._rate_limit_events.append(now)
+        if len(self._rate_limit_events) >= _WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD:
+            self._rate_limit_circuit_until = max(
+                self._rate_limit_circuit_until, now + _WEIXIN_RATE_LIMIT_CIRCUIT_OPEN
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _is_stale_session_ret(ret: int | None, errcode: int | None, errmsg: str | None) -> bool:
+        if ret != _WEIXIN_RATE_LIMIT_ERRCODE and errcode != _WEIXIN_RATE_LIMIT_ERRCODE:
+            return False
+        return (errmsg or "").lower() == "unknown error"
+
     async def _send_text(self, prepared: _PreparedWeixinMessage, text: str) -> None:
-        """微信出站文本统一入口：先做 Markdown 换行适配再发送。"""
-        await self.client.send_message(
-            to_user_id=prepared.to_user,
-            text=_ensure_weixin_line_breaks(text),
-            context_token=prepared.context_token,
-            client_id=f"openhachimi-{uuid.uuid4().hex[:8]}",
-        )
+        """微信出站文本统一入口 — 对齐 hermes gateway/platforms/weixin.py 的限流/熔断策略。
+
+        * 全局 `_send_text_gate` 串行化,避免并发 10 条齐发触发 -2
+        * 单条 2000 字符 + 1.5s 间隔
+        * 4 次重试, -2 限频时 3 倍退避 + 熔断窗口 30s
+        * -14 / stale-session (-2 + unknown error) 时清除 token 并重试一次无 token
+        """
+        display = _ensure_weixin_line_breaks(text)
+        async with self._send_text_gate:
+            await self._send_text_locked(prepared, display)
+
+    async def _send_text_locked(self, prepared: _PreparedWeixinMessage, display: str) -> None:
+        # 频率控制:相邻发送间隔 _WEIXIN_SEND_MIN_INTERVAL (hermes 1.5s)
+        last = getattr(self, "_last_weixin_send_at", 0.0)
+        wait = _WEIXIN_SEND_MIN_INTERVAL - (time.monotonic() - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        if self._rate_limit_cooldown_remaining() > 0:
+            raise RuntimeError(
+                f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s"
+            )
+
+        async def _checked_send(ctx_token: str | None) -> dict:
+            resp = await self.client.send_message(
+                to_user_id=prepared.to_user,
+                text=display,
+                context_token=ctx_token,
+                client_id=f"openhachimi-{uuid.uuid4().hex[:8]}",
+            )
+            return resp if isinstance(resp, dict) else {}
+
+        last_exc: Exception | None = None
+        context_token: str | None = prepared.context_token
+        retried_without_token = False
+        for attempt in range(_WEIXIN_SEND_MAX_RETRIES + 1):
+            if self._rate_limit_cooldown_remaining() > 0:
+                raise RuntimeError(
+                    f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s"
+                )
+            try:
+                resp = await _checked_send(context_token)
+                ret = resp.get("ret")
+                errcode = resp.get("errcode")
+                errmsg = resp.get("errmsg") or resp.get("msg")
+                if ret not in (0, None) or errcode not in (0, None):
+                    is_session_expired = (
+                        ret == _WEIXIN_SESSION_EXPIRED_ERRCODE
+                        or errcode == _WEIXIN_SESSION_EXPIRED_ERRCODE
+                        or self._is_stale_session_ret(ret, errcode, errmsg)
+                    )
+                    if is_session_expired and not retried_without_token and context_token:
+                        retried_without_token = True
+                        context_token = None
+                        logger.warning("[weixin] session expired for %s; retrying without context_token", prepared.to_user[:8])
+                        continue
+                    is_rate_limited = ret == _WEIXIN_RATE_LIMIT_ERRCODE or errcode == _WEIXIN_RATE_LIMIT_ERRCODE
+                    if is_rate_limited:
+                        errmsg_text = errmsg or "rate limited"
+                        last_exc = RuntimeError(f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg_text}")
+                        if self._record_rate_limit_event():
+                            last_exc = RuntimeError(
+                                f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s"
+                            )
+                            break
+                        if attempt >= _WEIXIN_SEND_MAX_RETRIES:
+                            break
+                        wait = 1.0 * 3  # hermes 3x backoff
+                        logger.warning("[weixin] rate limited for %s; backing off %.1fs before retry", prepared.to_user[:8], wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}")
+                self._reset_rate_limit_circuit()
+                self._last_weixin_send_at = time.monotonic()  # type: ignore[attr-defined]
+                return
+            except Exception as exc:
+                # 网络/HTTP 异常
+                last_exc = exc
+                msg = str(exc)
+                # 限流特征已在上层处理,这里仅对网络错误重试
+                if "rate limited" in msg.lower() or "cooldown active" in msg.lower():
+                    break
+                if attempt >= _WEIXIN_SEND_MAX_RETRIES:
+                    break
+                wait = 1.0 * (attempt + 1)
+                logger.warning("[weixin] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s", prepared.to_user[:8], attempt + 1, _WEIXIN_SEND_MAX_RETRIES + 1, wait, msg[:200])
+                if wait > 0:
+                    await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
 
     def _prune_recent_media(self, session_key: str, now: float | None = None) -> list[_RecentMediaEntry]:
         self._ensure_media_context_state()
@@ -754,40 +877,60 @@ class WeixinChannel:
     ) -> None:
         """流式消费 agent 事件并按"事件类型边界"分段推送给微信。
 
-        对齐 Telegram 的分段策略:每段是一条**完整**的同类型内容,不按字符数
-        或时间硬切。仅在事件类型切换时 flush 当前段:
-        - text 事件累积到 answer_buffer,遇到 tool/notice/artifact/clarification
-          时整段 flush 成一条(或多条,仅当整段超过 _WEIXIN_MAX_MSG_CHARS);
-        - tool 事件由 ToolProgressPresenter 累积为汇总,遇切换时整段发出;
-        - notice/system 进 notice_buffer,逻辑同 text;
-        - clarification/artifact 立即单独发。
+        对齐 hermes gateway/platforms/weixin.py:个人微信不支持消息编辑,
+        为规避 iLink 10 条后 -2 限频,微信不发送 tool 进度(其他渠道如
+        Telegram/WebUI 仍通过 ToolProgressPresenter 展示)。
+        仅 flush 完整语义段:
+        - text 累积到 answer_buffer,遇到 notice/artifact/clarification 时 flush
+        - tool 仅用于 flush 前一段 text 并重置,本身不发消息
+        - notice/system 进 notice_buffer
+        - clarification/artifact 立即单独发
         收尾时 flush 残余缓冲;全程无输出时回退 "已完成。"。
+
+        弹性:单条发送失败(限流/上下文失效)不中断整轮,记日志后继续后续段,
+        且超过 10 条后 iLink 易限流,已有的 _send_text 含重试+回退+熔断。
         """
         presenter = ToolProgressPresenter(mode="conversation")
         answer_buffer: list[str] = []
         notice_buffer: list[str] = []
         sent_any = False
         sent_artifact_paths: set[str] = set()
+        send_index = 0
 
         async def send_long_text(text: str) -> None:
-            """整段发送,超过单条上限时按 _split_weixin_text 在换行/句末优先切。"""
-            nonlocal sent_any
+            """整段发送,超过单条上限时按 _split_weixin_text 在换行/句末优先切。
+
+            单段失败不抛异常,记日志后继续——避免 10 条后某条限流导致整轮静默。
+            """
+            nonlocal sent_any, send_index
             stripped = text.strip()
             if not stripped:
                 return
-            for part in _split_weixin_text(stripped):
-                await self._send_text(prepared, part)
-            sent_any = True
+            parts = _split_weixin_text(stripped)
+            for part in parts:
+                send_index += 1
+                preview = part[:80].replace("\n", " ")
+                logger.info("微信流式发送 #%d 给 %s 长度=%d 预览=%s", send_index, prepared.to_user, len(part), preview)
+                try:
+                    await self._send_text(prepared, part)
+                    sent_any = True
+                except Exception as e:
+                    # 已在 _send_text 内重试+回退,仍失败则记日志但不中断后续段
+                    logger.exception("微信流式发送 #%d 失败,跳过继续后续段: %s", send_index, e)
+                    # 仍标记 sent_any,避免最后误发"已完成。"
+                    sent_any = True
 
         async def flush_answer() -> None:
             text = "".join(answer_buffer)
             answer_buffer.clear()
-            await send_long_text(text)
+            if text.strip():
+                await send_long_text(text)
 
         async def flush_notice() -> None:
             text = "".join(notice_buffer)
             notice_buffer.clear()
-            await send_long_text(text)
+            if text.strip():
+                await send_long_text(text)
 
         async for event in self.service.stream_events(
             text_content,
@@ -801,15 +944,14 @@ class WeixinChannel:
                 continue
             for action in presenter.handle_event(event):
                 if action.type == "tool":
-                    # 类型切换:text/notice → tool。先把已累积的完整段发掉,
-                    # 再发当前工具汇总。发送后立即 reset_tools,避免 finalize
-                    # 阶段又把同一批工具行重发一遍(微信无法像 TG 那样删消息)。
+                    # 对齐 hermes weixin:不发送 tool 进度,仅把已累积的完整段发掉
+                    # 并重置 presenter,避免 finalize 再发。其他渠道(Telegram 等)
+                    # 仍保留 tool 展示,此处仅微信静默。
                     await flush_answer()
                     await flush_notice()
-                    summary = action.text.strip()
-                    if summary:
-                        await send_long_text(summary)
                     presenter.reset_tools()
+                    # 不发 tool summary,仅 debug 保留
+                    logger.debug("微信跳过 tool 进度 %s", action.text[:120])
                 elif action.type == "text":
                     answer_buffer.append(action.text)
                 elif action.type == "notice":
@@ -837,17 +979,22 @@ class WeixinChannel:
                     if artifact.local_path in sent_artifact_paths:
                         continue
                     sent_artifact_paths.add(artifact.local_path)
-                    await self._send_artifacts(prepared, [artifact])
+                    try:
+                        await self._send_artifacts(prepared, [artifact])
+                    except Exception as e:
+                        logger.exception("微信 artifact 发送失败 %s: %s", artifact.filename, e)
                     sent_any = True
 
-        # 收尾:工具摘要 final、剩余正文/通知 flush。
-        for action in presenter.finalize():
-            if action.type == "tool" and action.text.strip():
-                await send_long_text(action.text)
+        # 收尾:微信不发 tool 汇总(对齐 hermes),仅 flush 正文/通知
+        presenter.finalize()  # 清理 presenter 状态,不发消息
         await flush_answer()
         await flush_notice()
         if not sent_any:
-            await self._send_text(prepared, "已完成。")
+            try:
+                await self._send_text(prepared, "已完成。")
+            except Exception as e:
+                logger.exception("微信兜底发送失败: %s", e)
+        logger.info("微信流式完成 给 %s 共发送 %d 段", prepared.to_user, send_index)
 
     @staticmethod
     def _format_error_reply(exc: BaseException) -> str:

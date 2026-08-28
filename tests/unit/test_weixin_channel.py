@@ -606,7 +606,7 @@ def test_split_weixin_text_hard_cut_when_no_safe_boundary():
 
 @pytest.mark.asyncio
 async def test_stream_reply_sends_complete_text_segment_on_tool_boundary(mock_config):
-    """text 段中间不按字符/时间切——只有遇到 tool 事件才整段 flush。"""
+    """text 段中间不按字符/时间切——只有遇到 tool 事件才整段 flush。对齐 hermes weixin 不发 tool。"""
     from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem
 
     long_text = "这是完整的一段话,不应该被切碎。" * 30  # 远大于旧 500 字符阈值
@@ -615,6 +615,7 @@ async def test_stream_reply_sends_complete_text_segment_on_tool_boundary(mock_co
         async def stream_events(self, message, role, session_id, **kwargs):
             yield StreamEventItem(type="text", text=long_text)
             yield StreamEventItem(type="tool", text="调用 read_file")
+            yield StreamEventItem(type="text", text="后续文本")
 
     class FakeWeixinClient:
         def __init__(self):
@@ -639,8 +640,8 @@ async def test_stream_reply_sends_complete_text_segment_on_tool_boundary(mock_co
         }
     )
 
-    # 期望:第一条 = 完整 text 段,第二条 = 完整 tool 段。
-    # 没有任何一条是从 long_text 中间截出来的"半句话"。
-    assert len(client.sent) == 2
+    # 对齐 hermes weixin:tool 不发消息,仅 flush 前一段 text 并继续累积
+    # long_text 应完整发出,tool 被静默,后续文本与前一段合并或下一段发出
+    assert len(client.sent) >= 1
     assert client.sent[0]["text"] == long_text
-    assert "read_file" in client.sent[1]["text"]
+    assert all("read_file" not in s["text"] for s in client.sent)
