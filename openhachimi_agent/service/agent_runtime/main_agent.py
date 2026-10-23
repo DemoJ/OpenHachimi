@@ -9,8 +9,7 @@
 - **保留** clarify_user 的 deferred 跨轮链路、视觉预处理、preflight 压缩、
   output_validator 闸门。
 
-视觉/消息构造相关函数(``message_with_attachments`` 等)从 ``executor.py`` 原样迁入,
-供 ``turn_setup.py`` / ``turn.py`` 继续使用。
+附件 / 视觉相关的辅助函数(``message_with_attachments`` 等)在 ``attachment_vision.py``。
 """
 
 from __future__ import annotations
@@ -18,8 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic_ai.exceptions import ModelHTTPError
@@ -32,167 +30,35 @@ from openhachimi_agent.agent.verification_stop import reset_turn_verification
 from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.memory.capture import REMEMBERED_THIS_TURN_KEY
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
     has_active_todos,
     has_restorable_suspended_plan,
     restore_suspended_plan,
 )
+from openhachimi_agent.service.agent_runtime.attachment_vision import (
+    _degrade_direct_vision_result,
+    _mark_vision_processing,
+    _mark_vision_result,
+    _vision_result_summary,
+    _with_direct_vision_parts,
+    message_with_attachments,
+)
+from openhachimi_agent.service.agent_runtime.history_prep import prepare_history_for_run
 from openhachimi_agent.transport.api_models import AttachmentRef
 from openhachimi_agent.vision.capabilities import mark_model_vision_support
 from openhachimi_agent.vision.preprocess import VisionPreprocessResult, image_attachments, preprocess_vision_attachments
-from openhachimi_agent.tools.vision_guard import normalize_vision_guard_path
 
 
 logger = logging.getLogger(__name__)
 
 
-# ── 附件 / 视觉(从 executor.py 原样迁入) ────────────────────────────────────
-
-
-def _normalize_attachment_path(config: AppConfig, attachment: AttachmentRef) -> str:
-    path = Path(attachment.local_path)
-    target = path if path.is_absolute() else config.base_dir / path
-    return normalize_vision_guard_path(target)
-
-
-def _vision_state_entry(config: AppConfig, attachment: AttachmentRef, *, status: str, mode: str | None = None) -> dict[str, Any]:
-    resolved_path = _normalize_attachment_path(config, attachment)
-    return {
-        "attachment_id": attachment.id,
-        "filename": attachment.filename,
-        "content_type": attachment.content_type,
-        "kind": attachment.kind,
-        "local_path": attachment.local_path,
-        "resolved_path": resolved_path,
-        "mode": mode,
-        "status": status,
-        "model": None,
-        "summary": None,
-        "errors": [],
-        "size_bytes": attachment.size_bytes,
-    }
-
-
-def _mark_vision_processing(session_state: dict[str, Any], config: AppConfig, attachments: list[AttachmentRef]) -> None:
-    images = image_attachments(attachments)
-    if not images:
-        return
-    vision_attachments = session_state.setdefault("vision_attachments", {})
-    path_index = session_state.setdefault("vision_attachment_paths", {})
-    for attachment in images:
-        entry = _vision_state_entry(config, attachment, status="processing")
-        vision_attachments[attachment.id] = entry
-        path_index[entry["resolved_path"]] = attachment.id
-
-
-def _mark_vision_result(session_state: dict[str, Any], config: AppConfig, attachments: list[AttachmentRef], vision_result: VisionPreprocessResult) -> None:
-    images_by_id = {attachment.id: attachment for attachment in image_attachments(attachments)}
-    vision_attachments = session_state.setdefault("vision_attachments", {})
-    path_index = session_state.setdefault("vision_attachment_paths", {})
-
-    for status in vision_result.attachment_statuses:
-        attachment = images_by_id.get(status.attachment_id)
-        if attachment is None:
-            continue
-        entry = dict(vision_attachments.get(attachment.id) or _vision_state_entry(config, attachment, status=status.status, mode=status.mode))
-        entry.update(asdict(status))
-        entry["kind"] = attachment.kind
-        entry["size_bytes"] = attachment.size_bytes
-        entry["resolved_path"] = _normalize_attachment_path(config, attachment)
-        vision_attachments[attachment.id] = entry
-        path_index[entry["resolved_path"]] = attachment.id
-
-    status_ids = {status.attachment_id for status in vision_result.attachment_statuses}
-    fallback_status = "unavailable" if vision_result.mode == "unavailable" else vision_result.mode
-    for attachment in images_by_id.values():
-        if attachment.id in status_ids:
-            continue
-        entry = dict(vision_attachments.get(attachment.id) or _vision_state_entry(config, attachment, status=fallback_status, mode=vision_result.mode))
-        entry.update({"mode": vision_result.mode, "status": fallback_status, "errors": list(vision_result.errors)})
-        vision_attachments[attachment.id] = entry
-        path_index[entry["resolved_path"]] = attachment.id
-
-
-def _vision_result_summary(vision_result: VisionPreprocessResult) -> tuple[int, int]:
-    succeeded = sum(1 for status in vision_result.attachment_statuses if status.mode == "fallback" and status.status == "succeeded")
-    failed = sum(1 for status in vision_result.attachment_statuses if status.status in {"failed", "unavailable"})
-    return succeeded, failed
+# ── 视觉预处理状态提示 ──────────────────────────────────────────────────────
 
 
 async def _emit_system_event(ctx: AgentRunContext, text: str) -> None:
     logger.info("vision preprocess status role=%s session_id=%s message=%s", ctx.role, ctx.session_id, text.strip())
-
-
-def format_attachments_for_prompt(attachments: list[AttachmentRef], vision_result: VisionPreprocessResult | None = None) -> str:
-    if not attachments:
-        return ""
-
-    consumed_ids = set(vision_result.consumed_attachment_ids) if vision_result else set()
-    vision_mode = vision_result.mode if vision_result else "none"
-    if consumed_ids and vision_mode == "fallback":
-        handling_hint = (
-            "图片附件已由辅助视觉模型识别，识别结果已在上文提供。"
-            "不要再调用 inspect_image、read_file、browser_navigate 或其他工具读取这些图片；"
-            "请直接基于辅助视觉模型输出和用户问题继续处理。"
-        )
-    elif consumed_ids and vision_mode == "direct":
-        handling_hint = "图片附件已随本轮消息直接发送给主模型；不要再调用工具读取这些图片。"
-    elif consumed_ids and vision_mode == "unavailable":
-        handling_hint = (
-            "系统已尝试处理图片但未能取得可用视觉内容。"
-            "inspect_image、read_file、browser_navigate 不能替代视觉识别；不要调用这些工具假装读取图片内容。"
-        )
-    else:
-        handling_hint = "请不要臆测附件内容；需要内容时调用文件或图片工具。不要在回复中泄露本地绝对路径。"
-
-    lines = [
-        "用户同时发送了以下附件：",
-        handling_hint,
-    ]
-    for attachment in attachments:
-        status = "已处理" if attachment.id in consumed_ids else "未处理"
-        lines.extend(
-            [
-                f"- id: {attachment.id}",
-                f"  status: {status}",
-                f"  kind: {attachment.kind}",
-                f"  filename: {attachment.filename or 'unknown'}",
-                f"  content_type: {attachment.content_type or 'unknown'}",
-                f"  size_bytes: {attachment.size_bytes if attachment.size_bytes is not None else 'unknown'}",
-                f"  local_path: {attachment.local_path}",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def message_with_attachments(message: str, attachments: list[AttachmentRef], vision_result: VisionPreprocessResult | None = None) -> str:
-    """构造给模型的 user-prompt 文本:用户原话 + 附件元数据块(+ 视觉前缀)。"""
-    attachment_block = format_attachments_for_prompt(attachments, vision_result)
-    user_message = message.strip() or "用户发送了附件，请根据附件内容协助处理。"
-    prefix = vision_result.text_prefix.strip() if vision_result and vision_result.text_prefix.strip() else ""
-    parts = [part for part in [prefix, user_message, attachment_block] if part]
-    if not parts:
-        return message
-    return "\n\n".join(parts)
-
-
-def _with_direct_vision_parts(text: str, vision_result: VisionPreprocessResult | None) -> str | list[UserContent]:
-    if not vision_result or not vision_result.direct_parts:
-        return text
-    return [text, *vision_result.direct_parts]
-
-
-def _degrade_direct_vision_result(vision_result: VisionPreprocessResult, error: Exception) -> VisionPreprocessResult:
-    """主模型直传图片失败后，降级为纯文本上下文，避免整轮对话崩溃。"""
-    error_text = str(error).strip() or error.__class__.__name__
-    text_prefix = render_system_prompt("vision/direct_error_prefix", {"error_text": error_text}) + "\n"
-    return VisionPreprocessResult(
-        mode="unavailable",
-        text_prefix=text_prefix,
-        consumed_attachment_ids=vision_result.consumed_attachment_ids,
-        errors=[*vision_result.errors, error_text],
-    )
 
 
 # ── 主 agent run ────────────────────────────────────────────────────────────
@@ -422,12 +288,8 @@ async def _run_main_with_llm_retry(
     raise RuntimeError("llm retry loop exhausted unexpectedly")
 
 
-async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) -> ExecutionOutcome:
-    """主 agent 单次 run:视觉预处理 → 单次 agent.run → deferred 短路 → verification signal 上抛。
-
-    不再有 replan/repair 内部循环。失败由主 agent 自己 cancel+修订 todo;
-    停止时完整性校验由 ``factory._validate_execution_result`` 闸门一次完成。
-    """
+async def _prepare_vision(ctx: AgentRunContext) -> VisionPreprocessResult:
+    """图片附件的视觉预处理,并把识别状态写进 session_state、发系统事件。"""
     if image_attachments(ctx.attachments):
         ctx.operation_state.start("vision", "preprocess")
         _mark_vision_processing(ctx.session_state, ctx.config, ctx.attachments)
@@ -443,20 +305,52 @@ async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) ->
         await _emit_system_event(ctx, f"\n\n[System] 辅助视觉模型已完成 {succeeded} 张图片识别，后续将使用识别摘要并阻止重复读取同一图片。\n")
     elif failed or vision_result.errors:
         await _emit_system_event(ctx, "\n\n[System] 图片视觉识别未能取得可用结果，将按附件处理状态继续执行。\n")
+    return vision_result
 
-    ctx.operation_state.start("model", "main")
-    main_agent = _build_main_agent(ctx.role, ctx.deps.run_mode, get_agent)
-    ledger_start_seq = get_ledger_length(ctx.session_state)
-    ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
-    # 清零本轮 verification / final-answer validator 的计数与旗标。跨轮必须清零,
-    # 否则上一轮的死循环遗产会立刻让新一轮放行。
+
+def _reset_turn_gates(ctx: AgentRunContext) -> None:
+    """清零本轮 verification / final-answer validator 的计数与旗标,记下本轮 ledger 起点。
+
+    跨轮必须清零,否则上一轮的死循环遗产会立刻让新一轮放行。
+    """
+    ctx.session_state["current_turn_ledger_start_seq"] = get_ledger_length(ctx.session_state)
     ctx.session_state.pop("_final_validator_retries", None)
     ctx.session_state.pop("_final_validator_yielded", None)
     ctx.session_state.pop("_final_validator_last_signal", None)
-    ctx.session_state.pop("_plan_viewed_this_turn", None)
+    ctx.session_state.pop(REMEMBERED_THIS_TURN_KEY, None)
     reset_turn_verification(ctx.session_state)
-    preflight_compress_history(ctx)
 
+
+def _outcome_from_result(ctx: AgentRunContext, result: Any) -> ExecutionOutcome:
+    """把一次 run 的结果包装成 ExecutionOutcome。
+
+    clarify_user 抛了 CallDeferred 时,run 已被 pydantic-ai 在 graph 层合法终止,output 是
+    DeferredToolRequests 而非最终回复;任务处于"等用户输入"的合法暂停态,跳过收尾校验。
+    """
+    if isinstance(getattr(result, "output", None), DeferredToolRequests):
+        logger.info(
+            "main agent: deferred tool request (clarify_user) — short-circuit role=%s session_id=%s",
+            ctx.role,
+            ctx.session_id,
+        )
+        return ExecutionOutcome(result=result)
+    verification_signal = get_final_verification_signal(ctx.session_state)
+    if verification_signal:
+        return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
+    return ExecutionOutcome(result=result)
+
+
+async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) -> ExecutionOutcome:
+    """主 agent 单次 run:视觉预处理 → 单次 agent.run → deferred 短路 → verification signal 上抛。
+
+    停止时完整性校验由 ``factory._validate_execution_result`` 闸门一次完成。
+    """
+    vision_result = await _prepare_vision(ctx)
+    ctx.operation_state.start("model", "main")
+    main_agent = _build_main_agent(ctx.role, ctx.deps.run_mode, get_agent)
+    _reset_turn_gates(ctx)
+    preflight_compress_history(ctx)
+    prepare_history_for_run(ctx.history)
     result = await _run_main_with_llm_retry(
         main_agent=main_agent,
         message=ctx.message,
@@ -468,23 +362,7 @@ async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) ->
         stream=ctx.stream,
         handle_stream_events=_main_stream_handler(ctx),
     )
-
-    # clarify_user 抛了 CallDeferred:run 已被 pydantic-ai 在 graph 层合法终止,
-    # output 是 DeferredToolRequests 而非 final answer。下游 verification 闸门
-    # 全部跳过——任务在"等用户输入"这个合法暂停态。
-    if isinstance(getattr(result, "output", None), DeferredToolRequests):
-        logger.info(
-            "run_main_agent: deferred tool request (clarify_user) — short-circuit "
-            "role=%s session_id=%s",
-            ctx.role,
-            ctx.session_id,
-        )
-        return ExecutionOutcome(result=result)
-
-    verification_signal = get_final_verification_signal(ctx.session_state)
-    if verification_signal:
-        return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
-    return ExecutionOutcome(result=result)
+    return _outcome_from_result(ctx, result)
 
 
 # ── clarify_user deferred resume(从 executor.py 原样迁入,精简 plan 状态机依赖) ──
@@ -516,16 +394,14 @@ def _find_pending_clarify_tool_call(history: list[Any]) -> str | None:
     return None
 
 
-async def resume_main_agent(
-    ctx: AgentRunContext,
-    get_agent: Callable[..., Any],
-) -> ExecutionOutcome | None:
-    """处理 clarify_user 触发的下一轮:把用户回复以 deferred tool result 形式
-    无感知地灌回主 agent。
+_RESUME_PLAN_HINT = (
+    "[系统提示] 以上是用户对你追问的回复。你还有一个进行中的计划:先确认这条回复补齐了哪一项,"
+    "把它推进或标记完成,再继续剩下的 pending 项。"
+)
 
-    返回 None 表示无法 resume(状态损坏或 history 中找不到 pending tool call),
-    上层应清理 ``_user_clarification`` 并退回正常 run_main_agent 路径。
-    """
+
+def _resume_tool_call_id(ctx: AgentRunContext) -> str | None:
+    """找到要回灌结果的 clarify_user 调用 id;找不到时清掉挂起标志并返回 None。"""
     info = ctx.session_state.get("_user_clarification", {}) or {}
     tool_call_id = info.get("tool_call_id") or _find_pending_clarify_tool_call(ctx.history)
     if not tool_call_id:
@@ -537,77 +413,61 @@ async def resume_main_agent(
             ctx.session_id,
         )
         ctx.session_state.pop("_user_clarification", None)
-        return None
+    return tool_call_id
 
-    # 恢复挂起的活动计划(若有):上一次 clarify_user 触发的 suspend_current_plan 把
-    # todo_state.is_active 翻成了 False。回灌结果前先把它翻回去,模型回到工具循环
-    # 之后才能正常推进。
-    if has_restorable_suspended_plan(ctx.session_state):
-        restore_suspended_plan(ctx.session_state, deps=ctx.deps)
 
-    ledger_start_seq = get_ledger_length(ctx.session_state)
-    ctx.session_state["current_turn_ledger_start_seq"] = ledger_start_seq
-    ctx.session_state.pop("_final_validator_retries", None)
-    ctx.session_state.pop("_final_validator_yielded", None)
-    ctx.session_state.pop("_final_validator_last_signal", None)
-    ctx.session_state.pop("_plan_viewed_this_turn", None)
-    reset_turn_verification(ctx.session_state)
+def _resume_run_kwargs(ctx: AgentRunContext, tool_call_id: str) -> dict[str, Any]:
+    """把用户回复作为 clarify_user 的结果灌回去的 run 参数。
 
-    results = DeferredToolResults(calls={tool_call_id: ctx.message})
-    main_agent = _build_main_agent(ctx.role, ctx.deps.run_mode, get_agent)
-    ctx.operation_state.start("model", "main_resume")
-    preflight_compress_history(ctx)
-
-    # 注入 TODO 恢复执行提醒:模型从 clarify_user 恢复后,history 顶部的上下文
-    # 可能让模型沉浸在"正在研究"的状态中,忽略 TODO 接力规则。
-    try:
-        from pydantic_ai.messages import ModelRequest, SystemPromptPart
-
-        if has_active_todos(ctx.session_state):
-            todo_reminder = (
-                "[System 恢复执行提醒] 你当前有一个活动计划，用户刚刚回复了你的追问。\n"
-                "请严格按以下顺序操作：\n"
-                "1. **立即查看 TODO 列表**（确认当前进度）；\n"
-                "2. 如果之前因等待用户输入而暂停的任务现在有了答案，"
-                "先 `update_todo(任务id, \"done\")` 标记完成；\n"
-                "3. 然后挑出第一个 status=pending 且依赖已 done 的任务继续执行；\n"
-                "4. 不要在不查看 TODO 的情况下直接调用执行工具。"
-            )
-            ctx.history.append(ModelRequest(parts=[SystemPromptPart(content=todo_reminder)]))
-    except Exception:
-        logger.debug("failed to inject todo resume reminder", exc_info=True)
-
+    有进行中的计划时,把恢复提示拼在返回值里。不能另插一条系统消息:它会夹在工具调用
+    和工具结果之间,部分 OpenAI 兼容服务会直接报错("assistant tool_calls 后必须紧跟 tool 消息")。
+    """
+    reply = ctx.message
+    if has_active_todos(ctx.session_state):
+        reply = f"{ctx.message}\n\n{_RESUME_PLAN_HINT}"
     run_kwargs: dict[str, Any] = {
         "message_history": ctx.history,
-        "deferred_tool_results": results,
+        "deferred_tool_results": DeferredToolResults(calls={tool_call_id: reply}),
         "deps": ctx.deps,
         "usage_limits": UsageLimits(request_limit=60),
     }
     if ctx.stream and ctx.stream_event_handler is not None:
         run_kwargs["event_stream_handler"] = ctx.stream_event_handler
+    return run_kwargs
 
+
+async def resume_main_agent(
+    ctx: AgentRunContext,
+    get_agent: Callable[..., Any],
+) -> ExecutionOutcome | None:
+    """处理 clarify_user 触发的下一轮:把用户回复以 deferred tool result 形式
+    无感知地灌回主 agent。
+
+    返回 None 表示无法 resume(状态损坏或 history 中找不到 pending tool call),
+    上层应清理 ``_user_clarification`` 并退回正常 run_main_agent 路径。
+    """
+    tool_call_id = _resume_tool_call_id(ctx)
+    if not tool_call_id:
+        return None
+    # 上一次 clarify_user 挂起了活动计划(todo_state.is_active=False),回灌前先恢复,
+    # 模型回到工具循环之后才能正常推进。
+    if has_restorable_suspended_plan(ctx.session_state):
+        restore_suspended_plan(ctx.session_state, deps=ctx.deps)
+    _reset_turn_gates(ctx)
+    main_agent = _build_main_agent(ctx.role, ctx.deps.run_mode, get_agent)
+    ctx.operation_state.start("model", "main_resume")
+    preflight_compress_history(ctx)
+    prepare_history_for_run(ctx.history)
+    run_kwargs = _resume_run_kwargs(ctx, tool_call_id)
     logger.info(
-        "resume_main_agent: feeding user reply as deferred tool result "
-        "session_id=%s tool_call_id=%s reply_chars=%d",
+        "resume_main_agent: feeding user reply as deferred tool result session_id=%s tool_call_id=%s reply_chars=%d",
         ctx.session_id,
         tool_call_id,
         len(ctx.message),
     )
-
-    # 注意:run 的第一个位置参数(user_prompt)传 None —— 用户当前消息已经作为
-    # tool return 注入,不再独立作 user-prompt;否则 graph 会拼一个空 ModelRequest
-    # 让模型困惑。
+    # run 的第一个位置参数(user_prompt)传 None:用户当前消息已经作为 tool return 注入,
+    # 不再独立作 user-prompt;否则 graph 会拼一个空 ModelRequest 让模型困惑。
     result = await main_agent.run(None, **run_kwargs)
-
-    # 消费成功 → 清掉 _user_clarification 标志(无论本轮是否又触发了新的 deferred)。
+    # 消费成功 → 清掉 _user_clarification(无论本轮是否又触发了新的 deferred)
     ctx.session_state.pop("_user_clarification", None)
-
-    # 模型在 resume 之后又调用了一次 clarify_user → 输出仍是 DeferredToolRequests,
-    # 走和正常 run_main_agent 一致的短路语义。
-    if isinstance(getattr(result, "output", None), DeferredToolRequests):
-        return ExecutionOutcome(result=result)
-
-    verification_signal = get_final_verification_signal(ctx.session_state)
-    if verification_signal:
-        return ExecutionOutcome(result=result, final_verification_signal=verification_signal)
-    return ExecutionOutcome(result=result)
+    return _outcome_from_result(ctx, result)

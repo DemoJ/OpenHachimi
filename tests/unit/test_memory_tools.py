@@ -128,3 +128,73 @@ def test_forget_memory_with_short_non_id_query_does_not_crash(mock_config, mock_
         result = memory_tools.forget_memory(ctx, tricky, mode="soft_delete")
         # 不应抛异常;结果 deleted=0 也可接受(没有匹配)
         assert "deleted" in result
+
+
+def _memory_ctx(mock_config, mock_browser_manager):
+    deps = AgentDeps(
+        config=mock_config,
+        session_id="s1",
+        browser_manager=mock_browser_manager,
+        memory_scope=MemoryScope(role_name="default", session_id="s1"),
+    )
+    return SimpleNamespace(deps=deps)
+
+
+def _stored_type(mock_config, memory_id):
+    with get_memory_store(mock_config).connect() as conn:
+        return conn.execute("SELECT memory_type FROM memory_atoms WHERE id = ?", (memory_id,)).fetchone()[0]
+
+
+def test_remember_defaults_to_user_preference(mock_config, mock_browser_manager):
+    ctx = _memory_ctx(mock_config, mock_browser_manager)
+
+    result = memory_tools.remember(ctx, "以后回答都用中文")
+
+    assert result["memory_type"] == "user_preference"
+    assert _stored_type(mock_config, result["id"]) == "user_preference"
+
+
+def test_remember_normalizes_legacy_and_unknown_types(mock_config, mock_browser_manager):
+    ctx = _memory_ctx(mock_config, mock_browser_manager)
+
+    legacy = memory_tools.remember(ctx, "用户是后端工程师", memory_type="fact")
+    project = memory_tools.remember(ctx, "项目基于 PydanticAI", memory_type="project_fact")
+    unknown = memory_tools.remember(ctx, "喜欢深色主题", memory_type="whatever")
+
+    assert _stored_type(mock_config, legacy["id"]) == "user_trait"
+    assert _stored_type(mock_config, project["id"]) == "project_fact"
+    assert _stored_type(mock_config, unknown["id"]) == "user_preference"
+
+
+def test_remember_dedupes_identical_content(mock_config, mock_browser_manager):
+    ctx = _memory_ctx(mock_config, mock_browser_manager)
+
+    first = memory_tools.remember(ctx, "以后回答都用中文")
+    second = memory_tools.remember(ctx, "以后回答都用中文")
+
+    assert second["id"] == first["id"]
+    assert second.get("deduplicated") is True
+    with get_memory_store(mock_config).connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM memory_atoms").fetchone()[0] == 1
+
+
+def test_forget_memory_queues_consolidation(mock_config, mock_browser_manager):
+    """删掉的记忆可能已被合并进主题块和画像,删除后要排队重新合并。"""
+    ctx = _memory_ctx(mock_config, mock_browser_manager)
+    stored = memory_tools.remember(ctx, "以后回答都用中文")
+
+    memory_tools.forget_memory(ctx, stored["id"])
+
+    with get_memory_store(mock_config).connect() as conn:
+        jobs = conn.execute("SELECT COUNT(*) FROM memory_jobs WHERE job_type = 'consolidate_scope'").fetchone()[0]
+    assert jobs == 1
+
+
+def test_remember_marks_turn_for_capture(mock_config, mock_browser_manager):
+    from openhachimi_agent.memory.capture import REMEMBERED_THIS_TURN_KEY
+
+    ctx = _memory_ctx(mock_config, mock_browser_manager)
+
+    memory_tools.remember(ctx, "以后回答都用中文")
+
+    assert ctx.deps.session_state[REMEMBERED_THIS_TURN_KEY] is True

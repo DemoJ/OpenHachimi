@@ -23,7 +23,6 @@
   返回 ``[记忆召回] + [时间]``。
 - :func:`build_executor_extra_dynamic_block(deps)` —— 仅 main agent 用,
   返回 ``[执行接力规则?] + [产物落点引导] + [技能索引]``。
-- :func:`build_volatile_prefix(deps)` —— 兼容旧测试的 thin wrapper。
 
 key 设计原则:user-prompt 只承载用户原始消息 + 附件;其它一切系统级运行时
 上下文走 system_prompt 动态注入。
@@ -47,6 +46,7 @@ from openhachimi_agent.content.role_filters import filter_skills_for_role, get_r
 from openhachimi_agent.content.skills import Skill, find_skills
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.memory.recall import build_memory_context_text
+from openhachimi_agent.tools.planning import has_open_tasks
 
 
 logger = logging.getLogger(__name__)
@@ -184,20 +184,15 @@ def _skills_index_block(deps: AgentDeps) -> str:
 
 
 def _has_active_todos_in_state(session_state: dict[str, Any]) -> bool:
-    """轻量复刻 ``service.agent_runtime.context.has_active_todos``。
+    """与 ``service.agent_runtime.context.has_active_todos`` 同语义:计划激活且还有
+    pending / in-progress 项。两处都委托 ``tools.planning.has_open_tasks``,保证一致。
 
-    内联在这里是为了避免 ``content.runtime_context`` 反向 import ``service.*``,
-    防止循环依赖。语义须与上层严格一致:既要 ``todo_state.is_active`` 为真,
-    又要存在至少一个 ``status != "done"`` 的任务。如果上层语义日后扩展,
-    需要同步这里。
+    内联在这里是为了避免 ``content.runtime_context`` 反向 import ``service.*``。
     """
     todo_state = session_state.get("todo_state")
     if not getattr(todo_state, "is_active", False):
         return False
-    tasks = getattr(todo_state, "tasks", None)
-    if not isinstance(tasks, dict) or not tasks:
-        return False
-    return any(getattr(task, "status", None) != "done" for task in tasks.values())
+    return has_open_tasks(getattr(todo_state, "tasks", None))
 
 
 def _todo_handoff_block(deps: AgentDeps) -> str:
@@ -214,6 +209,46 @@ def _todo_handoff_block(deps: AgentDeps) -> str:
         return render_system_prompt("runtime/executor_todo_handoff")
     except Exception:  # noqa: BLE001
         logger.debug("executor_todo_handoff render failed", exc_info=True)
+        return ""
+
+
+_TODO_STATUS_MARKERS = {"done": "[x]", "in-progress": "[-]", "pending": "[ ]", "blocked": "[!]"}
+# 快照里最多列出的任务数,防止超长计划撑爆系统指令。
+_MAX_SNAPSHOT_TASKS = 30
+
+
+def _format_plan_snapshot(todo_state: Any) -> str:
+    lines: list[str] = []
+    goal = str(getattr(todo_state, "goal", "") or "").strip()
+    if goal:
+        lines.append(f"目标：{goal}")
+    tasks = list(getattr(todo_state, "tasks", {}).values())
+    for task in tasks[:_MAX_SNAPSHOT_TASKS]:
+        status = getattr(task, "status", "pending")
+        line = f"{_TODO_STATUS_MARKERS.get(status, '[ ]')} {task.id}. {task.description}"
+        notes = str(getattr(task, "notes", "") or "").strip()
+        if status == "blocked" and notes:
+            line += f"（受阻原因：{notes}）"
+        lines.append(line)
+    if len(tasks) > _MAX_SNAPSHOT_TASKS:
+        lines.append(f"……另有 {len(tasks) - _MAX_SNAPSHOT_TASKS} 项,用 get_todos 查看完整列表")
+    return "\n".join(lines)
+
+
+def _todo_snapshot_block(deps: AgentDeps) -> str:
+    """有活动计划时,把本轮开始时的计划进度直接放进系统指令。
+
+    之前模型只能靠"先调 get_todos"或翻历史里的工具返回才知道进度;对话被压缩后
+    那些工具返回会被摘要掉,计划就丢了。系统指令不参与压缩,每轮按当前状态生成。
+    """
+    session_state = getattr(deps, "session_state", None)
+    if not isinstance(session_state, dict) or not _has_active_todos_in_state(session_state):
+        return ""
+    try:
+        snapshot = _format_plan_snapshot(session_state["todo_state"])
+        return render_system_prompt("runtime/todo_snapshot", {"plan_snapshot": snapshot})
+    except Exception:  # noqa: BLE001
+        logger.debug("todo_snapshot render failed", exc_info=True)
         return ""
 
 
@@ -281,6 +316,10 @@ def build_executor_extra_dynamic_block(deps: AgentDeps | None) -> str:
     skills_index = _skills_index_block(deps)
     if skills_index:
         blocks.append(skills_index)
+    # 计划快照每轮都可能变,放在本段最后,不影响前面技能索引等半稳定内容的缓存命中
+    todo_snapshot = _todo_snapshot_block(deps)
+    if todo_snapshot:
+        blocks.append(todo_snapshot)
     return "\n\n".join(blocks)
 
 
@@ -310,23 +349,7 @@ def build_system_dynamic_block(deps: AgentDeps | None) -> str:
     return "\n\n".join(blocks)
 
 
-def build_volatile_prefix(deps: AgentDeps | None) -> str:
-    """兼容旧调用方与测试，但**不再被 executor/planner 直接使用**。
-
-    渐进披露后这个函数主体被掏空(skill 全文/摘要不再被动注入),只保留记忆块
-    用于必要的离线/调试场景。生产路径请改用 :func:`build_system_dynamic_block`。
-    """
-    if deps is None:
-        return ""
-    blocks: list[str] = []
-    memory_block = _memory_block(deps)
-    if memory_block:
-        blocks.append(memory_block)
-    return "\n\n".join(blocks)
-
-
 __all__ = [
     "build_system_dynamic_block",
     "build_executor_extra_dynamic_block",
-    "build_volatile_prefix",
 ]

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from openhachimi_agent.core.deps import AgentDeps
-from openhachimi_agent.memory.capture import capture_turn_memories
+from openhachimi_agent.memory.capture import REMEMBERED_THIS_TURN_KEY, capture_turn_memories
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.service.agent_runtime.context import AgentRunContext
 from openhachimi_agent.service.agent_runtime.context_snapshot import (
@@ -335,10 +335,11 @@ async def _capture_turn_memory(
     else:
         capture_source = "user"
     capture_kwargs = {
-        "task_frame": session_state.get("task_frame") if isinstance(session_state.get("task_frame"), dict) else None,
         "memory_context_ids": memory_context.ids,
         "duration_ms": int((time.perf_counter() - start_time) * 1000),
         "source": capture_source,
+        # 模型本轮已经调 remember 存过了:跳过"明确要求记住"的同步写入,避免同一句话存两条
+        "skip_explicit": bool(session_state.pop(REMEMBERED_THIS_TURN_KEY, False)),
     }
     if service.config.memory.capture.async_enabled:
         async def _capture_memory_background() -> None:

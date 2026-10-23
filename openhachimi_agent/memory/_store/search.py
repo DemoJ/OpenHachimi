@@ -6,7 +6,9 @@ from openhachimi_agent.memory.models import (
     MemorySearchResult,
     MemorySensitivity,
     MemoryStatus,
+    utc_now_iso,
 )
+from openhachimi_agent.memory._store.fts import match_expression, query_terms
 from openhachimi_agent.memory._store.utils import _load_json_array
 
 
@@ -16,7 +18,7 @@ class SearchStoreMixin:
         terms = self._query_terms(query)
         if not terms:
             return []
-        fts_query = " OR ".join(terms)
+        fts_query = match_expression(terms)
         statuses = [MemoryStatus.ACTIVE.value]
         if include_archived:
             statuses.append(MemoryStatus.ARCHIVED.value)
@@ -131,6 +133,41 @@ class SearchStoreMixin:
         if touch:
             self.touch([item.id for item in final])
         return final
+
+    def list_core_atoms(self, scope: MemoryScope, memory_types: frozenset[str], *, limit: int) -> list[MemorySearchResult]:
+        """常驻记忆:指定类型里置信度最高的 active 记忆(未过期、非 secret),不需要查询词。"""
+        if limit <= 0 or not memory_types:
+            return []
+        types = sorted(memory_types)
+        type_placeholders = ",".join("?" for _ in types)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM memory_atoms
+                WHERE status = ? AND tenant_id = ? AND user_id = ?
+                  AND (role_name = ? OR role_name = '') AND sensitivity != ?
+                  AND memory_type IN ({type_placeholders})
+                  AND (valid_until IS NULL OR valid_until > ?)
+                ORDER BY confidence DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (MemoryStatus.ACTIVE.value, scope.tenant_id, scope.user_id, scope.role_name,
+                 MemorySensitivity.SECRET.value, *types, utc_now_iso(), limit),
+            ).fetchall()
+        return [
+            MemorySearchResult(
+                id=row["id"],
+                level="L1",
+                content=row["content"],
+                score=float(row["confidence"]),
+                memory_type=row["memory_type"],
+                confidence=row["confidence"],
+                updated_at=row["updated_at"],
+                source="core",
+                metadata={"valid_until": row["valid_until"], "decay_at": row["decay_at"], "stability": row["stability"]},
+            )
+            for row in rows
+        ]
 
     def _search_atoms(self, conn: sqlite3.Connection, scope: MemoryScope, query: str, statuses: list[str], limit: int) -> list[MemorySearchResult]:
         placeholders = ",".join("?" for _ in statuses)
@@ -298,28 +335,12 @@ class SearchStoreMixin:
         ]
 
     def _query_terms(self, query: str) -> list[str]:
-        # 先按"非字母数字非汉字 -> 空格"分词
-        cleaned = "".join(char if char.isalnum() or "一" <= char <= "鿿" else " " for char in query)
-        terms: list[str] = []
-        for part in cleaned.split():
-            part = part.strip()
-            if not part:
-                continue
-            if len(part) > 32:
-                part = part[:32]
-            terms.append(part)
-        # 兜底:整个 query 全是 FTS5 特殊字符(如 "*", "?", "---", "()" 等)时,
-        # 分词结果为空。直接整段塞回去会让 FTS5 抛 "unknown special query"。
-        # 这里再次清洗,**只保留字母数字和汉字**,完全无内容则返回空 list,
-        # 由调用方走 LIKE 兜底或返回空结果。
-        if not terms and query.strip():
-            sanitized = "".join(
-                char for char in query
-                if char.isalnum() or "一" <= char <= "鿿"
-            )
-            if sanitized:
-                terms.append(sanitized[:32])
-        return terms[:12]
+        # 汉字切成二元组、其余按字母数字片段切分,与写入索引的切法一致(见 _store/fts.py)。
+        # 全是标点/特殊字符时返回空 list,由调用方直接返回空结果。
+        return query_terms(query)
 
     def _rank_to_score(self, rank: float, confidence: float) -> float:
-        return (1.0 / (1.0 + abs(float(rank)))) * float(confidence)
+        # FTS5 的 bm25() 越匹配越负(绝对值越大),所以分数要随 |rank| 增大而增大,
+        # 映射到 [0, 1) 后再乘置信度。旧实现用 1/(1+|rank|),把排序整个反了过来。
+        magnitude = abs(float(rank))
+        return (magnitude / (1.0 + magnitude)) * float(confidence)

@@ -154,7 +154,14 @@ def test_main_agent_hook_registration_order_puts_runtime_block_last(mock_config,
     role_file.write_text("# default\n\n测试用角色。\n", encoding="utf-8")
 
     agent = build_main_agent(mock_config, "default")
-    hook_names = [runner.function.__name__ for runner in agent._system_prompt_functions]
+    # 动态块注册为 instructions(每次请求重算)。pydantic-ai 2.33 存原函数,
+    # 较新版本包一层 SourcedInstruction(.instruction 是原函数),两种都兼容。
+    hook_names = [
+        getattr(getattr(item, "instruction", item), "__name__", None)
+        for item in agent._instructions
+    ]
+    hook_names = [name for name in hook_names if name]
+    assert agent._system_prompts == ()  # 不再有会被冻结在历史里的 system prompt
 
     assert "_executor_extra_block" in hook_names
     assert "_runtime_dynamic_block" in hook_names
@@ -422,3 +429,62 @@ def test_skills_index_dedupes_same_name_across_dirs(mock_config, tmp_path):
     # 保留的是 primary 目录的版本(first-wins)
     assert "Primary copy." in block
     assert "External copy." not in block
+
+
+def test_executor_extra_block_only_blocked_left_not_handoff(mock_config):
+    """只剩 done / blocked:计划视为结束,不再注入接力规则,改为注入规划引导。"""
+    todo_state = TodoState(
+        goal="stuck goal",
+        is_active=True,
+        tasks={
+            1: TodoTask(id=1, description="done step", status="done"),
+            2: TodoTask(id=2, description="needs credentials", status="blocked"),
+        },
+    )
+    deps = _make_executor_deps(mock_config, task_frame=None, todo_state=todo_state)
+
+    block = build_executor_extra_dynamic_block(deps)
+
+    assert _TODO_HANDOFF_HEADING not in block
+    assert "规划引导" in block
+
+
+def test_todo_handoff_prompt_matches_code_behavior():
+    """接力规则不再声称"会拦截回复",也不再引用不存在的 success_criteria 字段。"""
+    text = load_system_prompt("runtime/executor_todo_handoff")
+
+    assert "success_criteria" not in text
+    assert "拦截" not in text
+    assert "无关的新问题" in text
+
+
+def test_executor_extra_block_includes_plan_snapshot(mock_config):
+    """有活动计划时,系统指令末尾直接带上计划进度,不必靠 get_todos 或历史里的工具返回。"""
+    todo_state = TodoState(
+        goal="发布新版本",
+        is_active=True,
+        tasks={
+            1: TodoTask(id=1, description="跑测试", status="done"),
+            2: TodoTask(id=2, description="打 tag", status="in-progress"),
+            3: TodoTask(id=3, description="推送到 PyPI", status="blocked", notes="缺 token"),
+            4: TodoTask(id=4, description="写发布说明", status="pending"),
+        },
+    )
+    deps = _make_executor_deps(mock_config, task_frame=None, todo_state=todo_state)
+
+    block = build_executor_extra_dynamic_block(deps)
+
+    assert "目标：发布新版本" in block
+    assert "[x] 1. 跑测试" in block
+    assert "[-] 2. 打 tag" in block
+    assert "[!] 3. 推送到 PyPI（受阻原因：缺 token）" in block
+    assert "[ ] 4. 写发布说明" in block
+    # 计划快照最易变,排在本段最后
+    assert block.rindex("## 当前计划进度") > block.rindex(_TODO_HANDOFF_HEADING)
+    assert "## " not in block[block.rindex("## 当前计划进度") + 2:]
+
+
+def test_executor_extra_block_no_snapshot_without_active_plan(mock_config):
+    deps = _make_executor_deps(mock_config, task_frame=None)
+
+    assert "当前计划进度" not in build_executor_extra_dynamic_block(deps)

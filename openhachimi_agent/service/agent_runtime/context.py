@@ -13,13 +13,8 @@ from pydantic_ai.messages import ModelMessage
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.deps import AgentDeps
+from openhachimi_agent.tools.planning import has_open_tasks
 from openhachimi_agent.transport.api_models import AttachmentRef
-
-
-@dataclass
-class TurnState:
-    replan_attempts: int = 0
-    final_verification_repair_attempts: int = 0
 
 
 @dataclass
@@ -63,27 +58,23 @@ class AgentRunContext:
     stream: bool
     stream_queue: asyncio.Queue[object] | None = None
     stream_event_handler: Callable[[object, object], Awaitable[None]] | None = None
-    turn_state: TurnState = field(default_factory=TurnState)
     operation_state: OperationState = field(default_factory=OperationState)
     context_compressor: Any = None
 
 
 def has_active_todos(session_state: dict[str, Any]) -> bool:
+    """计划激活且还有 pending / in-progress 项(done / blocked 都算结束)。"""
     todo_state = session_state.get("todo_state")
-    tasks = getattr(todo_state, "tasks", None)
-    if not getattr(todo_state, "is_active", False) or not isinstance(tasks, dict):
+    if not getattr(todo_state, "is_active", False):
         return False
-    return any(getattr(task, "status", None) != "done" for task in tasks.values())
+    return has_open_tasks(getattr(todo_state, "tasks", None))
 
 
 def has_restorable_suspended_plan(session_state: dict[str, Any]) -> bool:
     if not session_state.get("suspended_plan"):
         return False
     todo_state = session_state.get("todo_state")
-    tasks = getattr(todo_state, "tasks", None)
-    if not isinstance(tasks, dict):
-        return False
-    return any(getattr(task, "status", None) != "done" for task in tasks.values())
+    return has_open_tasks(getattr(todo_state, "tasks", None))
 
 
 def _current_todo_state(session_state: dict[str, Any]) -> Any:
@@ -101,14 +92,7 @@ def suspend_current_plan(session_state: dict[str, Any], reason: str, detail: obj
             _save_state(SimpleNamespace(deps=deps), todo_state)
         except Exception:
             pass
-    session_state["plan_status"] = "suspended"
     session_state["suspended_plan"] = {
-        "reason": reason,
-        "detail": detail,
-        "task_frame": session_state.get("task_frame"),
-    }
-    session_state["active_plan_lease"] = {
-        "status": "suspended",
         "reason": reason,
         "detail": detail,
     }
@@ -125,23 +109,4 @@ def restore_suspended_plan(session_state: dict[str, Any], deps: AgentDeps | None
                 _save_state(SimpleNamespace(deps=deps), todo_state)
             except Exception:
                 pass
-    session_state["plan_status"] = "active"
-    session_state["active_plan_lease"] = {"status": "running", "restored": True}
     session_state.pop("suspended_plan", None)
-
-
-def should_route_new_turn(session_state: dict[str, Any]) -> bool:
-    return bool(session_state.get("last_turn_complete", True))
-
-
-def mark_turn_started(session_state: dict[str, Any]) -> None:
-    session_state["last_turn_complete"] = False
-    session_state["active_plan_lease"] = {"status": "running"}
-    # ``_user_clarification`` 不在这里清:它代表 clarify_user 通过 CallDeferred 留
-    # 下的、跨轮的 deferred tool call pending 状态。execute_task_resume 在用户
-    # 回复成功灌回模型后会显式 pop 该字段;``/new`` / ``/stop`` 等命令应由各自
-    # 的处理路径在会话重置时一并清理。
-
-
-def mark_turn_finished(session_state: dict[str, Any]) -> None:
-    session_state["last_turn_complete"] = True

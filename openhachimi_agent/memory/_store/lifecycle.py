@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 
 from openhachimi_agent.memory.models import (
+    CORE_MEMORY_TYPES,
     MemoryJobStatus,
     MemoryScope,
     MemoryStatus,
@@ -35,9 +36,9 @@ class LifecycleStoreMixin:
     def archive_stale_task_references(self, *, now: str | None = None, limit: int = 200) -> int:
         """归档过期的任务引用型记忆。
 
-        任务引用记忆(如"[历史任务] 目标: lxh.io")记录的是一次性任务的摘要,
-        随着时间的推移,这些记忆与当前工作的相关性越来越低。超过 7 天未被访问
-        的任务引用应该被归档,避免长期占用召回预算。
+        任务引用记忆记录的是一次性任务的摘要,随着时间推移与当前工作越来越无关。
+        超过 7 天没被访问的归档。从没被访问过的按创建时间算:task_reference 不进
+        自动召回,last_accessed_at 往往一直为空,旧实现要求它非空,导致永远归档不了。
         """
         current = now or utc_now_iso()
         with self.connect() as conn:
@@ -45,8 +46,7 @@ class LifecycleStoreMixin:
                 """
                 SELECT id FROM memory_atoms
                 WHERE status = ? AND memory_type = 'task_reference'
-                  AND last_accessed_at IS NOT NULL
-                  AND last_accessed_at <= datetime(?, '-7 days')
+                  AND datetime(COALESCE(last_accessed_at, created_at)) <= datetime(?, '-7 days')
                 LIMIT ?
                 """,
                 (MemoryStatus.ACTIVE.value, current, limit),
@@ -73,8 +73,8 @@ class LifecycleStoreMixin:
                 """
                 SELECT id FROM memory_atoms
                 WHERE status = ? AND stability = 'situational'
-                  AND decay_at IS NOT NULL AND decay_at <= ?
-                  AND (last_accessed_at IS NULL OR last_accessed_at <= datetime(?, '-30 days'))
+                  AND decay_at IS NOT NULL AND datetime(decay_at) <= datetime(?)
+                  AND (last_accessed_at IS NULL OR datetime(last_accessed_at) <= datetime(?, '-30 days'))
                 LIMIT ?
                 """,
                 (MemoryStatus.ACTIVE.value, current, current, limit),
@@ -95,18 +95,30 @@ class LifecycleStoreMixin:
         stable 记忆(如用户长期偏好)理论上长期有效,但如果 90 天未被访问,
         可能已不再反映用户当前状态。降权处理(score × 0.5)而非直接归档,
         保留召回可能性但降低优先级。
+
+        降权会刷新 updated_at,而这里要求 updated_at 也早于 90 天前,所以同一条
+        记忆每 90 天最多降权一次。否则每次维护(每 6 小时 + 每次合并)都会
+        再减半一次,几天内置信度就趋近于 0。两侧都用 datetime() 归一,避免
+        ISO 格式("T" 分隔、带时区)和 SQLite 格式(空格分隔)直接按字符串比较。
+
+        常驻类型(偏好 / 约束 / 身份 / 工作方式)不参与:它们每轮都注入、不再按检索命中刷新
+        访问时间,按"多久没访问"降权没有意义;这类记忆只会被新说法替换或被明确删除。
         """
         current = now or utc_now_iso()
+        core_types = sorted(CORE_MEMORY_TYPES)
+        type_placeholders = ",".join("?" for _ in core_types)
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT id FROM memory_atoms
                 WHERE status = ? AND stability = 'stable'
+                  AND memory_type NOT IN ({type_placeholders})
                   AND last_accessed_at IS NOT NULL
-                  AND last_accessed_at <= datetime(?, '-90 days')
+                  AND datetime(last_accessed_at) <= datetime(?, '-90 days')
+                  AND datetime(updated_at) <= datetime(?, '-90 days')
                 LIMIT ?
                 """,
-                (MemoryStatus.ACTIVE.value, current, limit),
+                (MemoryStatus.ACTIVE.value, *core_types, current, current, limit),
             ).fetchall()
             ids = [row["id"] for row in rows]
             if not ids:

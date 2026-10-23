@@ -31,16 +31,16 @@ def test_create_and_get_todos(mock_ctx):
     assert "[ ] 2." in res
 
 
-def test_create_todos_inherits_task_frame_contract(mock_ctx):
-    mock_ctx.deps.session_state["task_frame"] = {
-        "goal": "Visit the requested URL",
-        "invariants": ["Do not replace target URL https://example.com/a"],
-    }
+def test_create_todos_uses_explicit_goal_and_invariants(mock_ctx):
+    """目标和约束只来自调用参数;旧的 task_frame 不再被读取(它早已没有写入方)。"""
+    mock_ctx.deps.session_state["task_frame"] = {"goal": "旧 router 遗留目标", "invariants": ["旧约束"]}
 
-    res = create_todos(mock_ctx, ["Open the page"])
+    res = create_todos(mock_ctx, ["Open the page"], goal="Visit the requested URL", invariants=["Do not replace target URL"])
 
     assert "目标：Visit the requested URL" in res
-    assert "Do not replace target URL https://example.com/a" in res
+    assert "Do not replace target URL" in res
+    assert "旧 router 遗留目标" not in res and "旧约束" not in res
+
 
 def test_update_todo(mock_ctx):
     create_todos(mock_ctx, ["Task 1"])
@@ -85,33 +85,34 @@ def test_update_todo_rejects_unknown_status_softly(mock_ctx):
     assert "未识别" in res
 
 
-def test_create_todos_rejects_missing_dependency(mock_ctx):
-    with pytest.raises(Exception, match="依赖不存在"):
-        create_todos(mock_ctx, [
-            {"id": 1, "description": "Task 1", "depends_on": [99]},
-        ])
-
-
-def test_create_todos_rejects_cycle(mock_ctx):
-    with pytest.raises(Exception, match="循环依赖"):
-        create_todos(mock_ctx, [
-            {"id": 1, "description": "Task 1", "depends_on": [2]},
-            {"id": 2, "description": "Task 2", "depends_on": [1]},
-        ])
-
-
-def test_update_todo_requires_dependencies_done(mock_ctx):
-    create_todos(mock_ctx, [
-        {"id": 1, "description": "Task 1"},
-        {"id": 2, "description": "Task 2", "depends_on": [1]},
+def test_create_todos_ignores_depends_on(mock_ctx):
+    """依赖图已取消:模型即使传了 depends_on 也不再校验,不会因此报错重试。"""
+    res = create_todos(mock_ctx, [
+        {"id": 1, "description": "Task 1", "depends_on": [99]},
+        {"id": 2, "description": "Task 2", "depends_on": [2]},
     ])
 
-    res = update_todo(mock_ctx, 2, "in-progress")
-    assert "依赖尚未完成" in res
+    assert "[ ] 1. Task 1" in res
+    assert "[ ] 2. Task 2" in res
+    assert "依赖" not in res
 
-    update_todo(mock_ctx, 1, "done", "finished")
-    res2 = update_todo(mock_ctx, 2, "in-progress")
-    assert "[-] 2." in res2
+
+def test_create_todos_still_rejects_duplicate_ids(mock_ctx):
+    with pytest.raises(ModelRetry, match="重复的任务 ID"):
+        create_todos(mock_ctx, [
+            {"id": 1, "description": "Task 1"},
+            {"id": 1, "description": "Task 1 again"},
+        ])
+
+
+def test_update_todo_follows_list_order_without_dependency_gate(mock_ctx):
+    """不再有"依赖未完成不能开始"的拦截,任意一项都可以直接开始。"""
+    create_todos(mock_ctx, ["Task 1", "Task 2"])
+
+    res = update_todo(mock_ctx, 2, "in-progress")
+
+    assert "[-] 2." in res
+    assert "错误" not in res
 
 
 def test_all_done_deactivates_plan(mock_ctx):
@@ -134,14 +135,15 @@ def test_execution_guard_removed_allows_mutating_without_in_progress(mock_ctx):
     assert mutating_tool(mock_ctx) == {"ok": True}
 
 
-def test_update_todo_rejects_second_in_progress_task(mock_ctx):
+def test_update_todo_allows_second_in_progress_with_hint(mock_ctx):
+    """同时开始第二项不再报错(以前会逼模型多调一次工具先改别的项),只提示一句。"""
     create_todos(mock_ctx, ["Task 1", "Task 2"])
     update_todo(mock_ctx, 1, "in-progress")
 
     res = update_todo(mock_ctx, 2, "in-progress")
 
-    assert "已有任务正在进行" in res
-    assert _get_state(mock_ctx).tasks[2].status == "pending"
+    assert _get_state(mock_ctx).tasks[2].status == "in-progress"
+    assert "任务 [1] 仍标记为进行中" in res
 
 
 def test_create_todos_cross_turn_blocks_without_merge(mock_ctx):
@@ -200,3 +202,52 @@ def test_create_todos_same_turn_still_requires_merge(mock_ctx):
     assert len(state.tasks) == 2
     assert state.tasks[1].description == "Old A"
 
+
+
+def test_blocked_and_done_close_plan(mock_ctx):
+    """只剩 done / blocked 时计划关闭,不再一直挂着。"""
+    create_todos(mock_ctx, ["Task 1", "Task 2"])
+    update_todo(mock_ctx, 1, "done", "ok")
+    update_todo(mock_ctx, 2, "blocked", notes="缺凭据")
+
+    assert _get_state(mock_ctx).is_active is False
+
+
+def test_create_todos_after_blocking_old_plan(mock_ctx):
+    """旧计划剩下的项标 blocked 后,可以不带 merge 直接新建计划(拒绝提示里的选项 c)。"""
+    create_todos(mock_ctx, ["Old 1", "Old 2"])
+    with pytest.raises(ModelRetry):
+        create_todos(mock_ctx, ["New 1"])
+
+    update_todo(mock_ctx, 1, "blocked", notes="用户改做其他任务")
+    update_todo(mock_ctx, 2, "blocked", notes="用户改做其他任务")
+    res = create_todos(mock_ctx, ["New 1"])
+
+    assert "New 1" in res
+    assert _get_state(mock_ctx).is_active is True
+    assert [task.description for task in _get_state(mock_ctx).tasks.values()] == ["New 1"]
+
+
+def test_reopening_blocked_task_reactivates_plan(mock_ctx):
+    """用户补齐信息后把 blocked 项重新打开,计划要重新激活。"""
+    create_todos(mock_ctx, ["Task 1"])
+    update_todo(mock_ctx, 1, "blocked", notes="缺凭据")
+    assert _get_state(mock_ctx).is_active is False
+
+    update_todo(mock_ctx, 1, "in-progress")
+
+    assert _get_state(mock_ctx).is_active is True
+
+
+def test_todo_reminder_skips_plan_with_only_blocked_left(mock_ctx):
+    """只剩 blocked 项时,工具结果里不再追加"记得更新 TODO"的提醒。"""
+    from openhachimi_agent.tools.planning import _inject_reminder_if_needed
+
+    create_todos(mock_ctx, ["Task 1"])
+    update_todo(mock_ctx, 1, "blocked", notes="缺凭据")
+    state = _get_state(mock_ctx)
+    state.is_active = True  # 即使旧数据里 is_active 仍为 True,也不应提醒
+
+    results = [_inject_reminder_if_needed(mock_ctx, "ok") for _ in range(5)]
+
+    assert all(result == "ok" for result in results)

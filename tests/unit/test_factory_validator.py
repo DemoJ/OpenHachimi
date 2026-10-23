@@ -1,87 +1,86 @@
 # pyrefly: ignore [missing-import]
-"""测试 final-answer validator 的"未完成 TODO 软提醒"逻辑。
+"""测试主 agent 的 final-answer validator(闸门 2)。
 
-直接测 ``_build_unfinished_reminder`` helper 而非完整 closure,这样无需搭建完整
-Agent + RunContext + OpenAI provider。closure 主体仅是:有 reminder 则追加到 result
-末尾后放行(不打回),无 reminder 则继续走 latest_failure 打回路径,无独立可测逻辑。
-
-语义(对齐 Hermes,2026-07 重构):
-- unfinished_todos 不再触发 ModelRetry 打回,改为在最终回复末尾追加软提醒后放行。
-- 仅 pending/in-progress 计入提醒;blocked/done 是合法终止态,不提醒。
-- 若 signal 同时含 latest_execution_not_successful,返回 None(失败优先走打回,
-  软提醒不重复出现)。
-- 无 signal / 无未完成项 → 返回 None。
+语义:
+- 计划还有 pending/in-progress 项时不打回,回复原样放行,不往回复里拼提醒
+  (未完成项由 turn_stream 在回复后统一向用户展示,拼进回复会显示两遍并污染历史)。
+- 本轮最近一次工具调用失败时打回一次,提示里允许模型如实汇报失败;第二次放行。
 """
 
-from openhachimi_agent.agent.factory import _build_unfinished_reminder
+from types import SimpleNamespace
+
+import pytest
+from pydantic_ai.exceptions import ModelRetry
+
+from openhachimi_agent.agent.factory import (
+    _build_latest_failure_retry_message,
+    _latest_failure_issues,
+    build_main_agent,
+)
+from openhachimi_agent.tools.planning import TodoState, TodoTask
 
 
 def _signal(*issues):
     return {"reason": "final verification failed", "issues": list(issues)}
 
 
+def _latest_failure(tool="web_fetch", detail="HTTP 404"):
+    return {"type": "latest_execution_not_successful", "tool_name": tool, "status": "failed", "detail": detail}
+
+
 def _unfinished(*items):
     return {"type": "unfinished_todos", "items": list(items)}
 
 
-def _latest_failure(tool="write_file", detail="disk full"):
-    return {"type": "latest_execution_not_successful", "tool_name": tool,
-            "status": "failed", "detail": detail}
+def test_latest_failure_issues_picks_only_failures():
+    signal = _signal(_unfinished({"id": 1, "status": "pending"}), _latest_failure())
+
+    assert _latest_failure_issues(signal) == [_latest_failure()]
+    assert _latest_failure_issues(None) == []
+    assert _latest_failure_issues(_signal(_unfinished({"id": 1, "status": "pending"}))) == []
 
 
-def test_no_signal_returns_none():
-    assert _build_unfinished_reminder(None) is None
-    assert _build_unfinished_reminder({}) is None
+def test_retry_message_allows_honest_failure_report():
+    message = _build_latest_failure_retry_message([_latest_failure()])
+
+    assert "web_fetch" in message
+    assert "HTTP 404" in message
+    assert "如实说明失败原因" in message
+    assert "不要给用户回复任何文字" not in message
 
 
-def test_pending_items_produce_reminder():
-    signal = _signal(_unfinished(
-        {"id": 1, "description": "a", "status": "pending"},
-        {"id": 2, "description": "b", "status": "in-progress"},
-    ))
-    reminder = _build_unfinished_reminder(signal)
-    assert reminder is not None
-    assert "2 项未完成" in reminder
-    assert "[pending] #1 a" in reminder
-    assert "[in-progress] #2 b" in reminder
+@pytest.fixture
+def validator(mock_config):
+    (mock_config.roles_dir / "default.md").write_text("# default\n\n测试用角色。\n", encoding="utf-8")
+    agent = build_main_agent(mock_config, "default")
+    return agent._output_validators[0].function
 
 
-def test_blocked_only_returns_none():
-    """全 blocked 是合法终止态(模型诚实声明卡点),不需要软提醒。"""
-    signal = _signal(_unfinished(
-        {"id": 1, "description": "a", "status": "blocked"},
-        {"id": 2, "description": "b", "status": "blocked"},
-    ))
-    assert _build_unfinished_reminder(signal) is None
+def _ctx(session_state):
+    return SimpleNamespace(deps=SimpleNamespace(session_state=session_state, session_store=None, session_id="s1"))
 
 
-def test_done_only_returns_none():
-    """全 done 自然无需提醒。"""
-    signal = _signal(_unfinished(
-        {"id": 1, "description": "a", "status": "done"},
-    ))
-    assert _build_unfinished_reminder(signal) is None
+def _state_with_pending_plan():
+    todo = TodoState(goal="g", is_active=True, tasks={1: TodoTask(id=1, description="写报告", status="pending")})
+    return {"todo_state": todo}
 
 
-def test_latest_failure_suppresses_reminder():
-    """工具刚失败时,失败优先走打回路径,软提醒不重复出现。"""
-    signal = _signal(
-        _unfinished({"id": 1, "description": "a", "status": "pending"}),
-        _latest_failure(),
-    )
-    assert _build_unfinished_reminder(signal) is None
+def test_unfinished_todos_pass_through_unchanged(validator):
+    state = _state_with_pending_plan()
+
+    result = validator(_ctx(state), "已完成第一部分,报告还没写。")
+
+    assert result == "已完成第一部分,报告还没写。"
 
 
-def test_mixed_pending_and_blocked_only_reminds_pending():
-    """blocked 项不计入提醒,只提醒 pending/in-progress。"""
-    signal = _signal(_unfinished(
-        {"id": 1, "description": "done-item", "status": "done"},
-        {"id": 2, "description": "blocked-item", "status": "blocked"},
-        {"id": 3, "description": "pending-item", "status": "pending"},
-    ))
-    reminder = _build_unfinished_reminder(signal)
-    assert reminder is not None
-    assert "1 项未完成" in reminder
-    assert "pending-item" in reminder
-    assert "blocked-item" not in reminder
-    assert "done-item" not in reminder
+def test_latest_failure_retries_once_then_passes(validator):
+    state = {
+        "execution_ledger": [{"seq": 1, "tool_name": "web_fetch", "status": "failed", "result_preview": "HTTP 404"}],
+        "current_turn_ledger_start_seq": 0,
+    }
+
+    with pytest.raises(ModelRetry):
+        validator(_ctx(state), "网页打不开。")
+
+    # 第二次:模型如实汇报失败,应放行
+    assert validator(_ctx(state), "这个网址返回 404,无法访问。") == "这个网址返回 404,无法访问。"

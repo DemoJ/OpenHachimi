@@ -233,3 +233,185 @@ def test_find_conflict_candidates_filters_different_predicate(tmp_path):
     candidates = store.find_conflict_candidates(scope, new)
 
     assert old.id not in {row["id"] for row in candidates}
+
+
+def _stable_atom_confidence(store, atom_id):
+    with store.connect() as conn:
+        return conn.execute("SELECT confidence FROM memory_atoms WHERE id = ?", (atom_id,)).fetchone()[0]
+
+
+def test_downgrade_stable_atoms_halves_only_once_per_window(tmp_path):
+    """长期未访问的 stable 记忆每 90 天最多降权一次,不能每次维护都减半。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    old = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+    atom_id = store.add_atom(
+        MemoryAtom(memory_type="project_fact", content="项目使用 PydanticAI", scope=MemoryScope(), confidence=0.8, stability=MemoryStability.STABLE)
+    )
+    with store.connect() as conn:
+        conn.execute("UPDATE memory_atoms SET last_accessed_at = ?, updated_at = ? WHERE id = ?", (old, old, atom_id))
+
+    first = store.downgrade_stable_atoms()
+    second = store.downgrade_stable_atoms()
+    third = store.downgrade_stable_atoms()
+
+    assert (first, second, third) == (1, 0, 0)
+    assert _stable_atom_confidence(store, atom_id) == 0.4
+
+
+def test_downgrade_stable_atoms_runs_again_after_next_window(tmp_path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(days=120)).isoformat()
+    atom_id = store.add_atom(
+        MemoryAtom(memory_type="project_fact", content="项目使用 PydanticAI", scope=MemoryScope(), confidence=0.8, stability=MemoryStability.STABLE)
+    )
+    with store.connect() as conn:
+        conn.execute("UPDATE memory_atoms SET last_accessed_at = ?, updated_at = ? WHERE id = ?", (old, old, atom_id))
+
+    assert store.downgrade_stable_atoms(now=now.isoformat()) == 1
+    # 又过了 100 天仍未访问:允许再降权一次
+    assert store.downgrade_stable_atoms(now=(now + timedelta(days=100)).isoformat()) == 1
+    assert _stable_atom_confidence(store, atom_id) == 0.2
+
+
+def test_downgrade_stable_atoms_skips_recently_accessed(tmp_path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    old = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+    recent = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    atom_id = store.add_atom(
+        MemoryAtom(memory_type="project_fact", content="项目使用 PydanticAI", scope=MemoryScope(), confidence=0.8, stability=MemoryStability.STABLE)
+    )
+    with store.connect() as conn:
+        conn.execute("UPDATE memory_atoms SET last_accessed_at = ?, updated_at = ? WHERE id = ?", (recent, old, atom_id))
+
+    assert store.downgrade_stable_atoms() == 0
+    assert _stable_atom_confidence(store, atom_id) == 0.8
+
+
+def test_downgrade_stable_atoms_skips_core_memory_types(tmp_path):
+    """偏好 / 约束这类常驻记忆不按"多久没访问"降权:它们每轮都注入,不再刷新访问时间。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    old = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+    atom_id = store.add_atom(
+        MemoryAtom(memory_type="user_preference", content="使用中文回答", scope=MemoryScope(), confidence=0.8, stability=MemoryStability.STABLE)
+    )
+    with store.connect() as conn:
+        conn.execute("UPDATE memory_atoms SET last_accessed_at = ?, updated_at = ? WHERE id = ?", (old, old, atom_id))
+
+    assert store.downgrade_stable_atoms() == 0
+    assert _stable_atom_confidence(store, atom_id) == 0.8
+
+
+def test_search_matches_chinese_sentences_and_ranks_better_match_first(tmp_path):
+    """中文整句查询按二元组命中,匹配更多的记忆排在前面。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope()
+    store.add_atom(MemoryAtom(memory_type="user_preference", content="用户讨厌冗长的回答", scope=scope))
+    store.add_atom(MemoryAtom(memory_type="user_preference", content="用户偏好使用中文回答", scope=scope))
+    store.add_atom(MemoryAtom(memory_type="project_fact", content="项目使用 PydanticAI 框架", scope=scope))
+
+    results = store.search(scope, "请用中文回答我", limit=5, touch_results=False)
+
+    assert [item.source for item in results] == ["bm25", "bm25"]
+    assert results[0].content == "用户偏好使用中文回答"
+
+
+def test_search_matches_english_inside_mixed_text(tmp_path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope()
+    store.add_atom(MemoryAtom(memory_type="project_fact", content="项目基于PydanticAI框架", scope=scope))
+
+    results = store.search(scope, "PydanticAI 怎么用", limit=5, touch_results=False)
+
+    assert [item.content for item in results] == ["项目基于PydanticAI框架"]
+
+
+def test_search_treats_fts_operators_as_plain_words(tmp_path):
+    """查询里的 OR / NOT 等词不能被 FTS5 当成运算符而报错。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope()
+    store.add_atom(MemoryAtom(memory_type="user_preference", content="prefer tea OR coffee", scope=scope))
+
+    results = store.search(scope, "OR NOT", limit=5, touch_results=False)
+
+    assert [item.content for item in results] == ["prefer tea OR coffee"]
+
+
+def test_initialize_rebuilds_old_fts_index_for_chinese(tmp_path):
+    """v3 旧库的 FTS 行是按整段汉字建的;升级到 v4 时重建索引,中文检索恢复可用。"""
+    db_path = tmp_path / "memory.sqlite3"
+    store = MemoryStore(db_path)
+    scope = MemoryScope()
+    atom_id = store.add_atom(MemoryAtom(memory_type="user_preference", content="用户偏好使用中文回答", scope=scope))
+    with store.connect() as conn:
+        # 模拟旧库:索引里只有原文(没有二元组),也没有 v4 迁移记录
+        conn.execute("DELETE FROM memory_atoms_fts WHERE id = ?", (atom_id,))
+        conn.execute(
+            "INSERT INTO memory_atoms_fts(id, content, search_text, keywords) VALUES(?,?,?,?)",
+            (atom_id, "用户偏好使用中文回答", "用户偏好使用中文回答", ""),
+        )
+        conn.execute("DELETE FROM memory_schema_migrations WHERE version = 4")
+    # 旧索引下 FTS 命中不了,只能退回 LIKE / 最近记录兜底
+    assert store.search(scope, "请用中文回答我", limit=5, touch_results=False)[0].source != "bm25"
+
+    store.initialize()
+
+    results = store.search(scope, "请用中文回答我", limit=5, touch_results=False)
+    assert [(item.content, item.source) for item in results] == [("用户偏好使用中文回答", "bm25")]
+    with store.connect() as conn:
+        versions = {row[0] for row in conn.execute("SELECT version FROM memory_schema_migrations")}
+    assert {3, 4} <= versions
+
+
+def test_archive_task_reference_never_accessed(tmp_path):
+    """从没被召回过的历史任务记忆按创建时间算,7 天后归档(旧实现要求访问时间非空,永远归档不了)。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+    recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    stale_id = store.add_atom(MemoryAtom(memory_type="task_reference", content="整理过 example.com", scope=MemoryScope(), created_at=old))
+    fresh_id = store.add_atom(MemoryAtom(memory_type="task_reference", content="整理过 example.org", scope=MemoryScope(), created_at=recent))
+
+    assert store.archive_stale_task_references() == 1
+    with store.connect() as conn:
+        statuses = dict(conn.execute("SELECT id, status FROM memory_atoms").fetchall())
+    assert statuses[stale_id] == "archived"
+    assert statuses[fresh_id] == "active"
+
+
+def test_initialize_backfills_expiry_for_legacy_atoms(tmp_path):
+    """v5:旧库里没有过期时间的临时 / 情境性记忆按创建时间补上期限,稳定记忆不动。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    created = "2026-01-01T00:00:00+00:00"
+    ids = {
+        stability: store.add_atom(
+            MemoryAtom(memory_type="user_preference", content=f"{stability} 记忆", scope=MemoryScope(), stability=stability, created_at=created)
+        )
+        for stability in (MemoryStability.EPHEMERAL, MemoryStability.SITUATIONAL, MemoryStability.STABLE)
+    }
+    with store.connect() as conn:
+        conn.execute("DELETE FROM memory_schema_migrations WHERE version = 5")
+
+    store.initialize()
+
+    with store.connect() as conn:
+        rows = {row["id"]: row for row in conn.execute("SELECT id, valid_until, decay_at FROM memory_atoms")}
+    assert rows[ids[MemoryStability.EPHEMERAL]]["valid_until"].startswith("2026-01-08")
+    assert rows[ids[MemoryStability.SITUATIONAL]]["decay_at"].startswith("2026-01-31")
+    stable = rows[ids[MemoryStability.STABLE]]
+    assert stable["valid_until"] is None and stable["decay_at"] is None
+
+
+def test_scopes_with_stale_blocks_reports_scope_after_atom_archived(tmp_path):
+    from openhachimi_agent.memory.consolidation import consolidate_due_memories
+
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope(role_name="default", session_id="s1")
+    atom_id = store.add_atom(
+        MemoryAtom(memory_type="user_preference", content="用户偏好中文回答", scope=scope, keywords=["中文"], tags=["回答"], stability=MemoryStability.STABLE)
+    )
+    consolidate_due_memories(store, scope=scope)
+    assert store.scopes_with_stale_blocks() == []
+
+    store.forget(scope, atom_id)
+
+    assert [item.role_name for item in store.scopes_with_stale_blocks()] == ["default"]

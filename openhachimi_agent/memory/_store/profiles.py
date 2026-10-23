@@ -6,6 +6,7 @@ from openhachimi_agent.memory.models import (
     MemoryScope,
     MemoryStatus,
 )
+from openhachimi_agent.memory._store.fts import index_text
 from openhachimi_agent.memory._store.utils import (
     _json,
     _profile_from_row,
@@ -51,7 +52,7 @@ class ProfileStoreMixin:
             if str(profile.status) == MemoryStatus.ACTIVE.value:
                 conn.execute(
                     "INSERT INTO memory_profiles_fts(id, title, summary) VALUES(?,?,?)",
-                    (profile.id, profile.title, profile.summary),
+                    (profile.id, index_text(profile.title), index_text(profile.summary)),
                 )
         return profile.id
 

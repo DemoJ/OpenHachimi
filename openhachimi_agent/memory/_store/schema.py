@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from openhachimi_agent.memory.models import utc_now_iso
+from datetime import datetime
 
-SCHEMA_VERSION = 3
+from openhachimi_agent.memory._store.fts import rebuild_fts_indexes
+from openhachimi_agent.memory.models import default_expiry, utc_now_iso
+
+SCHEMA_VERSION = 5
 
 
 def _column_exists(conn, table: str, column: str) -> bool:
@@ -223,9 +226,54 @@ class SchemaStoreMixin:
             # v3 migration:移除 supersede 机制遗留的列与表,把历史 superseded
             # atom 降级为 archived。幂等:已应用过 v3 的库不再执行。
             self._migrate_to_v3(conn)
+            # v4 migration:按中文二元分词重建 FTS 索引。
+            self._migrate_to_v4(conn)
+            # v5 migration:给旧库里没有过期时间的临时 / 情境性记忆补上过期时间。
+            self._migrate_to_v5(conn)
+            for version in (3, 4, SCHEMA_VERSION):
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_schema_migrations(version, applied_at) VALUES(?, ?)",
+                    (version, utc_now_iso()),
+                )
+
+    def _migrate_to_v4(self, conn) -> None:
+        """v4:旧库的 FTS 索引是按 unicode61 整段汉字建的,中文检索基本命中不了。
+        按 ``_store/fts.py`` 的二元分词重建三张 FTS 表。幂等:已记 version=4 则跳过;
+        新建库表是空的,重建是空操作。
+        """
+        already = conn.execute(
+            "SELECT 1 FROM memory_schema_migrations WHERE version = ?", (4,)
+        ).fetchone()
+        if already:
+            return
+        rebuild_fts_indexes(conn)
+
+    def _migrate_to_v5(self, conn) -> None:
+        """v5:旧版 LLM 抽取不设过期时间,stability 标成 ephemeral / situational 的记忆永远
+        不会过期或衰减。按创建时间补上 ``default_expiry`` 的期限(已过期的会在下次维护时
+        归档)。只补两个字段都为空的行,幂等:已记 version=5 则跳过。
+        """
+        already = conn.execute(
+            "SELECT 1 FROM memory_schema_migrations WHERE version = ?", (5,)
+        ).fetchone()
+        if already:
+            return
+        rows = conn.execute(
+            """
+            SELECT id, stability, created_at FROM memory_atoms
+            WHERE status = 'active' AND stability IN ('ephemeral', 'situational')
+              AND valid_until IS NULL AND decay_at IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(row["created_at"])
+            except (TypeError, ValueError):
+                created = None
+            valid_until, decay_at = default_expiry(row["stability"], now=created)
             conn.execute(
-                "INSERT OR IGNORE INTO memory_schema_migrations(version, applied_at) VALUES(?, ?)",
-                (SCHEMA_VERSION, utc_now_iso()),
+                "UPDATE memory_atoms SET valid_until = ?, decay_at = ? WHERE id = ?",
+                (valid_until, decay_at, row["id"]),
             )
 
     def _migrate_to_v3(self, conn) -> None:

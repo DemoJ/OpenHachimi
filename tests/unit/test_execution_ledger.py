@@ -7,7 +7,6 @@ from openhachimi_agent.agent.execution import (
     get_execution_ledger,
     get_final_verification_signal,
     get_ledger_length,
-    get_replan_signal,
     with_execution_ledger,
 )
 from openhachimi_agent.tools.planning import create_todos, update_todo
@@ -116,35 +115,6 @@ def test_async_tool_failure_returned_as_string(mock_agent_deps):
 
 
 
-
-
-def test_replan_signal_requires_consecutive_failures(mock_agent_deps):
-    """单次 blocked/failed 不触发 replan，连续 >=2 次才触发。"""
-    # 单次 failed 后不触发 replan
-    mock_agent_deps.session_state["execution_ledger"] = [
-        {"seq": 1, "tool_name": "browser_navigate", "status": "started"},
-        {"seq": 2, "tool_name": "browser_navigate", "status": "failed", "result_preview": "timeout"},
-    ]
-    assert get_replan_signal(mock_agent_deps.session_state, since_seq=0) is None
-
-    # 单次 failed 后跟 succeeded，不触发 replan
-    mock_agent_deps.session_state["execution_ledger"] = [
-        {"seq": 1, "tool_name": "browser_navigate", "status": "blocked", "violation": "old"},
-        {"seq": 2, "tool_name": "browser_navigate", "status": "started"},
-        {"seq": 3, "tool_name": "browser_navigate", "status": "succeeded"},
-    ]
-    assert get_replan_signal(mock_agent_deps.session_state, since_seq=0) is None
-
-    # 连续 2 次 failed，触发 replan
-    mock_agent_deps.session_state["execution_ledger"] = [
-        {"seq": 1, "tool_name": "browser_navigate", "status": "started"},
-        {"seq": 2, "tool_name": "browser_navigate", "status": "failed", "result_preview": "timeout"},
-        {"seq": 3, "tool_name": "run_command", "status": "failed", "result_preview": "boom"},
-    ]
-    signal = get_replan_signal(mock_agent_deps.session_state, since_seq=0)
-    assert signal is not None
-    assert signal["consecutive_failures"] == 2
-    assert signal["latest_status"] == "failed"
 
 
 def test_final_verifier_detects_unfinished_todos(mock_agent_deps):

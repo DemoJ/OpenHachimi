@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -15,6 +15,9 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from openhachimi_agent.core.config import AppConfig
 
 logger = logging.getLogger(__name__)
+OutputT = TypeVar("OutputT", bound=BaseModel)
+# 单次后台记忆 LLM 调用的上限(秒)。超时按失败处理,由调用方降级(规则抽取 / 向量规则)。
+_MEMORY_LLM_TIMEOUT_SECONDS = 120
 
 
 class MemoryLLMItem(BaseModel):
@@ -43,6 +46,21 @@ class MemorySummaryOutput(BaseModel):
     """Structured output for long-term memory summarization."""
 
     summary: str = ""
+
+
+class MemoryUpdateDecision(BaseModel):
+    """新记忆对旧记忆的处理决定(ADD / UPDATE / DELETE / NONE)。"""
+
+    index: int
+    event: str = "ADD"
+    target_id: str = ""
+    content: str = ""
+
+
+class MemoryUpdateOutput(BaseModel):
+    """Structured output for deciding how new memories update existing ones."""
+
+    decisions: list[MemoryUpdateDecision] = Field(default_factory=list)
 
 
 def _memory_llm_available(config: AppConfig | None) -> bool:
@@ -83,22 +101,7 @@ def run_memory_extraction(
     Windows Proactor pipe transport 未清理(``OverlappedFuture 句柄无效``)。
     ``asyncio.run`` 每次创建并**关闭**临时循环,彻底清理 transport,杜绝泄漏。
     """
-    if not _memory_llm_available(config):
-        return None
-    assert config is not None
-    agent = Agent(
-        _build_memory_model(config),
-        system_prompt=system_prompt,
-        output_type=MemoryExtractionOutput,
-        defer_model_check=True,
-        retries=3,
-    )
-    try:
-        result = asyncio.run(agent.run(json.dumps(payload, ensure_ascii=False)))
-        return result.output
-    except Exception as exc:
-        logger.debug("memory llm extraction agent degraded: %s", exc)
-        return None
+    return _run_structured(config, system_prompt=system_prompt, payload=payload, output_type=MemoryExtractionOutput, kind="extraction")
 
 
 def run_memory_summary(
@@ -108,19 +111,45 @@ def run_memory_summary(
     payload: dict[str, Any],
 ) -> MemorySummaryOutput | None:
     """Run structured long-term memory summarization through pydantic_ai."""
+    return _run_structured(config, system_prompt=system_prompt, payload=payload, output_type=MemorySummaryOutput, kind="summary")
+
+
+def run_memory_update(
+    config: AppConfig | None,
+    *,
+    system_prompt: str,
+    payload: dict[str, Any],
+) -> MemoryUpdateOutput | None:
+    """让 LLM 决定新记忆对旧记忆做 ADD / UPDATE / DELETE / NONE。同步接口,调用约束同 run_memory_extraction。"""
+    return _run_structured(config, system_prompt=system_prompt, payload=payload, output_type=MemoryUpdateOutput, kind="update")
+
+
+def _run_structured(
+    config: AppConfig | None,
+    *,
+    system_prompt: str,
+    payload: dict[str, Any],
+    output_type: type[OutputT],
+    kind: str,
+) -> OutputT | None:
+    """三个记忆 LLM 调用的公共实现。LLM 未配置或调用失败时返回 None,由调用方降级。"""
     if not _memory_llm_available(config):
         return None
     assert config is not None
     agent = Agent(
         _build_memory_model(config),
         system_prompt=system_prompt,
-        output_type=MemorySummaryOutput,
+        output_type=output_type,
         defer_model_check=True,
         retries=3,
     )
     try:
-        result = asyncio.run(agent.run(json.dumps(payload, ensure_ascii=False)))
+        # 后台记忆任务是串行的:一次卡住的调用会让后面所有抽取排队等待,所以给个上限
+        result = asyncio.run(asyncio.wait_for(agent.run(json.dumps(payload, ensure_ascii=False)), timeout=_MEMORY_LLM_TIMEOUT_SECONDS))
         return result.output
+    except asyncio.TimeoutError:
+        logger.warning("memory llm %s timed out after %ss", kind, _MEMORY_LLM_TIMEOUT_SECONDS)
+        return None
     except Exception as exc:
-        logger.debug("memory llm summary agent degraded: %s", exc)
+        logger.warning("memory llm %s agent degraded: %s", kind, exc)
         return None

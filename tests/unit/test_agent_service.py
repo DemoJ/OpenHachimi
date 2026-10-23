@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 from openhachimi_agent.service.agent_service import AgentService
 from openhachimi_agent.service.agent_runtime.agent_cache import AGENT_DEPENDENCY_MTIME_TTL_SECONDS
-from openhachimi_agent.agent.intent import extract_urls
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.tools import mcp as mcp_module
 import openhachimi_agent.service.browser  # Ensure module is loaded for mock.patch
@@ -153,11 +152,6 @@ async def test_stream_events_stop_yields_control_event_without_lock(agent_servic
     assert not task.done() or task.cancelled()
     with pytest.raises(asyncio.CancelledError):
         await task
-
-
-def test_extract_requested_urls():
-    assert extract_urls("请访问 https://example.com/a，然后总结") == ["https://example.com/a"]
-    assert extract_urls("没有链接") == []
 
 
 def test_agent_dependency_mtime_scans_role_and_skill_files_only(agent_service, mock_config, tmp_path):

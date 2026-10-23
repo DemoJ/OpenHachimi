@@ -3,7 +3,13 @@
 - 用户陈述的稳定项目事实（技术栈选型、架构决定、长期背景）
 - 用户自身属性（职业、技能、角色、身份）
 
-一次性任务请求、提问、命令执行、过程描述、寒暄、临时 TODO 一律不抽取。
+一次性任务请求、提问、命令执行、过程描述、寒暄、临时 TODO 一律不抽取。只针对本次任务的执行要求（如"这次先别改代码""跑完测试再提交"）也不抽取。
+
+## 输入说明
+
+- `user_message`：本轮用户消息，**只从这里抽取**。
+- `assistant_output`：本轮助手回复，只用来理解用户在回应什么；助手自己说的话不是用户事实，不要抽取。
+- `recent_turns`（可能没有）：同一会话前几轮，只用来理解"好的，就按这个来"这类简短回复指的是什么；不要从中重复抽取已经说过的内容。
 
 ## 核心原则：原子化拆分
 
@@ -23,13 +29,13 @@
   {"memory_type":"user_constraint","content":"不要废话","subject":"user","predicate":"dislikes","object":"verbose answers","keywords":["废话"],"confidence":0.9,"stability":"stable","source_quote":"不要废话"}
 ]}
 
-输入："深挖关于lxh.io这个网站的任何事情，以及深挖这个网站背后的博主。记住不要还剩余信息没挖干净前主动停止"
-错误（保存整段任务指令）：
-{"memories":[{"memory_type":"task_reference","content":"深挖关于lxh.io这个网站的任何事情，以及深挖这个网站背后的博主。记住不要还剩余信息没挖干净前主动停止"}]}
+输入："帮我把 example.com 这个网站的所有文章都整理一遍，记住不要漏掉任何一篇再停下"
+错误（保存整段任务指令，或把"不要漏掉"当成长期约束）：
+{"memories":[{"memory_type":"user_constraint","content":"不要漏掉任何一篇再停下"}]}
 
-正确（原子化提取目标+动作，不保存执行约束）：
+正确（只保留目标 + 动作作为历史任务引用，不保存本次的执行要求）：
 {"memories":[
-  {"memory_type":"task_reference","content":"调研 lxh.io 网站及其博主相关信息","subject":"user","predicate":"researched","object":"lxh.io website and blogger","keywords":["lxh.io","调研","博主"],"entities":["lxh.io"],"confidence":0.65,"stability":"ephemeral","source_quote":"深挖关于lxh.io这个网站的任何事情，以及深挖这个网站背后的博主"}
+  {"memory_type":"task_reference","content":"整理 example.com 网站的文章","subject":"user","predicate":"requested","object":"example.com articles","keywords":["example.com","整理","文章"],"entities":["example.com"],"confidence":0.65,"stability":"ephemeral","source_quote":"帮我把 example.com 这个网站的所有文章都整理一遍"}
 ]}
 
 ## 记忆类型定义

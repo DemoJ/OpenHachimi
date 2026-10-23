@@ -103,3 +103,66 @@ def test_llm_summary_degrades_to_empty_string(mock_config, monkeypatch):
     monkeypatch.setattr("openhachimi_agent.memory.consolidation.run_memory_summary", fake_run_memory_summary)
 
     assert _llm_summarize("block", {"atoms": ["用户偏好中文回答"]}, config) == ""
+
+
+def _block_rows(store):
+    with store.connect() as conn:
+        return conn.execute("SELECT id, status, summary, details, atom_ids_json FROM memory_blocks").fetchall()
+
+
+def _two_atom_block(store, scope):
+    first = MemoryAtom(memory_type="user_preference", content="用户偏好中文回答", scope=scope, keywords=["中文"], tags=["回答"], stability=MemoryStability.STABLE)
+    second = MemoryAtom(memory_type="user_preference", content="用户要求中文解释代码", scope=scope, keywords=["中文"], tags=["回答"], stability=MemoryStability.STABLE)
+    store.add_atom(first)
+    store.add_atom(second)
+    consolidate_due_memories(store, scope=scope)
+    return first, second
+
+
+def test_block_rebuilt_without_forgotten_atom(tmp_path):
+    """主题块里的某条记忆被删掉后,块的摘要和关联只保留剩下的记忆。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope(role_name="default", session_id="s1")
+    first, second = _two_atom_block(store, scope)
+
+    store.forget(scope, first.id)
+    result = consolidate_due_memories(store, scope=scope)
+
+    assert result["blocks_rebuilt"] == 1
+    (block,) = [row for row in _block_rows(store) if row["status"] == "active"]
+    assert "用户偏好中文回答" not in block["summary"] + block["details"]
+    assert "用户要求中文解释代码" in block["summary"]
+    assert first.id not in block["atom_ids_json"]
+
+
+def test_block_and_profile_archived_when_all_atoms_gone(tmp_path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope(role_name="default", session_id="s1")
+    first, second = _two_atom_block(store, scope)
+    assert store.get_active_profile("local", "local", "default", "user_profile") is not None
+
+    store.forget(scope, f"{first.id},{second.id}", hard_delete=True)
+    result = consolidate_due_memories(store, scope=scope)
+
+    assert result["blocks_archived"] == 1
+    assert result["profiles_archived"] == 1
+    assert all(row["status"] == "archived" for row in _block_rows(store))
+    assert store.get_active_profile("local", "local", "default", "user_profile") is None
+
+
+def test_profile_rebuilt_from_current_blocks_only(tmp_path):
+    """画像每次按当前 block 重建,已经失效的旧条目不会残留。"""
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope(role_name="default", session_id="s1")
+    store.add_atom(MemoryAtom(memory_type="user_preference", content="用户偏好深色主题", scope=scope, keywords=["主题"], tags=["主题"], stability=MemoryStability.STABLE))
+    old_constraint = MemoryAtom(memory_type="user_constraint", content="用户要求使用 Python2", scope=scope, keywords=["Python"], tags=["语言"], stability=MemoryStability.STABLE)
+    store.add_atom(old_constraint)
+    consolidate_due_memories(store, scope=scope)
+    assert "Python2" in store.get_active_profile("local", "local", "default", "user_profile").summary
+
+    store.forget(scope, old_constraint.id)
+    consolidate_due_memories(store, scope=scope)
+
+    profile = store.get_active_profile("local", "local", "default", "user_profile")
+    assert "Python2" not in profile.summary
+    assert profile.constraints == {}

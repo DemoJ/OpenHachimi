@@ -103,3 +103,68 @@ def test_capture_enqueues_llm_extraction_for_explicit_preference(mock_config):
     assert store.stats()["turns"] == 1
     assert _count_extract_jobs(mock_config) == 1  # 过闸,入队 LLM 抽取
 
+
+
+def _atom_contents(mock_config) -> list[str]:
+    store = get_memory_store(mock_config)
+    with store.connect() as conn:
+        return [row[0] for row in conn.execute("SELECT content FROM memory_atoms ORDER BY created_at")]
+
+
+def test_capture_does_not_store_plain_task_request_as_atom(mock_config):
+    """普通任务指令(含"项目 / 不要"等词)不在同步路径写 atom,只交给后台 LLM 抽取。"""
+    scope = MemoryScope(role_name="default", session_id="s1")
+
+    capture_turn_memories(mock_config, scope, "帮我看下这个项目的代码，先不要改动任何文件", "ok")
+
+    assert _atom_contents(mock_config) == []
+    assert _count_extract_jobs(mock_config) == 1
+
+
+def test_capture_stores_explicit_request_as_clauses(mock_config):
+    """明确要求记住时,按子句存,不存整句原话,也不存单独的"请你记住"。"""
+    scope = MemoryScope(role_name="default", session_id="s1")
+
+    capture_turn_memories(mock_config, scope, "好的，请你记住，以后回答一律使用中文，不要用表情符号", "ok")
+
+    contents = _atom_contents(mock_config)
+    assert "以后回答一律使用中文" in contents
+    assert "不要用表情符号" in contents
+    assert not any("记住" in content for content in contents)
+
+
+def test_capture_skips_task_constraint_with_remember(mock_config):
+    """"记住不要……"是本次任务的执行约束,不当作长期记忆同步写入。"""
+    scope = MemoryScope(role_name="default", session_id="s1")
+
+    capture_turn_memories(mock_config, scope, "深挖 lxh.io 这个网站，记住不要在信息没挖干净前主动停止", "ok")
+
+    assert _atom_contents(mock_config) == []
+
+
+def test_capture_passes_recent_turns_to_extraction_job(mock_config):
+    """后台抽取任务带上同会话前几轮,让 LLM 能理解"就按这个来"这类回复。"""
+    import json
+
+    scope = MemoryScope(role_name="default", session_id="s1")
+    capture_turn_memories(mock_config, scope, "我们的项目要不要换成 PostgreSQL 数据库呢", "建议换")
+    capture_turn_memories(mock_config, scope, "好的，那就按你说的换成 PostgreSQL 吧", "好的")
+
+    store = get_memory_store(mock_config)
+    with store.connect() as conn:
+        payloads = [json.loads(row[0]) for row in conn.execute(
+            "SELECT payload_json FROM memory_jobs WHERE job_type = 'extract_atoms_from_turn' ORDER BY created_at"
+        )]
+    assert payloads[0]["recent_turns"] == []
+    assert payloads[1]["recent_turns"][0]["user_message"].startswith("我们的项目要不要换成")
+
+
+def test_capture_skips_explicit_write_when_model_already_remembered(mock_config):
+    """模型本轮已调 remember 时,不再对同一句"记住……"同步写一条(真实对话里出现过两条近似重复)。"""
+    scope = MemoryScope(role_name="default", session_id="s1")
+
+    capture_turn_memories(mock_config, scope, "请记住：以后回答我都用中文，并且尽量简洁。", "好的", skip_explicit=True)
+
+    assert _atom_contents(mock_config) == []
+    # 后台 LLM 抽取照常排队,重复由写入时的 LLM 决策处理
+    assert _count_extract_jobs(mock_config) == 1

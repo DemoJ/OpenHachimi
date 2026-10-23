@@ -19,45 +19,54 @@ from openhachimi_agent.tools import MAIN_TOOLSET
 logger = logging.getLogger(__name__)
 
 
-def _build_unfinished_reminder(signal: dict | None) -> str | None:
-    """根据 final verification signal 里的 unfinished_todos 生成软提醒文案。
+def _latest_failure_issues(signal: dict | None) -> list[dict]:
+    """取出 final verification signal 里"本轮最近一次工具调用失败"的 issue。"""
+    if not isinstance(signal, dict):
+        return []
+    return [
+        issue for issue in signal.get("issues", [])
+        if isinstance(issue, dict) and issue.get("type") == "latest_execution_not_successful"
+    ]
 
-    闸门2 对 unfinished_todos 不再打回(对齐 Hermes:停止闸门不卡 TODO 是否全完成),
-    而是在模型最终回复末尾追加这段提醒后放行。返回 None 表示无未完成项,无需追加。
 
-    仅统计 pending/in-progress(blocked/done 视为合法终止态,不提醒)。
-    若 signal 同时含 latest_execution_not_successful,返回 None——失败优先走打回
-    路径,软提醒不重复出现。
-    """
-    if not signal:
-        return None
-    issues = signal.get("issues", []) if isinstance(signal, dict) else []
-    has_latest_failure = any(
-        isinstance(issue, dict) and issue.get("type") == "latest_execution_not_successful"
+def _build_latest_failure_retry_message(issues: list[dict]) -> str:
+    """最近一次工具调用失败时打回给模型的提示。只打回一次,允许模型如实汇报失败。"""
+    detail_lines = [
+        f"  - `{issue.get('tool_name', '?')}` 以 `{issue.get('status', '?')}` 结束："
+        f"{(issue.get('detail') or '')[:300]}"
         for issue in issues
-    )
-    if has_latest_failure:
-        return None
-    unfinished_items = [
-        item for issue in issues
-        if isinstance(issue, dict) and issue.get("type") == "unfinished_todos"
-        for item in issue.get("items", [])
-        if isinstance(item, dict)
     ]
-    pending = [it for it in unfinished_items if it.get("status") in {"pending", "in-progress"}]
-    if not pending:
-        return None
-    lines = [
-        f"  - [{it.get('status', '?')}] #{it.get('id', '?')} {it.get('description', '')}"
-        for it in pending[:10]
-    ]
-    return (
-        "\n\n---\n[System 提醒] 当前计划仍有 "
-        f"{len(pending)} 项未完成（pending/in-progress）：\n"
-        + "\n".join(lines)
-        + "\n若这些项确实无法继续，请在回复里如实告知用户：已完成什么、卡在哪、需要什么；"
-          "不要装作全部完成。"
+    parts = ["[系统提醒] 本轮最近一次工具调用没有成功。"]
+    if detail_lines:
+        parts.append("失败详情：\n" + "\n".join(detail_lines))
+    parts.append(
+        "请先判断原因：\n"
+        "- 能修正（参数错、路径不对、可以换工具或换数据源）就修正后重试；\n"
+        "- 确实无法恢复（外部条件缺失、需要用户决策）就直接回复用户，如实说明失败原因、"
+        "已完成什么、还需要什么。有对应的 TODO 项时，先用 "
+        "`update_todo(id, \"blocked\", notes=\"原因\")` 标记。\n"
+        "不要在文字里模仿工具返回格式（如 \"✅ 任务 X → done\"）。"
     )
+    return "\n\n".join(parts)
+
+
+def _record_validator_retry(session_state: dict, signal: dict, attempt: int) -> None:
+    """把一次 validator 打回记进 execution ledger,便于事后排查。失败不影响主流程。"""
+    import json
+
+    from openhachimi_agent.agent.execution import _append_ledger_event
+
+    try:
+        _append_ledger_event(
+            session_state,
+            tool_name="<final_answer_validator>",
+            status="blocked",
+            args={"attempt": attempt},
+            result=signal,
+            violation=json.dumps(signal, ensure_ascii=False)[:500],
+        )
+    except Exception:
+        logger.debug("failed to append validator event to ledger", exc_info=True)
 
 
 def _build_reasoning_model_settings(config: AppConfig) -> dict:
@@ -189,22 +198,28 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         else:
             extra_prompt = load_system_prompt("agents/main_agent")
 
-    # 最终 system prompt 顺序（从上到下,按 KV cache 前缀命中率优化）:
-    #   1. base.md              — 系统人格、核心原则、安全边界
-    #   2. role_content         — 角色设定（用户级 user/roles/<name>.md）
-    #   3. extra_prompt         — main_agent.md / subagent.md 操作规范
-    #   4. @agent.system_prompt — config 块 + executor 专用按需块(半稳定)
-    #   5. @agent.system_prompt — 记忆召回(随记忆写入变化)
-    #   6. @agent.system_prompt — 当前时间(每轮必变)
+    # 最终系统指令顺序（从上到下,按 KV cache 前缀命中率优化）:
+    #   1. base.md               — 系统人格、核心原则、安全边界
+    #   2. role_content          — 角色设定（用户级 user/roles/<name>.md）
+    #   3. extra_prompt          — main_agent.md / subagent.md 操作规范
+    #   4. @agent.instructions   — config 块 + executor 专用按需块(半稳定)
+    #   5. @agent.instructions   — 记忆召回(随记忆写入变化)
+    #   6. @agent.instructions   — 当前时间(每轮必变)
     # 越靠前越稳定、越靠后越易变:前面几乎不变的主体可完整命中前缀缓存,
     # 每轮失效的只有末尾几十~几百 token。
+    #
+    # 用 instructions 而不是 system_prompt:pydantic-ai 只在 message_history 为空时生成
+    # system_prompt,之后它作为第一条消息留在历史里原样复用——记忆召回、当前时间、
+    # TODO 接力这些"每轮动态"块实际上从第二轮起就冻结在第一轮的内容。instructions
+    # 每次请求都按当前状态重新计算,也不会从历史里读回旧内容。旧会话历史里残留的
+    # system prompt 由 main_agent.strip_frozen_system_prompt 在运行前清掉。
     agent = Agent(
         OpenAIChatModel(
             config.model_name,
             provider=provider,
             profile=_build_model_profile(config),
         ),
-        system_prompt=system_prompt + "\n\n" + role_content + "\n\n" + extra_prompt,
+        instructions=system_prompt + "\n\n" + role_content + "\n\n" + extra_prompt,
         deps_type=AgentDeps,
         toolsets=toolsets,
         output_type=output_type,
@@ -212,205 +227,130 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
         # retries 既覆盖工具调用错误,也覆盖 output_validator 抛出的 ModelRetry。
         # 一次工具偶发失败(1) + 一次 final-answer validator 打回(1) + 一次 schema
         # 修正(1) 已耗光 retries=3 → UnexpectedModelBehavior。这里给到 5 是为
-        # validator 重试链留出预算,真正的死循环熔断由 validator 内部计数器和
-        # executor.py 的 replan 兜底负责,不能只靠抬上限。
+        # validator 重试链留出预算,真正的死循环熔断由 validator 内部计数器负责,
+        # 不能只靠抬上限。
         retries=5,
         model_settings=_build_reasoning_model_settings(config),
     )
 
     if agent_type == "main":
-        # 同一轮内 validator 连续打回的次数,用于硬熔断。在 run_main_agent 入口处
-        # 会清零(见 service.agent_runtime.main_agent.run_main_agent)。
-        VALIDATOR_RETRY_KEY = "_final_validator_retries"
-        VALIDATOR_HARD_LIMIT = 2  # 第 0、1 次打回,第 2 次强制放行避免 UnexpectedModelBehavior
+        agent.output_validator(_validate_execution_result)
 
-        @agent.output_validator
-        def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
-            from openhachimi_agent.agent.execution import (
-                _append_ledger_event,
-                get_final_verification_signal,
-            )
-            from openhachimi_agent.agent.verification_stop import build_verify_on_stop_nudge
-            import json
-            from pydantic_ai.exceptions import ModelRetry
-
-            session_state = ctx.deps.session_state
-
-            # ── 闸门 1:验证缺口(workspace_edited 后无 fresh evidence) ──
-            # 照搬 Hermes verification_stop:模型编辑了代码却想直接结束,先 nudge 它验证。
-            # nudge 内部自带 max_attempts 上限,超限即返回 None 放行,不会死循环。
-            # 透传 session_store/session_id 让 nudge 能引用"上次验证"证据(若已持久化)。
-            verify_nudge = build_verify_on_stop_nudge(
-                session_state,
-                session_store=getattr(ctx.deps, "session_store", None),
-                session_id=ctx.deps.session_id,
-            )
-            if verify_nudge:
-                try:
-                    _append_ledger_event(
-                        session_state,
-                        tool_name="<verification_stop>",
-                        status="blocked",
-                        args={"reason": "edited_without_fresh_evidence"},
-                        result=verify_nudge,
-                        violation=verify_nudge[:500],
-                    )
-                except Exception:
-                    logger.debug("failed to append verification_stop event to ledger", exc_info=True)
-                raise ModelRetry(verify_nudge)
-
-            # ── 闸门 2:final verification signal ──
-            # signal 含两类 issue:
-            #   - unfinished_todos:计划仍有 pending/in-progress 项。
-            #   - latest_execution_not_successful:本轮最近一次工具调用 failed。
-            #
-            # 语义(对齐 Hermes:停止闸门只校验"别带着失败装完成",不卡 TODO 是否全完成):
-            #   - unfinished_todos → 降级为软提醒:在 result 末尾追加提示后放行,不打回。
-            #     旧实现强制 TODO 全 done/blocked 才能结束,逼模型撒谎标 done 或标 blocked
-            #     逃避交互;现在模型说停就停,用户仍能看到"还有没做完的"提醒。
-            #   - latest_execution_not_successful → 仍打回(别带着失败装完成),带硬熔断。
-            signal = get_final_verification_signal(session_state)
-            if not signal:
-                return result
-
-            issues = signal.get("issues", []) if isinstance(signal, dict) else []
-            latest_failure_issues = [
-                issue for issue in issues
-                if isinstance(issue, dict) and issue.get("type") == "latest_execution_not_successful"
-            ]
-
-            # ── unfinished_todos 软提醒:追加后放行,不打回 ──
-            reminder = _build_unfinished_reminder(signal)
-            if reminder:
-                pending_count = reminder.count("\n  - [")
-                logger.info(
-                    "validator soft-remind unfinished todos (session=%s, pending=%d)",
-                    ctx.deps.session_id,
-                    pending_count,
-                )
-                session_state["_final_validator_yielded"] = True
-                session_state["_final_validator_last_signal"] = signal
-                return result + reminder
-
-            # ── latest_execution_not_successful 打回(带硬熔断) ──
-            # 到这里要么只有 latest_failure,要么 latest_failure + unfinished 同时存在
-            # (工具刚失败 + 还有未完成项)——失败优先打回,让模型先处理失败。
-            counter = int(session_state.get(VALIDATOR_RETRY_KEY, 0) or 0)
-
-            try:
-                _append_ledger_event(
-                    session_state,
-                    tool_name="<final_answer_validator>",
-                    status="blocked",
-                    args={"attempt": counter + 1},
-                    result=signal,
-                    violation=(
-                        json.dumps(signal, ensure_ascii=False)[:500]
-                        if signal
-                        else ""
-                    ),
-                )
-            except Exception:
-                logger.debug("failed to append validator event to ledger", exc_info=True)
-
-            # 硬熔断:已经被打回 >=VALIDATOR_HARD_LIMIT 次,放行,把模型的话给用户。
-            if counter >= VALIDATOR_HARD_LIMIT:
-                logger.warning(
-                    "final answer validator yielding after %d retries to avoid loop "
-                    "(session=%s); raw signal=%s",
-                    counter,
-                    ctx.deps.session_id,
-                    json.dumps(signal, ensure_ascii=False)[:200],
-                )
-                session_state["_final_validator_yielded"] = True
-                session_state["_final_validator_last_signal"] = signal
-                return result
-
-            session_state[VALIDATOR_RETRY_KEY] = counter + 1
-
-            latest_failure_lines = [
-                f"  - 上一次 `{issue.get('tool_name', '?')}` 以 `{issue.get('status', '?')}` 结束："
-                f"{(issue.get('detail') or '')[:300]}"
-                for issue in latest_failure_issues
-            ]
-            parts = [
-                f"[系统拦截] 你不能现在就给用户最终回复——最近一次工具调用没有成功"
-                f"（第 {counter + 1} 次拦截）。",
-            ]
-            if latest_failure_lines:
-                parts.append("失败详情：\n" + "\n".join(latest_failure_lines))
-            parts.append(
-                "请按以下顺序操作，**不要给用户回复任何文字**：\n"
-                "1. 根据上面的失败详情判断根因（参数错？路径不存在？权限？依赖缺失？）；\n"
-                "2. 修正后重试该工具，或换用其它工具/方案；\n"
-                "3. 若确实无法继续（外部条件缺失、需要用户决策），"
-                "用 `update_todo(id, \"blocked\", notes=\"原因\")` 明确标记，"
-                "然后在最终回复里如实告知用户卡在哪、需要什么——不要装作完成。"
-            )
-            # 第 2 次拦截仍未通过 = 同一卡点重试过仍失败,引导模型修订计划而非硬重试。
-            if counter >= 1:
-                parts.append(
-                    "你已连续失败多次。如果原计划的这一步确实走不通,考虑用 "
-                    "`create_todos(merge=True, tasks=[...])` 修订计划:把受阻任务标 "
-                    "blocked、追加替代步骤,按新计划继续——不要反复以同样方式重试。"
-                )
-            parts.append(
-                "禁止在文字里模仿工具返回格式（如 \"✅ 任务 X → done\"）；"
-                "系统能区分真假，假陈述会再次被打回。"
-            )
-
-            raise ModelRetry("\n\n".join(parts))
-
-    @agent.system_prompt
+    @agent.instructions
     def _config_prompt(ctx: RunContext[AgentDeps]) -> str:
         return render_system_prompt("runtime/config", {"user_dir": str(config.user_dir).replace("\\", "/")}) + "\n"
 
-    # 主 agent 额外的按需块(TODO 接力 / direct-mode / 技能索引):
-    # 把过去恒定写在 executor.md 里的几大段策略按 session 状态按需注入,并永远
-    # 附上一份"技能索引"(name + 一句话用途,按 category 分组),让主模型自主
-    # 决定要不要调 get_skill_instructions 拉某个 skill 的全文。subagent 各自的
-    # 角色文档已经明确职责,这套块不在它身上注册。
-    #
-    # 注册顺序即 system prompt 拼装顺序:此块必须先于 _runtime_dynamic_block
-    # 注册 —— 技能索引/TODO 接力随会话状态变化,但比记忆/时间稳定;按"越易变
-    # 越靠后"排列才能最大化 KV cache 前缀命中(见文件顶部最终顺序注释)。
+    # 注册顺序即系统指令拼装顺序:executor 专用块必须先于 _runtime_dynamic_block ——
+    # 技能索引/TODO 接力随会话状态变化,但比记忆/时间稳定;按"越易变越靠后"排列才能
+    # 最大化 KV cache 前缀命中(见本函数开头的顺序注释)。subagent 不注册 executor 专用块。
     if agent_type == "main":
-        @agent.system_prompt
-        def _executor_extra_block(ctx: RunContext[AgentDeps]) -> str:
-            try:
-                from openhachimi_agent.content.runtime_context import build_executor_extra_dynamic_block
-
-                return build_executor_extra_dynamic_block(ctx.deps)
-            except Exception:  # noqa: BLE001
-                logger.exception("executor extra dynamic block failed")
-                return ""
-
-    # 每轮易变运行时上下文（长期记忆召回 / 当前时间）
-    # 通过 pydantic-ai 的 @agent.system_prompt 动态钩子注入 system prompt 末尾。
-    #
-    # 之所以放 system prompt 而不是 user-prompt：
-    # - 这些内容在语义上属于"系统给模型的上下文"，不是用户说的话。如果塞到
-    #   user-prompt 前缀，capture_turn_memories 会把"<memory-context>...<SKILL>..."
-    #   也作为"用户输入"抽进长期记忆，雪球越滚越大。
-    # - system prompt 是按 token 前缀渐进式命中 KV cache 的，前面稳定主体仍能
-    #   完整命中；只损失末尾几十~几百 token，远低于把万字 SKILL 塞进 user-prompt
-    #   的代价。
-    # - 动态钩子每次 run 都重新计算，跨天/跨长会话仍能拿到当下时间和当下记忆，
-    #   不会出现"几天后模型还以为是几天前"的问题。
-    #
-    # 此钩子必须是最后一个注册的 system prompt 钩子:记忆块垫底、时间块收尾,
-    # 保证每轮必变的时间位于整个 system prompt 的绝对末尾,失效面最小。
-    @agent.system_prompt
-    def _runtime_dynamic_block(ctx: RunContext[AgentDeps]) -> str:
-        try:
-            from openhachimi_agent.content.runtime_context import build_system_dynamic_block
-
-            return build_system_dynamic_block(ctx.deps)
-        except Exception:  # noqa: BLE001  动态注入失败不应阻断 agent run
-            logger.exception("runtime dynamic block failed")
-            return ""
-
+        agent.instructions(_executor_extra_block)
+    # 必须是最后一个注册的指令钩子:记忆块垫底、时间块收尾,每轮必变的时间位于绝对末尾。
+    agent.instructions(_runtime_dynamic_block)
     return agent
+
+
+# 同一轮内 validator 连续打回的次数,用于熔断。run_main_agent / resume_main_agent 入口处清零。
+VALIDATOR_RETRY_KEY = "_final_validator_retries"
+# 最近一次工具失败时只打回 1 次:第二次模型多半是在如实汇报失败,再拦只会浪费调用。
+VALIDATOR_HARD_LIMIT = 1
+
+
+def _verification_gap_nudge(ctx: RunContext[AgentDeps]) -> str | None:
+    """闸门 1:改了代码却没验证就想结束时返回提醒文案(内部有次数上限),否则 None。
+
+    照搬 Hermes verification_stop;透传 session_store/session_id 让提醒能引用"上次验证"证据。
+    """
+    from openhachimi_agent.agent.execution import _append_ledger_event
+    from openhachimi_agent.agent.verification_stop import build_verify_on_stop_nudge
+
+    session_state = ctx.deps.session_state
+    nudge = build_verify_on_stop_nudge(
+        session_state,
+        session_store=getattr(ctx.deps, "session_store", None),
+        session_id=ctx.deps.session_id,
+    )
+    if nudge:
+        try:
+            _append_ledger_event(
+                session_state,
+                tool_name="<verification_stop>",
+                status="blocked",
+                args={"reason": "edited_without_fresh_evidence"},
+                result=nudge,
+                violation=nudge[:500],
+            )
+        except Exception:
+            logger.debug("failed to append verification_stop event to ledger", exc_info=True)
+    return nudge
+
+
+def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
+    """主 agent 的收尾校验(output_validator)。
+
+    闸门 1:改了代码没验证 → 打回提醒验证。
+    闸门 2:final verification signal 里两类 issue ——
+      - unfinished_todos:计划仍有 pending/in-progress 项。不打回,也不往回复里拼提醒:回复
+        发出后 turn_stream 会统一向用户列出未完成项。拼进回复会显示两遍并污染历史。
+      - latest_execution_not_successful:本轮最近一次工具调用失败。打回一次,让模型修正重试
+        或如实汇报;第二次放行。
+    """
+    import json
+
+    from pydantic_ai.exceptions import ModelRetry
+
+    from openhachimi_agent.agent.execution import get_final_verification_signal
+
+    verify_nudge = _verification_gap_nudge(ctx)
+    if verify_nudge:
+        raise ModelRetry(verify_nudge)
+
+    session_state = ctx.deps.session_state
+    signal = get_final_verification_signal(session_state)
+    latest_failure_issues = _latest_failure_issues(signal)
+    if not latest_failure_issues:
+        return result
+
+    counter = int(session_state.get(VALIDATOR_RETRY_KEY, 0) or 0)
+    _record_validator_retry(session_state, signal, counter + 1)
+    if counter >= VALIDATOR_HARD_LIMIT:
+        logger.warning(
+            "final answer validator yielding after %d retries to avoid loop (session=%s); raw signal=%s",
+            counter,
+            ctx.deps.session_id,
+            json.dumps(signal, ensure_ascii=False)[:200],
+        )
+        session_state["_final_validator_yielded"] = True
+        session_state["_final_validator_last_signal"] = signal
+        return result
+    session_state[VALIDATOR_RETRY_KEY] = counter + 1
+    raise ModelRetry(_build_latest_failure_retry_message(latest_failure_issues))
+
+
+def _executor_extra_block(ctx: RunContext[AgentDeps]) -> str:
+    """主 agent 专用的按需指令块:规划引导或 TODO 接力、产物落点、技能索引、计划进度快照。"""
+    try:
+        from openhachimi_agent.content.runtime_context import build_executor_extra_dynamic_block
+
+        return build_executor_extra_dynamic_block(ctx.deps)
+    except Exception:  # noqa: BLE001
+        logger.exception("executor extra dynamic block failed")
+        return ""
+
+
+def _runtime_dynamic_block(ctx: RunContext[AgentDeps]) -> str:
+    """每轮易变的运行时上下文(长期记忆召回 / 当前时间),放在系统指令最末尾。
+
+    放系统指令而不是 user-prompt:这些是"系统给模型的上下文",塞进 user-prompt 会被
+    capture_turn_memories 当成用户输入抽进长期记忆,越滚越大。
+    """
+    try:
+        from openhachimi_agent.content.runtime_context import build_system_dynamic_block
+
+        return build_system_dynamic_block(ctx.deps)
+    except Exception:  # noqa: BLE001  动态注入失败不应阻断 agent run
+        logger.exception("runtime dynamic block failed")
+        return ""
 
 
 def build_main_agent(config: AppConfig, role_name: str, allowed_tools: set[str] | None = None, mcp_toolsets: list | None = None, run_mode: str = "interactive") -> Agent:

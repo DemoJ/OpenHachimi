@@ -8,9 +8,11 @@ from openhachimi_agent.memory.models import (
     MemoryStatus,
     utc_now_iso,
 )
+from openhachimi_agent.memory._store.fts import index_text
 from openhachimi_agent.memory._store.utils import (
     _block_from_row,
     _json,
+    _load_json_array,
 )
 
 
@@ -62,7 +64,14 @@ class BlockStoreMixin:
             if str(block.status) == MemoryStatus.ACTIVE.value:
                 conn.execute(
                     "INSERT INTO memory_blocks_fts(id, title, summary, details, search_text, keywords) VALUES(?,?,?,?,?,?)",
-                    (block.id, block.title, block.summary, block.details, search_text, keywords_text),
+                    (
+                        block.id,
+                        index_text(block.title),
+                        index_text(block.summary),
+                        index_text(block.details),
+                        index_text(search_text),
+                        index_text(keywords_text),
+                    ),
                 )
         return block.id
 
@@ -121,6 +130,53 @@ class BlockStoreMixin:
                 (MemoryStatus.ACTIVE.value, scope.tenant_id, scope.user_id, scope.role_name, block_type, title),
             ).fetchone()
             return _block_from_row(row) if row else None
+
+    def get_atom_rows(self, atom_ids: list[str]) -> list[sqlite3.Row]:
+        """按 id 取 atom 行(任意状态)。已被硬删除的 id 不会出现在结果里。"""
+        unique_ids = list(dict.fromkeys(atom_ids))
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connect() as conn:
+            return conn.execute(f"SELECT * FROM memory_atoms WHERE id IN ({placeholders})", unique_ids).fetchall()
+
+    def get_block_atom_ids(self, block_row: sqlite3.Row) -> list[str]:
+        """block 关联的全部 atom id:关联表 ∪ atom_ids_json(硬删除会清掉关联表,但 json 里还留着)。"""
+        with self.connect() as conn:
+            linked = [
+                row["atom_id"]
+                for row in conn.execute("SELECT atom_id FROM memory_block_atoms WHERE block_id = ?", (block_row["id"],)).fetchall()
+            ]
+        return list(dict.fromkeys([*_load_json_array(block_row["atom_ids_json"]), *linked]))
+
+    def replace_block_atoms(self, block_id: str, atom_ids: list[str]) -> None:
+        """把 block 的关联 atom 整体换成 atom_ids(丢掉已失效的关联)。"""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM memory_block_atoms WHERE block_id = ?", (block_id,))
+        self.link_block_atoms(block_id, atom_ids)
+
+    def archive_block(self, block_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE memory_blocks SET status = ?, updated_at = ? WHERE id = ?",
+                (MemoryStatus.ARCHIVED.value, utc_now_iso(), block_id),
+            )
+            conn.execute("DELETE FROM memory_blocks_fts WHERE id = ?", (block_id,))
+
+    def scopes_with_stale_blocks(self) -> list[MemoryScope]:
+        """有 active block 关联了非 active atom 的作用域,供维护任务排队重新合并。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT b.tenant_id, b.user_id, b.role_name
+                FROM memory_blocks b
+                JOIN memory_block_atoms ba ON ba.block_id = b.id
+                JOIN memory_atoms a ON a.id = ba.atom_id
+                WHERE b.status = ? AND a.status != ?
+                """,
+                (MemoryStatus.ACTIVE.value, MemoryStatus.ACTIVE.value),
+            ).fetchall()
+        return [MemoryScope(tenant_id=row["tenant_id"], user_id=row["user_id"], role_name=row["role_name"]) for row in rows]
 
     def link_block_atoms(self, block_id: str, atom_ids: list[str], *, relation: str = "supports") -> None:
         now = utc_now_iso()

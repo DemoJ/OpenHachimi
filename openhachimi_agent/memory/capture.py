@@ -9,7 +9,7 @@ from typing import Any
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.conflicts import resolve_atom_conflict
 from openhachimi_agent.memory.embeddings import EmbeddingProvider
-from openhachimi_agent.memory.models import MemoryAtom, MemoryScope, MemoryStability, MemoryTurn
+from openhachimi_agent.memory.models import MemoryAtom, MemoryScope, MemoryTurn
 from openhachimi_agent.memory.privacy import PrivacyGuard
 from openhachimi_agent.memory.recall import get_memory_store
 
@@ -39,25 +39,13 @@ def _keywords(text: str) -> list[str]:
     return list(dict.fromkeys(words))[:12]
 
 
-def _looks_memorable(user_message: str) -> bool:
-    markers = ["记住", "以后", "偏好", "喜欢", "不喜欢", "习惯", "要求", "纠正", "不要", "项目", "背景", "决定", "remember", "prefer", "preference", "like", "dislike"]
-    return any(marker in user_message for marker in markers)
-
-
-# LLM 抽取作业入队:所有用户消息都进 LLM 抽取,由 LLM 判断是否为可记忆内容。
-# 移除关键词过滤闸门——LLM 比规则更能理解语义,避免"记住不要停"这类任务指令
-# 被误判为记忆意图,也避免"帮我研究一下"这类隐性任务指令被漏掉。
-# 隐私保护由 PrivacyGuard 在抽取后统一处理,不依赖前置关键词过滤。
-# 任务型指令特征:这类消息虽然可能含"记住"等词,但本质是一次性任务指令,
-# 而非需要长期记忆的偏好或事实。识别后用于规则提取原子化内容,不存原文。
-_TASK_COMMAND_MARKERS = (
-    "深挖", "挖掘", "调研", "搜索", "查找", "分析", "爬取", "抓取", "采集",
-    "必须", "一定", "务必", "记住不要", "不要还", "直到", "挖到", "挖无可挖",
-    "所有事情", "任何事情", "所有信息", "剩余信息", "相关信息",
-    "dig", "research", "search", "find", "analyze", "scrape", "crawl",
-    "must", "until", "exhaust", "everything about",
+# 同步快速通道只认"明确要求记住"的说法,让"记住……"这类话本轮结束就能被召回。
+# 其余消息一律交给后台 LLM 抽取判断。旧实现只要出现"项目 / 不要 / 喜欢 / like"
+# 就把整句原话按 0.82 置信度存成长期偏好或约束,大量一次性任务指令被当成长期记忆。
+_EXPLICIT_MEMORY_MARKERS = (
+    "记住", "记得", "以后都", "以后请", "以后一律", "今后", "remember", "from now on",
 )
-# 复合任务指令:含"记住"但后面紧跟的是任务执行约束而非记忆意图
+# 含"记住"但后面跟的是本次任务的执行约束,不是要长期记住的偏好。
 _TASK_CONSTRAINT_PATTERNS = (
     "记住不要", "记住必须", "记住一定", "记住务必", "记住直到",
     "记住在", "记住当", "记住如果", "记住对于",
@@ -65,58 +53,17 @@ _TASK_CONSTRAINT_PATTERNS = (
 
 
 def _is_question_like(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if stripped.endswith(("？", "?")):
-        return True
-    return False
+    return text.strip().endswith(("？", "?"))
 
 
-def _is_task_command(text: str) -> bool:
-    """判断文本是否为任务型指令而非需要记忆的事实/偏好。
-
-    保留用于规则提取原子信息,不再作为 LLM 抽取的过滤闸门。
-    """
+def _is_explicit_memory_request(text: str) -> bool:
+    """用户是否明确要求记住某件事(而不是在提问或给本次任务加约束)。"""
     lowered = text.lower()
-    task_marker_count = sum(1 for marker in _TASK_COMMAND_MARKERS if marker in text or marker in lowered)
-    if task_marker_count >= 2:
-        return True
+    if not any(marker in lowered for marker in _EXPLICIT_MEMORY_MARKERS):
+        return False
     if any(pattern in text for pattern in _TASK_CONSTRAINT_PATTERNS):
-        return True
-    has_command_verb = any(marker in text for marker in ("深挖", "挖掘", "调研", "搜索", "查找", "分析", "dig", "research", "search", "analyze"))
-    has_target = any(char in text for char in (".", "。", "io", "com", "cn", "网站", "博主", "作者", "项目"))
-    if len(text) > 50 and has_command_verb and has_target:
-        return True
-    return False
-
-
-def _extract_atomic_from_task_command(text: str) -> str | None:
-    """从任务型指令中提取原子化的关键信息,而非保存整段原文。
-
-    例如: "深挖关于lxh.io这个网站的任何事情,以及深挖这个网站背后的博主"
-    提取: "用户曾要求调研 lxh.io 网站及其博主相关信息"
-
-    如果无法提取有意义的原子信息,返回 None。
-    """
-    import re
-    # 提取目标对象(域名/网站/人名等)
-    domains = re.findall(r'[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}', text)
-    # 提取动作词
-    actions = []
-    for action in ("深挖", "挖掘", "调研", "搜索", "查找", "分析", "了解"):
-        if action in text:
-            actions.append(action)
-    if not domains and not actions:
-        return None
-    parts = []
-    if domains:
-        parts.append(f"目标: {', '.join(domains[:3])}")
-    if actions:
-        parts.append(f"动作: {', '.join(dict.fromkeys(actions))}")
-    return f"[历史任务] {' | '.join(parts)}"
-
-
+        return False
+    return not _is_question_like(text)
 
 
 
@@ -172,61 +119,15 @@ def _strip_attachment_block(text: str) -> str:
     return head
 
 
-def _extract_clean_user_message(user_message: str, task_frame: dict[str, object] | None) -> str:
-    """优先取 task_frame.user_request 作为真用户输入,缺失时回退到剥离前缀。"""
-    if isinstance(task_frame, dict):
-        clean = task_frame.get("user_request")
-        if isinstance(clean, str) and clean.strip():
-            return clean.strip()
+def _extract_clean_user_message(user_message: str) -> str:
+    """剥离系统注入的前缀和附件元数据块,还原用户真正说的那句话。"""
     cleaned = _strip_volatile_prefix(user_message)
     cleaned = _strip_attachment_block(cleaned)
     return cleaned.strip()
 
 
-def capture_turn_memories(
-    config: AppConfig,
-    scope: MemoryScope,
-    user_message: str,
-    assistant_output: str,
-    *,
-    task_frame: dict[str, object] | None = None,
-    memory_context_ids: list[str] | None = None,
-    status: str = "completed",
-    duration_ms: int = 0,
-    source: str = "user",
-) -> str | None:
-    """把本轮对话写入长期记忆。
-
-    v2 关键约束:
-    - ``source != "user"`` 的 turn(scheduler / system)只写 L0 turn 行,**不**入 L1
-      抽取队列、**不**做规则抽取(避免定时任务 payload 被当作长期事实)。
-    - 写入前先用 ``_extract_clean_user_message`` 把 user_message 还原成"用户真正
-      说的那句话",优先以 ``task_frame.user_request`` 为准;这样 L1 抽取看到的
-      就不再是带 volatile 前缀的污染版本。
-    - 如检测到内容仍像定时任务执行 payload,直接拒绝写入 L1。
-    """
-    if not config.memory.enabled or not config.memory.capture.enabled:
-        return None
-
-    clean_user_message = _extract_clean_user_message(user_message, task_frame)
-
-    store = get_memory_store(config)
-    turn = MemoryTurn(
-        tenant_id=scope.tenant_id,
-        user_id=scope.user_id,
-        role_name=scope.role_name,
-        session_id=scope.session_id,
-        channel=scope.channel,
-        user_message=clean_user_message,
-        assistant_output=assistant_output,
-        task_frame_json=json.dumps(task_frame or {}, ensure_ascii=False),
-        memory_context_ids_json=json.dumps(memory_context_ids or [], ensure_ascii=False),
-        status=status,
-        duration_ms=duration_ms,
-        source=source,
-    )
-    turn_id = store.add_turn(turn)
-
+def _l1_extraction_allowed(config: AppConfig, scope: MemoryScope, clean_user_message: str, source: str, turn_id: str) -> bool:
+    """这一轮是否进入 L1 抽取(L0 turn 记录无论如何都已写入)。"""
     # 非用户 turn(scheduler / system 下发):只留 L0 turn,不进 L1 抽取
     if source != "user":
         logger.info(
@@ -236,8 +137,7 @@ def capture_turn_memories(
             scope.session_id,
             turn_id,
         )
-        return turn_id
-
+        return False
     # 内容形态像 scheduler payload 也跳过(防御已迁移到新通道前的回退路径污染)
     if _looks_like_scheduler_payload(clean_user_message):
         logger.warning(
@@ -246,96 +146,155 @@ def capture_turn_memories(
             scope.session_id,
             turn_id,
         )
+        return False
+    return len(clean_user_message.strip()) >= config.memory.capture.min_turn_chars
+
+
+def _enqueue_extraction(
+    store: Any,
+    scope: MemoryScope,
+    turn_id: str,
+    clean_user_message: str,
+    assistant_output: str,
+    recent_turns: list[dict[str, str]],
+) -> None:
+    """所有用户消息都进后台 LLM 抽取,由 LLM 判断是否值得长期记住。"""
+    store.enqueue_unique_job(
+        "extract_atoms_from_turn",
+        {
+            "turn_id": turn_id,
+            "scope": scope.to_json_dict(),
+            "user_message": clean_user_message,
+            "assistant_output": assistant_output,
+            "recent_turns": recent_turns,
+            "explicit_atom_ids": [],
+        },
+        dedupe_key=f"extract:{turn_id}",
+    )
+
+
+def capture_turn_memories(
+    config: AppConfig,
+    scope: MemoryScope,
+    user_message: str,
+    assistant_output: str,
+    *,
+    memory_context_ids: list[str] | None = None,
+    status: str = "completed",
+    duration_ms: int = 0,
+    source: str = "user",
+    skip_explicit: bool = False,
+) -> str | None:
+    """把本轮对话写入长期记忆。
+
+    v2 关键约束:
+    - ``source != "user"`` 的 turn(scheduler / system)只写 L0 turn 行,**不**入 L1
+      抽取队列、**不**做规则抽取(避免定时任务 payload 被当作长期事实)。
+    - 写入前先用 ``_extract_clean_user_message`` 把 user_message 还原成"用户真正
+      说的那句话";这样 L1 抽取看到的就不再是带 volatile 前缀的污染版本。
+    - 如检测到内容仍像定时任务执行 payload,直接拒绝写入 L1。
+    """
+    if not config.memory.enabled or not config.memory.capture.enabled:
+        return None
+
+    clean_user_message = _extract_clean_user_message(user_message)
+
+    store = get_memory_store(config)
+    # 写入本轮之前取前几轮,给后台抽取当上下文
+    recent_turns = store.list_recent_user_turns(scope.session_id, limit=_RECENT_TURNS_FOR_EXTRACTION)
+    turn_id = store.add_turn(MemoryTurn(
+        tenant_id=scope.tenant_id,
+        user_id=scope.user_id,
+        role_name=scope.role_name,
+        session_id=scope.session_id,
+        channel=scope.channel,
+        user_message=clean_user_message,
+        assistant_output=assistant_output,
+        memory_context_ids_json=json.dumps(memory_context_ids or [], ensure_ascii=False),
+        status=status,
+        duration_ms=duration_ms,
+        source=source,
+    ))
+    if not _l1_extraction_allowed(config, scope, clean_user_message, source, turn_id):
         return turn_id
-
-    if len(clean_user_message.strip()) < config.memory.capture.min_turn_chars:
-        return turn_id
-
-    # 任务型指令特殊处理:提取原子化关键信息,而非保存整段原文
-    # 所有用户消息都进 LLM 抽取,由 LLM 判断是否为可记忆内容
-    task_command_atomic = None
-    if _is_task_command(clean_user_message):
-        task_command_atomic = _extract_atomic_from_task_command(clean_user_message)
-        if task_command_atomic:
-            logger.info(
-                "memory task command detected, storing atomic summary role=%s session_id=%s turn_id=%s",
-                scope.role_name,
-                scope.session_id,
-                turn_id,
-            )
-
-    payload = {
-        "turn_id": turn_id,
-        "scope": scope.to_json_dict(),
-        "user_message": clean_user_message,
-        "assistant_output": assistant_output,
-        "explicit_atom_ids": [],
-    }
-    store.enqueue_unique_job("extract_atoms_from_turn", payload, dedupe_key=f"extract:{turn_id}")
-
-    if _looks_memorable(clean_user_message):
-        guard = PrivacyGuard(
-            allow_secret_memory=config.memory.privacy.allow_secret_memory,
-            pii_redaction=config.memory.privacy.pii_redaction,
-        )
-        decision = guard.should_store(clean_user_message)
-        if decision.action == "reject":
-            logger.warning("memory candidate rejected role=%s session_id=%s reason=%s", scope.role_name, scope.session_id, decision.reason)
-        if decision.action != "reject":
-            if decision.action == "redact":
-                logger.info("memory candidate redacted role=%s session_id=%s reason=%s", scope.role_name, scope.session_id, decision.reason)
-            content = decision.text.strip()
-            # 任务型指令:用原子化摘要替代原文,避免整段命令入库
-            if task_command_atomic:
-                content = task_command_atomic
-                logger.info("memory atom content replaced with atomic summary role=%s session_id=%s", scope.role_name, scope.session_id)
-            atom = MemoryAtom(
-                memory_type="task_reference" if task_command_atomic else ("user_preference" if any(word in clean_user_message.lower() for word in ["偏好", "喜欢", "不喜欢", "以后", "要求", "prefer", "preference", "like", "dislike"]) else "user_constraint"),
-                content=content,
-                scope=scope,
-                subject="user",
-                predicate="states",
-                object=content,
-                evidence_turn_ids=[turn_id],
-                source_quote=content[:500],
-                keywords=_keywords(content),
-                confidence=0.65 if task_command_atomic else 0.82,
-                stability=MemoryStability.EPHEMERAL if task_command_atomic else (MemoryStability.STABLE if any(word in clean_user_message.lower() for word in ["以后", "偏好", "习惯", "要求", "prefer", "preference"]) else MemoryStability.SITUATIONAL),
-                sensitivity=decision.sensitivity,
-            )
-            embedding = None
-            if config.memory.embedding.enabled:
-                embedding = EmbeddingProvider(config.memory.embedding).embed_sync(atom.content)
-            decision_conflict = resolve_atom_conflict(
-                store,
-                atom,
-                embedding_vector=embedding.vector if embedding and not embedding.degraded else None,
-                embedding_model=config.memory.embedding.model if embedding and not embedding.degraded else None,
-            )
-            atom_id = decision_conflict.winner_id or atom.id
-            if decision_conflict.action != "dedupe":
-                atom_id = store.add_atom(atom)
-            if config.memory.embedding.enabled and decision_conflict.action != "dedupe":
-                if embedding is None:
-                    embedding = EmbeddingProvider(config.memory.embedding).embed_sync(atom.content)
-                if embedding.degraded:
-                    store.set_atom_embedding_status(atom_id, "failed")
-                    logger.warning(
-                        "memory atom embedding failed atom_id=%s role=%s session_id=%s reason=%s",
-                        atom_id,
-                        scope.role_name,
-                        scope.session_id,
-                        embedding.reason,
-                    )
-                else:
-                    store.save_vector(atom_id, "L1", config.memory.embedding.model, embedding.vector)
-                    logger.info(
-                        "memory atom embedding stored atom_id=%s role=%s session_id=%s dimensions=%d",
-                        atom_id,
-                        scope.role_name,
-                        scope.session_id,
-                        len(embedding.vector),
-                    )
-
+    _enqueue_extraction(store, scope, turn_id, clean_user_message, assistant_output, recent_turns)
+    if not skip_explicit and _is_explicit_memory_request(clean_user_message):
+        stored = _capture_explicit_memories(config, store, scope, clean_user_message, turn_id)
+        logger.info("memory explicit request captured atoms=%d role=%s session_id=%s turn_id=%s", stored, scope.role_name, scope.session_id, turn_id)
     logger.info("memory turn captured role=%s session_id=%s turn_id=%s", scope.role_name, scope.session_id, turn_id)
     return turn_id
+
+
+# session_state 里的标记:模型本轮调用过 remember。由 remember 工具写入,本轮记忆捕获时取出,
+# 每轮开头(main_agent._reset_turn_gates)清掉。
+REMEMBERED_THIS_TURN_KEY = "_remembered_this_turn"
+
+# 后台抽取时附带的同会话前几轮对话数。
+_RECENT_TURNS_FOR_EXTRACTION = 2
+
+# 用户明确要求记住的内容,置信度高于普通规则抽取(0.74)。
+_EXPLICIT_MEMORY_CONFIDENCE = 0.85
+
+
+def _capture_explicit_memories(config: AppConfig, store: Any, scope: MemoryScope, text: str, turn_id: str) -> int:
+    """用户明确要求记住时,按子句拆开同步写入,本轮结束即可被召回。返回写入条数。
+
+    只存拆出来的偏好 / 约束子句,不存整句原话。后台 LLM 抽取随后还会再看这句话,
+    同内容的子句会被冲突检查去重。
+    """
+    # extraction 依赖本模块的工具函数,放到函数内 import 避免循环引用
+    from openhachimi_agent.memory.extraction import _extract_with_rules
+
+    guard = PrivacyGuard(
+        allow_secret_memory=config.memory.privacy.allow_secret_memory,
+        pii_redaction=config.memory.privacy.pii_redaction,
+    )
+    decision = guard.should_store(text)
+    if decision.action == "reject":
+        logger.warning("memory candidate rejected role=%s session_id=%s reason=%s", scope.role_name, scope.session_id, decision.reason)
+        return 0
+    stored = 0
+    for extracted in _extract_with_rules(decision.text.strip(), guard).memories:
+        atom = MemoryAtom(
+            memory_type=extracted.memory_type,
+            content=extracted.content,
+            scope=scope,
+            subject=extracted.subject,
+            predicate=extracted.predicate,
+            object=extracted.object,
+            evidence_turn_ids=[turn_id],
+            source_quote=extracted.source_quote,
+            keywords=extracted.keywords,
+            tags=extracted.tags,
+            confidence=_EXPLICIT_MEMORY_CONFIDENCE,
+            stability=extracted.stability,
+            sensitivity=extracted.sensitivity,
+            valid_until=extracted.valid_until,
+            decay_at=extracted.decay_at,
+        )
+        if _store_atom_with_embedding(config, store, atom):
+            stored += 1
+    return stored
+
+
+def _store_atom_with_embedding(config: AppConfig, store: Any, atom: MemoryAtom) -> bool:
+    """冲突检查后写入 atom,并尽量同步写入向量。被判为重复时不写,返回 False。"""
+    embedding = None
+    if config.memory.embedding.enabled:
+        embedding = EmbeddingProvider(config.memory.embedding).embed_sync(atom.content)
+    vector_ok = embedding is not None and not embedding.degraded
+    conflict = resolve_atom_conflict(
+        store,
+        atom,
+        embedding_vector=embedding.vector if vector_ok else None,
+        embedding_model=config.memory.embedding.model if vector_ok else None,
+    )
+    if conflict.action == "dedupe":
+        return False
+    atom_id = store.add_atom(atom)
+    if vector_ok:
+        store.save_vector(atom_id, "L1", config.memory.embedding.model, embedding.vector)
+    elif embedding is not None:
+        store.set_atom_embedding_status(atom_id, "failed")
+        logger.warning("memory atom embedding failed atom_id=%s reason=%s", atom_id, embedding.reason)
+    return True

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
@@ -45,6 +45,27 @@ class MemoryStability(_StringEnum):
     STABLE = "stable"
 
 
+# 按稳定性给出的默认有效期:临时记忆 7 天后过期、1 天后开始降权;情境性记忆 30 天后
+# 开始降权(长期不用再归档);稳定记忆不设期限。
+_EPHEMERAL_VALID_DAYS = 7
+_EPHEMERAL_DECAY_DAYS = 1
+_SITUATIONAL_DECAY_DAYS = 30
+
+
+def default_expiry(stability: object, now: datetime | None = None) -> tuple[str | None, str | None]:
+    """返回 (valid_until, decay_at) 的 ISO 时间。所有写入路径都用它,保证 stability 真的生效。"""
+    current = now or datetime.now(timezone.utc)
+    value = str(stability)
+    if value == MemoryStability.EPHEMERAL.value:
+        return (
+            (current + timedelta(days=_EPHEMERAL_VALID_DAYS)).isoformat(),
+            (current + timedelta(days=_EPHEMERAL_DECAY_DAYS)).isoformat(),
+        )
+    if value == MemoryStability.SITUATIONAL.value:
+        return None, (current + timedelta(days=_SITUATIONAL_DECAY_DAYS)).isoformat()
+    return None, None
+
+
 class MemoryType(_StringEnum):
     """记忆类型枚举:重构后的类型体系,明确区分用户/项目/任务三个维度。"""
 
@@ -55,6 +76,37 @@ class MemoryType(_StringEnum):
     PROJECT_DECISION = "project_decision" # 项目决策(选型、放弃、变更及原因)
     TASK_REFERENCE = "task_reference"   # 历史任务引用(原子化摘要,目标+动作)
     WORKFLOW = "workflow"               # 工作流程(用户的工作方式、协作模式)
+
+
+# 旧类型名 → 新类型体系。
+_MEMORY_TYPE_ALIASES = {
+    "preference": MemoryType.USER_PREFERENCE.value,
+    "constraint": MemoryType.USER_CONSTRAINT.value,
+    "fact": MemoryType.USER_TRAIT.value,
+    "project_context": MemoryType.PROJECT_FACT.value,
+    "decision": MemoryType.PROJECT_DECISION.value,
+}
+_MEMORY_TYPE_VALUES = frozenset(item.value for item in MemoryType)
+
+
+# 常驻记忆类型:关于"用户是谁、要我怎么做"的记忆,每轮都直接放进系统指令,不依赖检索命中。
+# 含旧类型名,旧库里没归一的记录也能被选上。
+CORE_MEMORY_TYPES = frozenset({
+    MemoryType.USER_PREFERENCE.value,
+    MemoryType.USER_CONSTRAINT.value,
+    MemoryType.USER_TRAIT.value,
+    MemoryType.WORKFLOW.value,
+    "preference",
+    "constraint",
+    "fact",
+})
+
+
+def normalize_memory_type(value: object, default: str | None = None) -> str | None:
+    """把记忆类型归一到 MemoryType 取值:先映射旧别名,不认识的返回 default。"""
+    text = str(value or "").strip().lower()
+    text = _MEMORY_TYPE_ALIASES.get(text, text)
+    return text if text in _MEMORY_TYPE_VALUES else default
 
 
 class MemoryJobStatus(_StringEnum):
@@ -241,6 +293,8 @@ class ExtractedMemory:
     stability: MemoryStability = MemoryStability.SITUATIONAL
     sensitivity: MemorySensitivity = MemorySensitivity.PERSONAL
     source_quote: str = ""
+    valid_until: str | None = None
+    decay_at: str | None = None
 
     @property
     def memory_type_enum(self) -> MemoryType | None:

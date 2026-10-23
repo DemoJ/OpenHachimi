@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from openhachimi_agent.content.prompts import load_system_prompt
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.capture import _keywords, _looks_like_scheduler_payload
-from openhachimi_agent.memory.models import ExtractedMemory, MemoryExtractionResult, MemoryScope, MemoryStability
+from openhachimi_agent.memory.models import (
+    ExtractedMemory,
+    MemoryExtractionResult,
+    MemoryScope,
+    MemoryStability,
+    default_expiry,
+    normalize_memory_type,
+)
 from openhachimi_agent.memory.llm import run_memory_extraction
 from openhachimi_agent.memory.privacy import PrivacyGuard
 
@@ -34,7 +41,14 @@ def extract_memories_from_turn(
     *,
     privacy_guard: PrivacyGuard | None = None,
     config: AppConfig | None = None,
+    recent_turns: list[dict[str, str]] | None = None,
 ) -> MemoryExtractionResult:
+    """从一轮对话里抽取长期记忆。LLM 是主路径;只有 LLM 不可用或调用失败时才退回规则抽取。
+
+    LLM 正常返回空列表表示"这轮没有值得记的",此时不再用规则补抽:规则只看关键词,
+    会把任务请求里的"不要改动""必须先跑测试"当成长期约束存下来。
+    ``recent_turns`` 是同一会话前几轮,只给 LLM 用来理解"好的,就这么办"这类回复。
+    """
     text = user_message.strip()
     if not text:
         return MemoryExtractionResult()
@@ -47,27 +61,45 @@ def extract_memories_from_turn(
     if decision.action == "reject":
         return MemoryExtractionResult()
     content = decision.text.strip()
-    llm_result = _extract_with_llm(content, assistant_output, config) if config else MemoryExtractionResult()
-    rule_result = _extract_with_rules(content, guard)
-    return _merge_results(llm_result, rule_result)
+    llm_result = _extract_with_llm(content, assistant_output, config, recent_turns) if config else None
+    if llm_result is not None:
+        return llm_result
+    return _extract_with_rules(content, guard)
 
 
-def _extract_with_llm(user_message: str, assistant_output: str, config: AppConfig | None) -> MemoryExtractionResult:
+# 传给抽取 LLM 的助手回复最多保留的字符数。抽取只关心用户说了什么,助手回复只作参考。
+_MAX_ASSISTANT_CHARS = 1500
+
+
+def _extract_with_llm(
+    user_message: str,
+    assistant_output: str,
+    config: AppConfig | None,
+    recent_turns: list[dict[str, str]] | None = None,
+) -> MemoryExtractionResult | None:
+    """调用抽取 LLM。返回 None 表示 LLM 不可用或调用失败(由调用方退回规则抽取)。"""
     started = time.perf_counter()
+    payload: dict[str, Any] = {
+        "user_message": user_message,
+        "assistant_output": assistant_output[:_MAX_ASSISTANT_CHARS],
+    }
+    if recent_turns:
+        payload["recent_turns"] = recent_turns
     try:
-        output = run_memory_extraction(
-            config,
-            system_prompt=_llm_extraction_prompt(),
-            payload={"user_message": user_message, "assistant_output": assistant_output},
-        )
-        if output is None:
-            return MemoryExtractionResult()
-        memories = [_extracted_from_json(item.model_dump()) for item in output.memories]
-        logger.info("memory llm extraction succeeded memories=%d duration_ms=%d", len(memories), int((time.perf_counter() - started) * 1000))
-        return MemoryExtractionResult(memories=[memory for memory in memories if memory is not None])
+        output = run_memory_extraction(config, system_prompt=_llm_extraction_prompt(), payload=payload)
     except Exception as exc:
         logger.warning("memory llm extraction degraded: %s", exc)
-        return MemoryExtractionResult()
+        return None
+    if output is None:
+        return None
+    memories = [memory for memory in (_extracted_from_json(item.model_dump()) for item in output.memories) if memory is not None]
+    if output.memories and not memories:
+        # 给了条目但没有一条能用(真实模型出现过 content 为空、只堆 tags 的输出):按失败处理,
+        # 退回规则抽取。这和模型正常返回空列表("这轮没什么值得记")不是一回事。
+        logger.warning("memory llm extraction returned %d unusable items, falling back to rules", len(output.memories))
+        return None
+    logger.info("memory llm extraction succeeded memories=%d duration_ms=%d", len(memories), int((time.perf_counter() - started) * 1000))
+    return MemoryExtractionResult(memories=memories)
 
 
 def _extract_with_rules(content: str, guard: PrivacyGuard) -> MemoryExtractionResult:
@@ -83,16 +115,10 @@ def _extract_with_rules(content: str, guard: PrivacyGuard) -> MemoryExtractionRe
         return MemoryExtractionResult()
 
     memories: list[ExtractedMemory] = []
-    now = datetime.now(timezone.utc)
     stability = MemoryStability.STABLE if _contains_any(content, lowered, STABLE_MARKERS) else MemoryStability.SITUATIONAL
-    valid_until = None
-    decay_at = None
     if _contains_any(content, lowered, TEMPORARY_MARKERS):
         stability = MemoryStability.EPHEMERAL
-        valid_until = (now + timedelta(days=7)).isoformat()
-        decay_at = (now + timedelta(days=1)).isoformat()
-    elif stability == MemoryStability.SITUATIONAL:
-        decay_at = (now + timedelta(days=30)).isoformat()
+    valid_until, decay_at = default_expiry(stability)
 
     for clause in clauses:
         clause = clause.strip()
@@ -115,11 +141,17 @@ def _extract_with_rules(content: str, guard: PrivacyGuard) -> MemoryExtractionRe
             sensitivity=guard.should_store(clause).sensitivity,
             source_quote=clause[:500],
         )
-        setattr(extracted, "valid_until", valid_until)
-        setattr(extracted, "decay_at", decay_at)
+        extracted.valid_until = valid_until
+        extracted.decay_at = decay_at
         memories.append(extracted)
 
     return MemoryExtractionResult(memories=memories)
+
+
+_MEMORY_PREFIX_PATTERN = re.compile(
+    r"^(?:(?:请你|请|你)?(?:记住|记得)|(?:please\s+)?remember(?:\s+that)?)[:：\s]*",
+    re.IGNORECASE,
+)
 
 
 def _split_into_clauses(text: str) -> list[str]:
@@ -129,13 +161,12 @@ def _split_into_clauses(text: str) -> list[str]:
         "记住：以后用中文回答,要简洁,格式用 markdown,不要废话"
         -> ["以后用中文回答", "要简洁", "格式用 markdown", "不要废话"]
     """
-    import re
-    # 先去掉"记住:"这类前缀
-    text = re.sub(r'^记住[::]?\s*', '', text)
-    text = re.sub(r'^请记住[::]?\s*', '', text)
     # 按常见分隔符切分
     parts = re.split(r'[,，;；。\n]|(?:并且)|(?:同时)|(?:以及)|(?:还有)', text)
-    return [part.strip() for part in parts if part.strip()]
+    # 每个子句都去掉"(请你)记住 / remember:"这类前缀:否则"好的,请你记住,以后……"
+    # 里单独的"请你记住"会因含"记住"被当成一条偏好存下来。
+    clauses = [_MEMORY_PREFIX_PATTERN.sub("", part.strip()).strip() for part in parts]
+    return [clause for clause in clauses if clause]
 
 
 def _memory_type(text: str, lowered: str) -> str | None:
@@ -168,16 +199,9 @@ def _llm_extraction_prompt() -> str:
 
 
 def _extracted_from_json(item: dict[str, Any]) -> ExtractedMemory | None:
-    memory_type = str(item.get("memory_type", "")).strip()
-    # 新类型体系映射:旧类型名兼容
-    _TYPE_ALIAS = {
-        "preference": "user_preference",
-        "constraint": "user_constraint",
-        "fact": "user_trait",
-        "project_context": "project_fact",
-        "decision": "project_decision",
-    }
-    memory_type = _TYPE_ALIAS.get(memory_type, memory_type)
+    raw_type = str(item.get("memory_type", "")).strip()
+    # 旧类型名映射到新类型体系;不认识的类型原样保留(与旧行为一致)
+    memory_type = normalize_memory_type(raw_type) or raw_type
     if not memory_type:
         return None
     content = str(item.get("content", "")).strip()
@@ -189,6 +213,8 @@ def _extracted_from_json(item: dict[str, Any]) -> ExtractedMemory | None:
     except ValueError:
         stability = MemoryStability.SITUATIONAL
     confidence = float(item.get("confidence", 0.7))
+    # LLM 标的 stability 要换成具体的过期 / 衰减时间,否则"临时""情境性"记忆永远不会过期。
+    valid_until, decay_at = default_expiry(stability)
     return ExtractedMemory(
         memory_type=memory_type,
         content=content,
@@ -201,16 +227,6 @@ def _extracted_from_json(item: dict[str, Any]) -> ExtractedMemory | None:
         confidence=max(0.0, min(1.0, confidence)),
         stability=stability,
         source_quote=str(item.get("source_quote", content))[:500],
+        valid_until=valid_until,
+        decay_at=decay_at,
     )
-
-
-def _merge_results(primary: MemoryExtractionResult, fallback: MemoryExtractionResult) -> MemoryExtractionResult:
-    memories: list[ExtractedMemory] = []
-    seen: set[tuple[str, str]] = set()
-    for memory in [*primary.memories, *fallback.memories]:
-        key = (memory.memory_type, memory.content.strip().lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        memories.append(memory)
-    return MemoryExtractionResult(memories=memories, persona_updates=primary.persona_updates or fallback.persona_updates)

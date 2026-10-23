@@ -10,6 +10,7 @@ from openhachimi_agent.memory.models import (
     MemoryStatus,
     utc_now_iso,
 )
+from openhachimi_agent.memory._store.fts import index_text
 from openhachimi_agent.memory._store.utils import (
     _json,
     _load_json_array,
@@ -103,7 +104,7 @@ class AtomStoreMixin:
             if str(atom.status) == MemoryStatus.ACTIVE.value:
                 conn.execute(
                     "INSERT INTO memory_atoms_fts(id, content, search_text, keywords) VALUES(?,?,?,?)",
-                    (atom.id, atom.content, search_text, keywords_text),
+                    (atom.id, index_text(atom.content), index_text(search_text), index_text(keywords_text)),
                 )
         return atom.id
 
@@ -129,7 +130,7 @@ class AtomStoreMixin:
             if row["status"] == MemoryStatus.ACTIVE.value:
                 conn.execute(
                     "INSERT INTO memory_atoms_fts(id, content, search_text, keywords) VALUES(?,?,?,?)",
-                    (atom_id, content, search_text, keywords_text),
+                    (atom_id, index_text(content), index_text(search_text), index_text(keywords_text)),
                 )
             return True
 

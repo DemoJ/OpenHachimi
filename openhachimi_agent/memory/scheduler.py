@@ -9,10 +9,10 @@ from typing import Any
 
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.consolidation import consolidate_due_memories
-from openhachimi_agent.memory.conflicts import resolve_atom_conflict
 from openhachimi_agent.memory.embeddings import EmbeddingProvider
 from openhachimi_agent.memory.extraction import extract_memories_from_turn
-from openhachimi_agent.memory.models import MemoryAtom, MemoryJob, MemoryScope
+from openhachimi_agent.memory.update_decision import apply_extracted_memories
+from openhachimi_agent.memory.models import MemoryJob, MemoryScope
 from openhachimi_agent.memory.privacy import PrivacyGuard
 from openhachimi_agent.memory.store import MemoryStore
 
@@ -125,6 +125,9 @@ class MemoryScheduler:
         self.store.archive_stale_task_references()
         self.store.archive_stale_situational_atoms()
         self.store.downgrade_stable_atoms()
+        # 刚失效的 atom 可能还挂在主题块 / 画像里,对这些作用域排队重新合并
+        for scope in self.store.scopes_with_stale_blocks():
+            enqueue_consolidation(self.store, scope)
 
     def _handle_extract_atoms(self, payload: dict[str, Any]) -> dict[str, int]:
         scope = _scope_from_payload(payload.get("scope", {}))
@@ -139,53 +142,20 @@ class MemoryScheduler:
             str(payload.get("turn_id", "")),
             privacy_guard=guard,
             config=self.config,
+            recent_turns=payload.get("recent_turns") or None,
         )
-        created = 0
-        for extracted in result.memories:
-            atom = MemoryAtom(
-                memory_type=extracted.memory_type,
-                content=extracted.content,
-                scope=scope,
-                subject=extracted.subject,
-                predicate=extracted.predicate,
-                object=extracted.object,
-                evidence_turn_ids=[str(payload.get("turn_id", ""))],
-                source_quote=extracted.source_quote,
-                entities=extracted.entities,
-                keywords=extracted.keywords,
-                tags=extracted.tags,
-                confidence=extracted.confidence,
-                stability=extracted.stability,
-                sensitivity=extracted.sensitivity,
-                valid_until=getattr(extracted, "valid_until", None),
-                decay_at=getattr(extracted, "decay_at", None),
-            )
-            embedding = None
-            if self.config and self.config.memory.embedding.enabled:
-                provider = self.embedding_provider or EmbeddingProvider(self.config.memory.embedding)
-                embedding = provider.embed_sync(atom.content)
-            decision = resolve_atom_conflict(
-                self.store,
-                atom,
-                embedding_vector=embedding.vector if embedding and not embedding.degraded else None,
-                embedding_model=self.config.memory.embedding.model if self.config and embedding and not embedding.degraded else None,
-            )
-            if decision.action == "dedupe":
-                continue
-            atom_id = self.store.add_atom(atom)
-            created += 1
-            if self.config and self.config.memory.embedding.enabled:
-                if embedding and not embedding.degraded:
-                    self.store.save_vector(atom_id, "L1", self.config.memory.embedding.model, embedding.vector)
-                else:
-                    self.store.enqueue_unique_job(
-                        "embed_memory_item",
-                        {"item_id": atom_id, "level": "L1", "text": atom.content, "model": self.config.memory.embedding.model},
-                        dedupe_key=f"embed:L1:{atom_id}",
-                    )
-        if created:
-            self.store.enqueue_unique_job("consolidate_scope", {"scope": scope.to_json_dict()}, dedupe_key=f"consolidate:{scope.tenant_id}:{scope.user_id}:{scope.role_name}")
-        return {"atoms_created": created}
+        applied = apply_extracted_memories(
+            self.store,
+            self.config,
+            scope,
+            str(payload.get("turn_id", "")),
+            result.memories,
+            embedding_provider=self.embedding_provider,
+        )
+        # 新增或归档了记忆,主题块和画像都要重新合并
+        if applied.changed:
+            enqueue_consolidation(self.store, scope)
+        return {"atoms_created": applied.created}
 
     def _handle_embed_memory_item(self, payload: dict[str, Any]) -> dict[str, int]:
         if not self.config:
@@ -203,6 +173,15 @@ class MemoryScheduler:
             raise RuntimeError(embedding.reason)
         self.store.save_vector(item_id, level, str(payload.get("model") or self.config.memory.embedding.model), embedding.vector)
         return {}
+
+
+def enqueue_consolidation(store: MemoryStore, scope: MemoryScope) -> None:
+    """为一个作用域排队合并任务(同一作用域未执行的任务只保留一个)。"""
+    store.enqueue_unique_job(
+        "consolidate_scope",
+        {"scope": scope.to_json_dict()},
+        dedupe_key=f"consolidate:{scope.tenant_id}:{scope.user_id}:{scope.role_name}",
+    )
 
 
 def _scope_from_payload(payload: dict[str, Any]) -> MemoryScope:

@@ -293,3 +293,52 @@ def test_expire_clarification_clears_flag_and_injects_nudge():
     nudge_text = next(p.content for p in parts if isinstance(p, SystemPromptPart))
     assert "长时间未回复" in nudge_text
     assert "请提供凭据" in nudge_text
+
+
+@pytest.mark.asyncio
+async def test_resume_with_active_plan_puts_hint_in_tool_result(monkeypatch):
+    """有进行中的计划时,恢复提示拼在 clarify_user 的返回值里,不再另插一条系统消息
+    (那条消息会夹在工具调用和工具结果之间,部分 OpenAI 兼容服务直接报错)。"""
+    from openhachimi_agent.tools.planning import TodoState, TodoTask
+
+    session_state = {
+        "_user_clarification": {"question": "要用哪个邮箱?", "tool_call_id": "call_abc"},
+        "todo_state": TodoState(goal="g", is_active=True, tasks={1: TodoTask(id=1, description="发邮件", status="pending")}),
+    }
+    history = [ModelRequest(parts=[UserPromptPart(content="原始任务")])]
+    ctx = _ctx(session_state=session_state, history=history, message="用 a@b.com")
+    main_agent = FakeAgent(["好的"])
+    from openhachimi_agent.service.agent_runtime import main_agent as main_mod
+
+    monkeypatch.setattr(main_mod, "_build_main_agent", lambda role, run_mode, get_agent: main_agent)
+    monkeypatch.setattr(main_mod, "preflight_compress_history", lambda ctx: None)
+
+    await resume_main_agent(ctx, lambda *a, **kw: main_agent)
+
+    run = main_agent.runs[0]
+    reply = run["kwargs"]["deferred_tool_results"].calls["call_abc"]
+    assert reply.startswith("用 a@b.com")
+    assert "进行中的计划" in reply
+    # 历史没有被追加额外消息
+    assert run["kwargs"]["message_history"] == history
+
+
+def test_expire_clarification_answers_pending_call_with_tool_result():
+    """历史末尾有未完成的 clarify_user 调用时,超时说明作为它的工具结果补上,而不是另插系统消息。"""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+
+    from openhachimi_agent.service.agent_runtime.turn import _expire_clarification
+
+    history = [
+        ModelRequest(parts=[UserPromptPart(content="帮我发邮件")]),
+        ModelResponse(parts=[ToolCallPart(tool_name="clarify_user", args={"question": "发件邮箱是?"}, tool_call_id="c1")]),
+    ]
+    session_state = {"_user_clarification": {"question": "发件邮箱是?", "tool_call_id": "c1", "created_at": 0}}
+    ctx = _ctx(session_state=session_state, history=history)
+
+    _expire_clarification(ctx)
+
+    (part,) = ctx.history[-1].parts
+    assert isinstance(part, ToolReturnPart)
+    assert part.tool_call_id == "c1"
+    assert "长时间未回复" in part.content

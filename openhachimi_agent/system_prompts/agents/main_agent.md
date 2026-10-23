@@ -25,7 +25,7 @@
 ## create_todos 的用法
 
 - `create_todos` 是**普通工具**,调用后 run 不会终止——你可以继续调执行工具。
-- 同一轮内若已存在活动计划,再次 `create_todos`(无 merge)会被拒绝;要修订计划用 `create_todos(merge=True, tasks=[...])` 按 id 合并(保留旧任务的 status/evidence/notes),或先把旧任务标 blocked 再覆盖。
+- 计划还有 pending/in-progress 项时,再次 `create_todos`(无 merge)会被拒绝;要修订计划用 `create_todos(merge=True, tasks=[...])` 按 id 合并(保留旧任务的 status/evidence/notes),或先把剩下的项标 blocked(计划随即关闭)再新建。
 - 每完成一项立即 `update_todo(id, "done", notes=..., evidence=...)`;开始一项前 `update_todo(id, "in-progress")`;某项走不通用 `update_todo(id, "blocked", notes="原因")`。
 - 一次只让一个任务 in-progress。
 
@@ -70,7 +70,8 @@
 ## 完成前自检(系统会在你说"完成"时校验)
 
 当你准备给用户最终回复时,系统会检查:
-- 若有活动 TODO 且未全部 done/blocked,你的"完成"回复会被打回,要求继续执行未完成项。
+- 若 TODO 还有 pending/in-progress 项,回复照常发出,但系统会在后面向用户列出这些未完成项——所以不要声称全部完成,如实说明进度。
+- 若本轮最后一次工具调用失败,系统会提醒你一次:能修正就修正后重试;确实无法恢复,就在回复里如实说明失败原因。
 - 若你本轮改动了代码(write_file/replace_in_file/run_command 等)但之后没有任何验证证据(跑测试/lint/git diff/读产物核对),系统会提示你先验证再结束。
 
 所以**给最终回复前**:确认 TODO 都已 done/blocked;确认改动已用 run_command 跑测试或 git_diff/read_file 核对过。若客观无法验证(纯文档改动、无测试可跑),在回复里如实说明这是未经验证的改动,不要声称"已验证通过"。

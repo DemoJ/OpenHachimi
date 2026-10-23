@@ -147,8 +147,7 @@ def _append_ledger_event(
 def _exception_ledger_status(exc: Exception) -> str:
     # CallDeferred / ApprovalRequired 是 pydantic-ai 的"挂起本次 run"控制流
     # 信号(由 clarify_user 等 deferred 工具主动抛出),不是错误。ledger 里把它
-    # 记成 ``deferred``,避免污染 ``get_replan_signal`` 的连续 blocked 计数,也
-    # 让 ``get_final_verification_signal`` 不会错误地把它当成"最近一次失败"。
+    # 记成 ``deferred``,让 ``get_final_verification_signal`` 不会错误地把它当成"最近一次失败"。
     from pydantic_ai.exceptions import ApprovalRequired, CallDeferred
 
     if isinstance(exc, (CallDeferred, ApprovalRequired)):
@@ -206,66 +205,6 @@ def get_execution_ledger(ctx: object) -> list[dict[str, Any]]:
 def get_ledger_length(session_state: dict[str, Any]) -> int:
     ledger = session_state.get("execution_ledger", [])
     return len(ledger) if isinstance(ledger, list) else 0
-
-
-def get_replan_signal(session_state: dict[str, Any], since_seq: int = 0) -> dict[str, object] | None:
-    """Return a compact replan signal when there are consecutive failures in new ledger events.
-    
-    只有在新事件中存在连续 >= 2 次 blocked/failed 且尾部没有被 succeeded 覆盖时才触发 replan。
-    单次 blocked（通常是 ModelRetry 后已成功重试）不应触发昂贵的重规划。
-    """
-
-    ledger = session_state.get("execution_ledger", [])
-    if not isinstance(ledger, list):
-        return None
-    new_events = [
-        event for event in ledger
-        if isinstance(event, dict) and int(event.get("seq", 0)) > since_seq
-    ]
-    if not new_events:
-        return None
-
-    # 检查尾部是否以 blocked/failed 结尾
-    latest = new_events[-1]
-    if latest.get("status") not in {"blocked", "failed"}:
-        return None
-
-    # 统计尾部连续的 blocked/failed 次数
-    consecutive_failures = 0
-    for event in reversed(new_events):
-        if event.get("status") in {"blocked", "failed"}:
-            consecutive_failures += 1
-        else:
-            break
-
-    # 单次失败不触发 replan，通常是 ModelRetry 后已自动重试成功
-    if consecutive_failures < 2:
-        return None
-
-    notable_events = [
-        event for event in new_events
-        if event.get("status") in {"blocked", "failed"}
-    ][-5:]
-    summary = []
-    for event in notable_events:
-        detail = event.get("violation") or event.get("result_preview") or ""
-        summary.append(
-            {
-                "seq": event.get("seq"),
-                "tool_name": event.get("tool_name"),
-                "status": event.get("status"),
-                "task_id": event.get("task_id"),
-                "args": event.get("args", {}),
-                "detail": detail,
-            }
-        )
-
-    return {
-        "reason": "consecutive execution failures require replan",
-        "consecutive_failures": consecutive_failures,
-        "latest_status": latest.get("status"),
-        "events": summary,
-    }
 
 
 def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, object] | None:
@@ -343,8 +282,7 @@ def _tool_timeout_for_call(ctx: object, tool_name: str, bound_args: dict[str, ob
 def with_execution_ledger(func: Callable) -> Callable:
     """Record tool execution in the in-memory ledger + feed verification state.
 
-    ledger 记每个工具的 started/succeeded/failed(供 ``get_replan_signal``/
-    ``get_final_verification_signal`` 消费);succeeded 后再调
+    ledger 记每个工具的 started/succeeded/failed(供 ``get_final_verification_signal`` 消费);succeeded 后再调
     ``verification_stop.mark_tool_succeeded`` 按工具语义更新验证状态(编辑类
     置 stale、验证类清 stale),供停止闸门 ``build_verify_on_stop_nudge`` 判定。
 

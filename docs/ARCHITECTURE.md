@@ -12,16 +12,17 @@ openhachimi_agent/
 │
 ├── agent/                   # Agent 构建
 │   ├── __init__.py
-│   ├── factory.py           # Agent 实例工厂（planner/executor/router/self_critique）
-│   ├── execution.py         # 执行账本与重规划/验证信号
-│   └── intent.py            # 任务意图分类与 TaskFrame
+│   ├── factory.py           # Agent 实例工厂（主 agent / 子 agent，系统指令与收尾校验）
+│   ├── execution.py         # 工具执行账本、工具超时、收尾验证信号
+│   ├── verification_stop.py # 改了代码却没验证就想结束时的提醒
+│   └── subagents.py         # delegate_task 子 agent
 │
 ├── content/                 # 内容管理
 │   ├── __init__.py
 │   ├── prompts.py           # 系统提示词加载与渲染
 │   ├── roles.py             # 角色配置加载
 │   ├── skills.py            # 技能发现与加载
-│   └── runtime_context.py   # 每轮易变上下文前缀（时间/记忆/技能）
+│   └── runtime_context.py   # 每轮重新生成的系统指令块（规划引导/TODO 接力与进度/技能索引/记忆/时间）
 │
 ├── context/                 # 上下文管理：对话历史压缩引擎
 │   ├── __init__.py
@@ -50,9 +51,11 @@ openhachimi_agent/
 │
 ├── memory/                  # 长期记忆系统
 │   ├── __init__.py
-│   ├── recall.py            # BM25+向量+RRF 召回
-│   ├── capture.py           # 记忆捕获 + 压缩窗口抢救
-│   ├── consolidation.py     # 原子→块→profile 固化
+│   ├── recall.py            # 召回：常驻层（偏好/约束等每轮注入）+ 检索层（BM25+向量+RRF）
+│   ├── capture.py           # 记录每轮对话；明确要求"记住"时按子句同步写入
+│   ├── extraction.py        # 后台 LLM 抽取（LLM 不可用时退回规则抽取）
+│   ├── update_decision.py   # 新记忆对照相近旧记忆，由 LLM 决定增/改/删/不动
+│   ├── consolidation.py     # 原子→块→profile 固化，失效记忆从块和画像中清理
 │   ├── store.py             # SQLite 存储与向量索引
 │   └── embeddings.py        # 嵌入服务
 │
@@ -60,10 +63,11 @@ openhachimi_agent/
 │   ├── __init__.py
 │   ├── agent_service.py     # Agent 会话管理、消息处理、上下文压缩集成
 │   └── agent_runtime/       # 单轮执行编排
-│       ├── context.py       # AgentRunContext 运行上下文
-│       ├── executor.py      # 执行器（含轮内预检压缩）
-│       ├── planner.py       # 规划器
-│       ├── router.py        # 任务路由与计划续接
+│       ├── context.py       # AgentRunContext 运行上下文、计划挂起/恢复
+│       ├── turn.py          # 单轮入口：解析结果、追问恢复、异常分类
+│       ├── main_agent.py    # 主 agent 单次运行（含轮内预检压缩、追问恢复）
+│       ├── attachment_vision.py # 附件元数据与视觉预处理状态
+│       ├── history_prep.py  # 运行前清理历史（旧 system prompt、过期 TODO 提醒）
 │       └── streaming.py     # 流式事件处理
 │
 ├── storage/                 # 存储层
@@ -176,9 +180,30 @@ openhachimi_agent/
 
 #### `factory.py`
 
-- `build_agent()`：根据配置和角色名称创建 PydanticAI Agent 实例
-- 组合：OpenAI 兼容模型 + 系统提示词 + 角色指令 + 工具集
+- `build_main_agent()` / `build_subagent_agent()`：根据配置和角色名称创建 PydanticAI Agent 实例
+- 组合：OpenAI 兼容模型 + 系统指令 + 角色指令 + 工具集
 - 使用 `defer_model_check=True` 延迟模型连接验证
+- 只有一个主 agent，没有 router / planner / self_critique 前置阶段：要不要建计划由主 agent 自己判断（`create_todos` 是普通工具）
+- 收尾校验（`output_validator`）：改了代码没验证会提醒一次；本轮最后一次工具调用失败会打回一次，第二次放行，允许如实汇报失败；还有未完成的 TODO 不打回，由回复后的系统提示告诉用户
+
+#### 任务规划（`tools/planning*.py`）
+
+- 计划是扁平、按顺序排列的清单，没有依赖图；"同一时间只做一项"只是建议，不做硬拦截
+- 状态：`pending` / `in-progress` / `done` / `blocked`；只剩 `done` 和 `blocked` 时计划自动关闭
+- 有活动计划时，系统指令里会注入 TODO 接力规则和"当前计划进度"快照（不参与对话压缩）
+- `planning_state.py`：数据模型、状态取值与持久化；`planning_reminder.py`：工具结果后的更新提醒
+
+---
+
+#### 长期记忆（`memory/`）
+
+- 三层数据：L1 原子记忆、L2 主题块（同主题原子的摘要）、L3 用户画像
+- 召回分两层：
+  - 常驻层：偏好、约束、用户身份、工作方式这几类，每轮按置信度取前 12 条放进系统指令，不依赖检索命中
+  - 检索层：其余记忆只注入与当前消息真正命中的结果；中文按二元组建全文索引；需要更多时模型调 `search_memory`
+- 写入：每轮对话都进后台 LLM 抽取（带前两轮作上下文）；抽出的新记忆先找相近旧记忆，由 LLM 决定 ADD / UPDATE / DELETE / NONE；LLM 不可用时退回向量规则（相似时以新为准）
+- 生命周期：按稳定性设过期 / 衰减时间；只有检索命中才算一次访问；失效的原子会从主题块和画像里清掉
+- 旧数据修复：`python -m openhachimi_agent.memory.scripts.repair_memory <db_path>`（默认只预览，加 `--apply` 执行）
 
 ---
 
@@ -470,10 +495,10 @@ logging:
 
 ### 双触发集成（多轮编排安全）
 
-单轮内 planner→executor→replan/repair→self_critique 会多次 `extend` 同一份 history，膨胀速度远快于对话轮数，故需双触发：
+单轮内主 agent 会多次调用工具，每次工具调用和返回都会追加进 history，膨胀速度远快于对话轮数，故需双触发：
 
 - **轮后主压缩**（`agent_service.py`）：用本轮真实 `result.usage` 判定，触发则在 `save_message_history` 前压缩并保存。轮边界最安全，不打断工具序列。
-- **轮内预检安全网**（`executor.py: preflight_compress_history`）：每次 `agent.run` 前粗略估计达 `hard_ceiling_percent`（0.90）时，对内存 history 先做廉价压缩（`allow_llm_summary=False` 走确定性兜底，避免中途中断调 LLM），防止单轮内撑爆模型窗口。
+- **轮内预检安全网**（`main_agent.py: preflight_compress_history`）：每次 `agent.run` 前粗略估计达 `hard_ceiling_percent`（0.90）时，对内存 history 先做廉价压缩（`allow_llm_summary=False` 走确定性兜底，避免中途中断调 LLM），防止单轮内撑爆模型窗口。
 
 ### 消息历史 append-only
 
@@ -484,10 +509,13 @@ OpenHachimi 的记忆系统（BM25+向量+RRF+三级分层）独立于 live cont
 
 ### prompt 缓存稳定性
 
-`agent/factory.py` 的系统提示分为稳定层与易变层：
+`agent/factory.py` 用 PydanticAI 的 `instructions` 注册系统指令（不用 `system_prompt`）。`system_prompt` 只在历史为空时生成一次，之后作为第一条消息留在历史里原样复用，导致动态内容从第二轮起冻结；`instructions` 每次请求都按当前状态重新生成，也不会从历史里读回。旧会话历史里残留的 system prompt 由 `history_prep.strip_frozen_system_prompt` 在运行前去掉。
 
-- **稳定层**（进 `Agent(system_prompt=)` 静态参数）：base 提示词 + 角色指令 + executor/planner 提示词。会话内不变，可被 provider 缓存。
-- **易变层**（迁出系统提示）：时间 / 记忆召回 / 匹配技能 / task_frame —— 由 `content/runtime_context.py: build_volatile_prefix` 注入每轮用户消息前缀，使系统前缀不再因时间每秒变化而击穿缓存。
+指令按"越稳定越靠前"排列，最大化前缀缓存命中：
+
+1. 稳定部分：base 提示词 + 角色指令 + main_agent / subagent 提示词
+2. 半稳定部分（`runtime_context.build_executor_extra_dynamic_block`）：规划引导或 TODO 接力规则、产物落点引导、技能索引、当前计划进度快照
+3. 易变部分（`runtime_context.build_system_dynamic_block`）：记忆召回、当前时间（放在最末尾）
 
 ### 手动压缩
 

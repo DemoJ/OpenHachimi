@@ -10,7 +10,7 @@ from pathlib import Path
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.memory.embeddings import EmbeddingProvider
 from openhachimi_agent.memory.formatting import format_memory_context
-from openhachimi_agent.memory.models import MemoryContext, MemoryScope, MemorySearchResult, MemoryType
+from openhachimi_agent.memory.models import CORE_MEMORY_TYPES, MemoryContext, MemoryScope, MemorySearchResult, MemoryType
 from openhachimi_agent.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -81,61 +81,11 @@ def apply_recall_decay(result: MemorySearchResult, *, now: str | None = None) ->
     return result
 
 
-# v2: scheduler_payload 不应从 L1 召回,避免定时调度 payload 被当成长期事实
-# 注入 system prompt。历史上还有 conversation_context(compressed window 抢救)
-# 类型,但该机制已移除,旧数据清理后该排除项无意义,仅保留 scheduler_payload。
-_EXCLUDED_L1_TYPES = {"scheduler_payload", "task_reference"}
-
-# 任务引用型记忆:虽然已提取原子信息,但召回时仍需降权处理,避免干扰当前任务
-_TASK_REFERENCE_TYPE = "task_reference"
-
-
-def _is_task_reference_relevant(query: str, content: str) -> bool:
-    """判断任务引用型记忆是否与当前查询相关。
-
-    任务引用记忆(如"[历史任务] 目标: lxh.io | 动作: 深挖, 挖掘")只在
-    查询明确涉及相同目标时才应被召回,否则是噪声。
-    """
-    import re
-    # 提取记忆中的目标域名/关键词
-    memory_domains = set(re.findall(r'[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}', content))
-    query_domains = set(re.findall(r'[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}', query))
-    # 域名重叠才认为相关
-    if memory_domains and query_domains and memory_domains & query_domains:
-        return True
-    # 提取记忆中的动作词
-    memory_actions = set(re.findall(r'深挖|挖掘|调研|搜索|查找|分析', content))
-    query_actions = set(re.findall(r'深挖|挖掘|调研|搜索|查找|分析', query))
-    # 动作词重叠且查询包含相似目标才相关
-    if memory_actions and query_actions and memory_actions & query_actions:
-        # 进一步检查是否有共同目标关键词
-        memory_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', content))
-        query_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}', query))
-        common = memory_keywords & query_keywords
-        # 排除通用词
-        common = common - {"历史", "任务", "目标", "动作", "用户", "要求", "网站", "信息"}
-        if len(common) >= 2:
-            return True
-    return False
-
-
-def filter_task_reference_noise(results: list[MemorySearchResult], query: str) -> list[MemorySearchResult]:
-    """过滤掉与当前查询无关的任务引用型记忆。
-
-    任务引用记忆是历史任务的摘要(如"[历史任务] 目标: lxh.io"),如果当前
-    查询与那个历史任务无关,这些记忆就是噪声,应该被过滤或大幅降权。
-    """
-    filtered = []
-    for item in results:
-        if item.memory_type == _TASK_REFERENCE_TYPE:
-            if _is_task_reference_relevant(query, item.content):
-                # 相关但降权:任务引用记忆的置信度打折
-                item.score *= 0.3
-                filtered.append(item)
-            # 不相关:直接丢弃,不进入结果
-        else:
-            filtered.append(item)
-    return filtered
+# 不进自动召回的类型(L1 原子和 L2 主题块都排除):
+# - scheduler_payload:定时任务下发的执行内容,不是用户事实;
+# - task_reference:历史任务摘要,与当前对话大多无关,需要时由模型调 search_memory 查。
+#   旧实现靠一套针对 lxh.io 写死的域名 / 动作词规则判断"是否相关",已删除。
+_EXCLUDED_AUTO_RECALL_TYPES = {"scheduler_payload", "task_reference"}
 
 
 # 任务意图到记忆类型的映射:不同任务类型召回不同维度的记忆
@@ -206,38 +156,66 @@ def infer_task_intent(query: str) -> str:
     return best
 
 
-def filter_by_intent(results: list[MemorySearchResult], intent: str) -> list[MemorySearchResult]:
-    """按任务意图过滤记忆类型。
+# 与当前意图匹配的记忆类型的加权系数。
+_INTENT_BOOST = 1.25
 
-    只保留与当前任务意图相关的记忆类型,减少无关记忆干扰。
-    例如写代码时召回"用户喜欢深色主题"没有意义。
+
+def apply_intent_boost(results: list[MemorySearchResult], intent: str) -> list[MemorySearchResult]:
+    """按任务意图给匹配的记忆类型加权,不丢弃任何记忆。
+
+    意图是关键词猜出来的,不可靠:硬过滤会在"修 bug"时丢掉全部用户偏好,
+    还会让 L3 画像(user_profile)和未登记类型永远召回不到。所以这里只调整
+    排序,最终条数仍由 select_by_level_budget 控制。
     """
-    allowed_types = set(INTENT_TYPE_MAP.get(intent, INTENT_TYPE_MAP["general"]))
-    filtered = [item for item in results if item.memory_type in allowed_types]
-    return filtered
-
-
-def deduplicate_by_subject(results: list[MemorySearchResult]) -> list[MemorySearchResult]:
-    """同主题记忆去重:按 subject+predicate 分组,只保留每组最高分。
-
-    避免召回多个相同主题的记忆(如多条"使用中文回答"),只保留最相关的一条。
-    """
-    groups: dict[tuple[str, str], list[MemorySearchResult]] = {}
+    preferred = set(INTENT_TYPE_MAP.get(intent, INTENT_TYPE_MAP["general"]))
     for item in results:
-        key = (item.metadata.get("subject", "user"), item.metadata.get("predicate", "states"))
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(item)
+        if item.memory_type in preferred:
+            item.score *= _INTENT_BOOST
+    results.sort(key=lambda item: item.score, reverse=True)
+    return results
 
-    deduped: list[MemorySearchResult] = []
-    for group in groups.values():
-        # 每组只保留最高分
-        best = max(group, key=lambda x: x.score)
-        deduped.append(best)
 
-    # 重新按分数排序
-    deduped.sort(key=lambda x: x.score, reverse=True)
-    return deduped
+# 两条记忆的字符二元组 Jaccard 相似度达到该值才视为重复。取值偏高是有意的:
+# "用中文回答" 与 "不要用中文回答" 意思相反,不能被合并。
+_DEDUPE_SIMILARITY = 0.85
+
+
+def _dedupe_text(text: str) -> str:
+    """去掉空白和标点并转小写,只保留字母数字和汉字。"""
+    return "".join(char for char in text.lower() if char.isalnum())
+
+
+def _char_bigrams(text: str) -> set[str]:
+    if len(text) < 2:
+        return {text}
+    return {text[index:index + 2] for index in range(len(text) - 1)}
+
+
+def _is_near_duplicate(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    left_grams, right_grams = _char_bigrams(left), _char_bigrams(right)
+    union = left_grams | right_grams
+    if not union:
+        return False
+    return len(left_grams & right_grams) / len(union) >= _DEDUPE_SIMILARITY
+
+
+def dedupe_by_content(results: list[MemorySearchResult]) -> list[MemorySearchResult]:
+    """按内容去重:内容相同或几乎相同的记忆只保留分数最高的一条。
+
+    旧实现按 subject+predicate 分组,会把"用中文回答""回答要简洁"这类
+    主谓相同但内容不同的偏好合并成一条。
+    """
+    kept: list[MemorySearchResult] = []
+    kept_texts: list[str] = []
+    for item in sorted(results, key=lambda result: result.score, reverse=True):
+        text = _dedupe_text(item.content)
+        if any(_is_near_duplicate(text, seen) for seen in kept_texts):
+            continue
+        kept.append(item)
+        kept_texts.append(text)
+    return kept
 
 
 def select_by_level_budget(
@@ -250,9 +228,12 @@ def select_by_level_budget(
     selected: list[MemorySearchResult] = []
     l1 = [
         item for item in results
-        if item.level == "L1" and item.memory_type not in _EXCLUDED_L1_TYPES
+        if item.level == "L1" and item.memory_type not in _EXCLUDED_AUTO_RECALL_TYPES
     ][:final_l1_top_k]
-    l2 = [item for item in results if item.level == "L2"][:final_l2_top_k]
+    l2 = [
+        item for item in results
+        if item.level == "L2" and item.memory_type not in _EXCLUDED_AUTO_RECALL_TYPES
+    ][:final_l2_top_k]
     selected.extend(l1)
     selected.extend(l2)
     if include_l3_profile:
@@ -261,55 +242,81 @@ def select_by_level_budget(
     return selected
 
 
+# 每轮常驻注入的记忆条数上限(按置信度取前 N 条)。
+_CORE_MEMORY_LIMIT = 12
+# 检索兜底来源:FTS 没命中时退回"最近写入的几条",与当前问题无关,不自动注入。
+_UNMATCHED_SOURCES = {"recent"}
+
+
+def _retrieve_relevant(
+    config: AppConfig, store: MemoryStore, scope: MemoryScope, query: str
+) -> tuple[list[MemorySearchResult], bool, str]:
+    """按当前消息检索相关记忆(BM25 + 向量 + RRF 融合)。返回 (结果, 是否降级, 降级原因)。"""
+    bm25_results = store.search(scope, query, limit=config.memory.recall.bm25_top_k, touch_results=False)
+    bm25_results = [item for item in bm25_results if item.source not in _UNMATCHED_SOURCES]
+    vector_results: list[MemorySearchResult] = []
+    degraded, reason = False, ""
+    if config.memory.embedding.enabled:
+        embedding = EmbeddingProvider(config.memory.embedding).embed_sync(query)
+        if embedding.degraded:
+            degraded, reason = True, embedding.reason
+            logger.warning("memory vector recall skipped role=%s session_id=%s reason=%s", scope.role_name, scope.session_id, embedding.reason)
+        else:
+            vector_results = store.vector_search(scope, embedding.vector, limit=config.memory.recall.vector_top_k, model=config.memory.embedding.model, levels=("L1", "L2"))
+    fused = fuse_results([bm25_results, vector_results], rrf_k=config.memory.recall.rrf_k)
+    # 任务意图感知:匹配当前意图的记忆类型加权,不丢弃
+    fused = apply_intent_boost(fused, infer_task_intent(query))
+    # 内容去重:避免同一偏好被多条记忆重复表达
+    fused = dedupe_by_content(fused)
+    selected = select_by_level_budget(
+        fused,
+        final_l1_top_k=config.memory.recall.final_l1_top_k,
+        final_l2_top_k=config.memory.recall.final_l2_top_k,
+        include_l3_profile=config.memory.recall.include_l3_profile,
+    )
+    return selected, degraded, reason
+
+
+def _drop_covered_by_core(retrieved: list[MemorySearchResult], core: list[MemorySearchResult]) -> list[MemorySearchResult]:
+    """去掉已在常驻记忆里出现(同 id 或内容几乎相同)的检索结果。"""
+    core_ids = {item.id for item in core}
+    core_texts = [_dedupe_text(item.content) for item in core]
+    return [
+        item for item in retrieved
+        if item.id not in core_ids
+        and not any(_is_near_duplicate(_dedupe_text(item.content), text) for text in core_texts)
+    ]
+
+
 def recall_memories(config: AppConfig, scope: MemoryScope, query: str) -> MemoryContext:
-    if not config.memory.enabled or not query.strip():
+    """本轮要放进系统指令的记忆 = 常驻记忆 + 与当前消息相关的检索结果。
+
+    常驻层:用户偏好 / 约束 / 身份 / 工作方式,每轮都带上,不依赖检索命中——以前"用中文回答"
+    这类偏好只有在当前消息碰巧检索到时才生效,表现为时有时无。
+    检索层:其余记忆只注入真正命中的结果;没注入的由模型需要时调 search_memory 查。
+    只有检索命中才刷新访问时间;常驻记忆每轮都注入,刷新它说明不了"用到了"。
+    """
+    if not config.memory.enabled:
         return MemoryContext(scope=scope, query=query)
     try:
         store = get_memory_store(config)
-        bm25_results = store.search(scope, query, limit=config.memory.recall.bm25_top_k, touch_results=False)
-        vector_results: list[MemorySearchResult] = []
-        degraded = False
-        reason = ""
-        if config.memory.embedding.enabled:
-            embedding = EmbeddingProvider(config.memory.embedding).embed_sync(query)
-            if embedding.degraded:
-                degraded = True
-                reason = embedding.reason
-                logger.warning("memory vector recall skipped role=%s session_id=%s reason=%s", scope.role_name, scope.session_id, embedding.reason)
-            else:
-                vector_results = store.vector_search(scope, embedding.vector, limit=config.memory.recall.vector_top_k, model=config.memory.embedding.model, levels=("L1", "L2"))
-                logger.info(
-                    "memory vector recall succeeded role=%s session_id=%s vector_results=%d bm25_results=%d",
-                    scope.role_name,
-                    scope.session_id,
-                    len(vector_results),
-                    len(bm25_results),
-                )
-        fused = fuse_results([bm25_results, vector_results], rrf_k=config.memory.recall.rrf_k)
-        # 过滤与当前查询无关的任务引用型记忆(历史任务摘要),避免噪声干扰
-        fused = filter_task_reference_noise(fused, query)
-        # 任务意图感知:按当前查询意图过滤记忆类型
-        intent = infer_task_intent(query)
-        fused = filter_by_intent(fused, intent)
-        # 同主题去重:避免同一偏好被多条记忆重复表达
-        fused = deduplicate_by_subject(fused)
-        results = select_by_level_budget(
-            fused,
-            final_l1_top_k=config.memory.recall.final_l1_top_k,
-            final_l2_top_k=config.memory.recall.final_l2_top_k,
-            include_l3_profile=config.memory.recall.include_l3_profile,
-        )
-        store.touch([item.id for item in results])
+        core = store.list_core_atoms(scope, CORE_MEMORY_TYPES, limit=_CORE_MEMORY_LIMIT)
+        retrieved: list[MemorySearchResult] = []
+        degraded, reason = False, ""
+        if query.strip():
+            retrieved, degraded, reason = _retrieve_relevant(config, store, scope, query)
+            retrieved = _drop_covered_by_core(retrieved, core)
+            store.touch([item.id for item in retrieved])
         logger.info(
-            "memory recall completed role=%s session_id=%s results=%d degraded=%s intent=%s sources=%s",
+            "memory recall completed role=%s session_id=%s core=%d retrieved=%d degraded=%s sources=%s",
             scope.role_name,
             scope.session_id,
-            len(results),
+            len(core),
+            len(retrieved),
             str(degraded).lower(),
-            intent,
-            sorted({item.source for item in results}),
+            sorted({item.source for item in retrieved}),
         )
-        return MemoryContext(scope=scope, query=query, results=results, degraded=degraded, reason=reason)
+        return MemoryContext(scope=scope, query=query, results=[*core, *retrieved], degraded=degraded, reason=reason)
     except Exception as exc:
         logger.warning("memory recall degraded role=%s session_id=%s: %s", scope.role_name, scope.session_id, exc)
         return MemoryContext(scope=scope, query=query, degraded=True, reason=str(exc))

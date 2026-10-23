@@ -29,10 +29,9 @@ from openhachimi_agent.core.redaction import redact_text
 from openhachimi_agent.memory.models import MemoryScope
 from openhachimi_agent.service.agent_runtime.context import (
     AgentRunContext,
-    mark_turn_finished,
-    mark_turn_started,
 )
 from openhachimi_agent.service.agent_runtime.main_agent import (
+    _find_pending_clarify_tool_call,
     resume_main_agent,
     run_main_agent,
 )
@@ -88,16 +87,20 @@ def _clarification_expired(session_state: dict[str, object]) -> bool:
 
 
 def _expire_clarification(ctx: AgentRunContext) -> None:
-    """超时兜底:清掉过期的 ``_user_clarification``,注入提示让模型知道情况。
+    """超时兜底:清掉过期的 ``_user_clarification``,把超时说明作为那次 clarify_user 的结果补上。
 
     清标志后 ``_resolve_turn_outcome`` 会 fall through 到正常 ``run_main_agent``,
     用户这条新消息作为普通 user prompt 进入模型,而非被当作旧追问的回复。
+
+    说明写成 clarify_user 的工具结果,而不是另插一条系统消息:历史末尾那次调用还没有
+    结果,另插消息要靠 pydantic-ai 自动补一个通用的"调用被中断"结果才能合法,
+    模型看到的信息也更含糊。找不到对应调用时才退回系统消息。
     """
     pending = ctx.session_state.pop("_user_clarification", None) or {}
     question = pending.get("question") or ""
     question_preview = str(question)[:120]
     try:
-        from pydantic_ai.messages import ModelRequest, SystemPromptPart
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart, ToolReturnPart
 
         nudge = (
             "[System 提示] 你之前在执行中调用 clarify_user 向用户追问过"
@@ -106,7 +109,13 @@ def _expire_clarification(ctx: AgentRunContext) -> None:
             "如果是,基于该回答继续;如果不是(用户已切换话题),按新消息处理,"
             "不要强行回到旧追问。若原任务仍需那个信息才能继续,可在合适时机再次追问。"
         )
-        ctx.history.append(ModelRequest(parts=[SystemPromptPart(content=nudge)]))
+        # 只认历史末尾确实还没有结果的那次调用,避免给已结束或已被压缩掉的调用补结果
+        tool_call_id = _find_pending_clarify_tool_call(ctx.history)
+        if tool_call_id:
+            part = ToolReturnPart(tool_name="clarify_user", content=nudge, tool_call_id=tool_call_id)
+        else:
+            part = SystemPromptPart(content=nudge)
+        ctx.history.append(ModelRequest(parts=[part]))
         logger.info(
             "clarification expired, falling back to normal run session_id=%s question=%r",
             ctx.session_id,
@@ -275,12 +284,10 @@ async def _run_agent_task(
     """本轮 agent 执行协程:解析 outcome + 异常分类 + finally 收尾。
 
     CancelledError 透传(由 run_turn 的 try/finally 清理 task);其余异常经
-    ``_handle_run_agent_exception`` 写入 result_holder。finally 保证 mark_turn_finished
-    与(流式时)STREAM_DONE 入队。
+    ``_handle_run_agent_exception`` 写入 result_holder。finally 保证(流式时)STREAM_DONE 入队。
     """
     role = ctx.role
     actual_session_id = ctx.session_id
-    mark_turn_started(ctx.session_state)
     try:
         await _resolve_turn_outcome(service, ctx, deps, refreshed, result_holder)
     except asyncio.CancelledError:
@@ -295,7 +302,6 @@ async def _run_agent_task(
             stream=stream, service=service, role=role, actual_session_id=actual_session_id,
         )
     finally:
-        mark_turn_finished(ctx.session_state)
         if stream:
             with contextlib.suppress(asyncio.CancelledError):
                 await ctx.stream_queue.put(STREAM_DONE)  # type: ignore[arg-type]
