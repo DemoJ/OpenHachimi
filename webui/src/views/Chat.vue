@@ -17,16 +17,19 @@
         </div>
       </header>
       <MessageList :messages="store.visibleMessages" />
-      <!-- clarify_user 追问的预设选项:点击即发送选项文本,比手打回复省事 -->
+      <!-- clarify_user 追问的预设选项:点击即发送选项文本,比手打回复省事。
+           追问原文已在上方 Agent 消息里,这里只放选项;复用 .input-row 与输入框同宽对齐。 -->
       <div v-if="store.clarification && !store.isGenerating" class="clarify-bar">
-        <span class="clarify-question">{{ store.clarification.question }}</span>
-        <div class="clarify-choices">
-          <button
-            v-for="(choice, i) in store.clarification.choices"
-            :key="i"
-            class="btn clarify-choice"
-            @click="onClarifyChoice(choice)"
-          >{{ choice }}</button>
+        <div class="input-row">
+          <span class="clarify-label">快捷回复</span>
+          <div class="clarify-choices">
+            <button
+              v-for="(choice, i) in store.clarification.choices"
+              :key="i"
+              class="btn clarify-choice"
+              @click="onClarifyChoice(choice)"
+            >{{ choice }}</button>
+          </div>
         </div>
       </div>
       <ChatInput :generating="store.isGenerating" @send="onSend" @stop="onStop" />
@@ -285,19 +288,19 @@ function onLogout() {
 </script>
 
 <style scoped>
-/* clarify 选项条:追问 + 可点选项,出现在输入框上方 */
+/* clarify 选项条:可点选项,出现在输入框上方;水平 padding 与 .input-area 一致,
+   内层 .input-row 限宽居中,保证与输入框左右对齐 */
 .clarify-bar {
-  padding: var(--sp-sm) var(--sp-lg);
-  border-top: 1px solid var(--hairline);
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-sm);
+  padding: var(--sp-sm) var(--sp-xl) 0;
 }
-.clarify-question {
-  font-size: 12px;
+.clarify-label {
+  display: block;
+  margin-bottom: var(--sp-xs);
+  font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: 1.2px;
   color: var(--body-mid);
-  max-height: 60px;
-  overflow: hidden;
 }
 .clarify-choices {
   display: flex;
@@ -305,7 +308,10 @@ function onLogout() {
   gap: var(--sp-sm);
 }
 .clarify-choice {
+  max-width: 100%;
   font-size: 13px;
+  text-align: left;
+  white-space: normal;
   cursor: pointer;
 }
 .channel-picker {
