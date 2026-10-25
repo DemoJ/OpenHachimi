@@ -553,6 +553,29 @@ export function artifactDownloadUrl(downloadUrl: string): string {
   return `${downloadUrl}${sep}token=${encodeURIComponent(token)}`
 }
 
+// 模型正文里可能直接写 ![图](/artifacts/xxx/download) 或附件下载链接,
+// markdown 渲染出的 <img>/<a> 不带 token 会 401。这里对指向本站受保护
+// 下载端点的 URL 补上 token,其他 URL 原样返回。
+const PROTECTED_DOWNLOAD_PREFIXES = ['/artifacts/', '/attachments/download']
+
+export function withDownloadToken(rawUrl: string): string {
+  const token = getToken()
+  if (!token || !rawUrl) return rawUrl
+  let url: URL
+  try {
+    url = new URL(rawUrl, window.location.origin)
+  } catch {
+    return rawUrl
+  }
+  if (url.origin !== window.location.origin) return rawUrl
+  if (!PROTECTED_DOWNLOAD_PREFIXES.some((p) => url.pathname.startsWith(p))) return rawUrl
+  if (url.searchParams.has('token')) return rawUrl
+  url.searchParams.set('token', token)
+  // 相对路径保持相对,避免把 origin 写进 DOM。
+  const isAbsolute = /^[a-z][a-z0-9+.-]*:/i.test(rawUrl) || rawUrl.startsWith('//')
+  return isAbsolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`
+}
+
 // 判断产物是否为图片(用于决定渲染缩略图还是文件链接)。
 export function isArtifactImage(artifact: ArtifactRef): boolean {
   return (artifact.content_type || '').startsWith('image/')

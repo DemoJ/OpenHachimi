@@ -22,6 +22,7 @@ import markdown from 'highlight.js/lib/languages/markdown'
 import diff from 'highlight.js/lib/languages/diff'
 import ini from 'highlight.js/lib/languages/ini'
 import plaintext from 'highlight.js/lib/languages/plaintext'
+import { withDownloadToken } from './api'
 
 hljs.registerLanguage('javascript', javascript)
 hljs.registerLanguage('typescript', typescript)
@@ -67,6 +68,24 @@ const md: MarkdownIt = new MarkdownIt({
 })
 // 显式启用表格规则（markdown-it 默认已启用，这里确保不被意外禁用）。
 md.enable(['table'])
+
+// 正文里引用产物/附件下载地址时补 token，否则 <img>/<a> 请求会 401 导致图裂。
+const defaultImage = md.renderer.rules.image!
+md.renderer.rules.image = (tokens, idx, options, env, self) => {
+  const token = tokens[idx]
+  const src = token.attrGet('src')
+  if (src) token.attrSet('src', withDownloadToken(src))
+  return defaultImage(tokens, idx, options, env, self)
+}
+
+const defaultLinkOpen = md.renderer.rules.link_open
+  || ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options))
+md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  const token = tokens[idx]
+  const href = token.attrGet('href')
+  if (href) token.attrSet('href', withDownloadToken(href))
+  return defaultLinkOpen(tokens, idx, options, env, self)
+}
 
 export function renderMarkdown(text: string): string {
   return md.render(text)
