@@ -169,6 +169,24 @@ class TestArtifactPersistence:
         assert loaded is not None
         assert loaded.filename == "report.md"
 
+    def test_real_artifact_id_format_roundtrip(self, tmp_path: Path):
+        # publish_artifact 生成的 id 形如 art_<12位hex>,含下划线;重启后须能回查。
+        from openhachimi_agent.transport.api_models import ArtifactRef
+
+        store = SessionStore(tmp_path / "sessions.sqlite3")
+        artifact = ArtifactRef(
+            id="art_ae61672cc424",
+            filename="qr.png",
+            content_type="image/png",
+            size_bytes=10,
+            local_path=".tmp/artifacts/art_ae61672cc424/qr.png",
+            download_url="/artifacts/art_ae61672cc424/download",
+        )
+        store.save_artifacts("default", "sess_a", [artifact])
+        loaded = store.get_artifact_by_id("art_ae61672cc424")
+        assert loaded is not None
+        assert loaded.filename == "qr.png"
+
     def test_missing_id_returns_none(self, tmp_path: Path):
         store = SessionStore(tmp_path / "sessions.sqlite3")
         assert store.get_artifact_by_id("nonexistent-id") is None

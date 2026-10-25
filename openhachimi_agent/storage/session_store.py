@@ -1003,7 +1003,8 @@ class SessionStore:
         """按 id 回查持久化产物;内存注册表未命中时下载端点的兜底。返回 ArtifactRef 或 None。"""
         from openhachimi_agent.transport.api_models import ArtifactRef
 
-        if not artifact_id or len(artifact_id) > 128 or not all(c.isalnum() or c == "-" for c in artifact_id):
+        # 产物 id 形如 art_<hex>,必须放行下划线,否则重启后回查全部落空(404)。
+        if not artifact_id or len(artifact_id) > 128 or not all(c.isalnum() or c in "-_" for c in artifact_id):
             return None
         try:
             with self._connect() as conn:
