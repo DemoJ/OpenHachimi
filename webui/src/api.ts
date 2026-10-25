@@ -154,12 +154,13 @@ export interface MessageItem {
   timestamp: string | null              // ISO-8601；user=收到时间，assistant=模型回复时间
   // 仅 assistant：本轮请求的 token 用量；旧会话 / 流式中尚未拿到 usage 时为 null
   tokens?: { input: number; output: number; total: number; cache_read?: number } | null
-  // 压缩标记条：非空时本条是「压缩标记」而非真实消息，仅提示该段对话
-  // 已压缩为摘要提供给 AI；原始消息始终完整返回并正常渲染。
+  // 压缩标记：非空时本条是「压缩标记」而非真实消息，放在压缩发生的那一轮之后，
+  // 仅提示此前部分对话以摘要形式提供给 AI；原始消息始终完整返回并正常渲染。
   fold?: {
     compression_id: number
     compressed_count: number
     summary_excerpt: string
+    summary?: string                    // 摘要全文(AI 实际收到的内容)
     head_end_turn: number
     tail_start_turn: number
   } | null
@@ -607,11 +608,4 @@ export function removeSchedule(id: string) {
   return request<{ ok?: boolean; message?: string }>(`/schedules/${encodeURIComponent(id)}`, {
     method: 'DELETE',
   })
-}
-
-// 被压缩折叠段的原始消息:FoldCard 点击展开时按需拉取。
-export function getFoldedMessages(sessionId: string, compressionId: number) {
-  return get<SessionMessagesResponse>(
-    `/sessions/${encodeURIComponent(sessionId)}/messages/folded/${compressionId}`,
-  )
 }

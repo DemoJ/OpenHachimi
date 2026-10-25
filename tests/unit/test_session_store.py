@@ -646,28 +646,6 @@ def test_record_compression_rejects_bad_bounds(store: SessionStore):
         store.record_compression("default", sid, 2, 3, "", total_len=4)  # 空 summary
 
 
-def test_get_folded_messages_returns_middle_window(store: SessionStore):
-    """取折叠区原始消息:返回 head_end+1 .. tail_start-1 区间。"""
-    sid = _new_sid()
-    store.save_messages("default", sid, _build_history(10))  # turn 0..19
-    store.record_compression("default", sid, 3, 12, "sum", total_len=20)
-    folded = store.get_folded_messages("default", sid, 1)
-    assert len(folded) == 8  # turn 4..11
-    folded_text = "\n".join(str(getattr(p, "content", "")) for m in folded for p in getattr(m, "parts", ()))
-    # 中间段 u2..u5 对应的回复/请求都在
-    assert "u2" in folded_text and "u5" in folded_text
-    # head/tail 段不在折叠区
-    assert "u0" not in folded_text
-    assert "u6" not in folded_text
-
-
-def test_get_folded_messages_unknown_compression(store: SessionStore):
-    """不存在的 compression_id 返回空列表。"""
-    sid = _new_sid()
-    store.save_messages("default", sid, _build_history(2))
-    assert store.get_folded_messages("default", sid, 999) == []
-
-
 def test_list_compressions_ordered(store: SessionStore):
     """list_compressions 按 compression_id 升序返回。"""
     sid = _new_sid()

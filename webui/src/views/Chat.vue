@@ -45,7 +45,7 @@ import MessageList from '../components/MessageList.vue'
 import ChatInput from '../components/ChatInput.vue'
 import { useChatStore, type LiveTurn } from '../store'
 import { chatStream } from '../sse'
-import { post, getToken, getSessionMessages, type AttachmentRef } from '../api'
+import { post, getToken, getSessionMessages, type AttachmentRef, type MessageItem } from '../api'
 
 const router = useRouter()
 const store = useChatStore()
@@ -70,45 +70,60 @@ async function syncMessagesFromServer() {
 
   try {
     const res = await getSessionMessages(sid, store.currentRole)
-    // 按顺序对齐本地与远端消息（按 role 匹配），只回填 metadata 字段，
-    // 不替换 content —— 避免覆盖 SSE 期间流式追加的 assistant 文本，也避免触发
-    // MessageList 的滚动闪烁。因为远端分页只返回最新一页，所以从后往前遍历对齐。
-    const local = store.messages
-    const remote = res.messages
-    let li = local.length - 1
-    let filledPrefix = 0
-    let filledTime = 0
-    let filledTokens = 0
-    for (let ri = remote.length - 1; ri >= 0; ri--) {
-      const rm = remote[ri]
-      while (li >= 0 && local[li].role !== rm.role) li -= 1
-      if (li < 0) break
-      const lm = local[li]
-      if (lm.role === 'user' && rm.role === 'user' && rm.prefix && !lm.prefix) {
-        lm.prefix = rm.prefix
-        filledPrefix += 1
-      }
-      // 用后端 ISO timestamp 覆盖本地的乐观时间戳（来源更权威，与持久化历史一致）
-      if (rm.timestamp) {
-        lm.timestamp = rm.timestamp
-        filledTime += 1
-      }
-      // tokens 仅 assistant 有；流式期间没办法实时拿，靠这次回填补齐
-      if (rm.role === 'assistant' && rm.tokens) {
-        lm.tokens = rm.tokens
-        filledTokens += 1
-      }
-      li -= 1
-    }
-    console.info('[Chat] message meta sync done', {
-      sid,
-      filledPrefix,
-      filledTime,
-      filledTokens,
-    })
+    const stats = backfillMessageMeta(store.messages, res.messages.filter((m) => !m.fold))
+    // 本轮结束时若刚发生上下文压缩,把新标记补到末尾:不刷新也能看到,与刷新后一致。
+    const addedFolds = appendNewFoldMarkers(store.messages, res.messages)
+    console.info('[Chat] message meta sync done', { sid, ...stats, addedFolds })
   } catch (err) {
     console.warn('[Chat] message meta sync failed', err)
   }
+}
+
+/**
+ * 按顺序对齐本地与远端消息（按 role 匹配），只回填 metadata 字段，
+ * 不替换 content —— 避免覆盖 SSE 期间流式追加的 assistant 文本，也避免触发
+ * MessageList 的滚动闪烁。远端分页只返回最新一页，所以从后往前遍历对齐。
+ * 远端一轮只有一个 assistant 气泡（与流式一致），本地压缩标记不参与对齐。
+ */
+function backfillMessageMeta(local: MessageItem[], remote: MessageItem[]) {
+  const stats = { filledPrefix: 0, filledTime: 0, filledTokens: 0 }
+  let li = local.length - 1
+  for (let ri = remote.length - 1; ri >= 0; ri--) {
+    const rm = remote[ri]
+    while (li >= 0 && (local[li].fold || local[li].role !== rm.role)) li -= 1
+    if (li < 0) break
+    const lm = local[li]
+    if (rm.role === 'user' && rm.prefix && !lm.prefix) {
+      lm.prefix = rm.prefix
+      stats.filledPrefix += 1
+    }
+    // 用后端 ISO timestamp 覆盖本地的乐观时间戳（来源更权威，与持久化历史一致）
+    if (rm.timestamp) {
+      lm.timestamp = rm.timestamp
+      stats.filledTime += 1
+    }
+    // tokens / 工具调用摘要仅 assistant 有；流式期间拿不到，靠这次回填补齐
+    if (rm.role === 'assistant') {
+      if (rm.tokens) {
+        lm.tokens = rm.tokens
+        stats.filledTokens += 1
+      }
+      if (rm.tool_calls?.length && !lm.tool_calls?.length) lm.tool_calls = rm.tool_calls
+    }
+    li -= 1
+  }
+  return stats
+}
+
+/** 把远端末尾、本地还没有的压缩标记追加到本地列表，返回追加条数。 */
+function appendNewFoldMarkers(local: MessageItem[], remote: MessageItem[]): number {
+  const known = new Set(local.filter((m) => m.fold).map((m) => m.fold!.compression_id))
+  const trailing: MessageItem[] = []
+  for (let i = remote.length - 1; i >= 0 && remote[i].fold; i--) {
+    if (!known.has(remote[i].fold!.compression_id)) trailing.unshift(remote[i])
+  }
+  local.push(...trailing)
+  return trailing.length
 }
 
 onMounted(async () => {

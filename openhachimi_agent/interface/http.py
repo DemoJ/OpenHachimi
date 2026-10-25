@@ -61,7 +61,6 @@ from openhachimi_agent.transport.api_models import (
     MemoryListResponse,
     MemoryUpdateRequest,
     MemoryUpdateResult,
-    MessageItem,
     MCPServerItem,
     McpServersResponse,
     McpServersUpdateRequest,
@@ -840,29 +839,6 @@ def get_session_messages(session_id: str, role: str | None = None, limit: int | 
     logger.info("http get session messages request session_id=%s role=%s limit=%s before_turn=%s", session_id, role, limit, before_turn)
     try:
         return SessionMessagesResponse(**service.get_session_messages(role, session_id, limit=limit, before_turn=before_turn))
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
-
-
-@app.get("/sessions/{session_id}/messages/folded/{compression_id}")
-def get_folded_messages(
-    session_id: str,
-    compression_id: int,
-    role: str | None = None,
-    service: AgentService = Depends(get_service),
-) -> SessionMessagesResponse:
-    """展开折叠占位条:返回某次压缩被折叠的原始消息(供前端展开渲染)。"""
-    logger.info(
-        "http get folded messages request session_id=%s compression_id=%d role=%s",
-        session_id, compression_id, role,
-    )
-    try:
-        items = service.get_folded_messages(role, session_id, compression_id)
-        return SessionMessagesResponse(
-            role=service._normalize_role(role),
-            session_id=session_id,
-            messages=[MessageItem(**p) for p in items],
-        )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=safe_error_detail(exc)) from exc
 

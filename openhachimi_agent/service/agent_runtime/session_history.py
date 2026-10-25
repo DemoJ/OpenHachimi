@@ -2,7 +2,7 @@
 
 `AgentService` 持有 `session_store` 与静态上下文池,这里提供接收 `service` 整体
 作参数的纯函数,负责:把 ``ModelMessage`` 序列抽成展示用文本结构、列出/加载/删除
-会话、按折叠区间还原消息流。`AgentService` 内对应方法退化为薄壳。
+会话、按轮合并出展示消息流(压缩只加标记,见 ``history_display``)。`AgentService` 内对应方法退化为薄壳。
 """
 
 from __future__ import annotations
@@ -14,6 +14,10 @@ from datetime import datetime
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse
 
 from openhachimi_agent.core.identifiers import validate_latest_scope
+from openhachimi_agent.service.agent_runtime.history_display import (
+    build_display_messages,
+    collect_tool_calls,
+)
 from openhachimi_agent.transport.api_models import CommandResponse
 
 
@@ -222,40 +226,11 @@ def extract_text_parts(
                         }
                         # 同一 ModelResponse 里的工具调用摘要挂到展示消息上
                         # (tool_calls 在 parts 循环外收集,见下方)。
-                        turn_tool_calls = _collect_tool_calls(msg)
+                        turn_tool_calls = collect_tool_calls(msg)
                         if turn_tool_calls:
                             item["tool_calls"] = turn_tool_calls
                         result.append(item)
     return result
-
-
-def _collect_tool_calls(msg: ModelResponse) -> list[str]:
-    """把 ModelResponse 里的 ToolCallPart 渲染成脱敏展示文本(历史回放用)。
-
-    只影响 WebUI 展示("Agent 做过什么"),不参与喂给模型的上下文。
-    格式化复用流式工具卡片的 format_tool_call(含参数脱敏与中文动作名)。
-    """
-    from pydantic_ai.messages import ToolCallPart
-
-    from openhachimi_agent.service.agent_runtime.streaming import format_tool_call
-
-    lines: list[str] = []
-    for part in getattr(msg, "parts", ()):
-        if not isinstance(part, ToolCallPart):
-            continue
-        args = part.args
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {"args": args}
-        if not isinstance(args, dict):
-            args = {}
-        try:
-            lines.append(format_tool_call(part.tool_name, args))
-        except Exception:  # noqa: BLE001 — 展示层兜底,不让格式化失败炸掉历史读取
-            logger.debug("tool call formatting failed tool=%s", part.tool_name, exc_info=True)
-    return lines
 
 
 def list_sessions(
@@ -374,75 +349,52 @@ def delete_session(service, role_name: str | None = None, session_id: str | None
     )
 
 
+def _compression_markers(compressions: list[dict]) -> dict[int, list[dict]]:
+    """把压缩记录转成 ``{anchor_turn: [标记项]}``:标记放在压缩发生时的最后一条消息之后。
+
+    压缩只影响喂给模型的运行时上下文,展示上不隐藏任何消息;标记仅提示「从这里起,
+    之前的部分对话以摘要形式提供给 AI」。旧数据缺 anchor_turn 时退回折叠区间末尾。
+    """
+    markers: dict[int, list[dict]] = {}
+    for c in compressions:
+        count = c["tail_start_turn"] - c["head_end_turn"] - 1
+        if count <= 0:
+            continue
+        anchor = c.get("anchor_turn")
+        if anchor is None:
+            anchor = c["tail_start_turn"] - 1
+        markers.setdefault(int(anchor), []).append({
+            "role": "user", "content": "", "fold": {
+                "compression_id": c["compression_id"],
+                "compressed_count": count,
+                "summary_excerpt": summary_excerpt(c["summary_text"]),
+                "summary": c["summary_text"],
+                "head_end_turn": c["head_end_turn"],
+                "tail_start_turn": c["tail_start_turn"],
+            },
+        })
+    return markers
+
+
 def get_session_messages(service, role_name: str | None = None, session_id: str | None = None, limit: int | None = None, before_turn: int | None = None) -> dict:
+    """WebUI 展示用的完整消息流:按轮合并,与流式界面一致;压缩只加标记,不改历史。"""
     role = service._normalize_role(role_name)
     service._validate_role_exists(role)
     resolved_session_id = service._normalize_session_id(session_id)
     if not resolved_session_id:
         raise ValueError("session_id 不能为空")
 
-    # 展示用「完整原始消息序列 + 压缩标记」:压缩只影响喂给模型的运行时上下文,
-    # WebUI 消息流永远返回全部原始消息(append-only,永不删)。session_compressions
-    # 记录每次压缩的折叠区间 [head_end_turn+1, tail_start_turn-1],仅在区间起始
-    # 位置插一条 fold 标记作分隔提示,不隐藏、不替换任何消息。
-    compressions = service.session_store.list_compressions(role, resolved_session_id)
-    fold_ranges = [
-        {
-            "compression_id": c["compression_id"],
-            "lo": c["head_end_turn"] + 1,
-            "count": c["tail_start_turn"] - c["head_end_turn"] - 1,
-            "summary_excerpt": summary_excerpt(c["summary_text"]),
-            "head_end_turn": c["head_end_turn"],
-            "tail_start_turn": c["tail_start_turn"],
-        }
-        for c in compressions
-        if c["tail_start_turn"] - c["head_end_turn"] - 1 > 0
-    ]
-    fold_starts = {f["lo"] for f in fold_ranges}
-
     from openhachimi_agent.transport.api_models import MessageItem
 
-    # 直接按 turn_index 读原始行,不走 extract_text_parts 的视图路径
-    # —— 视图按运行时上下文组装(含折叠),展示恰恰要完整消息 + 标记条。
-    safe_role = role
-    rows, _has_more = service.session_store._load_message_rows(safe_role, resolved_session_id, limit=limit, before_turn=before_turn)
-    messages: list[MessageItem] = []
-    folded_seen: set[int] = set()
+    compressions = service.session_store.list_compressions(role, resolved_session_id)
+    rows, _has_more = service.session_store._load_message_rows(role, resolved_session_id, limit=limit, before_turn=before_turn)
 
-    for turn_idx, msg in rows:
-        if turn_idx in fold_starts and turn_idx not in folded_seen:
-            # 压缩区间起点:插一条标记(仅提示此处对话被压缩为摘要提供给 AI)
-            fold_info = next(f for f in fold_ranges if f["lo"] == turn_idx)
-            messages.append(MessageItem(
-                role="user", content="", fold={
-                    "compression_id": fold_info["compression_id"],
-                    "compressed_count": fold_info["count"],
-                    "summary_excerpt": fold_info["summary_excerpt"],
-                    "head_end_turn": fold_info["head_end_turn"],
-                    "tail_start_turn": fold_info["tail_start_turn"],
-                },
-            ))
-            folded_seen.add(turn_idx)
-        parts = extract_text_parts(service, [msg], role=role)
-        for p in parts:
-            messages.append(MessageItem(**p))
+    def render_user(msg: ModelRequest) -> list[dict]:
+        return [p for p in extract_text_parts(service, [msg], role=role) if p["role"] == "user"]
 
+    items = build_display_messages(rows, render_user, _compression_markers(compressions))
     return {
         "role": role,
         "session_id": resolved_session_id,
-        "messages": messages,
+        "messages": [MessageItem(**item) for item in items],
     }
-
-
-def get_folded_messages(
-    service, role_name: str | None, session_id: str, compression_id: int
-) -> list[dict]:
-    """返回某次压缩被折叠的原始消息(展开用),已抽成 MessageItem 文本结构。"""
-    role = service._normalize_role(role_name)
-    service._validate_role_exists(role)
-    resolved_session_id = service._normalize_session_id(session_id)
-    msgs = service.session_store.get_folded_messages(role, resolved_session_id, compression_id)
-    out: list[dict] = []
-    for msg in msgs:
-        out.extend(extract_text_parts(service, [msg], role=role))
-    return out

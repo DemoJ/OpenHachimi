@@ -625,15 +625,22 @@ class SessionStore:
     def list_compressions(
         self, role: str, session_id: str
     ) -> list[dict]:
-        """列出某会话的全部压缩元数据(按 compression_id 升序),供前端折叠渲染。"""
+        """列出某会话的全部压缩元数据(按 compression_id 升序),供前端展示压缩标记。
+
+        ``anchor_turn`` 是压缩发生时已落库的最后一条消息(created_at 不晚于压缩时间),
+        展示层把标记放在它之后,即压缩真正发生的位置。
+        """
         safe_role = validate_role_name(role)
         safe_sid = validate_session_id(session_id, allow_legacy=False)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT compression_id, created_at, head_end_turn, tail_start_turn, "
-                "       summary_turn, summary_text "
-                "FROM session_compressions WHERE role=? AND session_id=? "
-                "ORDER BY compression_id",
+                "SELECT c.compression_id, c.created_at, c.head_end_turn, c.tail_start_turn, "
+                "       c.summary_turn, c.summary_text, "
+                "       (SELECT MAX(m.turn_index) FROM session_messages m "
+                "        WHERE m.role=c.role AND m.session_id=c.session_id "
+                "          AND m.created_at <= c.created_at) AS anchor_turn "
+                "FROM session_compressions c WHERE c.role=? AND c.session_id=? "
+                "ORDER BY c.compression_id",
                 (safe_role, safe_sid),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -688,34 +695,6 @@ class SessionStore:
             safe_role, safe_sid, next_id, head_end_turn, tail_start_turn,
         )
         return next_id
-
-    def get_folded_messages(
-        self, role: str, session_id: str, compression_id: int
-    ) -> list[ModelMessage]:
-        """取某次压缩被折叠的原始消息(head_end_turn+1 .. tail_start_turn-1),供前端展开。"""
-        safe_role = validate_role_name(role)
-        safe_sid = validate_session_id(session_id, allow_legacy=False)
-        with self._connect() as conn:
-            comp = conn.execute(
-                "SELECT head_end_turn, tail_start_turn FROM session_compressions "
-                "WHERE role=? AND session_id=? AND compression_id=?",
-                (safe_role, safe_sid, compression_id),
-            ).fetchone()
-            if comp is None:
-                return []
-            rows = conn.execute(
-                "SELECT message_json FROM session_messages "
-                "WHERE role=? AND session_id=? "
-                "  AND turn_index > ? AND turn_index < ? "
-                "ORDER BY turn_index",
-                (safe_role, safe_sid, comp["head_end_turn"], comp["tail_start_turn"]),
-            ).fetchall()
-        if not rows:
-            return []
-        arr_json = b"[" + b",".join(
-            r["message_json"].encode("utf-8") for r in rows
-        ) + b"]"
-        return list(ModelMessagesTypeAdapter.validate_json(arr_json))
 
     def load_context(
         self,

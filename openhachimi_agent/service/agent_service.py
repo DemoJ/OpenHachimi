@@ -210,12 +210,6 @@ class AgentService:
     def get_session_messages(self, role_name: str | None = None, session_id: str | None = None, limit: int | None = None, before_turn: int | None = None) -> dict:
         return session_history.get_session_messages(self, role_name, session_id, limit=limit, before_turn=before_turn)
 
-    def get_folded_messages(
-        self, role_name: str | None, session_id: str, compression_id: int
-    ) -> list[dict]:
-        """返回某次压缩被折叠的原始消息(展开用)。详见 ``session_history.get_folded_messages``。"""
-        return session_history.get_folded_messages(self, role_name, session_id, compression_id)
-
     # ------------------------------------------------------------------ 中断与停止
 
     async def interrupt_session_resources(self, session_id: str, reason: str = "interrupt") -> int:

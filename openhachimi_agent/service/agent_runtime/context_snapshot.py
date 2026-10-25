@@ -80,8 +80,6 @@ def _stamp_turn_metadata(
     Multi-step 单轮中可能多次往 history 追加 ``ModelRequest``（planner、
     executor_repair 等都会 extend），但首个 user 消息就是本轮入口。
     """
-    from pydantic_ai.messages import ModelRequest, UserPromptPart
-
     if not user_message:
         return
     payload: dict[str, str] = {_USER_MESSAGE_METADATA_KEY: user_message}
@@ -96,24 +94,44 @@ def _stamp_turn_metadata(
             ensure_ascii=False,
         )
 
+    target = _find_turn_entry_request(new_history, prev_len)
+    if target is None:
+        return
+    idx, msg = target
+    meta = getattr(msg, "metadata", None)
+    if meta is None:
+        try:
+            msg.metadata = dict(payload)
+        except Exception:  # noqa: BLE001  # 极端情况 dataclass 被冻结时静默放弃
+            logger.debug("failed to stamp turn metadata on ModelRequest idx=%d", idx)
+        return
+    # metadata 已存在：补齐我们这几项,不覆盖第三方已有键
+    for k, v in payload.items():
+        if k not in meta:
+            meta[k] = v
+
+
+def _find_turn_entry_request(new_history: list, prev_len: int) -> tuple[int, object] | None:
+    """找本轮用户输入所在的 ModelRequest:首个含 UserPromptPart 的请求。
+
+    clarify_user 回复轮次没有 UserPromptPart —— 用户回复以 clarify_user 的工具结果
+    灌回模型,此时退而取含该工具结果的请求,让历史回放能还原出用户原话。
+    """
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
+
+    fallback: tuple[int, object] | None = None
     for idx in range(prev_len, len(new_history)):
         msg = new_history[idx]
         if not isinstance(msg, ModelRequest):
             continue
-        if not any(isinstance(part, UserPromptPart) for part in getattr(msg, "parts", ())):
-            continue
-        meta = getattr(msg, "metadata", None)
-        if meta is None:
-            try:
-                msg.metadata = dict(payload)
-            except Exception:  # noqa: BLE001  # 极端情况 dataclass 被冻结时静默放弃
-                logger.debug("failed to stamp turn metadata on ModelRequest idx=%d", idx)
-            return
-        # metadata 已存在：补齐我们这几项,不覆盖第三方已有键
-        for k, v in payload.items():
-            if k not in meta:
-                meta[k] = v
-        return
+        parts = getattr(msg, "parts", ())
+        if any(isinstance(part, UserPromptPart) for part in parts):
+            return idx, msg
+        if fallback is None and any(
+            isinstance(part, ToolReturnPart) and part.tool_name == "clarify_user" for part in parts
+        ):
+            fallback = (idx, msg)
+    return fallback
 
 
 def _stamp_artifacts_metadata(

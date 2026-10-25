@@ -7,14 +7,8 @@
         <span v-else>滚动加载更多</span>
       </div>
       <template v-for="(m, idx) in messages" :key="messageKey(m, idx)">
-        <!-- 压缩标记条：该段对话被压缩为摘要提供给 AI 时显示。
-              可点击展开被折叠的原始消息。 -->
-        <FoldCard
-          v-if="m.fold"
-          :fold="m.fold"
-          :session-id="store.currentSessionId"
-          :role="store.currentRole"
-        />
+        <!-- 压缩标记：提示此处发生过上下文压缩，可展开查看摘要；不影响消息本身。 -->
+        <FoldCard v-if="m.fold" :fold="m.fold" />
         <MessageBubble
           v-else
           :role="m.role"
