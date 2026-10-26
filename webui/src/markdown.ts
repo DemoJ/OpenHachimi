@@ -84,6 +84,9 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   const token = tokens[idx]
   const href = token.attrGet('href')
   if (href) token.attrSet('href', withDownloadToken(href))
+  // 消息链接在新标签页打开，避免离开当前会话。
+  token.attrSet('target', '_blank')
+  token.attrSet('rel', 'noopener noreferrer')
   return defaultLinkOpen(tokens, idx, options, env, self)
 }
 
