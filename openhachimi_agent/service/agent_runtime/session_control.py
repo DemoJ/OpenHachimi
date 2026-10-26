@@ -39,6 +39,10 @@ async def stop_session(service, session_id: str) -> CommandResponse:
         if not task.done():
             task.cancel()
             task.add_done_callback(_log_cancelled_task_result)
+        checkpoint = service._turn_checkpoints.get(session_id)
+        if checkpoint is not None:
+            # /stop 返回后即可刷新历史,但不阻塞在可能很慢的工具取消清理上。
+            await checkpoint()
         return CommandResponse(
             message="已成功中断当前任务。",
             role=service.config.default_role_name,

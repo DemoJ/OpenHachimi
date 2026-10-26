@@ -165,8 +165,12 @@ def _build_run_context(
         stream_queue=stream_queue,
     )
     tool_trace: list[ToolTraceEntry] = []
+    partial_output: list[StreamEventItem] = []
     result_holder.setdefault("tool_trace", tool_trace)
-    ctx.stream_event_handler = build_stream_event_handler(stream_queue, ctx.operation_state, trace=tool_trace)
+    result_holder["partial_output"] = partial_output
+    ctx.stream_event_handler = build_stream_event_handler(
+        stream_queue, ctx.operation_state, trace=tool_trace, output=partial_output,
+    )
     ctx.context_compressor = service._get_context_compressor(inputs.session_id)
     return ctx, stream_queue, stream_stats, result_holder
 

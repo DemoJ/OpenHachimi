@@ -25,7 +25,7 @@ from openhachimi_agent.service.agent_runtime.context_snapshot import (
     _stamp_artifacts_metadata,
     _stamp_turn_metadata,
 )
-from openhachimi_agent.service.agent_runtime.streaming import ToolTraceEntry, format_tool_trace
+from openhachimi_agent.service.agent_runtime.streaming import StreamEventItem, ToolTraceEntry, format_tool_trace
 from openhachimi_agent.transport.api_models import ArtifactRef
 
 
@@ -188,14 +188,16 @@ async def _persist_failed_turn_user_message(
     user_message: str,
     attachments: list | None = None,
     tool_trace: list[ToolTraceEntry] | None = None,
+    partial_output: list[StreamEventItem] | None = None,
+    artifacts: list[ArtifactRef] | None = None,
     update_pointer: bool = True,
-) -> None:
+) -> bool:
     """agent 调用失败兜底:把本轮用户输入落库,避免下一轮丢失上下文。
 
     正常路径下用户消息由 pydantic-ai 追加进 ``result.all_messages()``,再经
     ``_persist_turn`` 差量落库。但 agent 抛异常时 ``result`` 不可用,该 user 消息
     从未进入历史,下一轮 ``load_context`` 读不到它 → agent 表现为"忘了刚才聊什么"。
-    本函数在失败时用一条 ``ModelRequest(UserPromptPart)`` 兜底落库,使下一轮能看到。
+    本函数在失败或中断时保存用户输入、已生成正文与产物,使刷新和下一轮均能读到。
 
     ``tool_trace`` 非空时,再追加一条 assistant 的中断摘要消息(已完成的工具调用
     及结果),让下一轮 agent 能接续执行而不是从头重跑;摘要只含脱敏的展示文本,
@@ -203,16 +205,16 @@ async def _persist_failed_turn_user_message(
     为 user 在前、摘要在后;``new_history[len(history):]`` 差量语义不受影响(见
     ``_persist_turn`` 注释,pydantic-ai 的 ``all_messages()`` 包含读回的 history)。
 
-    幂等:append-only + ``INSERT OR IGNORE`` + ``MAX(turn_index)+1`` 续编;下一轮
-    成功时 ``_persist_turn`` 的 ``new_history[len(history):]`` 会自然跳过已落库部分,
-    不会重复。落库失败只 warn,绝不掩盖原始 agent 错误。
+    本函数只追加本轮差量,调用方用轮次锁与 persisted 标记防止重复保存。下一轮
+    成功时 ``_persist_turn`` 的 ``new_history[len(history):]`` 跳过已落库部分。
+    返回保存是否成功;失败只 warn,由停止接口决定是否向用户报告保存失败。
     """
     # clarify_user deferred 路径:用户回复以 deferred tool result 灌回模型,不应再
     # 作为独立 user 消息落库(否则下一轮会出现"用户消息 + 未消费 tool return"双入口)。
     if ctx.session_state.get("_user_clarification"):
-        return
-    if not (user_message or "").strip():
-        return
+        return True
+    if not (user_message or "").strip() and not attachments:
+        return True
 
     _meta = {_USER_MESSAGE_METADATA_KEY: user_message}
     if attachments:
@@ -228,6 +230,19 @@ async def _persist_failed_turn_user_message(
     # save_messages 是 append-only 追加语义:只传本轮新增的 user 消息,不能带 history
     # (否则会把已落库的历史再存一遍)。turn_index 由 MAX(turn_index)+1 续编。
     new_slice: list[ModelRequest | ModelResponse] = [user_request]
+    chunks: list[str] = []
+    for item in partial_output or []:
+        if item.type == "text" and not item.temporary:
+            chunks.append(item.text)
+        elif item.temporary and chunks:
+            new_slice.append(ModelResponse(parts=[TextPart(content="".join(chunks))]))
+            chunks = []
+    if chunks:
+        new_slice.append(ModelResponse(parts=[TextPart(content="".join(chunks))]))
+    if artifacts:
+        if len(new_slice) == 1:
+            new_slice.append(ModelResponse(parts=[TextPart(content="")]))
+        _stamp_artifacts_metadata(new_slice, 0, artifacts)
     trace_text = format_tool_trace(tool_trace or [])
     if trace_text:
         new_slice.append(
@@ -253,12 +268,20 @@ async def _persist_failed_turn_user_message(
             "failed-turn user message fallback persist failed role=%s session_id=%s",
             role, actual_session_id, exc_info=True,
         )
-        return
+        return False
+
+    if artifacts:
+        service.register_artifacts(artifacts)
+        try:
+            await asyncio.to_thread(service.session_store.save_artifacts, role, actual_session_id, artifacts)
+        except Exception:
+            logger.warning("interrupted-turn artifact persistence failed session_id=%s", actual_session_id, exc_info=True)
 
     logger.info(
         "failed-turn trace persisted role=%s session_id=%s steps=%d messages=%d",
         role, actual_session_id, len(tool_trace or []), len(new_slice),
     )
+    return True
 
 
 async def _maybe_compress_post_turn(

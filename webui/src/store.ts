@@ -243,7 +243,7 @@ export const useChatStore = defineStore('chat', {
     setCurrentSession(id: string | null) {
       this.currentSessionId = id
       // 切走时清扫:已结束且不属于新视图的轮次就地丢弃。
-      // 错误/中断轮次的内容没落库,保留到用户看过为止(下次切走再清)。
+      // 错误或尚未确认保存的中断轮次,保留到用户看过为止(下次切走再清)。
       const keep = id ?? PENDING_TURN_KEY
       for (const key of Object.keys(this.liveTurns)) {
         if (key !== keep && !this.liveTurns[key].generating) delete this.liveTurns[key]
@@ -430,8 +430,8 @@ export const useChatStore = defineStore('chat', {
       delete this.liveTurns[key]
     },
     // 流结束(正常/错误/中断):终止 generating 态。errorMessage 非空时追加错误气泡。
-    // 错误/中断轮次的内容没落库,保留在缓冲里给用户看,切走时由
-    // setCurrentSession 清扫;正常结束走 completeTurn。
+    // 错误/尚未确认保存的中断内容保留在缓冲里;正常完成或 /stop 确认保存后
+    // 走 completeTurn,其余由 setCurrentSession 清扫。
     finishTurn(turn: LiveTurn, errorMessage?: string) {
       turn.generating = false
       turn.activity = null

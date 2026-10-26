@@ -244,7 +244,7 @@ async function onSend(text: string, attachments: AttachmentRef[]) {
         console.info('[Chat] stream done')
         store.finishTurn(turn)
         // chatStream 的 finally 在主动 abort 后也会调用 onDone。
-        // 此时只结束生成态并保留缓冲;刷新侧栏会重置分页,还可能覆盖新会话的乐观条目。
+        // 此时只结束生成态,缓冲等 /stop 确认保存后再物化;刷新侧栏会重置分页。
         if (ctrl.signal.aborted) return
         // done 事件在后端 _persist_turn 之后发出,本轮消息已全部落库:
         // 正在查看 → 乐观消息物化进 messages(视图无跳变),随后回填 meta;
@@ -263,7 +263,7 @@ async function onSend(text: string, attachments: AttachmentRef[]) {
           store.finishTurn(turn, msg)
         } else {
           console.info('[Chat] stream aborted by user/route')
-          // 中断的轮次保留已缓冲的部分回复(未落库,切走时由 store 清扫)
+          // 保留部分回复,等待 /stop 确认保存;失败时仍可在当前页面查看。
           store.finishTurn(turn)
         }
       },
@@ -283,6 +283,9 @@ async function onStop() {
   if (sid) {
     try {
       await post('/stop', { session_id: sid })
+      // 后端返回前已保存用户消息和部分回复。移除轮次缓冲,避免重新加载
+      // 同一会话时将已落库历史与缓冲重复合并;侧栏列表和分页保持不变。
+      store.completeTurn(turn)
     } catch (err) {
       // 停止请求失败要告知用户:本地 SSE 已断,但后端任务可能仍在跑。
       console.warn('[Chat] /stop request failed', err)

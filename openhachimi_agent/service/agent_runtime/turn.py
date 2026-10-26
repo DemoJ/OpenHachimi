@@ -19,10 +19,11 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+from anyio import CancelScope
 
 from openhachimi_agent.core.deps import AgentDeps
 from openhachimi_agent.core.redaction import redact_text
@@ -289,6 +290,8 @@ async def _run_agent_task(
     role = ctx.role
     actual_session_id = ctx.session_id
     try:
+        # 在登记可停止任务之后再做异步初始化,初始化期间停止也能保存用户输入。
+        await _refresh_mcp_once(service, ctx, deps, refreshed)
         await _resolve_turn_outcome(service, ctx, deps, refreshed, result_holder)
     except asyncio.CancelledError:
         logger.info(
@@ -331,6 +334,49 @@ class _TurnRunState:
     stream_queue: asyncio.Queue
     stream_stats: StreamStats
     result_holder: dict[str, object]
+    persist_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    persisted: bool = False
+
+
+async def _persist_unfinished_turn(state: _TurnRunState, *, require_saved: bool = False) -> None:
+    """中断/异常的快照与正常落库互斥,保证同一轮只追加一次。
+
+    HTTP 断流会取消整个 AnyIO scope,保存阶段需屏蔽该取消,否则 to_thread
+    还没提交 SQLite 事务就再次被打断。只保存已产生的文本,不继续调用模型。
+    """
+    with CancelScope(shield=True):
+        async with state.persist_lock:
+            if state.persisted:
+                return
+            if "result" in state.result_holder:
+                await _persist_turn(
+                    state.service, state.ctx, state.result_holder["result"], state.deps,
+                    role=state.role, actual_session_id=state.actual_session_id,
+                    latest_scope=state.inputs.latest_scope,
+                    resolved_channel_code=state.inputs.resolved_channel_code,
+                    message=state.message, history=state.history,
+                    attachments=state.inputs.attachment_list,
+                    artifacts=_collect_turn_artifacts(state.session_state),
+                    update_pointer=state.run_mode != "scheduled",
+                )
+            else:
+                saved = await _persist_failed_turn_user_message(
+                    state.service, state.ctx,
+                    role=state.role, actual_session_id=state.actual_session_id,
+                    latest_scope=state.inputs.latest_scope,
+                    resolved_channel_code=state.inputs.resolved_channel_code,
+                    user_message=state.message,
+                    attachments=state.inputs.attachment_list,
+                    tool_trace=state.result_holder.get("tool_trace"),
+                    partial_output=state.result_holder.get("partial_output"),
+                    artifacts=_collect_turn_artifacts(state.session_state),
+                    update_pointer=state.run_mode != "scheduled",
+                )
+                if not saved:
+                    if require_saved:
+                        raise RuntimeError("任务已停止,但消息保存失败,请稍后重试。")
+                    return
+            state.persisted = True
 
 
 async def _finalize_turn_data(
@@ -349,15 +395,20 @@ async def _finalize_turn_data(
     final_output_text = _resolve_final_output_text(result, state.result_holder)
     turn_artifacts = _collect_turn_artifacts(session_state)
     service.register_artifacts(turn_artifacts)
-    new_history = await _persist_turn(
-        service, ctx, result, deps,
-        role=role, actual_session_id=actual_session_id, latest_scope=state.inputs.latest_scope,
-        resolved_channel_code=state.inputs.resolved_channel_code, message=state.message, history=state.history,
-        attachments=state.inputs.attachment_list,
-        artifacts=turn_artifacts,
-        # scheduled 轮次不更新渠道 scope 的最新会话指针(防劫持闲聊上下文)
-        update_pointer=state.run_mode != "scheduled",
-    )
+    async with state.persist_lock:
+        if state.persisted:
+            new_history = list(result.all_messages())
+        else:
+            new_history = await _persist_turn(
+                service, ctx, result, deps,
+                role=role, actual_session_id=actual_session_id, latest_scope=state.inputs.latest_scope,
+                resolved_channel_code=state.inputs.resolved_channel_code, message=state.message, history=state.history,
+                attachments=state.inputs.attachment_list,
+                artifacts=turn_artifacts,
+                # scheduled 轮次不更新渠道 scope 的最新会话指针(防劫持闲聊上下文)
+                update_pointer=state.run_mode != "scheduled",
+            )
+            state.persisted = True
     await _maybe_compress_post_turn(
         service, ctx.context_compressor,
         role=role, actual_session_id=actual_session_id, latest_scope=state.inputs.latest_scope,
@@ -408,6 +459,7 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
         _run_agent_task(service, ctx, state.deps, [False], state.result_holder, stream=stream)
     )
     service._running_tasks[actual_session_id] = task
+    service._turn_checkpoints[actual_session_id] = lambda: _persist_unfinished_turn(state, require_saved=True)
 
     try:
         if stream:
@@ -428,16 +480,7 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
                 raise
             if state.result_holder.get("usage_limit_pause"):
                 # 步数保护阀:非流式渠道(TG/scheduled)用 ChatResponse 告知用户现状与继续方式。
-                await _persist_failed_turn_user_message(
-                    service, ctx,
-                    role=state.role, actual_session_id=actual_session_id,
-                    latest_scope=state.inputs.latest_scope,
-                    resolved_channel_code=state.inputs.resolved_channel_code,
-                    user_message=state.message,
-                    attachments=state.inputs.attachment_list,
-                    tool_trace=state.result_holder.get("tool_trace"),
-                    update_pointer=state.run_mode != "scheduled",
-                )
+                await _persist_unfinished_turn(state)
                 yield ChatResponse(
                     output="本轮任务已自动执行了较多步骤(达到单次对话步数上限 60),为防止失控已主动暂停。已完成的步骤已保存,请回复\"继续\"接着执行,或告诉我调整方向。",
                     role=state.role,
@@ -451,16 +494,7 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
             # stall / task 被取消路径:agent task 未产出 result(流式分支已 yield
             # 系统提示)。本轮视为失败轮,兜底落库用户消息 + 执行痕迹保上下文,
             # 正常收尾避免 KeyError 把已提示的失败变成新错误。
-            await _persist_failed_turn_user_message(
-                service, ctx,
-                role=state.role, actual_session_id=actual_session_id,
-                latest_scope=state.inputs.latest_scope,
-                resolved_channel_code=state.inputs.resolved_channel_code,
-                user_message=state.message,
-                attachments=state.inputs.attachment_list,
-                tool_trace=state.result_holder.get("tool_trace"),
-                update_pointer=state.run_mode != "scheduled",
-            )
+            await _persist_unfinished_turn(state)
             return
 
         final_output_text, new_history, turn_artifacts = await _finalize_turn_data(
@@ -469,9 +503,16 @@ async def _run_turn_locked(state: _TurnRunState) -> AsyncIterator[object]:
         async for event in _yield_turn_finish(state, final_output_text, new_history, turn_artifacts):
             yield event
     finally:
-        service._running_tasks.pop(actual_session_id, None)
-        if not task.done():
-            await _cancel_and_drain_task(task, reason="run_turn_finally")
+        with CancelScope(shield=True):
+            try:
+                if not task.done():
+                    task.cancel()
+                await _persist_unfinished_turn(state)
+            finally:
+                if not task.done():
+                    await _cancel_and_drain_task(task, reason="run_turn_finally")
+                service._turn_checkpoints.pop(actual_session_id, None)
+                service._running_tasks.pop(actual_session_id, None)
 
 
 async def run_turn(
@@ -505,7 +546,6 @@ async def run_turn(
             inputs.role, actual_session_id, len(message), len(history),
             len(inputs.attachment_list), str(stream).lower(),
         )
-        await service._maybe_reload_mcp_toolsets()
         session_state = service._session_states.setdefault(actual_session_id, {})
         session_state["turn_artifacts"] = []
         deps, memory_scope, memory_context = _build_turn_deps(
@@ -520,24 +560,7 @@ async def run_turn(
             session_state=session_state, deps=deps, memory_scope=memory_scope, memory_context=memory_context,
             ctx=ctx, stream_queue=stream_queue, stream_stats=stream_stats, result_holder=result_holder,
         )
-        try:
-            async for event in _run_turn_locked(state):
+        # 显式关闭内层迭代器,确保 aclose/GeneratorExit 也在会话锁内保存并清理。
+        async with contextlib.aclosing(_run_turn_locked(state)) as events:
+            async for event in events:
                 yield event
-        except Exception:
-            # agent 调用失败(CDP 超时 / 模型错误等):正常路径的 _persist_turn 被跳过,
-            # 本轮用户输入从未进入历史 → 下一轮 load_context 读不到,agent 表现为
-            # "忘了刚才聊什么"。这里在 per-session lock 内(与压缩互斥)兜底落库一条
-            # 用户消息 + 本轮已执行工具痕迹摘要,使下一轮能看到上下文并接续执行;
-            # 落库失败只 warn,绝不掩盖原始异常。
-            # CancelledError / GeneratorExit 不在此捕获:用户主动中断或消费方关闭
-            # generator 时,本轮视为放弃,不落库。
-            await _persist_failed_turn_user_message(
-                service, ctx,
-                role=inputs.role, actual_session_id=actual_session_id,
-                latest_scope=inputs.latest_scope, resolved_channel_code=inputs.resolved_channel_code,
-                user_message=message,
-                attachments=inputs.attachment_list,
-                tool_trace=state.result_holder.get("tool_trace"),
-                update_pointer=run_mode != "scheduled",
-            )
-            raise

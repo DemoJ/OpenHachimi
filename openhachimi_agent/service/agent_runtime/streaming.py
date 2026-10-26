@@ -463,6 +463,7 @@ def build_stream_event_handler(
     operation_state: OperationState,
     text_buffer: list[str] | None = None,
     trace: list[ToolTraceEntry] | None = None,
+    output: list[StreamEventItem] | None = None,
 ) -> Callable[[object, object], Awaitable[None]]:
     async def handle_stream_events(_ctx: object, stream_event: object) -> None:
         async for event in stream_event:  # type: ignore[attr-defined]
@@ -470,6 +471,9 @@ def build_stream_event_handler(
             if trace is not None:
                 _record_tool_trace(trace, event)
             if item := event_item_from_stream_event(event):
+                # 保留正文与工具分段边界,中断时无需完整 RunResult 也能保存已生成内容。
+                if output is not None:
+                    output.append(item)
                 if text_buffer is not None and item.type == "text":
                     text_buffer.append(item.text)
                     continue

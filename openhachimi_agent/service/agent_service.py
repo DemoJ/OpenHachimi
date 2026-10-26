@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import logging
 import weakref
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Any
 
 from pydantic_ai.messages import ModelMessage
@@ -58,6 +58,8 @@ class AgentService:
         self._mcp_reload_lock = asyncio.Lock()
         self._mcp_errors: list[str] = []
         self._running_tasks: dict[str, asyncio.Task] = {}
+        # 停止接口等待消息快照落库,无需等待模型/工具完成取消清理。
+        self._turn_checkpoints: dict[str, Callable[[], Awaitable[None]]] = {}
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         from openhachimi_agent.service.browser import BrowserManager
         from openhachimi_agent.service.process import ProcessManager
@@ -389,7 +391,7 @@ class AgentService:
         if priority_response is not None:
             return priority_response
 
-        async for result in self._run_with_session(
+        async with contextlib.aclosing(self._run_with_session(
             message,
             role,
             session_id,
@@ -400,8 +402,9 @@ class AgentService:
             scheduler_context=scheduler_context,
             channel=channel,
             delivery_target=delivery_target,
-        ):
-            return result  # type: ignore[return-value]
+        )) as results:
+            async for result in results:
+                return result  # type: ignore[return-value]
         raise RuntimeError("No result returned from run_turn")
 
     async def stream_events(
@@ -424,7 +427,7 @@ class AgentService:
                 yield event
             return
 
-        async for event in self._run_with_session(
+        async with contextlib.aclosing(self._run_with_session(
             message,
             role,
             session_id,
@@ -435,8 +438,10 @@ class AgentService:
             scheduler_context=scheduler_context,
             channel=channel,
             delivery_target=delivery_target,
-        ):
-            if isinstance(event, StreamEventItem):
+        )) as events:
+            async for event in events:
+                if not isinstance(event, StreamEventItem):
+                    continue
                 if event.type == "tool" and not self.config.show_tool_calls:
                     continue
                 # system 专表内部运行时状态(planner heartbeat / replan / 视觉模型 /
