@@ -243,11 +243,13 @@ async function onSend(text: string, attachments: AttachmentRef[]) {
       onDone() {
         console.info('[Chat] stream done')
         store.finishTurn(turn)
+        // chatStream 的 finally 在主动 abort 后也会调用 onDone。
+        // 此时只结束生成态并保留缓冲;刷新侧栏会重置分页,还可能覆盖新会话的乐观条目。
+        if (ctrl.signal.aborted) return
         // done 事件在后端 _persist_turn 之后发出,本轮消息已全部落库:
         // 正在查看 → 乐观消息物化进 messages(视图无跳变),随后回填 meta;
         // 已切走 → 丢弃缓冲,切回时 loadMessages 拉权威历史。
-        // aborted 时不物化:中断轮次的内容没落库,保留缓冲给用户看。
-        if (!ctrl.signal.aborted) store.completeTurn(turn)
+        store.completeTurn(turn)
         store.refreshSessions().then(() => syncMessagesFromServer()).catch((err) => {
           console.warn('[Chat] post-stream refresh failed', err)
         })
