@@ -60,6 +60,7 @@ class AgentRunContext:
     stream_event_handler: Callable[[object, object], Awaitable[None]] | None = None
     operation_state: OperationState = field(default_factory=OperationState)
     context_compressor: Any = None
+    answer_stream: Any = None
 
 
 def has_active_todos(session_state: dict[str, Any]) -> bool:

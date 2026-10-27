@@ -7,8 +7,78 @@ import inspect
 import json
 import logging
 import time
+from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, Literal
+
+from openhachimi_agent.agent.verification_evidence import (
+    VerificationScope,
+    effect_scopes,
+    evidence_scopes,
+)
+
+
+@dataclass(frozen=True)
+class ToolOutcome:
+    """Business outcome, independent of whether a Python function returned.
+
+    Failed operations have no *inferred* effects or evidence. They may explicitly
+    report partial effects, which still require matching verification.
+    """
+
+    status: Literal["succeeded", "failed"]
+    effects: frozenset[VerificationScope] = frozenset()
+    evidence: frozenset[VerificationScope] = frozenset()
+
+
+class ToolResult(str):
+    """String-compatible result carrying an explicit business outcome.
+
+    Prompt injection and TODO middleware prepend/append text. Preserve metadata
+    across those operations without changing the text/JSON contract seen by LLMs.
+    Consumers must inspect the outcome before serialization strips str attributes.
+    """
+
+    outcome: ToolOutcome
+
+    def __new__(cls, value: str, *, outcome: ToolOutcome):
+        result = super().__new__(cls, value)
+        result.outcome = outcome
+        return result
+
+    def __add__(self, other: str):
+        text = super().__add__(other)
+        return ToolResult(text, outcome=self.outcome)
+
+    def __radd__(self, other: str):
+        if not isinstance(other, str):
+            return NotImplemented
+        return ToolResult(str.__add__(other, self), outcome=self.outcome)
+
+    def __getnewargs_ex__(self):
+        return (str(self),), {"outcome": self.outcome}
+
+
+def get_tool_outcome(result: object, tool_name: str | None = None) -> ToolOutcome:
+    """Read explicit metadata; successful legacy returns use scoped defaults.
+
+    Never guess failure from arbitrary output text (including page content and
+    injected prompts). Exceptions may carry ``tool_outcome`` for partial effects.
+    """
+    outcome = result.outcome if isinstance(result, ToolResult) else getattr(result, "tool_outcome", None)
+    if isinstance(outcome, ToolOutcome):
+        return outcome
+    return ToolOutcome("succeeded", effect_scopes(tool_name), evidence_scopes(tool_name))
+
+
+def tool_result_status(result: object, tool_name: str | None = None) -> Literal["success", "failed"]:
+    """PydanticAI/SSE outcome spelling, derived from business metadata."""
+    return "failed" if get_tool_outcome(result, tool_name).status == "failed" else "success"
+
+
+def _failure_outcome(exc: Exception) -> ToolOutcome:
+    outcome = get_tool_outcome(exc)
+    return ToolOutcome("failed", effects=outcome.effects)
 
 
 _LEDGER_LIMIT = 200
@@ -123,6 +193,7 @@ def _append_ledger_event(
     args: dict[str, object] | None = None,
     result: object = None,
     violation: str = "",
+    outcome: ToolOutcome | None = None,
 ) -> None:
     ledger = session_state.setdefault("execution_ledger", [])
     if not isinstance(ledger, list):
@@ -130,7 +201,7 @@ def _append_ledger_event(
         session_state["execution_ledger"] = ledger
 
     event = {
-        "seq": len(ledger) + 1,
+        "seq": get_ledger_cursor(session_state) + 1,
         "ts": time.time(),
         "tool_name": tool_name,
         "status": status,
@@ -139,6 +210,9 @@ def _append_ledger_event(
         "result_preview": _summarize(result) if result is not None else "",
         "violation": violation,
     }
+    if outcome is not None:
+        event["effects"] = sorted(outcome.effects)
+        event["evidence"] = sorted(outcome.evidence) if outcome.status == "succeeded" else []
     ledger.append(event)
     if len(ledger) > _LEDGER_LIMIT:
         del ledger[: len(ledger) - _LEDGER_LIMIT]
@@ -205,6 +279,14 @@ def get_execution_ledger(ctx: object) -> list[dict[str, Any]]:
 def get_ledger_length(session_state: dict[str, Any]) -> int:
     ledger = session_state.get("execution_ledger", [])
     return len(ledger) if isinstance(ledger, list) else 0
+
+
+def get_ledger_cursor(session_state: dict[str, Any]) -> int:
+    """Monotonic event cursor, unlike the bounded ledger's list length."""
+    ledger = session_state.get("execution_ledger", [])
+    if isinstance(ledger, list) and ledger:
+        return int(ledger[-1].get("seq", 0))
+    return 0
 
 
 def get_final_verification_signal(session_state: dict[str, Any]) -> dict[str, object] | None:
@@ -303,7 +385,8 @@ def with_execution_ledger(func: Callable) -> Callable:
             timeout = _tool_timeout_for_call(ctx, tool_name, bound_args)
             try:
                 result = await asyncio.wait_for(func(ctx, *args, **kwargs), timeout=timeout)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
+                outcome = _failure_outcome(exc)
                 _append_ledger_event(
                     session_state,
                     tool_name=tool_name,
@@ -311,11 +394,14 @@ def with_execution_ledger(func: Callable) -> Callable:
                     args=bound_args,
                     result=f"timeout after {timeout}s",
                     violation="",
+                    outcome=outcome,
                 )
+                _mark_verify_state(session_state, tool_name, bound_args, outcome)
                 _logger.warning("tool call timed out tool_name=%s timeout=%ds", tool_name, timeout)
-                return _format_tool_timeout(tool_name, timeout)
+                return ToolResult(_format_tool_timeout(tool_name, timeout), outcome=outcome)
             except Exception as exc:
                 status = _exception_ledger_status(exc)
+                outcome = _failure_outcome(exc)
                 _append_ledger_event(
                     session_state,
                     tool_name=tool_name,
@@ -323,15 +409,21 @@ def with_execution_ledger(func: Callable) -> Callable:
                     args=bound_args,
                     result=exc,
                     violation=_exception_violation(exc, status),
+                    outcome=outcome,
                 )
+                _mark_verify_state(session_state, tool_name, bound_args, outcome)
                 # 控制流 / 重试信号(CallDeferred/ApprovalRequired/ModelRetry)原样向上抛,
                 # 交给 pydantic-ai 的 deferred / retry 预算机制;其余可恢复运行时错误
                 # 吞成错误字符串回灌给 LLM,不中断整轮。
                 if _should_reraise_tool_exception(exc):
                     raise
-                return _format_tool_error(exc)
-            _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
-            _mark_verify_state(session_state, tool_name, bound_args)
+                return ToolResult(_format_tool_error(exc), outcome=outcome)
+            outcome = get_tool_outcome(result, tool_name)
+            _append_ledger_event(
+                session_state, tool_name=tool_name, status=outcome.status,
+                args=bound_args, result=result, outcome=outcome,
+            )
+            _mark_verify_state(session_state, tool_name, bound_args, outcome)
             return result
         return async_wrapper
 
@@ -344,6 +436,7 @@ def with_execution_ledger(func: Callable) -> Callable:
             result = func(ctx, *args, **kwargs)
         except Exception as exc:
             status = _exception_ledger_status(exc)
+            outcome = _failure_outcome(exc)
             _append_ledger_event(
                 session_state,
                 tool_name=tool_name,
@@ -351,28 +444,32 @@ def with_execution_ledger(func: Callable) -> Callable:
                 args=bound_args,
                 result=exc,
                 violation=_exception_violation(exc, status),
+                outcome=outcome,
             )
+            _mark_verify_state(session_state, tool_name, bound_args, outcome)
             if _should_reraise_tool_exception(exc):
                 raise
-            return _format_tool_error(exc)
-        _append_ledger_event(session_state, tool_name=tool_name, status="succeeded", args=bound_args, result=result)
-        _mark_verify_state(session_state, tool_name, bound_args)
+            return ToolResult(_format_tool_error(exc), outcome=outcome)
+        outcome = get_tool_outcome(result, tool_name)
+        _append_ledger_event(
+            session_state, tool_name=tool_name, status=outcome.status,
+            args=bound_args, result=result, outcome=outcome,
+        )
+        _mark_verify_state(session_state, tool_name, bound_args, outcome)
         return result
     return sync_wrapper
 
 
-def _mark_verify_state(session_state: dict[str, Any], tool_name: str, bound_args: dict[str, Any] | None = None) -> None:
-    """工具成功后按语义更新验证状态(编辑置 stale / 验证清 stale)。
-
-    延迟 import 防止 ``agent.execution`` ↔ ``agent.verification_stop`` 循环;
-    验证模块失败不应阻断工具返回(ledger 已记完,闸门判定可缺位)。
-
-    bound_args 透传给 mark_tool_succeeded,供文件类型过滤(write_file/replace_in_file
-    改纯文本时不置 stale)。非文件编辑工具忽略该参数。
-    """
+def _mark_verify_state(
+    session_state: dict[str, Any],
+    tool_name: str,
+    bound_args: dict[str, Any] | None = None,
+    outcome: ToolOutcome | None = None,
+) -> None:
+    """Record scoped effects, including partial failures, without masking results."""
     try:
-        from openhachimi_agent.agent.verification_stop import mark_tool_succeeded
+        from openhachimi_agent.agent.verification_stop import mark_tool_outcome
 
-        mark_tool_succeeded(session_state, tool_name, bound_args)
+        mark_tool_outcome(session_state, tool_name, outcome, bound_args)
     except Exception:
-        pass
+        _logger.debug("failed to update verification state tool_name=%s", tool_name, exc_info=True)

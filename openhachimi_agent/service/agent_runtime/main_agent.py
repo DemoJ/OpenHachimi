@@ -20,12 +20,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic_ai import capture_run_messages
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import UserContent
+from pydantic_ai.messages import ToolCallPart, UserContent
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
 from pydantic_ai.usage import UsageLimits
 
-from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_length
+from openhachimi_agent.agent.execution import get_final_verification_signal, get_ledger_cursor
 from openhachimi_agent.agent.verification_stop import reset_turn_verification
 from openhachimi_agent.content.prompts import render_system_prompt
 from openhachimi_agent.core.config import AppConfig
@@ -46,6 +47,7 @@ from openhachimi_agent.service.agent_runtime.attachment_vision import (
     message_with_attachments,
 )
 from openhachimi_agent.service.agent_runtime.history_prep import prepare_history_for_run
+from openhachimi_agent.service.agent_runtime.streaming import ValidatedAnswerStream
 from openhachimi_agent.transport.api_models import AttachmentRef
 from openhachimi_agent.vision.capabilities import mark_model_vision_support
 from openhachimi_agent.vision.preprocess import VisionPreprocessResult, image_attachments, preprocess_vision_attachments
@@ -112,16 +114,27 @@ async def run_main_agent_once(
         "deps": deps,
         "usage_limits": UsageLimits(request_limit=60),
     }
-    if stream and handle_stream_events is not None:
-        run_kwargs["event_stream_handler"] = handle_stream_events
-        return await main_agent.run(run_message, **run_kwargs)
+    captured: list = []
+    try:
+        with capture_run_messages() as captured:
+            if stream and handle_stream_events is not None:
+                run_kwargs["event_stream_handler"] = handle_stream_events
+                return await main_agent.run(run_message, **run_kwargs)
 
-    if config.agent_timeout_seconds <= 0:
-        return await main_agent.run(run_message, **run_kwargs)
-    return await asyncio.wait_for(
-        main_agent.run(run_message, **run_kwargs),
-        timeout=config.agent_timeout_seconds,
-    )
+            if config.agent_timeout_seconds <= 0:
+                return await main_agent.run(run_message, **run_kwargs)
+            return await asyncio.wait_for(
+                main_agent.run(run_message, **run_kwargs),
+                timeout=config.agent_timeout_seconds,
+            )
+    except Exception as exc:
+        if any(
+            isinstance(part, ToolCallPart)
+            for message in captured[len(history):]
+            for part in message.parts
+        ):
+            exc.openhachimi_tools_started = True
+        raise
 
 
 def preflight_compress_history(ctx: AgentRunContext) -> None:
@@ -158,16 +171,11 @@ def preflight_compress_history(ctx: AgentRunContext) -> None:
         )
 
 
-def _main_stream_handler(ctx: AgentRunContext) -> Callable[[object, object], Any] | None:
-    """正文实时流式:复用 ctx.stream_event_handler(无缓冲)。
-
-    取消缓冲的代价:verification 闸门要求重写时,首版正文已经流式显示给用户,
-    repair 输出会作为续写追加。这与 ChatGPT/Claude 等主流产品的行为一致,
-    优于"长时间静默后一次性吐出"。
-    """
-    if not ctx.stream or ctx.stream_queue is None:
-        return ctx.stream_event_handler
-    return ctx.stream_event_handler
+def _main_stream_handler(ctx: AgentRunContext) -> ValidatedAnswerStream | None:
+    if not ctx.stream or ctx.stream_event_handler is None:
+        return None
+    ctx.answer_stream = ValidatedAnswerStream(ctx.stream_event_handler, ctx.operation_state)
+    return ctx.answer_stream
 
 
 async def _run_main_with_vision_fallback(
@@ -183,6 +191,8 @@ async def _run_main_with_vision_fallback(
     handle_stream_events: Callable[[object, object], Any] | None,
 ) -> object:
     run_message = _build_main_message(message, attachments, vision_result)
+    ledger_state = getattr(deps, "session_state", {})
+    ledger_start = get_ledger_cursor(ledger_state)
     try:
         result = await run_main_agent_once(
             main_agent=main_agent,
@@ -195,7 +205,13 @@ async def _run_main_with_vision_fallback(
         )
         return result
     except ModelHTTPError as exc:
-        if not vision_result.direct_parts:
+        if not vision_result.direct_parts or exc.status_code not in {400, 415, 422}:
+            raise
+        if (
+            get_ledger_cursor(ledger_state) > ledger_start
+            or getattr(handle_stream_events, "tool_calls_started", False)
+            or getattr(exc, "openhachimi_tools_started", False)
+        ):
             raise
         logger.warning(
             "direct vision request failed; retrying without image parts model=%s status=%s",
@@ -206,6 +222,8 @@ async def _run_main_with_vision_fallback(
         mark_model_vision_support(config, False)
         degraded_vision_result = _degrade_direct_vision_result(vision_result, exc)
         degraded_message = _build_main_message(message, attachments, degraded_vision_result)
+        if isinstance(handle_stream_events, ValidatedAnswerStream):
+            handle_stream_events.reset_candidate()
         result = await run_main_agent_once(
             main_agent=main_agent,
             run_message=degraded_message,
@@ -262,6 +280,8 @@ async def _run_main_with_llm_retry(
     4xx、超时(走外层 asyncio.TimeoutError)不在此重试——它们重试无意义或会掩盖真因。
     """
     max_retries = 2
+    ledger_state = getattr(deps, "session_state", {})
+    ledger_start = get_ledger_cursor(ledger_state)
     for attempt in range(max_retries + 1):
         try:
             return await _run_main_with_vision_fallback(
@@ -278,6 +298,18 @@ async def _run_main_with_llm_retry(
         except Exception as exc:
             if attempt >= max_retries or not _is_transient_llm_error(exc):
                 raise
+            if (
+                get_ledger_cursor(ledger_state) > ledger_start
+                or getattr(handle_stream_events, "tool_calls_started", False)
+                or getattr(exc, "openhachimi_tools_started", False)
+            ):
+                logger.warning(
+                    "llm retry skipped after tool execution role=%s session_id=%s",
+                    deps.role_name, deps.session_id,
+                )
+                raise
+            if isinstance(handle_stream_events, ValidatedAnswerStream):
+                handle_stream_events.reset_candidate()
             delay = 2**attempt
             logger.warning(
                 "llm transient error, retrying %d/%d in %ds role=%s session_id=%s error=%s",
@@ -313,7 +345,7 @@ def _reset_turn_gates(ctx: AgentRunContext) -> None:
 
     跨轮必须清零,否则上一轮的死循环遗产会立刻让新一轮放行。
     """
-    ctx.session_state["current_turn_ledger_start_seq"] = get_ledger_length(ctx.session_state)
+    ctx.session_state["current_turn_ledger_start_seq"] = get_ledger_cursor(ctx.session_state)
     ctx.session_state.pop("_final_validator_retries", None)
     ctx.session_state.pop("_final_validator_yielded", None)
     ctx.session_state.pop("_final_validator_last_signal", None)
@@ -351,6 +383,7 @@ async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) ->
     _reset_turn_gates(ctx)
     preflight_compress_history(ctx)
     prepare_history_for_run(ctx.history)
+    answer_stream = _main_stream_handler(ctx)
     result = await _run_main_with_llm_retry(
         main_agent=main_agent,
         message=ctx.message,
@@ -360,8 +393,10 @@ async def run_main_agent(ctx: AgentRunContext, get_agent: Callable[..., Any]) ->
         deps=ctx.deps,
         config=ctx.config,
         stream=ctx.stream,
-        handle_stream_events=_main_stream_handler(ctx),
+        handle_stream_events=answer_stream,
     )
+    if answer_stream is not None:
+        await answer_stream.commit(result)
     return _outcome_from_result(ctx, result)
 
 
@@ -431,8 +466,6 @@ def _resume_run_kwargs(ctx: AgentRunContext, tool_call_id: str) -> dict[str, Any
         "deps": ctx.deps,
         "usage_limits": UsageLimits(request_limit=60),
     }
-    if ctx.stream and ctx.stream_event_handler is not None:
-        run_kwargs["event_stream_handler"] = ctx.stream_event_handler
     return run_kwargs
 
 
@@ -459,6 +492,9 @@ async def resume_main_agent(
     preflight_compress_history(ctx)
     prepare_history_for_run(ctx.history)
     run_kwargs = _resume_run_kwargs(ctx, tool_call_id)
+    answer_stream = _main_stream_handler(ctx)
+    if answer_stream is not None:
+        run_kwargs["event_stream_handler"] = answer_stream
     logger.info(
         "resume_main_agent: feeding user reply as deferred tool result session_id=%s tool_call_id=%s reply_chars=%d",
         ctx.session_id,
@@ -468,6 +504,8 @@ async def resume_main_agent(
     # run 的第一个位置参数(user_prompt)传 None:用户当前消息已经作为 tool return 注入,
     # 不再独立作 user-prompt;否则 graph 会拼一个空 ModelRequest 让模型困惑。
     result = await main_agent.run(None, **run_kwargs)
+    if answer_stream is not None:
+        await answer_stream.commit(result)
     # 消费成功 → 清掉 _user_clarification(无论本轮是否又触发了新的 deferred)
     ctx.session_state.pop("_user_clarification", None)
     return _outcome_from_result(ctx, result)

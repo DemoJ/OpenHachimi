@@ -210,3 +210,46 @@ async def test_stop_reports_database_write_failure(service, monkeypatch):
         await service.stop_session(sid)
     await asyncio.wait_for(consumer, timeout=2)
     assert not service._running_tasks
+
+
+@pytest.mark.asyncio
+async def test_stop_validated_stream_saves_replacement_as_unverified_draft(service, monkeypatch):
+    from pydantic_ai import Agent
+    from pydantic_ai.exceptions import ModelRetry
+    from pydantic_ai.models.function import FunctionModel
+    from openhachimi_agent.agent.answer_attempts import ANSWER_STATUS_KEY, mark_latest_answer
+
+    started = asyncio.Event()
+    calls = 0
+
+    async def model(messages, info):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield "rejected first answer"
+        else:
+            yield "replacement draft"
+            started.set()
+            await asyncio.Event().wait()
+
+    agent = Agent(FunctionModel(stream_function=model), retries=2)
+
+    @agent.output_validator
+    def validate(ctx, result):
+        if result == "rejected first answer":
+            mark_latest_answer(ctx.messages, "rejected")
+            raise ModelRetry("verify first")
+        return result
+
+    monkeypatch.setattr(service, "_get_agent", lambda *a, **kw: agent)
+    sid = service.new_session_for_channel("default", "webui").session_id
+    consumer = asyncio.create_task(collect(service.stream_events("停止也应该保存", "default", sid)))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await service.stop_session(sid)
+    await asyncio.wait_for(consumer, timeout=2)
+    _, saved = SessionStore(service.config.memory_dir / "sessions.sqlite3").load_messages("default", sid)
+    replies = [m for m in saved if isinstance(m, ModelResponse)]
+    assert len(replies) == 1
+    assert replies[0].parts[0].content == "[未完成且未经验证的草稿]\nreplacement draft"
+    assert replies[0].metadata[ANSWER_STATUS_KEY] == "interrupted"
+    assert "rejected first answer" not in service.get_session_messages("default", sid)["messages"][-1].content

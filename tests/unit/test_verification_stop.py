@@ -1,8 +1,12 @@
 """verification_stop 停止闸门单测。"""
 
-from openhachimi_agent.agent.verification_evidence import is_edit_tool, is_verify_tool
+import pytest
+
+from openhachimi_agent.agent.execution import ToolOutcome
+from openhachimi_agent.agent.verification_evidence import effect_scopes, evidence_scopes, is_edit_tool, is_verify_tool
 from openhachimi_agent.agent.verification_stop import (
     build_verify_on_stop_nudge,
+    mark_tool_outcome,
     mark_tool_succeeded,
     reset_turn_verification,
 )
@@ -252,3 +256,96 @@ def test_nudge_evidence_summary_truncated_to_tail():
     # 末尾 TAIL 保留,头部 HEAD 被截断
     assert "TAIL" in nudge
     assert "HEAD-" not in nudge
+
+
+@pytest.mark.parametrize("tool_name", [
+    "browser_navigate", "browser_scroll", "browser_get_state", "browser_extract_content",
+    "browser_list_tabs", "browser_new_tab", "browser_switch_tab", "browser_close_tab",
+    "browser_go_back", "browser_go_forward", "browser_hover", "browser_screenshot",
+])
+def test_browser_view_changes_are_not_edits(tool_name):
+    state = {}
+    reset_turn_verification(state)
+    mark_tool_succeeded(state, tool_name)
+    assert not is_edit_tool(tool_name)
+    assert not _state(state)["workspace_edited"]
+    assert not _state(state)["browser_edited"]
+    assert build_verify_on_stop_nudge(state) is None
+
+
+@pytest.mark.parametrize("tool_name", [
+    "browser_click", "browser_type", "browser_press_key", "browser_select_option",
+])
+def test_browser_mutation_needs_browser_not_git_evidence(tool_name):
+    state = {}
+    reset_turn_verification(state)
+    mark_tool_succeeded(state, tool_name)
+    assert effect_scopes(tool_name) == frozenset({"browser"})
+    assert not _state(state)["workspace_edited"]
+    assert _state(state)["browser_edited"]
+    mark_tool_succeeded(state, "git_status")
+    mark_tool_succeeded(state, "read_file")
+    mark_tool_succeeded(state, "run_command")
+    assert _state(state)["browser_edited"]
+    nudge = build_verify_on_stop_nudge(state)
+    assert "browser_get_state" in nudge
+    assert "不能验证远端" in nudge
+    mark_tool_succeeded(state, "browser_get_state")
+    assert build_verify_on_stop_nudge(state) is None
+
+
+def test_browser_evidence_cannot_clear_workspace_gap():
+    state = {}
+    reset_turn_verification(state)
+    mark_tool_succeeded(state, "write_file", {"path": "src/main.py"})
+    mark_tool_succeeded(state, "browser_get_state")
+    assert _state(state)["workspace_edited"]
+    mark_tool_succeeded(state, "browser_click")
+    mark_tool_succeeded(state, "git_diff")
+    assert not _state(state)["workspace_edited"]
+    assert _state(state)["browser_edited"]
+    mark_tool_succeeded(state, "browser_extract_content")
+    assert build_verify_on_stop_nudge(state) is None
+    assert evidence_scopes("git_status") == frozenset({"workspace"})
+
+
+def test_failed_evidence_cannot_clear_matching_gap():
+    state = {}
+    reset_turn_verification(state)
+    mark_tool_succeeded(state, "browser_click")
+    mark_tool_outcome(state, "browser_get_state", ToolOutcome("failed", evidence=frozenset({"browser"})))
+    assert _state(state)["browser_edited"]
+    mark_tool_succeeded(state, "write_file")
+    mark_tool_outcome(state, "read_file", ToolOutcome("failed", evidence=frozenset({"workspace"})))
+    assert _state(state)["workspace_edited"]
+
+
+def test_partial_failure_retains_only_reported_scope():
+    state = {}
+    reset_turn_verification(state)
+    mark_tool_outcome(state, "browser_type", ToolOutcome("failed", effects=frozenset({"browser"})))
+    assert not _state(state)["workspace_edited"]
+    assert _state(state)["browser_edited"]
+    mark_tool_succeeded(state, "git_status")
+    assert build_verify_on_stop_nudge(state) is not None
+    mark_tool_succeeded(state, "browser_get_state")
+    assert build_verify_on_stop_nudge(state) is None
+
+
+def test_explicit_noop_does_not_clear_or_create_existing_gaps():
+    state = {}
+    reset_turn_verification(state)
+    mark_tool_succeeded(state, "write_file")
+    mark_tool_outcome(state, "browser_click", ToolOutcome("succeeded"))
+    assert _state(state)["workspace_edited"]
+    assert not _state(state)["browser_edited"]
+
+
+def test_browser_nudge_does_not_cite_local_command_evidence():
+    state = {}
+    reset_turn_verification(state)
+    mark_tool_succeeded(state, "browser_click")
+    store = _FakeEvidenceStore([{"command": "git status", "output_summary": "clean"}])
+    nudge = build_verify_on_stop_nudge(state, session_store=store, session_id="s")
+    assert "上次验证参考" not in nudge
+    assert store.calls == []

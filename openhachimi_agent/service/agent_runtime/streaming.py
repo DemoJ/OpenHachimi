@@ -15,10 +15,13 @@ from pydantic_ai.messages import (
     FunctionToolResultEvent,
     PartDeltaEvent,
     PartStartEvent,
+    ModelResponse,
     TextPart,
     TextPartDelta,
+    ToolReturnPart,
 )
 
+from openhachimi_agent.agent.execution import tool_result_status
 from openhachimi_agent.core.config import AppConfig
 from openhachimi_agent.core.redaction import redact_tool_args, summarize_redacted
 from openhachimi_agent.service.agent_runtime.context import OperationState
@@ -350,6 +353,22 @@ def format_tool_call(tool_name: str, args: dict[str, object]) -> str:
     return f"{icon} {action}：{detail}"
 
 
+def _tool_event_outcome(result: object) -> str:
+    outcome = str(getattr(result, "outcome", "success"))
+    if outcome == "success":
+        outcome = tool_result_status(getattr(result, "content", None), getattr(result, "tool_name", None))
+        if outcome != "success":
+            result.outcome = outcome  # type: ignore[attr-defined]
+    return outcome
+
+
+def normalize_tool_outcomes(messages: list) -> None:
+    for message in messages:
+        for part in getattr(message, "parts", ()):
+            if isinstance(part, ToolReturnPart):
+                _tool_event_outcome(part)
+
+
 def event_item_from_stream_event(event: object) -> StreamEventItem | None:
     if chunk := text_from_stream_event(event):
         return StreamEventItem(type="text", text=chunk)
@@ -382,7 +401,7 @@ def event_item_from_stream_event(event: object) -> StreamEventItem | None:
 
     if isinstance(event, FunctionToolResultEvent):
         result = event.part
-        outcome = getattr(result, "outcome", "success")
+        outcome = _tool_event_outcome(result)
         logger.info(
             "tool stream result tool_name=%s outcome=%s",
             result.tool_name,
@@ -423,7 +442,7 @@ def _record_tool_trace(trace: list[ToolTraceEntry], event: object) -> None:
         return
     if isinstance(event, FunctionToolResultEvent):
         result = event.part
-        outcome = str(getattr(result, "outcome", "success"))
+        outcome = _tool_event_outcome(result)
         for entry in reversed(trace):
             if entry.tool_name == result.tool_name and entry.outcome is None:
                 entry.outcome = outcome
@@ -480,6 +499,70 @@ def build_stream_event_handler(
                 await stream_queue.put(item)
 
     return handle_stream_events
+
+
+class ValidatedAnswerStream:
+    """Publish tool activity immediately, but only publish a run's accepted answer."""
+
+    def __init__(
+        self,
+        handler: Callable[[object, object], Awaitable[None]],
+        operation_state: OperationState,
+    ) -> None:
+        self.handler = handler
+        self.operation_state = operation_state
+        self.tool_calls_started = False
+        self.draft: list[str] = []
+        self.messages: list = []
+        self.request_message: object = None
+
+    async def __call__(self, ctx: object, events: object) -> None:
+        messages = getattr(ctx, "messages", None)
+        if messages is not None:
+            self.messages = messages
+        if self.messages and not isinstance(self.messages[-1], ModelResponse):
+            self.draft.clear()
+            self.request_message = self.messages[-1]
+
+        async def public_events():
+            async for event in events:  # type: ignore[attr-defined]
+                if isinstance(event, FunctionToolCallEvent):
+                    self.tool_calls_started = True
+                if chunk := text_from_stream_event(event):
+                    self.draft.append(chunk)
+                    self.operation_state.progress()
+                    continue
+                yield event
+
+        await self.handler(ctx, public_events())
+
+    def reset_candidate(self) -> None:
+        self.draft.clear()
+        self.messages = []
+        self.request_message = None
+
+    def interrupted_output(self) -> list[StreamEventItem]:
+        from openhachimi_agent.agent.answer_attempts import answer_status, is_answer_retry
+
+        if self.messages:
+            latest = self.messages[-1]
+            if (
+                is_answer_retry(latest) and latest is not self.request_message
+            ) or answer_status(latest) == "rejected":
+                return []
+        text = "".join(self.draft)
+        return [StreamEventItem(type="text", text="[未完成且未经验证的草稿]\n" + text)] if text else []
+
+    async def commit(self, result: object) -> None:
+        output = getattr(result, "output", None)
+        if not isinstance(output, str) or not output:
+            return
+
+        async def accepted_answer():
+            yield PartStartEvent(index=0, part=TextPart(content=output))
+
+        await self.handler(None, accepted_answer())
+        self.draft.clear()
 
 
 def _operation_timeout_seconds(operation_state: OperationState, config: AppConfig) -> int:

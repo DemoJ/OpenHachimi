@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from pydantic_ai.messages import (
@@ -13,10 +14,22 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.usage import RequestUsage, RunUsage
 
+from openhachimi_agent.context import token_estimate
 from openhachimi_agent.context.compressor import ContextCompressor
 from openhachimi_agent.context.pruning import prune_old_tool_results
 from openhachimi_agent.context.token_estimate import estimate_messages_tokens
+
+
+@pytest.fixture(autouse=True)
+def _offline_token_estimate(monkeypatch):
+    """压缩行为测试使用本地字符兜底,不因 tiktoken 首次加载下载 encoding。"""
+    monkeypatch.setattr(
+        token_estimate,
+        "_active_encoding",
+        Mock(side_effect=token_estimate._EncodingLoadError("offline compression test")),
+    )
 
 
 # ── 测试辅助 ──────────────────────────────────────────────────────────────
@@ -87,6 +100,185 @@ def test_prune_small_tool_returns_not_pruned():
     assert count == 0
 
 
+# ── 单次请求用量:不可把 RunUsage 成本累计当成上下文占用 ──────────────────────
+async def _save_turn_usage(comp, new_history, *, history, result):
+    from openhachimi_agent.service.agent_runtime.turn_postprocess import _save_turn_messages
+
+    save_messages = Mock()
+    service = SimpleNamespace(session_store=SimpleNamespace(save_messages=save_messages))
+    await _save_turn_messages(
+        service,
+        SimpleNamespace(context_compressor=comp),
+        result,
+        new_history,
+        role="default",
+        actual_session_id="test-context-usage",
+        latest_scope="test-scope",
+        resolved_channel_code="webui",
+        history=history,
+        update_pointer=False,
+    )
+    return save_messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callable_run_usage", [False, True])
+async def test_save_turn_uses_latest_request_not_cumulative_13_response_usage(callable_run_usage):
+    inputs = [17562, 19425, 19733, 44059, 44506, 61799, 63197,
+              64392, 93121, 93868, 94877, 98796, 98948]
+    outputs = [249, 135, 124, 294, 179, 253, 106, 220, 667, 77, 3765, 77, 2734]
+    responses = [
+        ModelResponse(
+            parts=[TextPart(content=f"step {i}")],
+            usage=RequestUsage(input_tokens=tokens, output_tokens=outputs[i]),
+        )
+        for i, tokens in enumerate(inputs)
+    ]
+    cumulative = RunUsage()
+    for response in responses:
+        cumulative.incr(response.usage)
+    assert len(responses) == 13
+    assert cumulative.input_tokens == 814283
+    assert cumulative.output_tokens == 8880
+    assert max(inputs) == inputs[-1] == 98948
+
+    usage_accessor = Mock(return_value=cumulative)
+    result = SimpleNamespace(usage=usage_accessor if callable_run_usage else cumulative)
+    history = [
+        ModelRequest(parts=[UserPromptPart(content="old turn")]),
+        ModelResponse(parts=[TextPart(content="old answer")], usage=RequestUsage(input_tokens=950000)),
+    ]
+    new_history = [*history, ModelRequest(parts=[UserPromptPart(content="current turn")]), *responses]
+    comp = ContextCompressor(context_length=1000000, threshold_percent=0.75)
+
+    save_messages = await _save_turn_usage(comp, new_history, history=history, result=result)
+
+    assert comp.last_prompt_tokens == 98948
+    assert comp.last_completion_tokens == 2734
+    assert comp.last_total_tokens == 101682
+    assert comp.should_compress() is False
+    # 累计成本及响应原始用量仍用于计费/展示,不被压缩器改写。
+    assert cumulative.input_tokens == 814283
+    assert cumulative.output_tokens == 8880
+    assert sum(response.usage.input_tokens for response in responses) == 814283
+    assert sum(response.usage.output_tokens for response in responses) == 8880
+    usage_accessor.assert_not_called()
+    save_messages.assert_called_once_with(
+        "default", "test-context-usage", new_history[len(history):],
+        scope="test-scope", channel="webui", scope_key="test-scope", append=True, update_pointer=False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous_tokens, latest_tokens", [(950000, 98948), (98948, 750000)])
+@pytest.mark.parametrize("tool_response", [False, True])
+async def test_save_turn_uses_latest_response_even_with_trailing_tool_result(previous_tokens, latest_tokens, tool_response):
+    history = [ModelResponse(parts=[TextPart(content="old turn")], usage=RequestUsage(input_tokens=999999))]
+    parts = [ToolCallPart(tool_name="read_file", args={}, tool_call_id="latest")] if tool_response else [TextPart(content="latest")]
+    new_history = [
+        *history,
+        ModelResponse(parts=[TextPart(content="earlier step")], usage=RequestUsage(input_tokens=previous_tokens)),
+        ModelResponse(parts=parts, usage=RequestUsage(input_tokens=latest_tokens, output_tokens=10)),
+        ModelRequest(parts=[ToolReturnPart(tool_name="read_file", content="ok", tool_call_id="latest")]),
+    ]
+    comp = ContextCompressor(context_length=1000000)
+    result = SimpleNamespace(usage=Mock(return_value=RunUsage(input_tokens=2000000)))
+
+    await _save_turn_usage(comp, new_history, history=history, result=result)
+
+    assert comp.last_prompt_tokens == latest_tokens
+    assert comp.last_completion_tokens == 10
+    assert comp.should_compress() is (latest_tokens >= 750000)
+    result.usage.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_usage", ["no_messages", "no_response", "empty", "none", "missing_input", "invalid"])
+async def test_save_turn_does_not_fall_back_to_old_or_cumulative_usage(missing_usage):
+    comp = ContextCompressor(context_length=1000000)
+    comp.update_from_response(RequestUsage(input_tokens=950000, output_tokens=100))
+    history = [ModelResponse(parts=[TextPart(content="old turn")], usage=RequestUsage(input_tokens=950000))]
+    if missing_usage == "no_messages":
+        new_history = list(history)
+    elif missing_usage == "no_response":
+        new_history = [*history, ModelRequest(parts=[UserPromptPart(content="current turn")])]
+    else:
+        latest = ModelResponse(parts=[TextPart(content="latest has no valid input usage")])
+        if missing_usage == "none":
+            latest.usage = None
+        elif missing_usage == "missing_input":
+            latest.usage = SimpleNamespace(details={"input_tokens": 950000})
+        elif missing_usage == "invalid":
+            latest.usage = SimpleNamespace(input_tokens="invalid", output_tokens=100)
+        new_history = [
+            *history,
+            ModelResponse(parts=[TextPart(content="earlier current-turn step")], usage=RequestUsage(input_tokens=950000)),
+            latest,
+        ]
+    result = SimpleNamespace(usage=Mock(return_value=RunUsage(input_tokens=2000000)))
+
+    await _save_turn_usage(comp, new_history, history=history, result=result)
+
+    assert comp.last_prompt_tokens == 0
+    assert comp.last_completion_tokens == 0
+    assert comp.last_total_tokens == 0
+    assert comp.should_compress() is False
+    result.usage.assert_not_called()
+
+
+@pytest.mark.parametrize("prompt_tokens", [749999, 750000, 750001, 899999, 900000, 900001])
+def test_context_cutoffs_use_normalized_input_including_cache_once(prompt_tokens):
+    comp = ContextCompressor(context_length=1000000, threshold_percent=0.75, hard_ceiling_percent=0.90)
+    comp.update_from_response(RequestUsage(
+        input_tokens=prompt_tokens,
+        output_tokens=2734,
+        cache_read_tokens=prompt_tokens - 101,
+        cache_write_tokens=100,
+        details={"input_tokens": 1},
+    ))
+
+    assert comp.last_prompt_tokens == prompt_tokens
+    assert comp.last_completion_tokens == 2734
+    assert comp.last_total_tokens == prompt_tokens + 2734
+    assert comp.should_compress() is (prompt_tokens >= 750000)
+    assert comp.should_compress_preflight([]) is (prompt_tokens >= 900000)
+
+
+@pytest.mark.parametrize("normalized_input, detail_input", [(800000, 1), (100, 950000), (0, 950000)])
+def test_update_from_response_never_overrides_normalized_input_with_details(normalized_input, detail_input):
+    comp = ContextCompressor(context_length=1000000)
+    comp.update_from_response(SimpleNamespace(
+        input_tokens=normalized_input,
+        output_tokens=10,
+        cache_read_tokens=500000,
+        cache_write_tokens=200000,
+        details={"input_tokens": detail_input},
+    ))
+
+    assert comp.last_prompt_tokens == normalized_input
+    assert comp.last_total_tokens == normalized_input + 10
+
+
+@pytest.mark.parametrize("usage", [None, RequestUsage(), SimpleNamespace(details={"input_tokens": 950000})])
+def test_update_from_response_missing_usage_clears_old_measurement(usage):
+    comp = ContextCompressor(context_length=1000000)
+    comp.update_from_response(RequestUsage(input_tokens=950000, output_tokens=100))
+
+    comp.update_from_response(usage)
+
+    assert comp.last_prompt_tokens == 0
+    assert comp.last_completion_tokens == 0
+    assert comp.last_total_tokens == 0
+
+
+def test_update_from_response_keeps_callable_compatibility():
+    comp = ContextCompressor()
+    comp.update_from_response(lambda: RequestUsage(input_tokens=100, output_tokens=10, details={"input_tokens": 1}))
+    assert comp.last_prompt_tokens == 100
+    assert comp.last_completion_tokens == 10
+    assert comp.last_total_tokens == 110
+
+
 # ── 阶段 0/2:触发、头尾保护 ────────────────────────────────────────────────
 def test_should_compress_below_threshold_returns_false():
     comp = ContextCompressor(context_length=10000, threshold_percent=0.75)
@@ -125,6 +317,59 @@ def test_compress_protects_head_and_tail():
     # 末条应是最后的 TextPart(done)或其所在消息
     last_texts = [str(p.content) for m in compressed for p in getattr(m, "parts", []) if isinstance(p, TextPart)]
     assert any("done" in t for t in last_texts)
+
+
+# ── 压缩后旧请求用量失效,无实际压缩则保留 ─────────────────────────────────
+@pytest.mark.parametrize("allow_llm_summary", [False, True])
+def test_compress_invalidates_usage_until_next_response(allow_llm_summary):
+    comp = ContextCompressor(
+        context_length=1000000,
+        protect_first_n=2,
+        protect_last_n=3,
+        tail_token_budget=500,
+        summarizer=lambda turns, focus, previous: "compressed history",
+    )
+    msgs = _make_tool_turns(10)
+    usage = RequestUsage(input_tokens=950000, output_tokens=2734)
+    comp.update_from_response(usage)
+    assert comp.should_compress() is True
+    assert comp.should_compress_preflight(msgs) is True
+
+    result = comp.compress(msgs, allow_llm_summary=allow_llm_summary)
+
+    assert result.dropped is True
+    assert comp.last_prompt_tokens == 0
+    assert comp.last_completion_tokens == 0
+    assert comp.last_total_tokens == 0
+    assert comp.should_compress() is False
+    assert comp.should_compress_preflight(result.runtime_view) is False
+    assert usage.input_tokens == 950000 and usage.output_tokens == 2734
+    # 新响应到达后恢复真实用量判定,不永久禁用压缩。
+    comp.update_from_response(RequestUsage(input_tokens=900000, output_tokens=10))
+    assert comp.should_compress() is True
+    assert comp.should_compress_preflight(result.runtime_view) is True
+
+
+@pytest.mark.parametrize("reason", ["short_history", "no_window", "summary_aborted"])
+def test_compress_without_dropped_content_keeps_usage(reason):
+    comp = ContextCompressor(
+        context_length=1000000,
+        protect_first_n=2,
+        protect_last_n=3,
+        tail_token_budget=1000000 if reason == "no_window" else 500,
+        abort_on_summary_failure=reason == "summary_aborted",
+        summarizer=lambda turns, focus, previous: None,
+    )
+    msgs = _make_tool_turns(0 if reason == "short_history" else 10)
+    comp.update_from_response(RequestUsage(input_tokens=950000, output_tokens=2734))
+
+    result = comp.compress(msgs)
+
+    assert result.dropped is False
+    assert comp.last_prompt_tokens == 950000
+    assert comp.last_completion_tokens == 2734
+    assert comp.last_total_tokens == 952734
+    assert comp.should_compress_preflight(msgs) is True
 
 
 # ── 阶段 4:配对清理 ────────────────────────────────────────────────────────
@@ -321,6 +566,18 @@ def test_allow_llm_summary_false_skips_summarizer():
     comp.compress(msgs, current_tokens=estimate_messages_tokens(msgs), allow_llm_summary=False)
     assert calls[0] == 0  # 预检模式不调 LLM
     assert comp._last_summary_fallback_used is True  # noqa: SLF001
+
+
+def test_compression_savings_compare_the_same_estimator_scale():
+    comp = ContextCompressor(
+        context_length=1000000, protect_first_n=2, protect_last_n=3, tail_token_budget=500,
+    )
+    messages = _make_tool_turns(10)
+    before = estimate_messages_tokens(messages)
+    result = comp.compress(messages, current_tokens=814283, allow_llm_summary=False)
+    assert result.dropped
+    after = estimate_messages_tokens(result.runtime_view)
+    assert comp._last_compression_savings_pct == pytest.approx((before - after) / before * 100)
 
 
 # ── 会话重置 ───────────────────────────────────────────────────────────────

@@ -131,25 +131,23 @@ class ContextCompressor(ContextEngine):
 
     # ── token 追踪 ──────────────────────────────────────────────────────
     def update_from_response(self, usage: Any) -> None:
-        """从 pydantic-ai Usage 更新 token 状态。
+        """从最近一次 ``ModelResponse.usage`` (``RequestUsage``)更新上下文用量。
 
-        ``usage`` 应为 ``RunUsage`` 对象。但 ``AgentRunResult.usage`` /
-        ``StreamedRunResult.usage`` 在 pydantic-ai 当前版本是**方法**而非属性
-        (官方 ``TODO (v2): Make this a property``),调用方若误传 ``result.usage``
-        (漏括号)会拿到 bound method,所有 token 字段将为 ``None``。此处对 callable
-        做一次解包防御,避免这种误用静默地把 token 统计全部清零。
+        ``RunUsage`` 是多次请求(含子 agent)的累计成本,不能用于上下文占用判定。
+        标准化的 ``input_tokens`` 已包含缓存输入,不能用 provider ``details`` 中
+        的非缓存数替代,也不能再加减 ``cache_read_tokens`` / ``cache_write_tokens``。
+        兼容 callable usage;传 ``None`` 或空 usage 清除旧请求的测量值。
         """
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
         if callable(usage) and not hasattr(usage, "input_tokens"):
             usage = usage()
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-        # input_tokens 在某些 provider 上含缓存读;优先用 details 里的非缓存输入
-        details = getattr(usage, "details", None) or {}
-        non_cached = 0
-        if isinstance(details, dict):
-            non_cached = int(details.get("input_tokens", 0) or 0)
-        self.last_prompt_tokens = non_cached or input_tokens
-        self.last_completion_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-        self.last_total_tokens = self.last_prompt_tokens + self.last_completion_tokens
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        self.last_prompt_tokens = input_tokens
+        self.last_completion_tokens = output_tokens
+        self.last_total_tokens = input_tokens + output_tokens
 
     # ── 触发判定 ────────────────────────────────────────────────────────
     def should_compress(self, prompt_tokens: int | None = None) -> bool:
@@ -235,7 +233,7 @@ class ContextCompressor(ContextEngine):
             return _no_drop
 
         original_messages = messages
-        display_tokens = current_tokens or self.last_prompt_tokens or estimate_messages_tokens(messages)
+        estimator_before = estimate_messages_tokens(messages)
 
         # 阶段 1:廉价预剪枝
         messages, pruned_count = prune_old_tool_results(
@@ -297,18 +295,14 @@ class ContextCompressor(ContextEngine):
 
         self.compression_count += 1
         new_estimate = estimate_messages_tokens(compressed)
-        saved = display_tokens - new_estimate
-        savings_pct = (saved / display_tokens * 100) if display_tokens > 0 else 0
+        # 压缩改变了实际上下文,旧响应的用量已失效。下一次响应前由 preflight
+        # 重新估算压缩视图,不能因旧的 hard-ceiling 用量再次触发压缩。
+        self.update_from_response(None)
+        self._consecutive_ceiling_breaches = 0
+        saved = estimator_before - new_estimate
+        savings_pct = (saved / estimator_before * 100) if estimator_before > 0 else 0.0
         self._last_compression_savings_pct = savings_pct
-
-        # ineffective 判定单独用 estimator-vs-estimator,避免 display_tokens(可能来自
-        # provider 真实值或 current_tokens)与 new_estimate(始终走 estimator)的尺度不一致,
-        # 否则 estimator 系统性偏差会把 _ineffective_compression_count 推到 anti-thrash
-        # 锁死阈值,导致后续压缩被永久拒绝直至会话重置。对外 log 与 _last_compression_savings_pct
-        # 仍沿用真实口径,保持展示一致。
-        estimator_before = estimate_messages_tokens(original_messages)
-        estimator_saved = estimator_before - new_estimate
-        estimator_savings_pct = (estimator_saved / estimator_before * 100) if estimator_before > 0 else 0.0
+        estimator_savings_pct = savings_pct
 
         # P1 兜底:消息数明显减少(≥20%)说明压缩实质生效,即使 estimator 算出 savings 偏低
         # 也不累积 ineffective。覆盖 estimator 对剪枝后短工具结果摘要、图片占位等场景估算不准
@@ -323,13 +317,14 @@ class ContextCompressor(ContextEngine):
             self._ineffective_compression_count = 0
 
         logger.info(
-            "压缩完成 #%d:%d→%d 条消息(约省 %d token,%.0f%%;estimator 视角 %.0f%%,消息数 -%.0f%%)",
+            "压缩完成 #%d:%d→%d 条消息(同口径估算 %d→%d token,约省 %d token,%.0f%%;消息数 -%.0f%%)",
             self.compression_count,
             len(messages),
             len(compressed),
+            estimator_before,
+            new_estimate,
             saved,
             savings_pct,
-            estimator_savings_pct,
             msg_reduction_pct,
         )
         return result

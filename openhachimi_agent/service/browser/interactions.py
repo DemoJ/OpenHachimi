@@ -27,7 +27,9 @@ from .dom_scripts import (
     SENSITIVE_FORM_DETECT_SCRIPT,
     WAIT_FOR_SCRIPT,
 )
-from .retry import auto_heal_retry, is_transient_disconnect
+from openhachimi_agent.agent.execution import ToolOutcome, ToolResult
+
+from .retry import auto_heal_retry, browser_failure, is_transient_disconnect
 from .utils import _human_verification_message
 
 logger = logging.getLogger(__name__)
@@ -258,19 +260,20 @@ class BrowserInteractionsMixin:
         async with self._op_lock:
             self._record_activity()
             restore = self._session_route(session_id)
+            changed = False
             try:
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 if element_id not in self._active_mapping:
-                    return f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。"
+                    return browser_failure(f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。")
 
                 selector_entry = self._active_mapping[element_id]
                 logger.info("Browser clicking element_id=%d selector=%s", element_id, selector_entry)
 
                 # 描述自检：不符则拒绝点击（防 DOM 变化后点错元素）
                 if mismatch := await self._verify_element_description(element_id, description, selector_entry):
-                    return mismatch
+                    return browser_failure(mismatch)
 
                 before_tabs = {id(p) for p in self._get_valid_pages()}
                 snapshot_before = await self._page_snapshot()
@@ -296,6 +299,7 @@ class BrowserInteractionsMixin:
                         if occluder:
                             logger.warning("force click used, occluded by: %s", occluder)
 
+                changed = True
                 # 条件等待：DOM 稳定即继续（快页面 0.4s，慢页面等到 3s 上限），
                 # 替代原固定 sleep(1.0)
                 await self._wait_dom_quiesce(quiet_ms=400, timeout_ms=3000)
@@ -316,7 +320,7 @@ class BrowserInteractionsMixin:
                     changes.append(f"URL 变为 {self._page.url}")
 
                 if reason := await self._detect_human_verification():
-                    return _human_verification_message(self._page.url, reason)
+                    return browser_failure(_human_verification_message(self._page.url, reason), changed=changed)
 
                 summary = f"成功点击元素 [{element_id}]。"
                 if changes:
@@ -327,11 +331,14 @@ class BrowserInteractionsMixin:
                         "若点击未生效，请先处理遮挡物（如关闭 cookie 提示条/弹窗）后重试。\n"
                     )
                 summary += "如需查看新内容请调用 browser_get_state。"
-                return summary + self._consume_dialog_report()
+                return ToolResult(
+                    summary + self._consume_dialog_report(),
+                    outcome=ToolOutcome("succeeded", effects=frozenset({"browser"})),
+                )
             except Exception as e:
-                if is_transient_disconnect(e):
-                    raise  # 冒泡到 auto_heal_retry 触发自愈重试
-                return f"点击失败：{e}" + self._consume_dialog_report()
+                return browser_failure(
+                    f"点击失败：{e}" + self._consume_dialog_report(), error=e, changed=changed,
+                )
             finally:
                 restore()
 
@@ -341,21 +348,22 @@ class BrowserInteractionsMixin:
         async with self._op_lock:
             self._record_activity()
             restore = self._session_route(session_id)
+            changed = False
             try:
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 if element_id not in self._active_mapping:
-                    return f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。"
+                    return browser_failure(f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。")
 
                 selector_entry = self._active_mapping[element_id]
                 logger.info("Browser typing text in element_id=%d selector=%s simulate_typing=%s", element_id, selector_entry, simulate_typing)
 
                 # 描述自检：不符则拒绝输入（防 DOM 变化后填错输入框）
                 if mismatch := await self._verify_element_description(element_id, description, selector_entry):
-                    return mismatch
+                    return browser_failure(mismatch)
 
                 locator = await self._resolve_locator(selector_entry)
 
@@ -378,12 +386,14 @@ class BrowserInteractionsMixin:
                 if not effective_typing:
                     # 默认使用原子的 fill 操作，速度快且能稳定触发框架的 v-model/onChange，自带清空机制
                     await locator.fill(text, timeout=10000)
+                    changed = True
                 else:
                     # 模拟逐字敲击（针对必须触发下拉联想建议的动态搜索框）
                     try:
                         await locator.click(timeout=5000)
                     except Exception:
                         await locator.click(timeout=3000, force=True)
+                    changed = True  # A later clear/typing failure must not hide this action.
                     await asyncio.sleep(random.uniform(0.1, 0.4))
 
                     # 先清空已有内容
@@ -403,12 +413,15 @@ class BrowserInteractionsMixin:
                     await locator.press_sequentially(text, delay=random.randint(10, 30), timeout=10000)
 
                 if reason := await self._detect_human_verification():
-                    return _human_verification_message(self._page.url, reason)
-                return f"成功在元素 [{element_id}] 输入文本。" + self._consume_dialog_report()
+                    return browser_failure(_human_verification_message(self._page.url, reason), changed=changed)
+                return ToolResult(
+                    f"成功在元素 [{element_id}] 输入文本。" + self._consume_dialog_report(),
+                    outcome=ToolOutcome("succeeded", effects=frozenset({"browser"})),
+                )
             except Exception as e:
-                if is_transient_disconnect(e):
-                    raise  # 冒泡到 auto_heal_retry 触发自愈重试
-                return f"输入文本失败：{e}" + self._consume_dialog_report()
+                return browser_failure(
+                    f"输入文本失败：{e}" + self._consume_dialog_report(), error=e, changed=changed,
+                )
             finally:
                 restore()
 
@@ -422,20 +435,21 @@ class BrowserInteractionsMixin:
         async with self._op_lock:
             self._record_activity()
             restore = self._session_route(session_id)
+            changed = False
             try:
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 key = key.strip()
                 if not key:
-                    return "参数 key 不能为空。支持示例：Enter / Tab / Escape / ArrowDown / Control+A"
+                    return browser_failure("参数 key 不能为空。支持示例：Enter / Tab / Escape / ArrowDown / Control+A")
 
                 try:
                     if element_id is not None:
                         if element_id not in self._active_mapping:
-                            return f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。"
+                            return browser_failure(f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。")
                         selector_entry = self._active_mapping[element_id]
                         logger.info("Browser pressing key=%s on element_id=%d", key, element_id)
                         locator = await self._resolve_locator(selector_entry)
@@ -444,15 +458,19 @@ class BrowserInteractionsMixin:
                         logger.info("Browser pressing key=%s on page", key)
                         await self._page.keyboard.press(key)
 
+                    changed = True
                     await asyncio.sleep(0.5)
                     if reason := await self._detect_human_verification():
-                        return _human_verification_message(self._page.url, reason)
+                        return browser_failure(_human_verification_message(self._page.url, reason), changed=changed)
                     target = f"元素 [{element_id}]" if element_id is not None else "当前页面"
-                    return f"已在{target}上按下 {key}。" + self._consume_dialog_report()
+                    return ToolResult(
+                        f"已在{target}上按下 {key}。" + self._consume_dialog_report(),
+                        outcome=ToolOutcome("succeeded", effects=frozenset({"browser"})),
+                    )
                 except Exception as e:
-                    if is_transient_disconnect(e):
-                        raise
-                    return f"按键失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(
+                        f"按键失败：{e}" + self._consume_dialog_report(), error=e, changed=changed,
+                    )
             finally:
                 restore()
 
@@ -465,14 +483,15 @@ class BrowserInteractionsMixin:
         async with self._op_lock:
             self._record_activity()
             restore = self._session_route(session_id)
+            changed = False
             try:
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 if element_id not in self._active_mapping:
-                    return f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。"
+                    return browser_failure(f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。")
 
                 selector_entry = self._active_mapping[element_id]
                 logger.info("Browser selecting option='%s' in element_id=%d", option, element_id)
@@ -484,7 +503,7 @@ class BrowserInteractionsMixin:
                     # 先读取全部选项供失败时提示（也让 agent 无需提前 get_state 就能拿到候选）
                     opts = await self._evaluate_in_frame(selector_entry[0], SELECT_OPTIONS_SCRIPT, css)
                     if opts is None:
-                        return f"元素 [{element_id}] 不是原生 <select> 下拉框。如果是自定义组件，请用 browser_click 展开后点击选项。"
+                        return browser_failure(f"元素 [{element_id}] 不是原生 <select> 下拉框。如果是自定义组件，请用 browser_click 展开后点击选项。")
 
                     match = next(
                         (o for o in opts if o["text"] == option or o["value"] == option),
@@ -499,19 +518,23 @@ class BrowserInteractionsMixin:
                         )
                     if match is None:
                         preview = "; ".join(f"{o['text']}({o['value']})" for o in opts[:20])
-                        return (
+                        return browser_failure(
                             f"下拉框中没有匹配“{option}”的选项。可用选项（text(value)）：{preview}"
                         )
 
                     await locator.select_option(match["value"], timeout=5000)
+                    changed = True
                     await asyncio.sleep(0.3)
                     if reason := await self._detect_human_verification():
-                        return _human_verification_message(self._page.url, reason)
-                    return f"已选择 [{element_id}] 的选项：{match['text']}。" + self._consume_dialog_report()
+                        return browser_failure(_human_verification_message(self._page.url, reason), changed=changed)
+                    return ToolResult(
+                        f"已选择 [{element_id}] 的选项：{match['text']}。" + self._consume_dialog_report(),
+                        outcome=ToolOutcome("succeeded", effects=frozenset({"browser"})),
+                    )
                 except Exception as e:
-                    if is_transient_disconnect(e):
-                        raise
-                    return f"选择选项失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(
+                        f"选择选项失败：{e}" + self._consume_dialog_report(), error=e, changed=changed,
+                    )
             finally:
                 restore()
 
@@ -525,10 +548,10 @@ class BrowserInteractionsMixin:
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 if element_id not in self._active_mapping:
-                    return f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。"
+                    return browser_failure(f"找不到 ID 为 {element_id} 的元素，请先调用 browser_get_state 刷新状态。")
 
                 selector_entry = self._active_mapping[element_id]
                 logger.info("Browser hovering element_id=%d", element_id)
@@ -541,9 +564,7 @@ class BrowserInteractionsMixin:
                         return _human_verification_message(self._page.url, reason)
                     return f"已悬停到元素 [{element_id}]。如悬停菜单已展开，请用 browser_get_state 获取新出现的元素。" + self._consume_dialog_report()
                 except Exception as e:
-                    if is_transient_disconnect(e):
-                        raise
-                    return f"悬停失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"悬停失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()
 
@@ -553,30 +574,31 @@ class BrowserInteractionsMixin:
 
         - text：等待页面包含该文本（不区分大小写）。
         - seconds：当不传 text 时，直接等待这么多秒（0.1 ~ 10）。
-        - timeout：等待 text 出现的最大秒数，超时返回提示（不算错误）。
+        - timeout：等待 text 出现的最大秒数，超时返回失败提示，不构成验证证据。
         """
         async with self._op_lock:
             self._record_activity()
             restore = self._session_route(session_id)
             try:
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 try:
                     if text:
                         logger.info("Browser waiting for text='%s' timeout=%.1fs", text, timeout)
                         found = await self._page.evaluate(WAIT_FOR_SCRIPT, {"text": text, "timeoutMs": int(timeout * 1000)})
                         if found:
-                            return f"页面已出现文本“{text}”。" + self._consume_dialog_report()
-                        return f"等待超时（{timeout}s）：页面未出现文本“{text}”。可用 browser_get_state 查看当前页面。"
+                            return ToolResult(
+                                f"页面已出现文本“{text}”。" + self._consume_dialog_report(),
+                                outcome=ToolOutcome("succeeded", evidence=frozenset({"browser"})),
+                            )
+                        return browser_failure(f"等待超时（{timeout}s）：页面未出现文本“{text}”。可用 browser_get_state 查看当前页面。")
                     else:
                         seconds = max(0.1, min(seconds, 10.0))
                         await asyncio.sleep(seconds)
                         return f"已等待 {seconds}s。" + self._consume_dialog_report()
                 except Exception as e:
-                    if is_transient_disconnect(e):
-                        raise
-                    return f"等待失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"等待失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()
 
@@ -593,7 +615,7 @@ class BrowserInteractionsMixin:
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 try:
                     import time as _time
@@ -618,7 +640,7 @@ class BrowserInteractionsMixin:
                     if is_transient_disconnect(e):
                         raise
                     logger.error("Screenshot failed: %s", e)
-                    return f"截图失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"截图失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()
 
@@ -651,16 +673,16 @@ class BrowserInteractionsMixin:
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 direction = direction.strip().lower()
                 if direction not in ("up", "down", "top", "bottom"):
-                    return f"不支持的滚动方向：{direction}，请使用 up / down / top / bottom。"
+                    return browser_failure(f"不支持的滚动方向：{direction}，请使用 up / down / top / bottom。")
 
                 try:
                     if element_id is not None:
                         if element_id not in self._active_mapping:
-                            return f"找不到 ID 为 {element_id} 的元素，无法进行局部滚动。请先调用 browser_get_state 刷新状态或直接进行全局滚动。"
+                            return browser_failure(f"找不到 ID 为 {element_id} 的元素，无法进行局部滚动。请先调用 browser_get_state 刷新状态或直接进行全局滚动。")
                         selector_entry = self._active_mapping[element_id]
 
                         success = await self._evaluate_in_frame(
@@ -669,7 +691,7 @@ class BrowserInteractionsMixin:
                             {"selector": selector_entry[1], "direction": direction, "amount": amount},
                         )
                         if not success:
-                            return "找不到该元素或局部滚动失败，可能是页面 DOM 发生了变化。"
+                            return browser_failure("找不到该元素或局部滚动失败，可能是页面 DOM 发生了变化。")
 
                         direction_cn = {"top": "顶部", "bottom": "底部", "down": f"向下 {amount}px", "up": f"向上 {amount}px"}[direction]
                         result_msg = f"已针对元素 [{element_id}] 所在的局部容器滚动到 {direction_cn}。"
@@ -697,6 +719,6 @@ class BrowserInteractionsMixin:
                     if is_transient_disconnect(e):
                         raise  # 冒泡到 auto_heal_retry 触发自愈重试
                     logger.error("Scroll failed: %s", e)
-                    return f"滚动失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"滚动失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()

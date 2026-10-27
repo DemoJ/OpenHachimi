@@ -22,8 +22,9 @@ Encoding 选择按模型自适应:
     注入真实 ``model_name``,确保 encoding 与实际模型一致;未注入则用
     ``o200k_base`` 作为合理默认。
 
-仅供预检与边界决策;对外展示与触发判定仍以 ``result.usage.input_tokens``
-(provider 真实值)为权威,见 ``ContextCompressor.update_from_response``。
+仅供预检与边界决策;轮后触发判定以最近一次 ``ModelResponse.usage.input_tokens``
+(provider 真实值)为权威,累计 ``RunUsage`` 仅用于成本统计。
+压缩收益的前后比较均使用本地估算,见 ``ContextCompressor``。
 """
 
 from __future__ import annotations

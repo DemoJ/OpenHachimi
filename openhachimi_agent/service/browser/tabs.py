@@ -15,7 +15,7 @@ import logging
 
 from .dom_scripts import MUTATION_OBSERVER_SCRIPT
 from .captcha_patterns import CAPTCHA_PATTERNS
-from .retry import auto_heal_retry, is_transient_disconnect
+from .retry import auto_heal_retry, browser_failure, is_transient_disconnect
 from .utils import _human_verification_message
 
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ class BrowserTabsMixin:
                 if is_transient_disconnect(e):
                     raise  # 冒泡到 auto_heal_retry 触发自愈重试
                 logger.error("Failed to create new tab: %s", e)
-                return f"新建标签页失败：{e}" + self._consume_dialog_report()
+                return browser_failure(f"新建标签页失败：{e}" + self._consume_dialog_report(), error=e)
 
     @auto_heal_retry()
     async def switch_tab(self, tab_index: int, session_id: str | None = None) -> str:
@@ -95,10 +95,10 @@ class BrowserTabsMixin:
             try:
                 valid_pages = self._get_valid_pages()
                 if not valid_pages:
-                    return "当前没有打开任何标签页。"
+                    return browser_failure("当前没有打开任何标签页。")
 
                 if tab_index < 0 or tab_index >= len(valid_pages):
-                    return f"无效的标签页索引 {tab_index}。当前有效索引范围: 0 到 {len(valid_pages) - 1}。"
+                    return browser_failure(f"无效的标签页索引 {tab_index}。当前有效索引范围: 0 到 {len(valid_pages) - 1}。")
 
                 self._page = valid_pages[tab_index]
                 # 切换页面后必须切换到该页面自己的元素映射
@@ -128,11 +128,11 @@ class BrowserTabsMixin:
             try:
                 valid_pages = self._get_valid_pages()
                 if not valid_pages:
-                    return "当前没有打开任何标签页。"
+                    return browser_failure("当前没有打开任何标签页。")
 
                 if tab_index is not None:
                     if tab_index < 0 or tab_index >= len(valid_pages):
-                        return f"无效的标签页索引 {tab_index}。当前有效索引范围: 0 到 {len(valid_pages) - 1}。"
+                        return browser_failure(f"无效的标签页索引 {tab_index}。当前有效索引范围: 0 到 {len(valid_pages) - 1}。")
                     target_page = valid_pages[tab_index]
                 else:
                     target_page = self._page
@@ -166,7 +166,7 @@ class BrowserTabsMixin:
                     if is_transient_disconnect(e):
                         raise  # 冒泡到 auto_heal_retry 触发自愈重试
                     logger.error("Failed to close tab: %s", e)
-                    return f"关闭标签页失败：{e}"
+                    return browser_failure(f"关闭标签页失败：{e}", error=e)
             finally:
                 restore()
 
@@ -239,7 +239,7 @@ class BrowserTabsMixin:
                     if is_transient_disconnect(e):
                         raise  # 冒泡到 auto_heal_retry 触发自愈重试
                     logger.error("Navigation failed: %s", e)
-                    return f"导航失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"导航失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()
 
@@ -251,7 +251,7 @@ class BrowserTabsMixin:
             restore = self._session_route(session_id)
             try:
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 try:
                     self._captcha_detected_reason = None
@@ -268,7 +268,7 @@ class BrowserTabsMixin:
                     if is_transient_disconnect(e):
                         raise
                     logger.error("go_back failed: %s", e)
-                    return f"后退失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"后退失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()
 
@@ -280,7 +280,7 @@ class BrowserTabsMixin:
             restore = self._session_route(session_id)
             try:
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面。"
+                    return browser_failure("当前没有打开的页面。")
 
                 try:
                     self._captcha_detected_reason = None
@@ -296,6 +296,6 @@ class BrowserTabsMixin:
                     if is_transient_disconnect(e):
                         raise
                     logger.error("go_forward failed: %s", e)
-                    return f"前进失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"前进失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()

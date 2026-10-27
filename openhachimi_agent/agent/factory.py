@@ -213,12 +213,20 @@ def _build_base_agent(config: AppConfig, role_name: str, agent_type: str, allowe
     # TODO 接力这些"每轮动态"块实际上从第二轮起就冻结在第一轮的内容。instructions
     # 每次请求都按当前状态重新计算,也不会从历史里读回旧内容。旧会话历史里残留的
     # system prompt 由 main_agent.strip_frozen_system_prompt 在运行前清掉。
+    model = OpenAIChatModel(
+        config.model_name,
+        provider=provider,
+        profile=_build_model_profile(config),
+    )
+    if config.context.enabled:
+        from openhachimi_agent.context.request_budget import ContextBudgetModel
+
+        model = ContextBudgetModel(
+            model, context_length=config.context.context_length,
+            hard_ceiling_percent=config.context.hard_ceiling_percent,
+        )
     agent = Agent(
-        OpenAIChatModel(
-            config.model_name,
-            provider=provider,
-            profile=_build_model_profile(config),
-        ),
+        model,
         instructions=system_prompt + "\n\n" + role_content + "\n\n" + extra_prompt,
         deps_type=AgentDeps,
         toolsets=toolsets,
@@ -301,14 +309,19 @@ def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
 
     from openhachimi_agent.agent.execution import get_final_verification_signal
 
+    from openhachimi_agent.agent.answer_attempts import mark_latest_answer
+
+    messages = getattr(ctx, "messages", ())
     verify_nudge = _verification_gap_nudge(ctx)
     if verify_nudge:
+        mark_latest_answer(messages, "rejected")
         raise ModelRetry(verify_nudge)
 
     session_state = ctx.deps.session_state
     signal = get_final_verification_signal(session_state)
     latest_failure_issues = _latest_failure_issues(signal)
     if not latest_failure_issues:
+        mark_latest_answer(messages, "committed")
         return result
 
     counter = int(session_state.get(VALIDATOR_RETRY_KEY, 0) or 0)
@@ -322,8 +335,10 @@ def _validate_execution_result(ctx: RunContext[AgentDeps], result: str) -> str:
         )
         session_state["_final_validator_yielded"] = True
         session_state["_final_validator_last_signal"] = signal
+        mark_latest_answer(messages, "committed")
         return result
     session_state[VALIDATOR_RETRY_KEY] = counter + 1
+    mark_latest_answer(messages, "rejected")
     raise ModelRetry(_build_latest_failure_retry_message(latest_failure_issues))
 
 

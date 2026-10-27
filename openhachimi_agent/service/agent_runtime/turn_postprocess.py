@@ -111,14 +111,23 @@ async def _save_turn_messages(
     """更新压缩器 token 用量,并把本轮新增差量(new_history[len(history):])追加落库。
 
     append-only 语义下视图已折叠的中间段不重存;``_stamp_turn_metadata`` 已用
-    ``len(history)`` 定位本轮新增起点,这里与之对齐。``result.usage`` 在当前
-    pydantic-ai 是方法(需调用)而非属性,传其本身交由 update_from_response 解包 callable,
-    避免库升级成 property 时炸,也防漏括号清零统计。
+    ``len(history)`` 定位本轮新增起点,这里与之对齐。只用本轮最后一个
+    ``ModelResponse.usage`` 追踪单次请求上下文;``result.usage`` 是累计成本,
+    留给计费使用。本轮无响应或最后响应无用量时清零,不回退到旧响应。
     """
     compressor = ctx.context_compressor
     if compressor is not None:
         try:
-            compressor.update_from_response(result.usage)  # type: ignore[attr-defined]
+            latest_response = next(
+                (msg for msg in reversed(new_history[len(history):]) if isinstance(msg, ModelResponse)),
+                None,
+            )
+            compressor.update_from_response(getattr(latest_response, "usage", None))
+            logger.info(
+                "context usage tracked role=%s session_id=%s request_input=%d request_output=%d window=%d threshold=%d",
+                role, actual_session_id, compressor.last_prompt_tokens, compressor.last_completion_tokens,
+                compressor.context_length, compressor.threshold_tokens,
+            )
         except Exception:
             logger.debug("context usage update failed", exc_info=True)
     new_slice = new_history[len(history):]
@@ -157,7 +166,16 @@ async def _persist_turn(
     ``_maybe_compress_post_turn``。``len(history)`` 是 ``_stamp_turn_metadata``
     的 prev_len 与差量起点的权威来源,须用 load_context 返回的原视图长度。
     """
+    from pydantic_ai.tools import DeferredToolRequests
+    from openhachimi_agent.agent.answer_attempts import stamp_answer_attempts
+    from openhachimi_agent.service.agent_runtime.streaming import normalize_tool_outcomes
+
     new_history = list(result.all_messages())  # type: ignore[attr-defined]
+    stamp_answer_attempts(
+        new_history, start_index=len(history),
+        committed=not isinstance(getattr(result, "output", None), DeferredToolRequests),
+    )
+    normalize_tool_outcomes(new_history[len(history):])
     _stamp_turn_context(service, new_history, deps, role=role, message=message, history=history, attachments=attachments, artifacts=artifacts)
     await _save_turn_messages(
         service, ctx, result, new_history,
@@ -216,6 +234,9 @@ async def _persist_failed_turn_user_message(
     if not (user_message or "").strip() and not attachments:
         return True
 
+    answer_stream = getattr(ctx, "answer_stream", None)
+    draft_output = answer_stream.interrupted_output() if answer_stream is not None else []
+
     _meta = {_USER_MESSAGE_METADATA_KEY: user_message}
     if attachments:
         import json
@@ -239,6 +260,13 @@ async def _persist_failed_turn_user_message(
             chunks = []
     if chunks:
         new_slice.append(ModelResponse(parts=[TextPart(content="".join(chunks))]))
+    if draft_output:
+        from openhachimi_agent.agent.answer_attempts import ANSWER_STATUS_KEY
+
+        new_slice.append(ModelResponse(
+            parts=[TextPart(content="".join(item.text for item in draft_output))],
+            metadata={ANSWER_STATUS_KEY: "interrupted"},
+        ))
     if artifacts:
         if len(new_slice) == 1:
             new_slice.append(ModelResponse(parts=[TextPart(content="")]))

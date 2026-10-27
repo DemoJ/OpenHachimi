@@ -18,6 +18,8 @@ import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from openhachimi_agent.agent.answer_attempts import answer_status, rejected_answer_indices
+
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -121,9 +123,14 @@ class _AssistantTurn:
     tokens: dict[str, int] | None = None
     timestamp: str | None = None
 
-    def add(self, msg: ModelResponse) -> None:
+    def add(self, msg: ModelResponse, *, rejected: bool = False) -> None:
         for part in getattr(msg, "parts", ()):
-            if isinstance(part, TextPart) and str(part.content).strip():
+            if (
+                isinstance(part, TextPart)
+                and not rejected
+                and answer_status(msg) != "internal"
+                and str(part.content).strip()
+            ):
                 self.texts.append(str(part.content).strip())
             elif isinstance(part, ToolCallPart) and part.tool_name == CLARIFY_TOOL_NAME:
                 question = _clarify_question_text(part)
@@ -192,6 +199,8 @@ def build_display_messages(
     附件等,由 session_history 提供)。``markers_after`` 是 ``{turn_index: [标记项]}``,
     标记插在该行所在的那一轮结束处。
     """
+    rows = list(rows)
+    rejected = rejected_answer_indices([msg for _, msg in rows])
     markers_after = markers_after or {}
     items: list[dict] = []
     turn = _AssistantTurn()
@@ -203,9 +212,9 @@ def build_display_messages(
             items.append(item)
         turn = _AssistantTurn()
 
-    for turn_idx, msg in rows:
+    for index, (turn_idx, msg) in enumerate(rows):
         if isinstance(msg, ModelResponse):
-            turn.add(msg)
+            turn.add(msg, rejected=index in rejected)
         elif isinstance(msg, ModelRequest):
             user_items = render_user(msg)
             reply = None if user_items else _clarify_reply_item(msg)

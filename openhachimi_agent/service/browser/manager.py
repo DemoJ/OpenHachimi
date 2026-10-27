@@ -27,7 +27,7 @@ from .tabs import BrowserTabsMixin
 from .interactions import BrowserInteractionsMixin
 from .dom_scripts import DETECT_HUMAN_VERIFICATION_SCRIPT, EXTRACT_CONTENT_SCRIPT, GET_STATE_SCRIPT, MUTATION_OBSERVER_SCRIPT
 from .captcha_patterns import CAPTCHA_PATTERNS
-from .retry import auto_heal_retry, is_transient_disconnect
+from .retry import auto_heal_retry, browser_failure, is_transient_disconnect
 from .utils import _human_verification_message
 
 logger = logging.getLogger(__name__)
@@ -370,11 +370,11 @@ class BrowserManager(BrowserTabsMixin, BrowserInteractionsMixin, BrowserLifecycl
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面，请先使用 browser_navigate 导航到网页。"
+                    return browser_failure("当前没有打开的页面，请先使用 browser_navigate 导航到网页。")
 
                 logger.info("获取当前页面状态（Accessibility Tree）...")
                 if reason := await self._detect_human_verification():
-                    return _human_verification_message(self._page.url, reason)
+                    return browser_failure(_human_verification_message(self._page.url, reason))
 
                 # soft 级验证组件提示：常驻防刷组件不算拦截，但提交表单时可能弹挑战
                 soft_note = getattr(self, "_captcha_soft_note", None)
@@ -477,7 +477,7 @@ class BrowserManager(BrowserTabsMixin, BrowserInteractionsMixin, BrowserLifecycl
                     if is_transient_disconnect(e):
                         raise  # 冒泡到 auto_heal_retry 触发自愈重试
                     logger.error("Failed to get state: %s", e)
-                    return f"获取页面状态失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"获取页面状态失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()
 
@@ -491,11 +491,11 @@ class BrowserManager(BrowserTabsMixin, BrowserInteractionsMixin, BrowserLifecycl
                 await self._update_active_page()
 
                 if not self._page or self._page.is_closed():
-                    return "当前没有打开的页面，请先使用 browser_navigate 导航到网页。"
+                    return browser_failure("当前没有打开的页面，请先使用 browser_navigate 导航到网页。")
 
                 logger.info("提取当前页面正文内容...")
                 if reason := await self._detect_human_verification():
-                    return _human_verification_message(self._page.url, reason)
+                    return browser_failure(_human_verification_message(self._page.url, reason))
 
                 # P3-3: 优先 trafilatura（中文/结构化页面效果远好于自研选择器猜谜），
                 # 未安装或提取失败时降级原 JS 提取
@@ -555,7 +555,7 @@ class BrowserManager(BrowserTabsMixin, BrowserInteractionsMixin, BrowserLifecycl
                     if is_transient_disconnect(e):
                         raise  # 冒泡到 auto_heal_retry 触发自愈重试
                     logger.error("Failed to extract page content: %s", e)
-                    return f"提取页面正文失败：{e}" + self._consume_dialog_report()
+                    return browser_failure(f"提取页面正文失败：{e}" + self._consume_dialog_report(), error=e)
             finally:
                 restore()
 

@@ -12,6 +12,7 @@ import logging
 
 import pytest
 
+from openhachimi_agent.agent.execution import ToolOutcome, ToolResult, get_tool_outcome
 from openhachimi_agent.service.browser.manager import auto_heal_retry
 
 
@@ -72,6 +73,8 @@ async def test_auto_heal_retry_non_transient_fails_fast(caplog):
         result = await boom(bm)
 
     assert result.startswith("BROWSER_OP_FAILED:")
+    assert isinstance(result, ToolResult)
+    assert get_tool_outcome(result) == ToolOutcome("failed")
     assert calls["n"] == 1, "非瞬时错误必须立即失败，禁止重试"
     assert bm.ensure_calls == 0, "非瞬时错误不应触发 heal"
     # 日志必须带 traceback，方便事后排查代码 bug
@@ -94,6 +97,8 @@ async def test_auto_heal_retry_disconnect_exhausted_returns_failure_marker(caplo
 
     # 契约 1：失败字符串以约定前缀开头，方便程序化识别
     assert result.startswith("BROWSER_OP_FAILED:")
+    assert isinstance(result, ToolResult)
+    assert get_tool_outcome(result) == ToolOutcome("failed")
     # 契约 2：保留底层异常的可读信息
     assert "not open" in result
     # 契约 3：日志携带 traceback

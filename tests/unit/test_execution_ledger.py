@@ -4,9 +4,14 @@ import pytest
 from pydantic_ai.exceptions import ModelRetry
 
 from openhachimi_agent.agent.execution import (
+    ToolOutcome,
+    ToolResult,
+    get_tool_outcome,
+    tool_result_status,
     get_execution_ledger,
     get_final_verification_signal,
     get_ledger_length,
+    get_ledger_cursor,
     with_execution_ledger,
 )
 from openhachimi_agent.tools.planning import create_todos, update_todo
@@ -253,3 +258,138 @@ def test_async_tool_timeout_does_not_swallow_cancellation(mock_agent_deps):
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(run_and_cancel())
+
+
+def test_tool_result_preserves_outcome_through_text_wrappers():
+    import copy
+    import json
+
+    outcome = ToolOutcome("failed", effects=frozenset({"browser"}))
+    result = ToolResult("BROWSER_OP_FAILED: startup failed", outcome=outcome)
+    wrapped = "[injected prompt]\n" + result + "\n[TODO reminder]"
+
+    assert isinstance(wrapped, str)
+    assert isinstance(wrapped, ToolResult)
+    assert wrapped.outcome is outcome
+    assert get_tool_outcome(copy.deepcopy(wrapped)) == outcome
+    assert tool_result_status(wrapped) == "failed"
+    assert json.loads(json.dumps(wrapped)) == str(wrapped)
+
+
+@pytest.mark.asyncio
+async def test_failed_browser_result_with_prompt_and_todo_is_not_success(mock_agent_deps, monkeypatch):
+    from openhachimi_agent.service.browser.retry import auto_heal_retry
+    from openhachimi_agent.tools.middleware import with_prompt_injection
+    from openhachimi_agent.tools.planning import with_todo_reminder
+    import openhachimi_agent.content.prompts as prompts
+
+    class Browser:
+        @auto_heal_retry(max_retries=1)
+        async def navigate(self):
+            raise RuntimeError("CDP startup failed")
+
+    async def browser_navigate(ctx, url):
+        return await Browser().navigate()
+
+    monkeypatch.setattr(prompts, "load_system_prompt", lambda name: "browser instructions")
+    ctx = MockRunContext(deps=mock_agent_deps)
+    create_todos(ctx, ["Open the page"])
+    mock_agent_deps.session_state["todo_state"].tool_calls_since_update = 2
+    guarded = with_execution_ledger(with_todo_reminder(with_prompt_injection("browser")(browser_navigate)))
+
+    result = await guarded(ctx, "https://example.invalid")
+
+    assert "[系统自动注入子提示词" in result
+    assert "System Reminder" in result
+    assert "BROWSER_OP_FAILED:" in result
+    assert tool_result_status(result) == "failed"
+    ledger = get_execution_ledger(ctx)
+    assert [event["status"] for event in ledger] == ["started", "failed"]
+    assert ledger[-1]["effects"] == []
+    state = mock_agent_deps.session_state["_verification_state"]
+    assert not state.get("workspace_edited")
+    assert not state.get("browser_edited")
+    assert get_final_verification_signal(mock_agent_deps.session_state) is not None
+
+
+@pytest.mark.parametrize("async_tool", [False, True])
+def test_explicit_failure_does_not_create_workspace_effect(mock_agent_deps, async_tool):
+    import asyncio
+
+    def write_file(ctx):
+        return ToolResult("not written", outcome=ToolOutcome("failed"))
+
+    if async_tool:
+        async def write_file(ctx):
+            return ToolResult("not written", outcome=ToolOutcome("failed"))
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    wrapped = with_execution_ledger(write_file)
+    result = asyncio.run(wrapped(ctx)) if async_tool else wrapped(ctx)
+    assert tool_result_status(result) == "failed"
+    assert get_execution_ledger(ctx)[-1]["status"] == "failed"
+    assert not mock_agent_deps.session_state["_verification_state"].get("workspace_edited")
+
+
+def test_failed_call_retains_explicit_partial_workspace_effect(mock_agent_deps):
+    from openhachimi_agent.agent.verification_stop import build_verify_on_stop_nudge
+
+    def write_file(ctx, path):
+        (ctx.deps.base_dir / path).write_text("partially written", encoding="utf-8")
+        exc = RuntimeError("post-write failure")
+        exc.tool_outcome = ToolOutcome("failed", effects=frozenset({"workspace"}))
+        raise exc
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    result = with_execution_ledger(write_file)(ctx, "actual.py")
+    assert (mock_agent_deps.base_dir / "actual.py").is_file()
+    assert get_tool_outcome(result).effects == frozenset({"workspace"})
+    assert get_execution_ledger(ctx)[-1]["status"] == "failed"
+    assert build_verify_on_stop_nudge(mock_agent_deps.session_state) is not None
+
+
+def test_actual_workspace_write_still_needs_workspace_verification(mock_agent_deps):
+    from openhachimi_agent.agent.verification_stop import build_verify_on_stop_nudge
+    from openhachimi_agent.tools.editing import write_file
+    from openhachimi_agent.tools.filesystem import read_file
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    with_execution_ledger(write_file)(ctx, "actual.py", "x = 1\n")
+    assert (mock_agent_deps.base_dir / "actual.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert build_verify_on_stop_nudge(mock_agent_deps.session_state) is not None
+    with_execution_ledger(read_file)(ctx, "actual.py")
+    assert build_verify_on_stop_nudge(mock_agent_deps.session_state) is None
+
+
+def test_output_failure_words_are_not_business_metadata(mock_agent_deps):
+    def browser_get_state(ctx):
+        return "BROWSER_OP_FAILED: documentation example\nfailed error false"
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    result = with_execution_ledger(browser_get_state)(ctx)
+    assert tool_result_status(result, "browser_get_state") == "success"
+    assert get_execution_ledger(ctx)[-1]["status"] == "succeeded"
+
+
+def test_ledger_cursor_advances_after_bounded_history_fills(mock_agent_deps):
+    def read_file(ctx):
+        return "ok"
+
+    ctx = MockRunContext(deps=mock_agent_deps)
+    wrapped = with_execution_ledger(read_file)
+    for _ in range(110):
+        wrapped(ctx)
+    ledger = get_execution_ledger(ctx)
+    assert get_ledger_length(mock_agent_deps.session_state) == 200
+    assert get_ledger_cursor(mock_agent_deps.session_state) == 220
+    assert [event["seq"] for event in ledger] == list(range(21, 221))
+
+    mock_agent_deps.session_state["current_turn_ledger_start_seq"] = 220
+
+    def browser_navigate(ctx):
+        return ToolResult("failed", outcome=ToolOutcome("failed"))
+
+    with_execution_ledger(browser_navigate)(ctx)
+    assert get_ledger_cursor(mock_agent_deps.session_state) == 222
+    signal = get_final_verification_signal(mock_agent_deps.session_state)
+    assert signal["issues"][0]["tool_name"] == "browser_navigate"

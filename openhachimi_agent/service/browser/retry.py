@@ -10,6 +10,8 @@ from functools import wraps
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
+from openhachimi_agent.agent.execution import ToolOutcome, ToolResult, get_tool_outcome
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,6 +35,24 @@ def is_transient_disconnect(e: Exception) -> bool:
     ) or "not open" in err_str
 
 
+def browser_failure(
+    message: str,
+    *,
+    error: Exception | None = None,
+    changed: bool = False,
+) -> ToolResult:
+    """Report a known business failure, retaining any completed browser action.
+
+    Operations call this at their existing guard/catch sites, not by inspecting
+    arbitrary page text. Transient disconnects still reach the retry decorator.
+    """
+    outcome = ToolOutcome("failed", effects=frozenset({"browser"}) if changed else frozenset())
+    if error is not None and is_transient_disconnect(error):
+        error.tool_outcome = outcome
+        raise error
+    return ToolResult(message, outcome=outcome)
+
+
 def auto_heal_retry(max_retries=3, base_delay=1.0):
     """
     自动恢复重试装饰器（仅对 Playwright 断连/页面崩溃类瞬时错误重试）。
@@ -46,8 +66,9 @@ def auto_heal_retry(max_retries=3, base_delay=1.0):
 
     设计契约：被装饰的方法面向 LLM 工具，错误以中文字符串返回（与 BrowserManager
     内部其它方法保持一致）。重试耗尽或非瞬时错误时的失败字符串以
-    ``BROWSER_OP_FAILED:`` 开头，方便监控和自动化通过前缀程序化识别失败，而不必
-    依赖整句中文匹配。
+    ``BROWSER_OP_FAILED:`` 开头，兼容现有文本消费者；``ToolResult.outcome``
+    是 ledger/streaming 的权威业务状态，不依赖错误文案或提示词前缀。已知部分副作用
+    由操作的异常 ``tool_outcome`` 显式报告；此时不自动重放操作，以免重复提交。
     """
     def decorator(func):
         @wraps(func)
@@ -58,6 +79,16 @@ def auto_heal_retry(max_retries=3, base_delay=1.0):
                     return await func(self, *args, **kwargs)
                 except Exception as e:
                     last_err = e
+                    effects = get_tool_outcome(e).effects
+                    if effects:
+                        # An action already completed. Replaying may double-submit;
+                        # the model must observe its real result before acting again.
+                        logger.warning("Browser action '%s' failed after side effects; not replaying", func.__name__, exc_info=True)
+                        return ToolResult(
+                            f"BROWSER_OP_FAILED: {func.__name__} 操作后连接或观察失败：{e}。"
+                            "已有部分操作生效，未自动重试；请先用 browser_get_state 确认实际状态。",
+                            outcome=ToolOutcome("failed", effects=effects),
+                        )
                     # 检查是否为连接断开或目标关闭类型的错误（与操作内层 except 共用判据）
                     is_disconnect = is_transient_disconnect(e)
 
@@ -68,7 +99,10 @@ def auto_heal_retry(max_retries=3, base_delay=1.0):
                             "Non-transient error in '%s', not retrying: %s",
                             func.__name__, e, exc_info=True,
                         )
-                        return f"BROWSER_OP_FAILED: {func.__name__} 操作失败：{e}"
+                        return ToolResult(
+                            f"BROWSER_OP_FAILED: {func.__name__} 操作失败：{e}",
+                            outcome=ToolOutcome("failed", effects=effects),
+                        )
 
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
@@ -91,6 +125,9 @@ def auto_heal_retry(max_retries=3, base_delay=1.0):
                 "'%s' failed after %d retries. Last error: %s",
                 func.__name__, max_retries, last_err, exc_info=last_err,
             )
-            return f"BROWSER_OP_FAILED: {func.__name__} 操作最终失败：{last_err}"
+            return ToolResult(
+                f"BROWSER_OP_FAILED: {func.__name__} 操作最终失败：{last_err}",
+                outcome=ToolOutcome("failed"),
+            )
         return wrapper
     return decorator
