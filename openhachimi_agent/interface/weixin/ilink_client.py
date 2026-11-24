@@ -156,7 +156,9 @@ class WeixinClient:
     def __init__(self, base_url: str = ILINK_BASE_URL, token: Optional[str] = None):
         self.base_url = base_url.rstrip("/")
         self.token = token
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(40.0))
+        # iLink / WeChat CDN are mainland China services: always connect directly, ignoring the
+        # environment-variable and Windows system proxies, so traffic doesn't detour overseas.
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(40.0), trust_env=False)
 
     async def close(self):
         await self.client.aclose()
